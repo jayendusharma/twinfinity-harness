@@ -644,6 +644,21 @@ def _utc_timestamp(value: str, *, error: str) -> datetime:
     return observed
 
 
+def _fetch_terminal_live_observation(
+    repository: str, issue_number: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fetch the fixed normalized GitHub issue and exact main ref."""
+
+    from sync_github_coordination import (  # local import avoids a cycle
+        _run_gh,
+        fetch_object,
+    )
+
+    issue_payload = fetch_object(repository, "issue", issue_number)
+    main_ref = _run_gh(["api", f"repos/{repository}/git/ref/heads/main"])
+    return issue_payload, main_ref
+
+
 def terminal_watch_key(repository: str, issue_number: int, generation: int) -> str:
     return f"terminal:{repository}:issue:{issue_number}:generation:{generation}"
 
@@ -7305,24 +7320,10 @@ def main() -> int:
             )
             print(canonical_json({"phase": status["state"], "closeout": status}))
         elif args.command == "commit-terminal-closeout":
-            existing_commit = store.connection.execute(
-                "SELECT 1 FROM coordination_terminal_closeout_commits "
-                "WHERE closeout_key=?",
-                (args.closeout_key,),
-            ).fetchone()
-            live_evidence = (
-                None
-                if existing_commit is not None
-                else store.acquire_terminal_live_evidence(
-                    closeout_key=args.closeout_key
-                )
-            )
             status = store.commit_terminal_closeout(
                 closeout_key=args.closeout_key,
                 attempt_id=os.environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID", ""),
                 executor_token=os.environ.get("TWINFINITY_EXECUTOR_TOKEN", ""),
-                live_evidence=live_evidence,
-                now=utc_now(),
             )
             print(canonical_json({"phase": status["state"], "closeout": status}))
         elif args.command == "heartbeat-terminal-watch":

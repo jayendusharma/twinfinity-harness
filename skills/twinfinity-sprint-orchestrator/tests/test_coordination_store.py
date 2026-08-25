@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,29 +67,36 @@ class CoordinationStoreTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.live_observation_patcher.stop()
         self.store.close()
         self.temp.cleanup()
 
     def snapshot(self, updated: str = "2026-08-22T10:00:00Z", title: str = "Issue"):
+        payload = {"number": 92, "title": title, "updated_at": updated}
+        self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(payload)
         return self.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
             object_number=92,
-            payload={"number": 92, "title": title, "updated_at": updated},
+            payload=payload,
             source_updated_at=updated,
             fetched_at="2026-08-22T10:00:01Z",
         )
 
     def issue_snapshot(self, issue_number: int):
+        payload = {
+            "number": issue_number,
+            "title": f"Issue {issue_number}",
+            "updated_at": "2026-08-22T10:00:00Z",
+        }
+        self.remote_issue_payloads[(REPOSITORY, issue_number)] = copy.deepcopy(
+            payload
+        )
         return self.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
             object_number=issue_number,
-            payload={
-                "number": issue_number,
-                "title": f"Issue {issue_number}",
-                "updated_at": "2026-08-22T10:00:00Z",
-            },
+            payload=payload,
             source_updated_at="2026-08-22T10:00:00Z",
             fetched_at="2026-08-22T10:00:01Z",
         )
@@ -97,6 +104,7 @@ class CoordinationStoreTests(unittest.TestCase):
     def seed_current_graph(self, issue_number: int, source_sha256: str) -> dict:
         graph_version = 1
         main_sha = "a" * 40
+        self.remote_main_shas[REPOSITORY] = main_sha
         node_key = f"issue-{issue_number}"
         graph_sha256 = digest_json(
             {"issue_number": issue_number, "source": source_sha256}
@@ -166,38 +174,45 @@ class CoordinationStoreTests(unittest.TestCase):
         )
         return self.store.reserve_outbox(outbox_id, now)
 
-    def terminal_live_evidence(
-        self,
-        closeout_key: str,
-        observed_at: str,
-        *,
-        issue_payload: dict | None = None,
-        current_main_sha: str | None = None,
-    ) -> dict:
-        packet = self.store.connection.execute(
-            "SELECT * FROM coordination_terminal_closeout_packets "
-            "WHERE closeout_key=?",
-            (closeout_key,),
-        ).fetchone()
-        snapshot = self.store.current_snapshot(
-            packet["repository"], "issue", int(packet["issue_number"])
-        )
+    def _terminal_live_observation(
+        self, repository: str, issue_number: int
+    ) -> tuple[dict, dict]:
         payload = copy.deepcopy(
-            snapshot.payload if issue_payload is None else issue_payload
+            self.remote_issue_payloads[(repository, issue_number)]
         )
-        main_sha = (
-            str(packet["graph_main_sha"])
-            if current_main_sha is None
-            else current_main_sha
-        )
-        return self.store.acquire_terminal_live_evidence(
-            closeout_key=closeout_key,
-            observed_at=observed_at,
-            issue_fetcher=lambda _repository, _kind, _number: payload,
-            main_ref_fetcher=lambda _repository: {
-                "ref": "refs/heads/main",
-                "object": {"sha": main_sha},
-            },
+        return payload, {
+            "ref": "refs/heads/main",
+            "object": {"sha": self.remote_main_shas[repository]},
+        }
+
+    def test_terminal_live_observation_uses_fixed_normalized_issue_and_main_ref(
+        self,
+    ) -> None:
+        issue_payload = {
+            "number": 92,
+            "updated_at": "2026-08-22T10:00:00Z",
+            "_projection_version": 3,
+        }
+        main_ref = {
+            "ref": "refs/heads/main",
+            "object": {"sha": "a" * 40},
+        }
+        with (
+            patch(
+                "sync_github_coordination.fetch_object",
+                return_value=issue_payload,
+            ) as fetch_issue,
+            patch(
+                "sync_github_coordination._run_gh",
+                return_value=main_ref,
+            ) as run_gh,
+        ):
+            observed = self.fixed_live_observation(REPOSITORY, 92)
+
+        self.assertEqual((issue_payload, main_ref), observed)
+        fetch_issue.assert_called_once_with(REPOSITORY, "issue", 92)
+        run_gh.assert_called_once_with(
+            ["api", f"repos/{REPOSITORY}/git/ref/heads/main"]
         )
 
     def install_all_current_endpoints(self) -> None:
@@ -1890,10 +1905,6 @@ class CoordinationStoreTests(unittest.TestCase):
             closeout_key=closeout_key,
             attempt_id=running["attempt_id"],
             executor_token=token,
-            live_evidence=self.terminal_live_evidence(
-                closeout_key, "2026-08-22T10:00:10Z"
-            ),
-            now="2026-08-22T10:00:10Z",
         )
         done = self.store.connection.execute(
             "SELECT status,allocation_class,sre_units FROM coordination_items "
@@ -2138,7 +2149,6 @@ class CoordinationStoreTests(unittest.TestCase):
                 closeout_key=closeout_key,
                 attempt_id=running["attempt_id"],
                 executor_token=token,
-                now="2026-08-22T10:00:08Z",
             )
         outbox_id = prepared["outbox_id"]
         with self.assertRaisesRegex(
@@ -2155,27 +2165,53 @@ class CoordinationStoreTests(unittest.TestCase):
         self.complete_terminal_outbox(
             outbox_id, "comment:123", "2026-08-22T10:00:10Z"
         )
-        remote_issue = Mock(
-            return_value={
-                "number": 92,
-                "title": "Remote source moved after publication readback",
-                "updated_at": "2026-08-22T10:00:20Z",
-            }
-        )
-        remote_main = Mock(
-            return_value={
-                "ref": "refs/heads/main",
-                "object": {"sha": "a" * 40},
-            }
-        )
-        drift_evidence = self.store.acquire_terminal_live_evidence(
-            closeout_key=closeout_key,
-            observed_at="2026-08-22T10:00:10Z",
-            issue_fetcher=remote_issue,
-            main_ref_fetcher=remote_main,
-        )
-        remote_issue.assert_called_once_with(REPOSITORY, "issue", 92)
-        remote_main.assert_called_once_with(REPOSITORY)
+        self.live_observation.reset_mock()
+        with self.store.transaction():
+            with self.assertRaisesRegex(
+                CoordinationError,
+                "TERMINAL_LIVE_EVIDENCE_TRANSACTION_ACTIVE",
+            ):
+                self.store.commit_terminal_closeout(
+                    closeout_key=closeout_key,
+                    attempt_id=running["attempt_id"],
+                    executor_token=token,
+                )
+        self.live_observation.assert_not_called()
+        packet_row = self.store.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_packets "
+            "WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        cached_source = self.store.current_snapshot(REPOSITORY, "issue", 92)
+        cached_descriptor = {
+            "schema": "twinfinity-terminal-live-evidence/v1",
+            "closeout_key": closeout_key,
+            "packet_sha256": packet_row["packet_sha256"],
+            "repository": REPOSITORY,
+            "issue_number": 92,
+            "source_payload_sha256": cached_source.payload_sha256,
+            "source_updated_at": cached_source.source_updated_at,
+            "current_main_sha": packet_row["graph_main_sha"],
+            "observed_at": "2026-08-22T10:00:10Z",
+        }
+        cached_forgery = {
+            **cached_descriptor,
+            "evidence_sha256": digest_json(cached_descriptor),
+        }
+        with self.assertRaisesRegex(TypeError, "live_evidence"):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=running["attempt_id"],
+                executor_token=token,
+                live_evidence=cached_forgery,
+            )
+
+        self.remote_issue_payloads[(REPOSITORY, 92)] = {
+            "number": 92,
+            "title": "Remote source moved after publication readback",
+            "updated_at": "2026-08-22T10:00:20Z",
+        }
+        self.live_observation.reset_mock()
         before_remote_drift = (
             tuple(
                 self.store.connection.execute(
@@ -2206,9 +2242,8 @@ class CoordinationStoreTests(unittest.TestCase):
                 closeout_key=closeout_key,
                 attempt_id=running["attempt_id"],
                 executor_token=token,
-                live_evidence=drift_evidence,
-                now="2026-08-22T10:00:10Z",
             )
+        self.live_observation.assert_called_once_with(REPOSITORY, 92)
         after_remote_drift = (
             tuple(
                 self.store.connection.execute(
@@ -2233,6 +2268,9 @@ class CoordinationStoreTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(before_remote_drift, after_remote_drift)
+        self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(
+            cached_source.payload
+        )
         completed_preparer = transition_attempt(
             self.store.connection,
             attempt_id=running["attempt_id"],
@@ -2443,7 +2481,6 @@ class CoordinationStoreTests(unittest.TestCase):
                     closeout_key=closeout_key,
                     attempt_id=invalid_attempt["attempt_id"],
                     executor_token=invalid_token,
-                    now="2026-08-22T10:00:10Z",
                 )
             self.assertEqual(before_invalid, terminal_fingerprint())
             transition_attempt(
@@ -2468,7 +2505,6 @@ class CoordinationStoreTests(unittest.TestCase):
                     closeout_key=closeout_key,
                     attempt_id=invalid_attempt_id,
                     executor_token=invalid_token,
-                    now="2026-08-22T10:00:10Z",
                 )
             self.assertEqual(before_invalid, terminal_fingerprint())
         rotated_pending_version = self.store.connection.execute(
@@ -2481,6 +2517,7 @@ class CoordinationStoreTests(unittest.TestCase):
             "WHERE repository=?",
             ("b" * 40, REPOSITORY),
         )
+        self.remote_main_shas[REPOSITORY] = "b" * 40
         with self.assertRaisesRegex(
             CoordinationError, "TERMINAL_GRAPH_BINDING_DRIFT"
         ):
@@ -2488,12 +2525,6 @@ class CoordinationStoreTests(unittest.TestCase):
                 closeout_key=closeout_key,
                 attempt_id=watcher["attempt_id"],
                 executor_token=watcher_token,
-                live_evidence=self.terminal_live_evidence(
-                    closeout_key,
-                    "2026-08-22T10:00:11Z",
-                    current_main_sha="b" * 40,
-                ),
-                now="2026-08-22T10:00:11Z",
             )
         self.assertEqual(
             ("PUBLICATION_PENDING", "ACTIVE", "CLAIMED"),
@@ -2514,6 +2545,7 @@ class CoordinationStoreTests(unittest.TestCase):
             "WHERE repository=?",
             ("a" * 40, REPOSITORY),
         )
+        self.remote_main_shas[REPOSITORY] = "a" * 40
         self.snapshot(updated="2026-08-22T10:00:20Z", title="Newer issue truth")
         with self.assertRaisesRegex(
             CoordinationError, "TERMINAL_CLOSEOUT_SOURCE_DRIFT"
@@ -2522,10 +2554,6 @@ class CoordinationStoreTests(unittest.TestCase):
                 closeout_key=closeout_key,
                 attempt_id=watcher["attempt_id"],
                 executor_token=watcher_token,
-                live_evidence=self.terminal_live_evidence(
-                    closeout_key, "2026-08-22T10:00:21Z"
-                ),
-                now="2026-08-22T10:00:21Z",
             )
         self.store.connection.execute(
             """
@@ -2545,28 +2573,27 @@ class CoordinationStoreTests(unittest.TestCase):
             "WHERE repository=?",
             (REPOSITORY,),
         )
-        good_live_evidence = self.terminal_live_evidence(
-            closeout_key, "2026-08-22T10:00:11Z"
-        )
-        stale_live_evidence = copy.deepcopy(good_live_evidence)
-        stale_live_evidence["observed_at"] = "2026-08-22T09:58:00Z"
-        stale_live_evidence["evidence_sha256"] = digest_json(
-            {
-                key: value
-                for key, value in stale_live_evidence.items()
-                if key != "evidence_sha256"
-            }
+        self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(
+            cached_source.payload
         )
         before_stale_evidence = terminal_fingerprint()
-        with self.assertRaisesRegex(
-            CoordinationError, "TERMINAL_LIVE_EVIDENCE_STALE"
+        with (
+            patch.object(
+                coordination_store_module,
+                "utc_now",
+                side_effect=[
+                    "2026-08-22T09:58:00Z",
+                    "2026-08-22T10:00:11Z",
+                ],
+            ),
+            self.assertRaisesRegex(
+                CoordinationError, "TERMINAL_LIVE_EVIDENCE_STALE"
+            ),
         ):
             self.store.commit_terminal_closeout(
                 closeout_key=closeout_key,
                 attempt_id=watcher["attempt_id"],
                 executor_token=watcher_token,
-                live_evidence=stale_live_evidence,
-                now="2026-08-22T10:00:11Z",
             )
         self.assertEqual(before_stale_evidence, terminal_fingerprint())
         for failpoint in (
@@ -2585,8 +2612,6 @@ class CoordinationStoreTests(unittest.TestCase):
                     closeout_key=closeout_key,
                     attempt_id=watcher["attempt_id"],
                     executor_token=watcher_token,
-                    live_evidence=good_live_evidence,
-                    now="2026-08-22T10:00:11Z",
                     _test_failpoint=fail_at(failpoint),
                 )
             rolled_back = self.store.connection.execute(
@@ -2627,8 +2652,6 @@ class CoordinationStoreTests(unittest.TestCase):
                     closeout_key=closeout_key,
                     attempt_id=watcher["attempt_id"],
                     executor_token=watcher_token,
-                    live_evidence=good_live_evidence,
-                    now="2026-08-22T10:00:11Z",
                 )
             finally:
                 concurrent_store.close()
@@ -2679,7 +2702,6 @@ class CoordinationStoreTests(unittest.TestCase):
             closeout_key=closeout_key,
             attempt_id=watcher["attempt_id"],
             executor_token=watcher_token,
-            now="2026-08-22T10:00:12Z",
         )
         self.assertEqual(committed, replay)
         self.assertEqual(
@@ -2712,12 +2734,26 @@ class CoordinationStoreTests(unittest.TestCase):
             "FROM coordination_terminal_closeout_commits WHERE closeout_key=?",
             (closeout_key,),
         ).fetchone()
+        persisted_live_evidence = json.loads(terminal_commit["live_evidence_json"])
+        persisted_descriptor = {
+            key: value
+            for key, value in persisted_live_evidence.items()
+            if key != "evidence_sha256"
+        }
         self.assertEqual(
+            digest_json(persisted_descriptor),
+            terminal_commit["live_evidence_sha256"],
+        )
+        self.assertEqual(
+            terminal_commit["live_evidence_sha256"],
+            persisted_live_evidence["evidence_sha256"],
+        )
+        self.assertEqual(
+            (cached_source.payload_sha256, "a" * 40),
             (
-                good_live_evidence["evidence_sha256"],
-                canonical_json(good_live_evidence),
+                persisted_live_evidence["source_payload_sha256"],
+                persisted_live_evidence["current_main_sha"],
             ),
-            tuple(terminal_commit),
         )
         self.assertEqual(
             1,
@@ -3958,10 +3994,6 @@ class CoordinationStoreTests(unittest.TestCase):
             closeout_key=closeout_key,
             attempt_id=running["attempt_id"],
             executor_token=token,
-            live_evidence=self.terminal_live_evidence(
-                closeout_key, "2026-08-22T10:00:12Z"
-            ),
-            now="2026-08-22T10:00:12Z",
         )
         self.assertEqual("COMPLETE", completed["state"])
         self.assertEqual(

@@ -20,6 +20,7 @@ from coordination_store import (  # noqa: E402
     terminal_published_body,
     terminal_publication_body,
 )
+import coordination_store as coordination_store_module  # noqa: E402
 from coordination_supervisor import (  # noqa: E402
     CoordinationSupervisor,
     SchedulerLaunchPolicy,
@@ -1098,22 +1099,30 @@ class CoordinationSupervisorTests(unittest.TestCase):
             process_id=2999,
             now="2026-08-22T10:20:04Z",
         )
-        live_evidence = self.store.acquire_terminal_live_evidence(
-            closeout_key=closeout_key,
-            observed_at="2026-08-22T10:20:05Z",
-            issue_fetcher=lambda _repository, _kind, _number: source.payload,
-            main_ref_fetcher=lambda _repository: {
-                "ref": "refs/heads/main",
-                "object": {"sha": "a" * 40},
-            },
-        )
-        self.store.commit_terminal_closeout(
-            closeout_key=closeout_key,
-            attempt_id=fresh_running["attempt_id"],
-            executor_token=fresh_token,
-            live_evidence=live_evidence,
-            now="2026-08-22T10:20:05Z",
-        )
+        with (
+            patch.object(
+                coordination_store_module,
+                "_fetch_terminal_live_observation",
+                return_value=(
+                    source.payload,
+                    {
+                        "ref": "refs/heads/main",
+                        "object": {"sha": "a" * 40},
+                    },
+                ),
+            ) as live_observation,
+            patch.object(
+                coordination_store_module,
+                "utc_now",
+                return_value="2026-08-22T10:20:05Z",
+            ),
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=fresh_running["attempt_id"],
+                executor_token=fresh_token,
+            )
+        live_observation.assert_called_once_with(REPOSITORY, 92)
 
         result = self.supervisor.run_once("2026-08-22T10:20:06Z")
         repeated = self.supervisor.run_once("2026-08-22T10:20:07Z")
