@@ -98,6 +98,21 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             (f"watch-{suffix}", identity, "2026-08-24T09:00:01Z"),
         )
 
+    def _seed_current_config_pointers(self, roles: tuple[str, ...]) -> None:
+        ensure_executor_registry_schema(self.connection)
+        now = "2026-08-24T09:00:00Z"
+        for role in roles:
+            endpoint = self.config.roles[role]
+            _verify_or_insert_endpoint(self.connection, endpoint.payload, now)
+            self.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint.endpoint_id, now),
+            )
+
     def _routing_state_bytes(self) -> bytes:
         schema = [
             tuple(row)
@@ -319,6 +334,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 self.assertEqual(before, self._routing_state_bytes())
 
     def test_apply_is_atomic_and_first_cutover_rollback_is_forbidden(self) -> None:
+        self._seed_current_config_pointers(("development", "sre"))
         self._insert_legacy_item_and_watch("103")
         reviewed = self._dry_run_plan()
         statements: list[str] = []
@@ -473,6 +489,64 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                     expected_role=entry["role"],
                 )
 
+    def test_fresh_registry_holds_without_broker_credential_transport(self) -> None:
+        reviewed = self._dry_run_plan()
+        before = self._routing_state_bytes()
+
+        self.assertEqual(
+            {
+                ("development", "role.development.v5", "credential_transport"),
+                ("sre", "role.sre.v5", "credential_transport"),
+            },
+            {
+                (entry["role"], entry["endpoint_id"], entry["kind"])
+                for entry in reviewed["broker_cutover_blockers"]
+            },
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED"
+        ):
+            self._migrate(reviewed, "fresh-registry-broker-cutover")
+
+        self.assertEqual(before, self._routing_state_bytes())
+
+    def test_missing_sre_pointer_holds_without_broker_credential_transport(self) -> None:
+        ensure_executor_registry_schema(self.connection)
+        now = "2026-08-24T09:00:00Z"
+        for role in ("planner", "development"):
+            endpoint_id = self.config.roles[role].endpoint_id
+            _verify_or_insert_endpoint(
+                self.connection, self.config.roles[role].payload, now
+            )
+            self.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint_id, now),
+            )
+        reviewed = self._dry_run_plan()
+        before = self._routing_state_bytes()
+
+        self.assertEqual(
+            [
+                {
+                    "role": "sre",
+                    "endpoint_id": "role.sre.v5",
+                    "kind": "credential_transport",
+                    "key": "ATTEMPT_BOUND_RESPONSES_PROXY_NOT_IMPLEMENTED",
+                }
+            ],
+            reviewed["broker_cutover_blockers"],
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED"
+        ):
+            self._migrate(reviewed, "missing-sre-pointer-broker-cutover")
+
+        self.assertEqual(before, self._routing_state_bytes())
+
     def test_v4_to_v5_cutover_rejects_every_actionable_target_class_atomically(self) -> None:
         ensure_executor_registry_schema(self.connection)
         now = "2026-08-24T09:00:00Z"
@@ -575,12 +649,8 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
         )
 
     def test_versioned_cutover_rejects_alias_bound_to_wrong_role_endpoint(self) -> None:
-        ensure_executor_registry_schema(self.connection)
+        self._seed_current_config_pointers(ROLES)
         now = "2026-08-24T09:00:00Z"
-        for role in ROLES:
-            _verify_or_insert_endpoint(
-                self.connection, self.config.roles[role].payload, now
-            )
         development_alias = self.alias_by_role["development"]
         self.connection.execute(
             """

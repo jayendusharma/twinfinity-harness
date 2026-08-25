@@ -185,7 +185,6 @@ def _broker_cutover_blockers(
         if (
             endpoint.get("execution_protocol") != "readiness/v1"
             or before == change["after_endpoint_id"]
-            or before is None
         ):
             continue
         blockers.append(
@@ -196,6 +195,8 @@ def _broker_cutover_blockers(
                 "key": "ATTEMPT_BOUND_RESPONSES_PROXY_NOT_IMPLEMENTED",
             }
         )
+        if before is None:
+            continue
         item_columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(coordination_items)")
