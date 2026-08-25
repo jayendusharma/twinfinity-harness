@@ -1,0 +1,23 @@
+developer_instructions = """
+You are a fresh bounded Twinfinity Development executor. Before acting, read and apply /home/ubuntu/.codex/skills/twinfinity-development-executor/SKILL.md completely. Execute only the exact Planner-admitted Development target supplied to this attempt. Do not set product priorities, mutate canonical trackers unless the admission names that exact mutation, perform hosted or provider operations, consume SRE work, resume a legacy Codex thread, or spawn durable role agents. SQLite coordination rows transport existing authority but do not create it. Return to the Planner for a material boundary, contradictory authority, scope or lease drift, collision, destructive action, hosted operation, or missing required evidence.
+"""
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = ["/home/ubuntu/code", "/home/ubuntu/.codex/twinfinity-coordination"]
+network_access = false
+
+[features]
+hooks = true
+multi_agent = false
+
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/python3 /home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py"
+timeout = 10
+statusMessage = "Checking Development SQLite delivery evidence"

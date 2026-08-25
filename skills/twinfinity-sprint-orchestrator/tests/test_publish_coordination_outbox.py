@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -10,7 +12,11 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from coordination_store import CoordinationError, CoordinationStore  # noqa: E402
+from coordination_store import (  # noqa: E402
+    CoordinationError,
+    CoordinationStore,
+    digest_json,
+)
 import publish_coordination_outbox as publisher  # noqa: E402
 
 
@@ -51,6 +57,105 @@ class PublisherTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.temp.cleanup()
+
+    def bind_terminal_packet(self, publisher_login: str | None = "twinfinity-bot") -> None:
+        row = self.store.connection.execute(
+            "SELECT * FROM github_outbox WHERE id=?", (self.outbox,)
+        ).fetchone()
+        closeout_key = row["idempotency_key"]
+        graph_sha = digest_json({"issue": 92, "source": row["expected_source_sha256"]})
+        graph_binding = {
+            "repository": REPOSITORY,
+            "issue_number": 92,
+            "graph_version": 1,
+            "graph_sha256": graph_sha,
+            "graph_main_sha": "a" * 40,
+            "graph_node_key": "issue-92",
+            "source_payload_sha256": row["expected_source_sha256"],
+        }
+        graph_binding["graph_binding_sha256"] = digest_json(graph_binding)
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_revisions VALUES (?,?,NULL,?,?,?,?,?)",
+            (
+                REPOSITORY, 1, "a" * 40, graph_sha,
+                '{"milestones":[]}', "[]", "2026-08-22T10:00:01Z",
+            ),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO portfolio_graph_nodes VALUES (
+                ?,1,'issue-92',92,'DELIVERY','STANDALONE',NULL,NULL,NULL,
+                'issue-92',0,1,1,1,1,1,0,?,'2026-08-22T10:00:01Z'
+            )
+            """,
+            (REPOSITORY, row["expected_source_sha256"]),
+        )
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_current VALUES (?,1,?,'CURRENT',?,NULL)",
+            (REPOSITORY, "a" * 40, "2026-08-22T10:00:01Z"),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO coordination_terminal_closeout_packets(
+                closeout_key,packet_sha256,repository,issue_number,generation,
+                source_payload_sha256,lease_manifest_sha256,accountable_role,
+                endpoint_id,preparer_attempt_id,preparer_attempt_version,
+                terminal_watch_key,activation_message_id,
+                activation_payload_sha256,expected_item_version,
+                publication_pending_item_version,terminal_receipt_sha256,
+                terminal_receipt_json,cleanup_evidence_sha256,
+                cleanup_evidence_json,outbox_id,outbox_payload_sha256,
+                graph_version,graph_sha256,graph_main_sha,graph_node_key,
+                graph_binding_sha256,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                closeout_key,
+                hashlib.sha256(f"packet:{closeout_key}".encode()).hexdigest(),
+                REPOSITORY,
+                92,
+                1,
+                row["expected_source_sha256"],
+                "5" * 64,
+                "development",
+                "role.development.v3",
+                "00000000-0000-4000-8000-000000000001",
+                1,
+                f"terminal:{REPOSITORY}:issue:92:generation:1",
+                1,
+                "6" * 64,
+                1,
+                2,
+                "7" * 64,
+                "{}",
+                "8" * 64,
+                "{}",
+                self.outbox,
+                row["payload_sha256"],
+                1,
+                graph_binding["graph_sha256"],
+                graph_binding["graph_main_sha"],
+                graph_binding["graph_node_key"],
+                graph_binding["graph_binding_sha256"],
+                "2026-08-22T10:00:02Z",
+            ),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO coordination_terminal_outbox_recovery(
+                outbox_id,readback_attempts,retry_rounds,next_retry_at,
+                state,updated_at,last_error
+            ) VALUES (?,0,0,'2026-08-22T10:00:02Z','PENDING',
+                      '2026-08-22T10:00:02Z',NULL)
+            """,
+            (self.outbox,),
+        )
+        if publisher_login is not None:
+            self.store.bind_terminal_outbox_publisher(
+                outbox_id=self.outbox,
+                publisher_login=publisher_login,
+                now="2026-08-22T10:00:02Z",
+            )
 
     @patch.object(publisher, "fetch_object")
     @patch.object(publisher, "_gh_json")
@@ -164,6 +269,209 @@ class PublisherTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(CoordinationError, "GITHUB_READBACK_MISSING"):
             publisher.publish(self.store, self.outbox)
+
+    @patch.object(publisher, "_gh_json")
+    def test_terminal_hold_reconciles_exact_marker_without_republish(self, gh) -> None:
+        self.bind_terminal_packet()
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "TERMINAL_OUTBOX_ENVELOPE_IMMUTABLE"
+        ):
+            self.store.connection.execute(
+                "UPDATE github_outbox SET payload_json='{}' WHERE id=?",
+                (self.outbox,),
+            )
+        self.store.reserve_outbox(self.outbox, "2026-08-22T10:00:03Z")
+        self.store.hold_outbox(
+            self.outbox, "GITHUB_WRITE_AMBIGUOUS", "2026-08-22T10:00:04Z"
+        )
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        gh.side_effect = [
+            {"login": "twinfinity-bot"},
+            [[{
+                "id": 789,
+                "body": published,
+                "created_at": "2026-08-22T10:00:03Z",
+                "user": {"login": "twinfinity-bot"},
+            }]],
+        ]
+
+        result = publisher.publish(self.store, self.outbox)
+
+        self.assertEqual("comment:789", result["receipt"])
+        self.assertTrue(all("POST" not in call.args[0] for call in gh.call_args_list))
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "TERMINAL_OUTBOX_COMPLETE_IMMUTABLE"):
+            self.store.connection.execute(
+                "UPDATE github_outbox SET remote_receipt='comment:999' WHERE id=?",
+                (self.outbox,),
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "TERMINAL_OUTBOX_READBACK_IMMUTABLE"):
+            self.store.connection.execute(
+                "UPDATE coordination_terminal_outbox_readbacks "
+                "SET publisher_login='somebody-else' WHERE outbox_id=?",
+                (self.outbox,),
+            )
+
+    @patch.object(publisher, "fetch_object")
+    @patch.object(publisher, "_gh_json")
+    def test_rotated_actor_reconciles_original_publisher_after_post_ack_loss(
+        self, gh, fetch
+    ) -> None:
+        self.bind_terminal_packet(publisher_login=None)
+        fetch.return_value = self.payload
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        gh.side_effect = [
+            {"login": "actor-a"},
+            CoordinationError("GITHUB_WRITE_AMBIGUOUS"),
+            [[]],
+        ]
+        with self.assertRaisesRegex(
+            CoordinationError, "GITHUB_READBACK_MISSING"
+        ):
+            publisher.publish(self.store, self.outbox)
+        binding = self.store.connection.execute(
+            "SELECT publisher_login FROM coordination_terminal_outbox_publishers "
+            "WHERE outbox_id=?",
+            (self.outbox,),
+        ).fetchone()
+        self.assertEqual("actor-a", binding["publisher_login"])
+
+        gh.side_effect = [
+            {"login": "actor-b"},
+            [[
+                {
+                    "id": 992,
+                    "body": published,
+                    "created_at": "2026-08-22T10:00:03Z",
+                    "user": {"login": "actor-a"},
+                }
+            ]],
+        ]
+        result = publisher.publish(self.store, self.outbox)
+
+        self.assertEqual("comment:992", result["receipt"])
+        self.assertEqual(
+            ("actor-a", "actor-a"),
+            tuple(
+                self.store.connection.execute(
+                    """
+                    SELECT publisher.publisher_login, readback.publisher_login
+                    FROM coordination_terminal_outbox_publishers publisher
+                    JOIN coordination_terminal_outbox_readbacks readback
+                      USING(outbox_id)
+                    WHERE publisher.outbox_id=?
+                    """,
+                    (self.outbox,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum("POST" in call.args[0] for call in gh.call_args_list),
+        )
+
+    @patch.object(publisher, "_gh_json")
+    def test_rotated_actor_without_original_marker_holds_without_rearm(
+        self, gh
+    ) -> None:
+        self.bind_terminal_packet(publisher_login="actor-a")
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        gh.side_effect = [{"login": "actor-b"}, [[]]]
+
+        with self.assertRaisesRegex(
+            CoordinationError,
+            "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH",
+        ):
+            publisher.publish(self.store, self.outbox)
+
+        outbox = self.store.connection.execute(
+            "SELECT state,last_error FROM github_outbox WHERE id=?",
+            (self.outbox,),
+        ).fetchone()
+        recovery = self.store.connection.execute(
+            "SELECT state,retry_rounds,readback_attempts "
+            "FROM coordination_terminal_outbox_recovery WHERE outbox_id=?",
+            (self.outbox,),
+        ).fetchone()
+        self.assertEqual(
+            ("HOLD", "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"),
+            tuple(outbox),
+        )
+        self.assertEqual(("HOLD", 0, 0), tuple(recovery))
+        self.assertTrue(all("POST" not in call.args[0] for call in gh.call_args_list))
+
+    @patch.object(publisher, "utc_now")
+    @patch.object(publisher, "_gh_json")
+    def test_terminal_missing_readback_has_bounded_rebind_to_same_outbox(
+        self, gh, now
+    ) -> None:
+        self.bind_terminal_packet()
+        self.store.reserve_outbox(self.outbox, "2026-08-22T10:00:02Z")
+        self.store.hold_outbox(
+            self.outbox, "GITHUB_WRITE_AMBIGUOUS", "2026-08-22T10:00:02Z"
+        )
+        gh.side_effect = [
+            {"login": "twinfinity-bot"}, [[]],
+            {"login": "twinfinity-bot"}, [[]],
+            {"login": "twinfinity-bot"}, [[]],
+        ]
+        now.side_effect = [
+            "2026-08-22T10:00:03Z",
+            "2026-08-22T10:01:04Z",
+            "2026-08-22T10:03:05Z",
+            "2026-08-22T10:03:06Z",
+        ]
+
+        for _ in range(3):
+            with self.assertRaisesRegex(
+                CoordinationError, "GITHUB_READBACK_MISSING"
+            ):
+                publisher.publish(self.store, self.outbox)
+
+        outbox = self.store.connection.execute(
+            "SELECT state FROM github_outbox WHERE id=?", (self.outbox,)
+        ).fetchone()
+        recovery = self.store.connection.execute(
+            "SELECT state,retry_rounds,readback_attempts "
+            "FROM coordination_terminal_outbox_recovery WHERE outbox_id=?",
+            (self.outbox,),
+        ).fetchone()
+        self.assertEqual("PREPARED", outbox["state"])
+        self.assertEqual(("RETRY_READY", 1, 0), tuple(recovery))
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_terminal_closeout_packets"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM github_outbox"
+            ).fetchone()[0],
+        )
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        prior_post_count = sum(
+            "POST" in call.args[0] for call in gh.call_args_list
+        )
+        gh.side_effect = [
+            {"login": "twinfinity-bot"},
+            [[
+                {
+                    "id": 993,
+                    "body": published,
+                    "created_at": "2026-08-22T10:00:03Z",
+                    "user": {"login": "twinfinity-bot"},
+                }
+            ]],
+        ]
+
+        result = publisher.publish(self.store, self.outbox)
+
+        self.assertEqual("comment:993", result["receipt"])
+        self.assertEqual(
+            prior_post_count,
+            sum("POST" in call.args[0] for call in gh.call_args_list),
+        )
 
 
 if __name__ == "__main__":

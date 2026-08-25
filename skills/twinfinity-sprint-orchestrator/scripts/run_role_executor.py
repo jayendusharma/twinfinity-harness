@@ -12,6 +12,11 @@ import subprocess
 import time
 from typing import Any, Callable
 
+from coordination_store import (
+    ACTIVE_EXECUTION_STATUSES,
+    digest_json,
+    terminal_watch_key,
+)
 from executor_registry import (
     AttemptLineage,
     DEFAULT_CONFIG,
@@ -163,7 +168,7 @@ def _validate_target(
         return attempt_lineage_for_target(connection, target_kind, target_key)
     if target_kind == "terminal_watch":
         row = connection.execute(
-            "SELECT accountable_session_id, state FROM coordination_terminal_watches WHERE watch_key=?",
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
             (target_key,),
         ).fetchone()
         if (
@@ -173,6 +178,113 @@ def _validate_target(
             or row["accountable_session_id"] != endpoint_id
         ):
             raise RegistryError("EXECUTOR_TARGET_INVALID")
+        admission = connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (row["admission_message_id"],),
+        ).fetchone()
+        try:
+            admission_payload = (
+                None
+                if admission is None
+                else json.loads(admission["payload_json"])
+            )
+        except (TypeError, json.JSONDecodeError):
+            admission_payload = None
+        admission_source = (
+            admission_payload.get("source")
+            if isinstance(admission_payload, dict)
+            else None
+        )
+        expected_admission_topics = (
+            {"development.admission", "development.recovery_commit"}
+            if role == "development"
+            else {"sre.admission"}
+        )
+        claim_attempt = connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?",
+            (row["claim_attempt_id"],),
+        ).fetchone()
+        packet = connection.execute(
+            "SELECT 1 FROM coordination_terminal_closeout_packets "
+            "WHERE terminal_watch_key=?",
+            (target_key,),
+        ).fetchone()
+        original_endpoint = (
+            None if admission is None else admission["recipient_session_id"]
+        )
+        if (
+            admission is None
+            or admission["topic"] not in expected_admission_topics
+            or not isinstance(admission_payload, dict)
+            or not isinstance(admission_source, dict)
+            or digest_json(admission_payload) != admission["payload_sha256"]
+            or admission["payload_sha256"] != row["admission_payload_sha256"]
+            or admission["state"] not in {"CLAIMED", "COMPLETE"}
+            or identity_role(connection, str(original_endpoint)) != role
+            or admission["claimed_by"] != original_endpoint
+            or admission_source.get("repository") != row["repository"]
+            or admission_source.get("object_kind") != "issue"
+            or admission_source.get("object_number") != int(row["issue_number"])
+            or admission_payload.get("issue_number") != int(row["issue_number"])
+            or admission_payload.get("generation") != int(row["generation"])
+            or admission_payload.get("accountable_session_id") != original_endpoint
+            or admission_payload.get("lease_manifest_sha256")
+            != row["lease_manifest_sha256"]
+            or claim_attempt is None
+            or claim_attempt["role"] != role
+            or claim_attempt["endpoint_id"] != original_endpoint
+            or claim_attempt["state"] not in (
+                {"RUNNING", "COMPLETE", "HOLD"}
+                if packet is not None
+                else {"RUNNING", "COMPLETE"}
+            )
+            or claim_attempt["target_kind"] != "message"
+            or claim_attempt["target_key"] != str(row["admission_message_id"])
+            or claim_attempt["lineage_repository"] != row["repository"]
+            or int(claim_attempt["lineage_issue_number"] or -1)
+            != int(row["issue_number"])
+            or int(claim_attempt["lineage_generation"] or -1)
+            != int(row["generation"])
+            or claim_attempt["lineage_lease_sha256"]
+            != row["lease_manifest_sha256"]
+        ):
+            raise RegistryError("EXECUTOR_TARGET_INVALID")
+        item = connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (row["repository"], row["issue_number"]),
+        ).fetchone()
+        current_source = connection.execute(
+            """
+            SELECT payload_sha256 FROM github_current
+            WHERE repository=? AND object_kind='issue' AND object_number=?
+            """,
+            (row["repository"], row["issue_number"]),
+        ).fetchone()
+        expected_watch_key = terminal_watch_key(
+            str(row["repository"]), int(row["issue_number"]), int(row["generation"])
+        )
+        if (
+            target_key != expected_watch_key
+            or item is None
+            or current_source is None
+            or current_source["payload_sha256"] != item["source_payload_sha256"]
+            or item["allocation_class"] != "ACTIVE"
+            or item["status"] not in ACTIVE_EXECUTION_STATUSES
+            or int(item["generation"]) != int(row["generation"])
+            or item["accountable_session_id"] != endpoint_id
+            or item["accountable_session_id"] != row["accountable_session_id"]
+            or item["lease_manifest_sha256"] != row["lease_manifest_sha256"]
+            or (role == "development" and int(item["sre_units"]) != 0)
+            or (
+                role == "sre"
+                and (
+                    int(item["development_units"]) != 0
+                    or int(item["shared_units"]) != 0
+                    or int(item["sre_units"]) <= 0
+                )
+            )
+        ):
+            raise RegistryError("EXECUTOR_TERMINAL_WATCH_CONTRACT_INVALID")
         return attempt_lineage_for_target(connection, target_kind, target_key)
     if target_kind == "hosted_operation":
         if role != "sre":

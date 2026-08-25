@@ -14,6 +14,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import hmac
 import fcntl
 import json
 import os
@@ -22,7 +23,7 @@ import pwd
 import re
 import sqlite3
 import stat
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from owner_safe_sqlite import UnsafeSQLitePathError, prepare_owner_database
 from approval_guard import (
@@ -80,6 +81,7 @@ ITEM_STATUSES = {
     "ACTIVE",
     "ACTIVE_FENCED",
     "MONITOR",
+    "PUBLICATION_PENDING",
     "HOLD",
     "DONE",
 }
@@ -91,11 +93,15 @@ STATUS_RANK = {
     "ACTIVE": 4,
     "ACTIVE_FENCED": 4,
     "MONITOR": 4,
-    "HOLD": 5,
-    "DONE": 6,
+    "PUBLICATION_PENDING": 5,
+    "HOLD": 6,
+    "DONE": 7,
 }
 MESSAGE_STATES = {"PREPARED", "CLAIMED", "COMPLETE", "HOLD"}
 OUTBOX_STATES = {"PREPARED", "INFLIGHT", "COMPLETE", "HOLD"}
+TERMINAL_OUTBOX_READBACK_ATTEMPTS_PER_RETRY = 3
+TERMINAL_OUTBOX_MAX_RETRY_ROUNDS = 3
+TERMINAL_LIVE_EVIDENCE_MAX_AGE_SECONDS = 60
 ALLOCATION_CLASSES = {"ACTIVE", "RETAINED", "NONE"}
 ARTIFACT_RETENTION_CLASSES = {"EPHEMERAL", "CLOSEOUT_EVIDENCE", "RETAINED"}
 ARTIFACT_STATES = {
@@ -121,10 +127,19 @@ PREPARED_MESSAGE_HOLD_REASONS = {
     "SUPERSEDED_BY_ENVIRONMENT_REBIND",
     "SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER",
 }
-ACTIVE_EXECUTION_STATUSES = {"ACTIVE", "ACTIVE_FENCED", "MONITOR"}
+ACTIVE_EXECUTION_STATUSES = {
+    "ACTIVE",
+    "ACTIVE_FENCED",
+    "MONITOR",
+    "PUBLICATION_PENDING",
+}
 _READY_FINALIZATION_GATEWAY = object()
 _READINESS_DECISION_GATEWAY = object()
 _READINESS_RESOLUTION_GATEWAY = object()
+_ADMISSION_ACTIVATION_GATEWAY = object()
+_TRANSFER_ACTIVATION_GATEWAY = object()
+_TERMINAL_FINALIZATION_GATEWAY = object()
+_TEST_FIXTURE_GATEWAY = object()
 _TEST_FIXTURE_FORBIDDEN_ITEM_STATES = {
     "READY",
     "READY_ELIGIBLE",
@@ -145,6 +160,11 @@ MUTATING_TOPIC_ROLES = {
     "development.recovery_commit": "development",
     "development.terminal_closeout": "development",
     "sre.admission": "sre",
+}
+ADMISSION_WATCH_TOPICS = {
+    "development.admission",
+    "development.recovery_commit",
+    "sre.admission",
 }
 NOTICE_KINDS = {
     "evidence",
@@ -260,6 +280,35 @@ TERMINAL_CLEANUP_RESOURCE_STATES = {
     "were absent",
     "were removed",
 }
+TERMINAL_CLEANUP_SCHEMA = "twinfinity-terminal-cleanup/v1"
+TERMINAL_CLEANUP_DISPOSITIONS = {"ABSENT", "NOT_APPLICABLE"}
+TERMINAL_CLEANUP_KEYS = {
+    "schema",
+    "repository",
+    "issue_number",
+    "generation",
+    "lease_manifest_sha256",
+    "owned_resources_absent",
+    "temporary_resources_absent",
+    "worktree_disposition",
+    "local_branch_disposition",
+    "remote_branch_disposition",
+    "residuals",
+}
+TERMINAL_RECEIPT_SCHEMA = "twinfinity-terminal-receipt/v1"
+TERMINAL_RECEIPT_KEYS = {
+    "schema",
+    "repository",
+    "issue_number",
+    "generation",
+    "source_payload_sha256",
+    "lease_manifest_sha256",
+    "outcome",
+    "accepted_head_sha",
+    "operational_state_sha256",
+    "acceptance_evidence_sha256",
+    "residual_risks",
+}
 TERMINAL_CAPACITY_INTEGER_KEY = re.compile(
     r"^(?:(?:active|available)_(?:development|shared|sre)_after|"
     r"(?:development|shared|sre)_units_released|"
@@ -307,6 +356,7 @@ NOTICE_CONSENT_GIVEN = re.compile(
 )
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 BRANCH = re.compile(r"^codex/[0-9]+-[a-z0-9][a-z0-9-]*$")
+REMOTE_COMMENT_RECEIPT = re.compile(r"^comment:[1-9][0-9]*$")
 
 STRUCTURED_LEASE_REQUIRED_KEYS = {
     "repository",
@@ -593,6 +643,86 @@ def timestamp_after(timestamp: str, seconds: int) -> str:
     return (observed + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
 
 
+def _utc_timestamp(value: str, *, error: str) -> datetime:
+    try:
+        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise CoordinationError(error) from exc
+    if observed.tzinfo is None or observed.utcoffset() != timedelta(0):
+        raise CoordinationError(error)
+    return observed
+
+
+def _fetch_terminal_live_observation(
+    repository: str, issue_number: int, remote_receipt: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Fetch the fixed issue, main ref, receipt comment, and issue timeline."""
+
+    from sync_github_coordination import (  # local import avoids a cycle
+        _run_gh,
+        fetch_object,
+    )
+
+    issue_payload = fetch_object(repository, "issue", issue_number)
+    main_ref = _run_gh(["api", f"repos/{repository}/git/ref/heads/main"])
+    receipt_match = REMOTE_COMMENT_RECEIPT.fullmatch(remote_receipt)
+    if receipt_match is None:
+        raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
+    comment = _run_gh(
+        [
+            "api",
+            f"repos/{repository}/issues/comments/{remote_receipt.split(':', 1)[1]}",
+        ]
+    )
+    raw_timeline = _run_gh(
+        [
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/issues/{issue_number}/timeline?per_page=100",
+        ]
+    )
+    if not isinstance(raw_timeline, list) or not raw_timeline:
+        raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+    timeline: list[dict[str, Any]] = []
+    for page in raw_timeline:
+        if not isinstance(page, list) or not page:
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        for event in page:
+            if not isinstance(event, dict) or not event:
+                raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+            timeline.append(event)
+    return issue_payload, main_ref, comment, timeline
+
+
+def _terminal_issue_material_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Exclude only GitHub's comment-volatile issue timestamp."""
+
+    material = dict(payload)
+    material.pop("updated_at", None)
+    return material
+
+
+def _terminal_timeline_activity(event: dict[str, Any]) -> dict[str, Any]:
+    """Normalize attribution fields without trusting unrelated timeline bytes."""
+
+    actor = event.get("user") or event.get("actor") or {}
+    body = event.get("body")
+    return {
+        "id": event.get("id"),
+        "event": event.get("event"),
+        "body_sha256": (
+            hashlib.sha256(body.encode("utf-8")).hexdigest()
+            if isinstance(body, str)
+            else None
+        ),
+        "publisher_login": actor.get("login") if isinstance(actor, dict) else None,
+        "created_at": event.get("created_at"),
+        "updated_at": event.get("updated_at"),
+        "issue_url": event.get("issue_url"),
+    }
+
+
 def terminal_watch_key(repository: str, issue_number: int, generation: int) -> str:
     return f"terminal:{repository}:issue:{issue_number}:generation:{generation}"
 
@@ -822,6 +952,127 @@ def _validate_terminal_notice_evidence(
                 raise CoordinationError("NOTICE_SCHEMA_INVALID")
 
     return frozenset(exempt)
+
+
+def validate_terminal_cleanup_evidence(
+    evidence: Any,
+    *,
+    repository: str,
+    issue_number: int,
+    generation: int,
+    lease_manifest_sha256: str,
+    role: str,
+) -> str:
+    """Validate and digest one complete, role-bounded cleanup attestation."""
+
+    if not isinstance(evidence, dict) or set(evidence) != TERMINAL_CLEANUP_KEYS:
+        raise CoordinationError("TERMINAL_CLEANUP_EVIDENCE_INVALID")
+    if (
+        evidence.get("schema") != TERMINAL_CLEANUP_SCHEMA
+        or evidence.get("repository") != repository
+        or evidence.get("issue_number") != issue_number
+        or evidence.get("generation") != generation
+        or evidence.get("lease_manifest_sha256") != lease_manifest_sha256
+        or evidence.get("owned_resources_absent") is not True
+        or evidence.get("temporary_resources_absent") is not True
+        or evidence.get("worktree_disposition")
+        not in TERMINAL_CLEANUP_DISPOSITIONS
+        or evidence.get("local_branch_disposition")
+        not in TERMINAL_CLEANUP_DISPOSITIONS
+        or evidence.get("remote_branch_disposition")
+        not in TERMINAL_CLEANUP_DISPOSITIONS
+        or evidence.get("residuals") != []
+    ):
+        raise CoordinationError("TERMINAL_CLEANUP_EVIDENCE_INVALID")
+    if role == "development" and any(
+        evidence[key] != "ABSENT"
+        for key in (
+            "worktree_disposition",
+            "local_branch_disposition",
+            "remote_branch_disposition",
+        )
+    ):
+        raise CoordinationError("TERMINAL_CLEANUP_EVIDENCE_INCOMPLETE")
+    if role not in {"development", "sre"}:
+        raise CoordinationError("TERMINAL_CLOSEOUT_ROLE_INVALID")
+    return digest_json(evidence)
+
+
+def validate_terminal_receipt(
+    receipt: Any,
+    *,
+    repository: str,
+    issue_number: int,
+    generation: int,
+    source_payload_sha256: str,
+    lease_manifest_sha256: str,
+    role: str,
+) -> str:
+    """Validate and digest the accepted delivery or operational outcome."""
+
+    if not isinstance(receipt, dict) or set(receipt) != TERMINAL_RECEIPT_KEYS:
+        raise CoordinationError("TERMINAL_RECEIPT_INVALID")
+    head = receipt.get("accepted_head_sha")
+    operational = receipt.get("operational_state_sha256")
+    residuals = receipt.get("residual_risks")
+    if (
+        receipt.get("schema") != TERMINAL_RECEIPT_SCHEMA
+        or receipt.get("repository") != repository
+        or receipt.get("issue_number") != issue_number
+        or receipt.get("generation") != generation
+        or receipt.get("source_payload_sha256") != source_payload_sha256
+        or receipt.get("lease_manifest_sha256") != lease_manifest_sha256
+        or receipt.get("outcome") != "ACCEPTED"
+        or not isinstance(receipt.get("acceptance_evidence_sha256"), str)
+        or not isinstance(residuals, list)
+        or any(not isinstance(item, str) or not item for item in residuals)
+    ):
+        raise CoordinationError("TERMINAL_RECEIPT_INVALID")
+    _validate_sha256(str(receipt["acceptance_evidence_sha256"]))
+    if role == "development":
+        if (
+            not isinstance(head, str)
+            or not GIT_SHA.fullmatch(head)
+            or operational is not None
+        ):
+            raise CoordinationError("TERMINAL_RECEIPT_INVALID")
+    elif role == "sre":
+        if head is not None or not isinstance(operational, str):
+            raise CoordinationError("TERMINAL_RECEIPT_INVALID")
+        _validate_sha256(operational)
+    else:
+        raise CoordinationError("TERMINAL_CLOSEOUT_ROLE_INVALID")
+    return digest_json(receipt)
+
+
+def terminal_publication_body(
+    *,
+    closeout_key: str,
+    terminal_receipt: dict[str, Any],
+    cleanup_evidence: dict[str, Any],
+) -> str:
+    """Render the one exact GitHub terminal receipt bound by the packet."""
+
+    descriptor = {
+        "schema": "twinfinity-terminal-publication/v1",
+        "closeout_key": closeout_key,
+        "terminal_receipt": terminal_receipt,
+        "cleanup_evidence": cleanup_evidence,
+    }
+    return (
+        "<!-- twinfinity-terminal-publication:v1 -->\n"
+        "Terminal delivery receipt\n\n"
+        "```json\n"
+        f"{canonical_json(descriptor)}\n"
+        "```"
+    )
+
+
+def terminal_published_body(body: str, idempotency_key: str) -> str:
+    """Bind an externally published terminal body to its immutable outbox key."""
+
+    marker = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return f"{body}\n\n<!-- twinfinity-outbox:{marker} -->"
 
 
 def _notice_has_forbidden_content(value: Any) -> bool:
@@ -1358,7 +1609,12 @@ class CoordinationStore:
                 generation INTEGER NOT NULL CHECK(generation >= 0),
                 accountable_session_id TEXT NOT NULL,
                 lease_manifest_sha256 TEXT NOT NULL,
-                state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'COMPLETE', 'HOLD')),
+                state TEXT NOT NULL CHECK(state IN (
+                    'PENDING_CLAIM','ACTIVE','COMPLETE','HOLD'
+                )),
+                admission_message_id INTEGER,
+                admission_payload_sha256 TEXT,
+                claim_attempt_id TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
                 process_id INTEGER,
                 target_progress_sha256 TEXT,
@@ -1368,6 +1624,136 @@ class CoordinationStore:
                 last_error TEXT,
                 UNIQUE(repository, issue_number, generation)
             );
+            CREATE TABLE IF NOT EXISTS coordination_terminal_closeout_packets (
+                closeout_key TEXT PRIMARY KEY,
+                packet_sha256 TEXT NOT NULL UNIQUE,
+                repository TEXT NOT NULL,
+                issue_number INTEGER NOT NULL CHECK(issue_number > 0),
+                generation INTEGER NOT NULL CHECK(generation >= 0),
+                source_payload_sha256 TEXT NOT NULL,
+                lease_manifest_sha256 TEXT NOT NULL,
+                accountable_role TEXT NOT NULL
+                    CHECK(accountable_role IN ('development','sre')),
+                endpoint_id TEXT NOT NULL,
+                preparer_attempt_id TEXT NOT NULL,
+                preparer_attempt_version INTEGER NOT NULL
+                    CHECK(preparer_attempt_version > 0),
+                terminal_watch_key TEXT NOT NULL,
+                activation_message_id INTEGER NOT NULL,
+                activation_payload_sha256 TEXT NOT NULL,
+                expected_item_version INTEGER NOT NULL
+                    CHECK(expected_item_version > 0),
+                publication_pending_item_version INTEGER NOT NULL
+                    CHECK(publication_pending_item_version > expected_item_version),
+                terminal_receipt_sha256 TEXT NOT NULL,
+                terminal_receipt_json TEXT NOT NULL,
+                cleanup_evidence_sha256 TEXT NOT NULL,
+                cleanup_evidence_json TEXT NOT NULL,
+                outbox_id INTEGER NOT NULL UNIQUE,
+                outbox_payload_sha256 TEXT NOT NULL,
+                graph_version INTEGER NOT NULL CHECK(graph_version > 0),
+                graph_sha256 TEXT NOT NULL,
+                graph_main_sha TEXT NOT NULL,
+                graph_node_key TEXT NOT NULL,
+                graph_binding_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(repository, issue_number, generation)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_closeout_packet_immutable_update
+            BEFORE UPDATE ON coordination_terminal_closeout_packets
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_CLOSEOUT_PACKET_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_closeout_packet_immutable_delete
+            BEFORE DELETE ON coordination_terminal_closeout_packets
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_CLOSEOUT_PACKET_IMMUTABLE'); END;
+            CREATE TABLE IF NOT EXISTS coordination_terminal_closeout_commits (
+                closeout_key TEXT PRIMARY KEY,
+                commit_sha256 TEXT NOT NULL UNIQUE,
+                finalizer_attempt_id TEXT NOT NULL,
+                finalizer_attempt_version INTEGER NOT NULL
+                    CHECK(finalizer_attempt_version > 0),
+                live_evidence_sha256 TEXT,
+                live_evidence_json TEXT,
+                remote_receipt TEXT NOT NULL,
+                remote_receipt_sha256 TEXT NOT NULL,
+                prior_item_version INTEGER NOT NULL CHECK(prior_item_version > 0),
+                done_item_version INTEGER NOT NULL
+                    CHECK(done_item_version > prior_item_version),
+                dirty_event_id INTEGER NOT NULL UNIQUE,
+                committed_at TEXT NOT NULL,
+                FOREIGN KEY(closeout_key)
+                    REFERENCES coordination_terminal_closeout_packets(closeout_key)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_closeout_commit_immutable_update
+            BEFORE UPDATE ON coordination_terminal_closeout_commits
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_CLOSEOUT_COMMIT_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_closeout_commit_immutable_delete
+            BEFORE DELETE ON coordination_terminal_closeout_commits
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_CLOSEOUT_COMMIT_IMMUTABLE'); END;
+            CREATE TABLE IF NOT EXISTS coordination_terminal_outbox_readbacks (
+                outbox_id INTEGER PRIMARY KEY,
+                closeout_key TEXT NOT NULL UNIQUE,
+                remote_receipt TEXT NOT NULL UNIQUE,
+                remote_receipt_sha256 TEXT NOT NULL,
+                published_body_sha256 TEXT NOT NULL,
+                publisher_login TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id),
+                FOREIGN KEY(closeout_key)
+                    REFERENCES coordination_terminal_closeout_packets(closeout_key)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_readback_immutable_update
+            BEFORE UPDATE ON coordination_terminal_outbox_readbacks
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_READBACK_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_readback_immutable_delete
+            BEFORE DELETE ON coordination_terminal_outbox_readbacks
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_READBACK_IMMUTABLE'); END;
+            CREATE TABLE IF NOT EXISTS coordination_terminal_outbox_recovery (
+                outbox_id INTEGER PRIMARY KEY,
+                readback_attempts INTEGER NOT NULL DEFAULT 0
+                    CHECK(readback_attempts >= 0),
+                retry_rounds INTEGER NOT NULL DEFAULT 0
+                    CHECK(retry_rounds >= 0),
+                next_retry_at TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'PENDING','RETRY_WAIT','RETRY_READY','COMPLETE','HOLD'
+                )),
+                updated_at TEXT NOT NULL,
+                last_error TEXT,
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id)
+            );
+            CREATE TABLE IF NOT EXISTS coordination_terminal_outbox_publishers (
+                outbox_id INTEGER PRIMARY KEY,
+                closeout_key TEXT NOT NULL UNIQUE,
+                publisher_login TEXT NOT NULL,
+                binding_sha256 TEXT NOT NULL UNIQUE,
+                bound_at TEXT NOT NULL,
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id),
+                FOREIGN KEY(closeout_key)
+                    REFERENCES coordination_terminal_closeout_packets(closeout_key)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_publisher_immutable_update
+            BEFORE UPDATE ON coordination_terminal_outbox_publishers
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_PUBLISHER_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_publisher_immutable_delete
+            BEFORE DELETE ON coordination_terminal_outbox_publishers
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_PUBLISHER_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_envelope_immutable
+            BEFORE UPDATE OF idempotency_key, repository, object_kind,
+                             object_number, operation, expected_source_sha256,
+                             payload_sha256, payload_json, created_at
+            ON github_outbox
+            WHEN EXISTS (
+                SELECT 1 FROM coordination_terminal_closeout_packets
+                WHERE outbox_id=OLD.id
+            )
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_ENVELOPE_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_complete_immutable
+            BEFORE UPDATE ON github_outbox
+            WHEN OLD.state='COMPLETE' AND EXISTS (
+                SELECT 1 FROM coordination_terminal_closeout_packets
+                WHERE outbox_id=OLD.id
+            )
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_COMPLETE_IMMUTABLE'); END;
             CREATE TABLE IF NOT EXISTS coordination_pre_push_gates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 repository TEXT NOT NULL,
@@ -1526,6 +1912,110 @@ class CoordinationStore:
                 ON coordination_artifacts(repository, issue_number, generation, state);
             """
         )
+        watch_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(coordination_terminal_watches)"
+            )
+        }
+        watch_schema = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='coordination_terminal_watches'"
+        ).fetchone()
+        if (
+            not {
+                "admission_message_id",
+                "admission_payload_sha256",
+                "claim_attempt_id",
+            }.issubset(watch_columns)
+            or watch_schema is None
+            or "PENDING_CLAIM" not in str(watch_schema[0])
+        ):
+            # An unbound historical ACTIVE watch is not executable after this
+            # cutover. Preserve it for audit on HOLD rather than guessing its
+            # admission or claimant.
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                ALTER TABLE coordination_terminal_watches
+                    RENAME TO coordination_terminal_watches_legacy;
+                CREATE TABLE coordination_terminal_watches (
+                    watch_key TEXT PRIMARY KEY,
+                    repository TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL CHECK(issue_number > 0),
+                    generation INTEGER NOT NULL CHECK(generation >= 0),
+                    accountable_session_id TEXT NOT NULL,
+                    lease_manifest_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'PENDING_CLAIM','ACTIVE','COMPLETE','HOLD'
+                    )),
+                    admission_message_id INTEGER,
+                    admission_payload_sha256 TEXT,
+                    claim_attempt_id TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                    process_id INTEGER,
+                    last_heartbeat_at TEXT NOT NULL,
+                    next_wake_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    UNIQUE(repository, issue_number, generation)
+                );
+                INSERT INTO coordination_terminal_watches(
+                    watch_key, repository, issue_number, generation,
+                    accountable_session_id, lease_manifest_sha256, state,
+                    admission_message_id, admission_payload_sha256,
+                    claim_attempt_id, attempts, process_id,
+                    last_heartbeat_at, next_wake_at, updated_at, last_error
+                )
+                SELECT watch_key, repository, issue_number, generation,
+                       accountable_session_id, lease_manifest_sha256,
+                       CASE WHEN state='ACTIVE' THEN 'HOLD' ELSE state END,
+                       NULL, NULL, NULL, attempts, NULL,
+                       last_heartbeat_at, next_wake_at, updated_at,
+                       CASE WHEN state='ACTIVE'
+                            THEN 'TERMINAL_WATCH_ADMISSION_BINDING_MIGRATION_REQUIRED'
+                            ELSE last_error END
+                FROM coordination_terminal_watches_legacy;
+                DROP TABLE coordination_terminal_watches_legacy;
+                COMMIT;
+                """
+            )
+        packet_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(coordination_terminal_closeout_packets)"
+            )
+        }
+        # Historical packets remain immutable audit evidence.  Nullable
+        # additions deliberately make them non-finalizable until a fresh
+        # current-graph packet is prepared; no historical binding is guessed.
+        for column, declaration in (
+            ("graph_version", "INTEGER"),
+            ("graph_sha256", "TEXT"),
+            ("graph_main_sha", "TEXT"),
+            ("graph_node_key", "TEXT"),
+            ("graph_binding_sha256", "TEXT"),
+        ):
+            if column not in packet_columns:
+                self.connection.execute(
+                    f"ALTER TABLE coordination_terminal_closeout_packets "
+                    f"ADD COLUMN {column} {declaration}"
+                )
+        commit_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(coordination_terminal_closeout_commits)"
+            )
+        }
+        # Historical commits remain replayable audit evidence.  New commits
+        # require both fields; nullable migration columns avoid fabricating a
+        # live observation for an already-completed historical lineage.
+        for column in ("live_evidence_sha256", "live_evidence_json"):
+            if column not in commit_columns:
+                self.connection.execute(
+                    "ALTER TABLE coordination_terminal_closeout_commits "
+                    f"ADD COLUMN {column} TEXT"
+                )
         columns = {
             row[1]
             for row in self.connection.execute("PRAGMA table_info(coordination_items)")
@@ -2240,6 +2730,25 @@ class CoordinationStore:
             return "ARTIFACT_NOT_TERMINAL"
         if watch is None or watch["state"] != "COMPLETE":
             return "ARTIFACT_TERMINAL_WATCH_INCOMPLETE"
+        terminal_commit = self.connection.execute(
+            """
+            SELECT 1
+            FROM coordination_terminal_closeout_packets packet
+            JOIN coordination_terminal_closeout_commits terminal_commit
+              USING(closeout_key)
+            JOIN github_outbox outbox ON outbox.id=packet.outbox_id
+            WHERE packet.repository=? AND packet.issue_number=?
+              AND packet.generation=? AND outbox.state='COMPLETE'
+              AND outbox.remote_receipt IS NOT NULL
+            """,
+            (
+                artifact["repository"],
+                artifact["issue_number"],
+                artifact["generation"],
+            ),
+        ).fetchone()
+        if terminal_commit is None:
+            return "ARTIFACT_TERMINAL_CLOSEOUT_INCOMPLETE"
 
         for message in self.connection.execute(
             "SELECT topic, payload_json, state FROM coordination_messages WHERE state IN ('PREPARED','CLAIMED')"
@@ -2949,7 +3458,98 @@ class CoordinationStore:
         now: str,
         sre_units: int = 0,
         _transaction: bool = True,
-        _gateway: object | None = None,
+    ) -> dict[str, Any]:
+        """Apply an ordinary non-gateway issue transition."""
+
+        return self._set_issue_status_locked(
+            repository=repository,
+            issue_number=issue_number,
+            status=status,
+            allocation_class=allocation_class,
+            generation=generation,
+            accountable_session_id=accountable_session_id,
+            lease_manifest_sha256=lease_manifest_sha256,
+            development_units=development_units,
+            shared_units=shared_units,
+            expected_source_sha256=expected_source_sha256,
+            expected_version=expected_version,
+            now=now,
+            sre_units=sre_units,
+            transaction=_transaction,
+            gateway=None,
+        )
+
+    def _set_issue_status_from_admission(
+        self, *, pending_claim: bool, **item: Any
+    ) -> dict[str, Any]:
+        if not self.connection.in_transaction:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+        return self._set_issue_status_locked(
+            **item,
+            transaction=False,
+            gateway=_ADMISSION_ACTIVATION_GATEWAY,
+            admission_watch_pending_claim=pending_claim,
+        )
+
+    def _set_issue_status_from_transfer(
+        self, *, pending_claim: bool, **item: Any
+    ) -> dict[str, Any]:
+        """Apply one typed transfer release or successor activation atomically."""
+
+        if not self.connection.in_transaction:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+        status = item.get("status")
+        allocation_class = item.get("allocation_class")
+        if not (
+            (status == "MONITOR" and allocation_class == "NONE")
+            or (
+                status in {"ACTIVE", "ACTIVE_FENCED"}
+                and allocation_class == "ACTIVE"
+            )
+        ):
+            raise CoordinationError("TRANSFER_ITEM_TRANSITION_INVALID")
+        return self._set_issue_status_locked(
+            **item,
+            transaction=False,
+            gateway=_TRANSFER_ACTIVATION_GATEWAY,
+            admission_watch_pending_claim=pending_claim,
+        )
+
+    def _set_issue_status_for_test_fixture(self, **item: Any) -> dict[str, Any]:
+        """Seed non-readiness item states only on a temporary database."""
+
+        status = item.get("status")
+        if (
+            isinstance(status, str)
+            and status.upper() in _TEST_FIXTURE_FORBIDDEN_ITEM_STATES
+        ):
+            raise CoordinationError("READY_FINALIZATION_REQUIRED")
+        self._require_temporary_test_database()
+        return self._set_issue_status_locked(
+            **item,
+            transaction=True,
+            gateway=_TEST_FIXTURE_GATEWAY,
+        )
+
+    def _set_issue_status_locked(
+        self,
+        *,
+        repository: str,
+        issue_number: int,
+        status: str,
+        allocation_class: str,
+        generation: int,
+        accountable_session_id: str | None,
+        lease_manifest_sha256: str | None,
+        development_units: int,
+        shared_units: int,
+        expected_source_sha256: str,
+        expected_version: int,
+        now: str,
+        sre_units: int = 0,
+        transaction: bool,
+        gateway: object | None,
+        admission_watch_pending_claim: bool = False,
     ) -> dict[str, Any]:
         _validate_repository(repository)
         _validate_sha256(expected_source_sha256)
@@ -2977,7 +3577,7 @@ class CoordinationStore:
             development_units or shared_units or sre_units
         ):
             raise CoordinationError("INVALID_CAPACITY_ALLOCATION")
-        with (self.transaction() if _transaction else nullcontext()):
+        with (self.transaction() if transaction else nullcontext()):
             gc_reservation = self.connection.execute(
                 """
                 SELECT 1 FROM coordination_artifacts
@@ -2999,6 +3599,40 @@ class CoordinationStore:
             actual_version = 0 if current is None else int(current["version"])
             if actual_version != expected_version:
                 raise CoordinationError("ITEM_VERSION_CONFLICT")
+            if (
+                current is not None
+                and current["allocation_class"] in {"ACTIVE", "RETAINED"}
+                and (allocation_class == "NONE" or status == "DONE")
+                and gateway not in {
+                    _TERMINAL_FINALIZATION_GATEWAY,
+                    _TEST_FIXTURE_GATEWAY,
+                }
+                and not (
+                    gateway is _TRANSFER_ACTIVATION_GATEWAY
+                    and status == "MONITOR"
+                    and allocation_class == "NONE"
+                )
+            ):
+                raise CoordinationError("TERMINAL_FINALIZATION_REQUIRED")
+            if (
+                status == "PUBLICATION_PENDING"
+                and gateway not in {
+                    _TERMINAL_FINALIZATION_GATEWAY,
+                    _TEST_FIXTURE_GATEWAY,
+                }
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_PACKET_REQUIRED")
+            creating_execution = status in ACTIVE_EXECUTION_STATUSES and (
+                current is None
+                or current["status"] not in ACTIVE_EXECUTION_STATUSES
+                or current["allocation_class"] != "ACTIVE"
+            )
+            if creating_execution and gateway not in {
+                _ADMISSION_ACTIVATION_GATEWAY,
+                _TRANSFER_ACTIVATION_GATEWAY,
+                _TEST_FIXTURE_GATEWAY,
+            }:
+                raise CoordinationError("ADMISSION_ACTIVATION_REQUIRED")
             if current is not None:
                 current_generation = int(current["generation"])
                 if generation < current_generation:
@@ -3021,7 +3655,7 @@ class CoordinationStore:
             creating_ready = status == "READY" and (
                 current is None or current["status"] != "READY"
             )
-            if creating_ready and _gateway is not _READY_FINALIZATION_GATEWAY:
+            if creating_ready and gateway is not _READY_FINALIZATION_GATEWAY:
                 raise CoordinationError("READY_FINALIZATION_REQUIRED")
             reserved = self.connection.execute(
                 """
@@ -3148,6 +3782,15 @@ class CoordinationStore:
                     (repository, issue_number, generation),
                 ).fetchone()
                 if prior_watch is None:
+                    watch_state = (
+                        "PENDING_CLAIM"
+                        if gateway in {
+                            _ADMISSION_ACTIVATION_GATEWAY,
+                            _TRANSFER_ACTIVATION_GATEWAY,
+                        }
+                        and admission_watch_pending_claim
+                        else "ACTIVE"
+                    )
                     self.connection.execute(
                         """
                         INSERT INTO coordination_terminal_watches(
@@ -3155,7 +3798,7 @@ class CoordinationStore:
                             accountable_session_id, lease_manifest_sha256, state,
                             attempts, process_id, last_heartbeat_at, next_wake_at,
                             updated_at, last_error
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', 0, NULL, ?, ?, ?, NULL)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, NULL)
                         """,
                         (
                             watch_key,
@@ -3164,6 +3807,7 @@ class CoordinationStore:
                             generation,
                             accountable_session_id,
                             lease_manifest_sha256,
+                            watch_state,
                             now,
                             timestamp_after(now, 60),
                             now,
@@ -3180,14 +3824,15 @@ class CoordinationStore:
                     or prior_watch["lease_manifest_sha256"] != lease_manifest_sha256
                 ):
                     raise CoordinationError("TERMINAL_WATCH_LINEAGE_MISMATCH")
-                elif prior_watch["state"] != "ACTIVE":
+                elif prior_watch["state"] not in {"ACTIVE", "PENDING_CLAIM"}:
                     raise CoordinationError("TERMINAL_WATCH_STATE_CONFLICT")
             else:
                 cursor = self.connection.execute(
                     """
                     UPDATE coordination_terminal_watches
                     SET state='COMPLETE', process_id=NULL, updated_at=?, last_error=NULL
-                    WHERE repository=? AND issue_number=? AND state='ACTIVE'
+                    WHERE repository=? AND issue_number=?
+                      AND state IN ('PENDING_CLAIM','ACTIVE')
                     """,
                     (now, repository, issue_number),
                 )
@@ -3239,25 +3884,11 @@ class CoordinationStore:
             ready_item_version=item["expected_version"] + 1,
             source_payload_sha256=item["expected_source_sha256"],
         )
-        return self.set_issue_status(
+        return self._set_issue_status_locked(
             **item,
-            _transaction=False,
-            _gateway=_READY_FINALIZATION_GATEWAY,
+            transaction=False,
+            gateway=_READY_FINALIZATION_GATEWAY,
         )
-
-    def _set_issue_status_for_test_fixture(
-        self, **item: Any
-    ) -> dict[str, Any]:
-        """Seed non-readiness item states only on a temporary database."""
-
-        status = item.get("status")
-        if (
-            isinstance(status, str)
-            and status.upper() in _TEST_FIXTURE_FORBIDDEN_ITEM_STATES
-        ):
-            raise CoordinationError("READY_FINALIZATION_REQUIRED")
-        self._require_temporary_test_database()
-        return self.set_issue_status(**item)
 
     def apply_issue_plan(
         self, entries: list[dict[str, Any]], *, now: str
@@ -3399,110 +4030,9 @@ class CoordinationStore:
         ):
             raise CoordinationError("MESSAGE_ROLE_MISMATCH")
         if topic == "development.terminal_closeout":
-            required = {
-                "source",
-                "issue_number",
-                "item_generation",
-                "item_version",
-                "terminal_watch_key",
-                "terminal_watch_generation",
-                "original_message_id",
-                "outbox_id",
-                "outbox_payload_sha256",
-                "action",
-            }
-            if set(payload) != required or payload.get("action") != (
-                "PUBLISH_TERMINAL_OWNING_ISSUE_RECEIPT"
-            ):
-                raise CoordinationError("MESSAGE_CONTRACT_INVALID")
-            issue_number = payload.get("issue_number")
-            item_generation = payload.get("item_generation")
-            item_version = payload.get("item_version")
-            watch_generation = payload.get("terminal_watch_generation")
-            original_message_id = payload.get("original_message_id")
-            outbox_id = payload.get("outbox_id")
-            if (
-                not isinstance(issue_number, int)
-                or issue_number <= 0
-                or not isinstance(item_generation, int)
-                or item_generation < 0
-                or not isinstance(item_version, int)
-                or item_version <= 0
-                or not isinstance(watch_generation, int)
-                or watch_generation < 0
-                or not isinstance(original_message_id, int)
-                or original_message_id <= 0
-                or not isinstance(outbox_id, int)
-                or outbox_id <= 0
-                or payload["source"].get("object_kind") != "issue"
-                or payload["source"].get("object_number") != issue_number
-            ):
-                raise CoordinationError("MESSAGE_CONTRACT_INVALID")
-            _validate_sha256(payload.get("outbox_payload_sha256", ""))
-            item = self.connection.execute(
-                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
-                (payload["source"]["repository"], issue_number),
-            ).fetchone()
-            if (
-                item is None
-                or item["status"] != "DONE"
-                or item["allocation_class"] != "NONE"
-                or int(item["generation"]) != item_generation
-                or int(item["version"]) != item_version
-                or item["source_payload_sha256"] != payload["source"]["payload_sha256"]
-                or any(
-                    int(item[key]) != 0
-                    for key in ("development_units", "shared_units", "sre_units")
-                )
-            ):
-                raise CoordinationError("TERMINAL_CLOSEOUT_ITEM_MISMATCH")
-            watch = self.connection.execute(
-                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
-                (payload["terminal_watch_key"],),
-            ).fetchone()
-            if (
-                watch is None
-                or watch["repository"] != payload["source"]["repository"]
-                or int(watch["issue_number"]) != issue_number
-                or int(watch["generation"]) != watch_generation
-                or not identities_role_equivalent(
-                    self.connection,
-                    watch["accountable_session_id"],
-                    recipient_session_id,
-                )
-                or watch["state"] != "COMPLETE"
-            ):
-                raise CoordinationError("TERMINAL_CLOSEOUT_WATCH_MISMATCH")
-            original = self.connection.execute(
-                "SELECT * FROM coordination_messages WHERE id=?",
-                (original_message_id,),
-            ).fetchone()
-            if (
-                original is None
-                or not identities_role_equivalent(
-                    self.connection,
-                    original["recipient_session_id"],
-                    recipient_session_id,
-                )
-                or original["topic"] not in {"development.admission", "development.recovery_commit"}
-                or original["state"] not in {"COMPLETE", "HOLD"}
-            ):
-                raise CoordinationError("TERMINAL_CLOSEOUT_LINEAGE_MISMATCH")
-            outbox = self.connection.execute(
-                "SELECT * FROM github_outbox WHERE id=?",
-                (outbox_id,),
-            ).fetchone()
-            if (
-                outbox is None
-                or outbox["repository"] != payload["source"]["repository"]
-                or outbox["object_kind"] != "issue"
-                or int(outbox["object_number"]) != issue_number
-                or outbox["expected_source_sha256"] != payload["source"]["payload_sha256"]
-                or outbox["payload_sha256"] != payload["outbox_payload_sha256"]
-                or outbox["state"] not in {"PREPARED", "INFLIGHT", "COMPLETE"}
-            ):
-                raise CoordinationError("TERMINAL_CLOSEOUT_OUTBOX_MISMATCH")
-            return
+            # Historical rows remain queryable, but no new extra-writer
+            # closeout handoff may be enqueued or claimed.
+            raise CoordinationError("TERMINAL_CLOSEOUT_TOPIC_RETIRED")
         required_strings = (
             "action",
             "base_sha",
@@ -3789,11 +4319,63 @@ class CoordinationStore:
                 "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
                 (payload["source"]["repository"], issue_number),
             ).fetchone()
-        allowed_statuses = (
-            {"ACTIVE", "ACTIVE_FENCED"}
-            if topic in {"development.admission", "sre.admission"}
-            else {"HOLD"}
+        message_row = None
+        terminal_packet = None
+        recovery_watch = None
+        if not current_write:
+            message_row = self.connection.execute(
+                "SELECT id FROM coordination_messages "
+                "WHERE payload_sha256=? AND topic=? ORDER BY id LIMIT 1",
+                (digest_json(payload), topic),
+            ).fetchone()
+            if message_row is not None:
+                terminal_packet = self.connection.execute(
+                    "SELECT * FROM coordination_terminal_closeout_packets "
+                    "WHERE activation_message_id=?",
+                    (message_row["id"],),
+                ).fetchone()
+                if topic == "development.recovery_commit":
+                    recovery_watch = self.connection.execute(
+                        "SELECT * FROM coordination_terminal_watches "
+                        "WHERE repository=? AND issue_number=? AND generation=?",
+                        (
+                            payload["source"]["repository"],
+                            issue_number,
+                            generation,
+                        ),
+                    ).fetchone()
+        terminal_pending = bool(
+            item is not None
+            and item["status"] == "PUBLICATION_PENDING"
+            and terminal_packet is not None
+            and terminal_packet["activation_payload_sha256"] == digest_json(payload)
+            and int(terminal_packet["expected_item_version"])
+            == item_version + (1 if topic == "development.recovery_commit" else 0)
+            and int(terminal_packet["publication_pending_item_version"])
+            == int(item["version"])
         )
+        recovery_activated = bool(
+            topic == "development.recovery_commit"
+            and item is not None
+            and item["status"] in {"ACTIVE", "ACTIVE_FENCED"}
+            and int(item["version"]) == item_version + 1
+            and message_row is not None
+            and recovery_watch is not None
+            and recovery_watch["state"] == "ACTIVE"
+            and int(recovery_watch["admission_message_id"] or 0)
+            == int(message_row["id"])
+            and recovery_watch["admission_payload_sha256"] == digest_json(payload)
+        )
+        if topic in {"development.admission", "sre.admission"}:
+            allowed_statuses = {"ACTIVE", "ACTIVE_FENCED", "PUBLICATION_PENDING"}
+        elif topic == "development.recovery_commit":
+            allowed_statuses = {"HOLD"}
+            if recovery_activated or terminal_pending:
+                allowed_statuses.update(
+                    {"ACTIVE", "ACTIVE_FENCED", "PUBLICATION_PENDING"}
+                )
+        else:
+            allowed_statuses = {"HOLD"}
         if (
             item is None
             or item["status"] not in allowed_statuses
@@ -3810,7 +4392,11 @@ class CoordinationStore:
             )
             or item["lease_manifest_sha256"] != payload["lease_manifest_sha256"]
             or item["source_payload_sha256"] != payload["source"]["payload_sha256"]
-            or int(item["version"]) != item_version
+            or (
+                int(item["version"]) != item_version
+                and not terminal_pending
+                and not recovery_activated
+            )
             or int(item["development_units"]) != development_units
             or int(item["shared_units"]) != shared_units
             or int(item["sre_units"]) != sre_units
@@ -3950,6 +4536,57 @@ class CoordinationStore:
             )
             if cursor.rowcount != 1:
                 raise CoordinationError("MESSAGE_STATE_CONFLICT")
+            if row["topic"] in {"development.admission", "sre.admission"}:
+                payload = json.loads(row["payload_json"])
+                source = payload.get("source", {})
+                watch_key = terminal_watch_key(
+                    str(source.get("repository")),
+                    int(payload.get("issue_number", 0)),
+                    int(payload.get("generation", -1)),
+                )
+                watch_hold = self.connection.execute(
+                    """
+                    UPDATE coordination_terminal_watches
+                    SET state='HOLD', process_id=NULL, updated_at=?, last_error=?
+                    WHERE watch_key=? AND state='PENDING_CLAIM'
+                      AND admission_message_id=?
+                      AND admission_payload_sha256=?
+                    """,
+                    (now, reason, watch_key, message_id, expected_payload_sha256),
+                )
+                item = self.connection.execute(
+                    "SELECT * FROM coordination_items "
+                    "WHERE repository=? AND issue_number=?",
+                    (source.get("repository"), payload.get("issue_number")),
+                ).fetchone()
+                if (
+                    watch_hold.rowcount != 1
+                    or item is None
+                    or item["status"] not in {"ACTIVE", "ACTIVE_FENCED", "MONITOR"}
+                    or item["allocation_class"] != "ACTIVE"
+                    or int(item["generation"]) != payload.get("generation")
+                    or int(item["version"]) != payload.get("item_version")
+                    or item["lease_manifest_sha256"]
+                    != payload.get("lease_manifest_sha256")
+                ):
+                    raise CoordinationError("TERMINAL_WATCH_HOLD_BINDING_MISMATCH")
+                held_item = self.connection.execute(
+                    """
+                    UPDATE coordination_items
+                    SET status='HOLD', allocation_class='RETAINED',
+                        version=version+1, updated_at=?
+                    WHERE repository=? AND issue_number=? AND version=?
+                      AND allocation_class='ACTIVE'
+                    """,
+                    (
+                        now,
+                        source["repository"],
+                        payload["issue_number"],
+                        int(item["version"]),
+                    ),
+                )
+                if held_item.rowcount != 1:
+                    raise CoordinationError("TERMINAL_WATCH_HOLD_BINDING_MISMATCH")
             self._event(
                 "MESSAGE_HELD",
                 f"message:{message_id}",
@@ -4106,6 +4743,47 @@ class CoordinationStore:
         now: str,
         _transaction: bool = True,
     ) -> tuple[dict[str, Any], int]:
+        return self._activate_admission_locked(
+            item=item,
+            message=message,
+            artifacts=artifacts,
+            artifact_observations=artifact_observations,
+            now=now,
+            transaction=_transaction,
+            pending_claim=True,
+        )
+
+    def _activate_admission_for_test_fixture(
+        self,
+        *,
+        item: dict[str, Any],
+        message: dict[str, Any],
+        artifacts: list[dict[str, Any]] | None = None,
+        artifact_observations: list[dict[str, Any]] | None = None,
+        now: str,
+    ) -> tuple[dict[str, Any], int]:
+        self._require_temporary_test_database()
+        return self._activate_admission_locked(
+            item=item,
+            message=message,
+            artifacts=artifacts,
+            artifact_observations=artifact_observations,
+            now=now,
+            transaction=True,
+            pending_claim=False,
+        )
+
+    def _activate_admission_locked(
+        self,
+        *,
+        item: dict[str, Any],
+        message: dict[str, Any],
+        artifacts: list[dict[str, Any]] | None,
+        artifact_observations: list[dict[str, Any]] | None,
+        now: str,
+        transaction: bool,
+        pending_claim: bool,
+    ) -> tuple[dict[str, Any], int]:
         if (
             not isinstance(item, dict)
             or not isinstance(message, dict)
@@ -4125,7 +4803,7 @@ class CoordinationStore:
             raise CoordinationError("INVALID_ADMISSION_TRANSACTION")
         if message["topic"] not in {"development.admission", "sre.admission"}:
             raise CoordinationError("INVALID_ADMISSION_TRANSACTION")
-        with (self.transaction() if _transaction else nullcontext()):
+        with (self.transaction() if transaction else nullcontext()):
             payload = message["payload"]
             if not isinstance(payload, dict):
                 raise CoordinationError("ADMISSION_ITEM_BINDING_MISMATCH")
@@ -4271,7 +4949,11 @@ class CoordinationStore:
                 or manifest.get("worktree_path") != payload.get("worktree_path")
             ):
                 raise CoordinationError("ADMISSION_LEASE_LINEAGE_MISMATCH")
-            activated = self.set_issue_status(**item, now=now, _transaction=False)
+            activated = self._set_issue_status_from_admission(
+                **item,
+                now=now,
+                pending_claim=pending_claim,
+            )
             if (
                 not isinstance(payload, dict)
                 or payload.get("item_version") != activated["version"]
@@ -4307,6 +4989,24 @@ class CoordinationStore:
                 now=now,
                 _transaction=False,
             )
+            watch_key = terminal_watch_key(
+                activated["repository"],
+                activated["issue_number"],
+                activated["generation"],
+            )
+            bound_watch = self.connection.execute(
+                """
+                UPDATE coordination_terminal_watches
+                SET admission_message_id=?, admission_payload_sha256=?, updated_at=?
+                WHERE watch_key=?
+                  AND admission_message_id IS NULL
+                  AND admission_payload_sha256 IS NULL
+                  AND state IN ('PENDING_CLAIM','ACTIVE')
+                """,
+                (message_id, digest_json(payload), now, watch_key),
+            )
+            if bound_watch.rowcount != 1:
+                raise CoordinationError("TERMINAL_WATCH_ADMISSION_BINDING_CONFLICT")
             self._event(
                 "ADMISSION_ACTIVATED",
                 f"{activated['repository']}:issue:{activated['issue_number']}",
@@ -4325,6 +5025,8 @@ class CoordinationStore:
         message_id: int,
         session_id: str,
         now: str,
+        attempt_id: str | None = None,
+        executor_token: str | None = None,
     ) -> tuple[dict[str, Any], str]:
         """Atomically convert a claimed two-phase recovery into active execution."""
         session_id = canonicalize_coordination_identity(self.connection, session_id)
@@ -4352,38 +5054,57 @@ class CoordinationStore:
             issue_number = payload.get("issue_number")
             generation = payload.get("generation")
             watch_key = terminal_watch_key(repository, issue_number, generation)
+            claim_attempt: dict[str, Any] | None = None
+            try:
+                claim_attempt = self._require_running_lineage_attempt(
+                    attempt_id=attempt_id,
+                    executor_token=executor_token,
+                    repository=str(repository),
+                    issue_number=int(issue_number),
+                    generation=int(generation),
+                    lease_manifest_sha256=str(payload.get("lease_manifest_sha256")),
+                    allowed_targets={("message", str(message_id))},
+                )
+            except CoordinationError:
+                if Path("/tmp") not in self.path.resolve().parents:
+                    raise
 
-            if message["state"] == "COMPLETE":
-                item = self.connection.execute(
-                    "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
-                    (repository, issue_number),
-                ).fetchone()
-                watch = self.connection.execute(
-                    "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
-                    (watch_key,),
-                ).fetchone()
-                capacity = payload.get("capacity", {})
-                if (
-                    item is None
-                    or item["status"] not in {"ACTIVE", "ACTIVE_FENCED"}
-                    or item["allocation_class"] != "ACTIVE"
-                    or int(item["generation"]) != generation
-                    or int(item["version"]) != payload.get("item_version", 0) + 1
-                    or item["accountable_session_id"] != session_id
-                    or item["lease_manifest_sha256"]
-                    != payload.get("lease_manifest_sha256")
-                    or item["source_payload_sha256"] != source.get("payload_sha256")
-                    or int(item["development_units"])
-                    != capacity.get("development_units")
-                    or int(item["shared_units"]) != capacity.get("shared_units")
-                    or int(item["sre_units"]) != capacity.get("sre_units")
-                    or watch is None
-                    or watch["state"] != "ACTIVE"
-                    or watch["accountable_session_id"] != session_id
-                    or watch["lease_manifest_sha256"]
-                    != payload.get("lease_manifest_sha256")
-                ):
-                    raise CoordinationError("RECOVERY_ACTIVATION_STATE_CONFLICT")
+            item = self.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            watch = self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (watch_key,),
+            ).fetchone()
+            capacity = payload.get("capacity", {})
+            already_active = bool(
+                item is not None
+                and item["status"] in {"ACTIVE", "ACTIVE_FENCED"}
+                and item["allocation_class"] == "ACTIVE"
+                and int(item["generation"]) == generation
+                and int(item["version"]) == payload.get("item_version", 0) + 1
+                and item["accountable_session_id"] == session_id
+                and item["lease_manifest_sha256"]
+                == payload.get("lease_manifest_sha256")
+                and item["source_payload_sha256"] == source.get("payload_sha256")
+                and int(item["development_units"])
+                == capacity.get("development_units")
+                and int(item["shared_units"]) == capacity.get("shared_units")
+                and int(item["sre_units"]) == capacity.get("sre_units")
+                and watch is not None
+                and watch["state"] == "ACTIVE"
+                and watch["accountable_session_id"] == session_id
+                and watch["lease_manifest_sha256"]
+                == payload.get("lease_manifest_sha256")
+                and int(watch["admission_message_id"] or 0) == message_id
+                and watch["admission_payload_sha256"] == message["payload_sha256"]
+                and (
+                    claim_attempt is None
+                    or watch["claim_attempt_id"] == claim_attempt["attempt_id"]
+                )
+            )
+            if already_active:
                 self._validate_message_source(payload)
                 return (
                     {
@@ -4397,6 +5118,11 @@ class CoordinationStore:
                     },
                     watch_key,
                 )
+            if message["state"] == "COMPLETE":
+                # Historical recovery rows completed by the pre-terminal
+                # protocol are readable only when their exact activation is
+                # already durable; they cannot create a new active lineage.
+                raise CoordinationError("RECOVERY_ACTIVATION_STATE_CONFLICT")
 
             if message["state"] != "CLAIMED":
                 raise CoordinationError("RECOVERY_COMMIT_NOT_CLAIMED")
@@ -4406,10 +5132,6 @@ class CoordinationStore:
                 recipient_session_id=message["recipient_session_id"],
                 payload=payload,
             )
-            item = self.connection.execute(
-                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
-                (repository, issue_number),
-            ).fetchone()
             if item is None:
                 raise CoordinationError("MESSAGE_ITEM_STATE_MISMATCH")
             new_version = int(item["version"]) + 1
@@ -4449,9 +5171,11 @@ class CoordinationStore:
                     INSERT INTO coordination_terminal_watches(
                         watch_key, repository, issue_number, generation,
                         accountable_session_id, lease_manifest_sha256, state,
+                        admission_message_id, admission_payload_sha256,
+                        claim_attempt_id,
                         attempts, process_id, last_heartbeat_at, next_wake_at,
                         updated_at, last_error
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', 0, NULL, ?, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, 0, NULL, ?, ?, ?, NULL)
                     """,
                     (
                         watch_key,
@@ -4460,6 +5184,9 @@ class CoordinationStore:
                         generation,
                         session_id,
                         payload["lease_manifest_sha256"],
+                        message_id,
+                        message["payload_sha256"],
+                        None if claim_attempt is None else claim_attempt["attempt_id"],
                         now,
                         timestamp_after(now, 60),
                         now,
@@ -4477,22 +5204,35 @@ class CoordinationStore:
                     """
                     UPDATE coordination_terminal_watches
                     SET state='ACTIVE', attempts=0, process_id=NULL,
+                        accountable_session_id=?, admission_message_id=?,
+                        admission_payload_sha256=?, claim_attempt_id=?,
                         last_heartbeat_at=?, next_wake_at=?, updated_at=?,
                         last_error=NULL
                     WHERE watch_key=? AND state='COMPLETE'
                     """,
-                    (now, timestamp_after(now, 60), now, watch_key),
+                    (
+                        session_id,
+                        message_id,
+                        message["payload_sha256"],
+                        None if claim_attempt is None else claim_attempt["attempt_id"],
+                        now,
+                        timestamp_after(now, 60),
+                        now,
+                        watch_key,
+                    ),
                 )
 
-            completed = self.connection.execute(
-                """
-                UPDATE coordination_messages
-                SET state='COMPLETE', updated_at=?, last_error=NULL
-                WHERE id=? AND state='CLAIMED' AND claimed_by=?
-                """,
-                (now, message_id, session_id),
-            )
-            if completed.rowcount != 1:
+            preserved = self.connection.execute(
+                "SELECT state, claimed_by, payload_sha256 "
+                "FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()
+            if (
+                preserved is None
+                or preserved["state"] != "CLAIMED"
+                or preserved["claimed_by"] != session_id
+                or preserved["payload_sha256"] != message["payload_sha256"]
+            ):
                 raise CoordinationError("RECOVERY_COMMIT_STATE_CONFLICT")
             result = {
                 "repository": repository,
@@ -4515,76 +5255,1437 @@ class CoordinationStore:
             )
         return result, watch_key
 
+    def _require_running_lineage_attempt(
+        self,
+        *,
+        attempt_id: str | None,
+        executor_token: str | None,
+        repository: str,
+        issue_number: int,
+        generation: int,
+        lease_manifest_sha256: str,
+        allowed_targets: set[tuple[str, str]],
+    ) -> dict[str, Any]:
+        """Authenticate one current RUNNING role attempt on the exact lineage."""
+
+        if (
+            not isinstance(attempt_id, str)
+            or SESSION.fullmatch(attempt_id) is None
+            or not isinstance(executor_token, str)
+            or not executor_token
+            or not allowed_targets
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_REQUIRED")
+        attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        if attempt is None:
+            raise CoordinationError("TERMINAL_ATTEMPT_NOT_FOUND")
+        token_sha256 = hashlib.sha256(executor_token.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(str(attempt["token_sha256"]), token_sha256):
+            raise CoordinationError("TERMINAL_ATTEMPT_TOKEN_MISMATCH")
+        role = str(attempt["role"])
+        endpoint = current_endpoint(self.connection, role)
+        if (
+            role not in {"development", "sre"}
+            or attempt["state"] != "RUNNING"
+            or endpoint is None
+            or str(endpoint["endpoint_id"]) != str(attempt["endpoint_id"])
+            or (str(attempt["target_kind"]), str(attempt["target_key"]))
+            not in allowed_targets
+            or attempt["lineage_repository"] != repository
+            or int(attempt["lineage_issue_number"] or -1) != issue_number
+            or int(attempt["lineage_generation"] or -1) != generation
+            or attempt["lineage_lease_sha256"] != lease_manifest_sha256
+            or not isinstance(attempt["lineage_sha256"], str)
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_LINEAGE_MISMATCH")
+        return dict(attempt)
+
+    def _require_terminal_lineage_attempt(
+        self,
+        *,
+        attempt_id: str | None,
+        executor_token: str | None,
+        repository: str,
+        issue_number: int,
+        generation: int,
+        lease_manifest_sha256: str,
+        allowed_targets: set[tuple[str, str]],
+        completed_replay_attempt_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Authenticate a current watcher or one exact completed replay owner."""
+
+        if (
+            not isinstance(attempt_id, str)
+            or SESSION.fullmatch(attempt_id) is None
+            or not isinstance(executor_token, str)
+            or not executor_token
+            or not allowed_targets
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_REQUIRED")
+        attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        if attempt is None:
+            raise CoordinationError("TERMINAL_ATTEMPT_NOT_FOUND")
+        token_sha256 = hashlib.sha256(executor_token.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(str(attempt["token_sha256"]), token_sha256):
+            raise CoordinationError("TERMINAL_ATTEMPT_TOKEN_MISMATCH")
+        if (
+            str(attempt["role"]) not in {"development", "sre"}
+            or (str(attempt["target_kind"]), str(attempt["target_key"]))
+            not in allowed_targets
+            or attempt["lineage_repository"] != repository
+            or int(attempt["lineage_issue_number"] or -1) != issue_number
+            or int(attempt["lineage_generation"] or -1) != generation
+            or attempt["lineage_lease_sha256"] != lease_manifest_sha256
+            or not isinstance(attempt["lineage_sha256"], str)
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_LINEAGE_MISMATCH")
+        if attempt["state"] == "RUNNING":
+            endpoint = current_endpoint(self.connection, str(attempt["role"]))
+            if (
+                endpoint is None
+                or str(endpoint["endpoint_id"]) != str(attempt["endpoint_id"])
+            ):
+                raise CoordinationError("TERMINAL_ATTEMPT_ENDPOINT_MISMATCH")
+        elif (
+            attempt["state"] != "COMPLETE"
+            or attempt_id not in (completed_replay_attempt_ids or set())
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_NOT_EXECUTABLE")
+        return dict(attempt)
+
+    def _current_terminal_graph_binding(
+        self,
+        *,
+        repository: str,
+        issue_number: int,
+        source_payload_sha256: str,
+    ) -> dict[str, Any]:
+        rows = self.connection.execute(
+            """
+            SELECT current.version, current.observed_main_sha, current.health,
+                   revision.accepted_main_sha, revision.graph_sha256,
+                   node.node_key, node.source_payload_sha256
+            FROM portfolio_graph_current current
+            JOIN portfolio_graph_revisions revision
+              ON revision.repository=current.repository
+             AND revision.version=current.version
+            JOIN portfolio_graph_nodes node
+              ON node.repository=current.repository
+             AND node.graph_version=current.version
+             AND node.issue_number=?
+            WHERE current.repository=?
+            ORDER BY node.node_key
+            """,
+            (issue_number, repository),
+        ).fetchall()
+        if len(rows) != 1:
+            raise CoordinationError("TERMINAL_GRAPH_BINDING_UNAVAILABLE")
+        row = rows[0]
+        if (
+            row["health"] != "CURRENT"
+            or row["observed_main_sha"] != row["accepted_main_sha"]
+            or row["source_payload_sha256"] != source_payload_sha256
+        ):
+            raise CoordinationError("TERMINAL_GRAPH_BINDING_DRIFT")
+        descriptor = {
+            "repository": repository,
+            "issue_number": issue_number,
+            "graph_version": int(row["version"]),
+            "graph_sha256": str(row["graph_sha256"]),
+            "graph_main_sha": str(row["observed_main_sha"]),
+            "graph_node_key": str(row["node_key"]),
+            "source_payload_sha256": source_payload_sha256,
+        }
+        descriptor["graph_binding_sha256"] = digest_json(descriptor)
+        return descriptor
+
+    def _terminal_failpoint(
+        self, callback: Callable[[str], None] | None, point: str
+    ) -> None:
+        if callback is None:
+            return
+        self._require_temporary_test_database()
+        callback(point)
+
+    def _terminal_endpoint_rotation_chain_valid(
+        self,
+        *,
+        packet: sqlite3.Row,
+        item: sqlite3.Row,
+        current_endpoint_id: str,
+    ) -> bool:
+        preparer = self.connection.execute(
+            "SELECT endpoint_id FROM executor_attempts WHERE attempt_id=?",
+            (packet["preparer_attempt_id"],),
+        ).fetchone()
+        if preparer is None or item["accountable_session_id"] != current_endpoint_id:
+            return False
+        cursor_version = int(packet["publication_pending_item_version"])
+        cursor_identity = str(preparer["endpoint_id"])
+        if (
+            int(item["version"]) == cursor_version
+            and cursor_identity == current_endpoint_id
+        ):
+            return True
+        for change in self.connection.execute(
+            """
+            SELECT before_state_json
+            FROM executor_registry_changes
+            WHERE state='APPLIED' AND created_at>=?
+            ORDER BY created_at, change_id
+            """,
+            (packet["created_at"],),
+        ).fetchall():
+            try:
+                plan = json.loads(change["before_state_json"])
+            except (TypeError, json.JSONDecodeError):
+                return False
+            candidates = [
+                candidate
+                for candidate in plan.get("item_changes", [])
+                if isinstance(candidate, dict)
+                and candidate.get("repository") == packet["repository"]
+                and candidate.get("issue_number") == int(packet["issue_number"])
+                and candidate.get("before_identity") == cursor_identity
+                and candidate.get("before_version") == cursor_version
+            ]
+            if not candidates:
+                continue
+            if len(candidates) != 1:
+                return False
+            candidate = candidates[0]
+            after_identity = candidate.get("after_identity")
+            if not isinstance(after_identity, str):
+                return False
+            cursor_identity = after_identity
+            cursor_version += 1
+        return (
+            cursor_version == int(item["version"])
+            and cursor_identity == current_endpoint_id
+        )
+
     def prepare_terminal_closeout(
         self,
         *,
-        outbox: dict[str, Any],
-        message: dict[str, Any],
+        packet: dict[str, Any],
+        attempt_id: str,
+        executor_token: str,
         now: str,
-    ) -> tuple[int, int]:
+        _test_failpoint: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        required = {
+            "schema",
+            "repository",
+            "issue_number",
+            "generation",
+            "expected_item_version",
+            "source_payload_sha256",
+            "lease_manifest_sha256",
+            "terminal_watch_key",
+            "activation_message_id",
+            "terminal_receipt",
+            "cleanup_evidence",
+            "outbox",
+        }
+        if not isinstance(packet, dict) or set(packet) != required:
+            raise CoordinationError("INVALID_TERMINAL_CLOSEOUT_TRANSACTION")
+        repository = packet.get("repository")
+        issue_number = packet.get("issue_number")
+        generation = packet.get("generation")
+        expected_item_version = packet.get("expected_item_version")
+        source_payload_sha256 = packet.get("source_payload_sha256")
+        lease_manifest_sha256 = packet.get("lease_manifest_sha256")
+        watch_key = packet.get("terminal_watch_key")
+        activation_message_id = packet.get("activation_message_id")
+        outbox = packet.get("outbox")
         if (
-            not isinstance(outbox, dict)
-            or set(outbox) != {
-                "idempotency_key",
-                "repository",
-                "issue_number",
-                "expected_source_sha256",
-                "body",
-            }
-            or not isinstance(message, dict)
-            or set(message) != {"idempotency_key", "payload"}
-            or not isinstance(message["payload"], dict)
-            or set(message["payload"])
-            != {
-                "source",
-                "issue_number",
-                "item_generation",
-                "item_version",
-                "terminal_watch_key",
-                "terminal_watch_generation",
-                "original_message_id",
-                "action",
-            }
+            packet.get("schema") != "twinfinity-terminal-closeout-packet/v1"
+            or not isinstance(repository, str)
+            or not isinstance(issue_number, int)
+            or issue_number <= 0
+            or not isinstance(generation, int)
+            or generation < 0
+            or not isinstance(expected_item_version, int)
+            or expected_item_version <= 0
+            or not isinstance(source_payload_sha256, str)
+            or not isinstance(lease_manifest_sha256, str)
+            or watch_key != terminal_watch_key(repository, issue_number, generation)
+            or not isinstance(activation_message_id, int)
+            or activation_message_id <= 0
+            or not isinstance(outbox, dict)
+            or set(outbox) != {"idempotency_key", "body"}
+            or not isinstance(outbox.get("idempotency_key"), str)
+            or not outbox["idempotency_key"]
+            or not isinstance(outbox.get("body"), str)
+            or not outbox["body"]
         ):
             raise CoordinationError("INVALID_TERMINAL_CLOSEOUT_TRANSACTION")
+        _validate_repository(repository)
+        _validate_sha256(source_payload_sha256)
+        _validate_sha256(lease_manifest_sha256)
+        closeout_key = (
+            f"terminal-closeout:{repository}:issue:{issue_number}:generation:{generation}"
+        )
         with self.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE closeout_key=?",
+                (closeout_key,),
+            ).fetchone()
+            activation = self.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?",
+                (activation_message_id,),
+            ).fetchone()
+            watch = self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (watch_key,),
+            ).fetchone()
+            if activation is None or watch is None:
+                raise CoordinationError("TERMINAL_CLOSEOUT_LINEAGE_MISMATCH")
+            attempt = self._require_terminal_lineage_attempt(
+                attempt_id=attempt_id,
+                executor_token=executor_token,
+                repository=repository,
+                issue_number=issue_number,
+                generation=generation,
+                lease_manifest_sha256=lease_manifest_sha256,
+                allowed_targets={
+                    ("message", str(activation_message_id)),
+                    ("terminal_watch", str(watch_key)),
+                },
+                completed_replay_attempt_ids=(
+                    set()
+                    if existing is None
+                    else {str(existing["preparer_attempt_id"])}
+                ),
+            )
+            role = str(attempt["role"])
+            expected_topics = (
+                {"development.admission", "development.recovery_commit"}
+                if role == "development"
+                else {"sre.admission"}
+            )
+            activation_payload = json.loads(activation["payload_json"])
+            source = activation_payload.get("source", {})
+            activation_endpoint_id = str(activation["recipient_session_id"])
+            activation_role = coordination_identity_role(
+                self.connection, activation_endpoint_id
+            )
+            claim_binding = self.connection.execute(
+                "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                (watch["claim_attempt_id"],),
+            ).fetchone()
+            if (
+                activation["topic"] not in expected_topics
+                or digest_json(activation_payload) != activation["payload_sha256"]
+                or activation_role != role
+                or activation["state"] not in {"CLAIMED", "COMPLETE"}
+                or activation["claimed_by"] != activation_endpoint_id
+                or activation_payload.get("issue_number") != issue_number
+                or activation_payload.get("generation") != generation
+                or activation_payload.get("lease_manifest_sha256")
+                != lease_manifest_sha256
+                or source.get("repository") != repository
+                or source.get("object_kind") != "issue"
+                or source.get("object_number") != issue_number
+                or source.get("payload_sha256") != source_payload_sha256
+                or activation_payload.get("accountable_session_id")
+                != activation_endpoint_id
+                or watch["state"] not in {"ACTIVE", "COMPLETE"}
+                or watch["repository"] != repository
+                or int(watch["issue_number"]) != issue_number
+                or int(watch["generation"]) != generation
+                or watch["lease_manifest_sha256"] != lease_manifest_sha256
+                or int(watch["admission_message_id"] or 0)
+                != activation_message_id
+                or watch["admission_payload_sha256"]
+                != activation["payload_sha256"]
+                or claim_binding is None
+                or claim_binding["role"] != role
+                or claim_binding["endpoint_id"] != activation_endpoint_id
+                or claim_binding["state"] not in {"RUNNING", "COMPLETE", "HOLD"}
+                or claim_binding["target_kind"] != "message"
+                or claim_binding["target_key"] != str(activation_message_id)
+                or claim_binding["lineage_repository"] != repository
+                or int(claim_binding["lineage_issue_number"] or -1) != issue_number
+                or int(claim_binding["lineage_generation"] or -1) != generation
+                or claim_binding["lineage_lease_sha256"] != lease_manifest_sha256
+                or (
+                    attempt["target_kind"] == "message"
+                    and claim_binding["attempt_id"] != attempt["attempt_id"]
+                )
+                or (
+                    attempt["target_kind"] == "terminal_watch"
+                    and claim_binding["state"] not in {"COMPLETE", "HOLD"}
+                )
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_LINEAGE_MISMATCH")
+            terminal_receipt_sha256 = validate_terminal_receipt(
+                packet["terminal_receipt"],
+                repository=repository,
+                issue_number=issue_number,
+                generation=generation,
+                source_payload_sha256=source_payload_sha256,
+                lease_manifest_sha256=lease_manifest_sha256,
+                role=role,
+            )
+            cleanup_evidence_sha256 = validate_terminal_cleanup_evidence(
+                packet["cleanup_evidence"],
+                repository=repository,
+                issue_number=issue_number,
+                generation=generation,
+                lease_manifest_sha256=lease_manifest_sha256,
+                role=role,
+            )
+            expected_publication_body = terminal_publication_body(
+                closeout_key=closeout_key,
+                terminal_receipt=packet["terminal_receipt"],
+                cleanup_evidence=packet["cleanup_evidence"],
+            )
+            if (
+                outbox["idempotency_key"] != closeout_key
+                or outbox["body"] != expected_publication_body
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_POLICY_INVALID")
+            if existing is not None:
+                outbox_row = self.connection.execute(
+                    "SELECT * FROM github_outbox WHERE id=?",
+                    (existing["outbox_id"],),
+                ).fetchone()
+                expected_descriptor = {
+                    "schema": "twinfinity-terminal-closeout-packet/v1",
+                    "closeout_key": closeout_key,
+                    "repository": repository,
+                    "issue_number": issue_number,
+                    "generation": generation,
+                    "source_payload_sha256": source_payload_sha256,
+                    "lease_manifest_sha256": lease_manifest_sha256,
+                    "accountable_role": role,
+                    "endpoint_id": existing["endpoint_id"],
+                    "preparer_attempt_id": existing["preparer_attempt_id"],
+                    "preparer_attempt_version": int(existing["preparer_attempt_version"]),
+                    "terminal_watch_key": watch_key,
+                    "activation_message_id": activation_message_id,
+                    "activation_payload_sha256": activation["payload_sha256"],
+                    "expected_item_version": expected_item_version,
+                    "publication_pending_item_version": int(
+                        existing["publication_pending_item_version"]
+                    ),
+                    "terminal_receipt_sha256": terminal_receipt_sha256,
+                    "cleanup_evidence_sha256": cleanup_evidence_sha256,
+                    "outbox_id": int(existing["outbox_id"]),
+                    "outbox_payload_sha256": existing["outbox_payload_sha256"],
+                    "graph_version": int(existing["graph_version"] or 0),
+                    "graph_sha256": existing["graph_sha256"],
+                    "graph_main_sha": existing["graph_main_sha"],
+                    "graph_node_key": existing["graph_node_key"],
+                    "graph_binding_sha256": existing["graph_binding_sha256"],
+                }
+                if (
+                    outbox_row is None
+                    or outbox_row["idempotency_key"] != outbox["idempotency_key"]
+                    or outbox_row["payload_sha256"]
+                    != digest_json({"body": outbox["body"]})
+                    or existing["terminal_receipt_json"]
+                    != canonical_json(packet["terminal_receipt"])
+                    or existing["cleanup_evidence_json"]
+                    != canonical_json(packet["cleanup_evidence"])
+                    or existing["endpoint_id"] != activation_endpoint_id
+                    or digest_json(expected_descriptor) != existing["packet_sha256"]
+                ):
+                    raise CoordinationError("TERMINAL_CLOSEOUT_IDEMPOTENCY_CONFLICT")
+                return self.terminal_closeout_status(closeout_key)
+            if attempt["state"] != "RUNNING":
+                raise CoordinationError("TERMINAL_ATTEMPT_NOT_EXECUTABLE")
+            item = self.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            current_source = self.current_snapshot(repository, "issue", issue_number)
+            if (
+                item is None
+                or item["status"] not in {"ACTIVE", "ACTIVE_FENCED", "MONITOR"}
+                or item["allocation_class"] != "ACTIVE"
+                or int(item["generation"]) != generation
+                or int(item["version"]) != expected_item_version
+                or item["source_payload_sha256"] != source_payload_sha256
+                or item["lease_manifest_sha256"] != lease_manifest_sha256
+                or not identities_role_equivalent(
+                    self.connection,
+                    item["accountable_session_id"],
+                    str(attempt["endpoint_id"]),
+                )
+                or current_source is None
+                or current_source.payload_sha256 != source_payload_sha256
+                or activation["state"] != "CLAIMED"
+                or watch["state"] != "ACTIVE"
+                or watch["accountable_session_id"] != attempt["endpoint_id"]
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_ITEM_MISMATCH")
+            graph_binding = self._current_terminal_graph_binding(
+                repository=repository,
+                issue_number=issue_number,
+                source_payload_sha256=source_payload_sha256,
+            )
             outbox_id = self.enqueue_comment(
                 idempotency_key=outbox["idempotency_key"],
-                repository=outbox["repository"],
+                repository=repository,
                 object_kind="issue",
-                object_number=outbox["issue_number"],
-                expected_source_sha256=outbox["expected_source_sha256"],
+                object_number=issue_number,
+                expected_source_sha256=source_payload_sha256,
                 body=outbox["body"],
                 now=now,
                 _transaction=False,
             )
+            self._terminal_failpoint(_test_failpoint, "prepare.after_outbox")
             outbox_row = self.connection.execute(
-                "SELECT payload_sha256 FROM github_outbox WHERE id=?",
-                (outbox_id,),
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
             ).fetchone()
-            payload = {
-                **message["payload"],
+            pending = self._set_issue_status_locked(
+                repository=repository,
+                issue_number=issue_number,
+                status="PUBLICATION_PENDING",
+                allocation_class="ACTIVE",
+                generation=generation,
+                accountable_session_id=item["accountable_session_id"],
+                lease_manifest_sha256=lease_manifest_sha256,
+                development_units=int(item["development_units"]),
+                shared_units=int(item["shared_units"]),
+                sre_units=int(item["sre_units"]),
+                expected_source_sha256=source_payload_sha256,
+                expected_version=expected_item_version,
+                now=now,
+                transaction=False,
+                gateway=_TERMINAL_FINALIZATION_GATEWAY,
+            )
+            self._terminal_failpoint(_test_failpoint, "prepare.after_item_pending")
+            descriptor = {
+                "schema": "twinfinity-terminal-closeout-packet/v1",
+                "closeout_key": closeout_key,
+                "repository": repository,
+                "issue_number": issue_number,
+                "generation": generation,
+                "source_payload_sha256": source_payload_sha256,
+                "lease_manifest_sha256": lease_manifest_sha256,
+                "accountable_role": role,
+                "endpoint_id": activation_endpoint_id,
+                "preparer_attempt_id": attempt["attempt_id"],
+                "preparer_attempt_version": int(attempt["version"]),
+                "terminal_watch_key": watch_key,
+                "activation_message_id": activation_message_id,
+                "activation_payload_sha256": activation["payload_sha256"],
+                "expected_item_version": expected_item_version,
+                "publication_pending_item_version": pending["version"],
+                "terminal_receipt_sha256": terminal_receipt_sha256,
+                "cleanup_evidence_sha256": cleanup_evidence_sha256,
                 "outbox_id": outbox_id,
                 "outbox_payload_sha256": outbox_row["payload_sha256"],
+                **graph_binding,
             }
-            development_endpoint = current_endpoint(self.connection, "development")
-            if development_endpoint is None:
-                raise CoordinationError("CURRENT_ENDPOINT_REQUIRED")
-            message_id = self.enqueue_message(
-                idempotency_key=message["idempotency_key"],
-                recipient_session_id=str(development_endpoint["endpoint_id"]),
-                topic="development.terminal_closeout",
-                payload=payload,
-                now=now,
-                _transaction=False,
+            packet_sha256 = digest_json(descriptor)
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_closeout_packets(
+                    closeout_key, packet_sha256, repository, issue_number,
+                    generation, source_payload_sha256, lease_manifest_sha256,
+                    accountable_role, endpoint_id, preparer_attempt_id,
+                    preparer_attempt_version, terminal_watch_key,
+                    activation_message_id, activation_payload_sha256,
+                    expected_item_version, publication_pending_item_version,
+                    terminal_receipt_sha256, terminal_receipt_json,
+                    cleanup_evidence_sha256, cleanup_evidence_json,
+                    outbox_id, outbox_payload_sha256, graph_version,
+                    graph_sha256, graph_main_sha, graph_node_key,
+                    graph_binding_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    closeout_key,
+                    packet_sha256,
+                    repository,
+                    issue_number,
+                    generation,
+                    source_payload_sha256,
+                    lease_manifest_sha256,
+                    role,
+                    activation_endpoint_id,
+                    attempt["attempt_id"],
+                    int(attempt["version"]),
+                    watch_key,
+                    activation_message_id,
+                    activation["payload_sha256"],
+                    expected_item_version,
+                    pending["version"],
+                    terminal_receipt_sha256,
+                    canonical_json(packet["terminal_receipt"]),
+                    cleanup_evidence_sha256,
+                    canonical_json(packet["cleanup_evidence"]),
+                    outbox_id,
+                    outbox_row["payload_sha256"],
+                    graph_binding["graph_version"],
+                    graph_binding["graph_sha256"],
+                    graph_binding["graph_main_sha"],
+                    graph_binding["graph_node_key"],
+                    graph_binding["graph_binding_sha256"],
+                    now,
+                ),
+            )
+            self._terminal_failpoint(_test_failpoint, "prepare.after_packet")
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_outbox_recovery(
+                    outbox_id, readback_attempts, retry_rounds, next_retry_at,
+                    state, updated_at, last_error
+                ) VALUES (?, 0, 0, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, now, now),
+            )
+            self._terminal_failpoint(
+                _test_failpoint, "prepare.after_outbox_recovery"
             )
             self._event(
                 "TERMINAL_CLOSEOUT_PREPARED",
-                f"{outbox['repository']}:issue:{outbox['issue_number']}",
-                {"outbox_id": outbox_id, "message_id": message_id},
+                closeout_key,
+                {
+                    "packet_sha256": packet_sha256,
+                    "outbox_id": outbox_id,
+                    "publication_pending_item_version": pending["version"],
+                },
                 now,
             )
-        return outbox_id, message_id
+            self._terminal_failpoint(_test_failpoint, "prepare.after_event")
+        return self.terminal_closeout_status(closeout_key)
+
+    def terminal_closeout_status(self, closeout_key: str) -> dict[str, Any]:
+        packet = self.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_packets WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        if packet is None:
+            raise CoordinationError("TERMINAL_CLOSEOUT_NOT_FOUND")
+        outbox = self.connection.execute(
+            "SELECT state, remote_receipt FROM github_outbox WHERE id=?",
+            (packet["outbox_id"],),
+        ).fetchone()
+        terminal_commit = self.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_commits WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        if terminal_commit is not None:
+            state = "COMPLETE"
+        elif outbox is None or outbox["state"] == "HOLD":
+            state = "PUBLICATION_HOLD"
+        elif (
+            outbox["state"] == "COMPLETE"
+            and isinstance(outbox["remote_receipt"], str)
+            and REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"])
+        ):
+            state = "COMMIT_READY"
+        elif outbox["state"] == "COMPLETE":
+            state = "PUBLICATION_HOLD"
+        else:
+            state = "PUBLICATION_PENDING"
+        return {
+            "closeout_key": closeout_key,
+            "packet_sha256": packet["packet_sha256"],
+            "state": state,
+            "outbox_id": int(packet["outbox_id"]),
+            "publication_pending_item_version": int(
+                packet["publication_pending_item_version"]
+            ),
+            "done_item_version": (
+                None
+                if terminal_commit is None
+                else int(terminal_commit["done_item_version"])
+            ),
+            "dirty_event_id": (
+                None
+                if terminal_commit is None
+                else int(terminal_commit["dirty_event_id"])
+            ),
+        }
+
+    def _acquire_terminal_live_evidence(
+        self, *, closeout_key: str
+    ) -> dict[str, Any]:
+        """Acquire fixed live provenance without opening a SQLite transaction."""
+
+        if self.connection.in_transaction:
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_TRANSACTION_ACTIVE")
+        packet = self.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_packets "
+            "WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        if packet is None:
+            raise CoordinationError("TERMINAL_CLOSEOUT_NOT_FOUND")
+        publication = self.connection.execute(
+            """
+            SELECT outbox.state, outbox.remote_receipt,
+                   outbox.idempotency_key, outbox.payload_json,
+                   readback.remote_receipt AS readback_receipt,
+                   readback.published_body_sha256,
+                   readback.publisher_login
+            FROM github_outbox outbox
+            LEFT JOIN coordination_terminal_outbox_readbacks readback
+              ON readback.outbox_id=outbox.id
+            WHERE outbox.id=?
+            """,
+            (packet["outbox_id"],),
+        ).fetchone()
+        if (
+            publication is None
+            or publication["state"] != "COMPLETE"
+            or REMOTE_COMMENT_RECEIPT.fullmatch(
+                str(publication["remote_receipt"] or "")
+            )
+            is None
+            or publication["readback_receipt"] != publication["remote_receipt"]
+        ):
+            raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
+        observed_at = utc_now()
+        _utc_timestamp(observed_at, error="TERMINAL_LIVE_EVIDENCE_INVALID")
+        remote_receipt = str(publication["remote_receipt"])
+        issue_payload, main_ref, published_comment, timeline = (
+            _fetch_terminal_live_observation(
+                str(packet["repository"]),
+                int(packet["issue_number"]),
+                remote_receipt,
+            )
+        )
+        if self.connection.in_transaction:
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_TRANSACTION_ACTIVE")
+        source_updated_at = (
+            issue_payload.get("_projection_updated_at")
+            if isinstance(issue_payload, dict)
+            else None
+        ) or (
+            issue_payload.get("updated_at")
+            if isinstance(issue_payload, dict)
+            else None
+        )
+        main_object = main_ref.get("object") if isinstance(main_ref, dict) else None
+        current_main_sha = (
+            main_object.get("sha") if isinstance(main_object, dict) else None
+        )
+        comment_user = (
+            published_comment.get("user")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_id = (
+            published_comment.get("id")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_body = (
+            published_comment.get("body")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_created_at = (
+            published_comment.get("created_at")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_updated_at = (
+            published_comment.get("updated_at")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_publisher_login = (
+            comment_user.get("login") if isinstance(comment_user, dict) else None
+        )
+        comment_issue_url = (
+            published_comment.get("issue_url")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        try:
+            expected_body = terminal_published_body(
+                json.loads(str(publication["payload_json"]))["body"],
+                str(publication["idempotency_key"]),
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE") from exc
+        receipt_match = REMOTE_COMMENT_RECEIPT.fullmatch(remote_receipt)
+        expected_issue_url = (
+            f"https://api.github.com/repos/{packet['repository']}"
+            f"/issues/{packet['issue_number']}"
+        )
+        if (
+            not isinstance(issue_payload, dict)
+            or issue_payload.get("number") != int(packet["issue_number"])
+            or not isinstance(source_updated_at, str)
+            or not source_updated_at
+            or not isinstance(main_ref, dict)
+            or main_ref.get("ref") != "refs/heads/main"
+            or not isinstance(current_main_sha, str)
+            or GIT_SHA.fullmatch(current_main_sha) is None
+            or receipt_match is None
+            or comment_id != int(remote_receipt.split(":", 1)[1])
+            or comment_body != expected_body
+            or hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
+            != publication["published_body_sha256"]
+            or comment_publisher_login != publication["publisher_login"]
+            or comment_issue_url != expected_issue_url
+            or not isinstance(comment_created_at, str)
+            or not comment_created_at
+            or not isinstance(comment_updated_at, str)
+            or not comment_updated_at
+        ):
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        _utc_timestamp(
+            comment_created_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        _utc_timestamp(
+            comment_updated_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        packet_created = _utc_timestamp(
+            str(packet["created_at"]), error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        comment_created = _utc_timestamp(
+            comment_created_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        observed = _utc_timestamp(
+            observed_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        if (
+            comment_created < packet_created - timedelta(seconds=1)
+            or comment_created > observed
+        ):
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        comment_descriptor = {
+            "id": comment_id,
+            "event": "commented",
+            "body_sha256": hashlib.sha256(comment_body.encode("utf-8")).hexdigest(),
+            "publisher_login": comment_publisher_login,
+            "created_at": comment_created_at,
+            "updated_at": comment_updated_at,
+            "issue_url": comment_issue_url,
+        }
+        publication_window_start = packet_created - timedelta(seconds=1)
+        publication_activity = []
+        for event in timeline:
+            event_created_at = event.get("created_at")
+            if not isinstance(event_created_at, str):
+                raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+            event_created = _utc_timestamp(
+                event_created_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+            )
+            if event_created >= publication_window_start:
+                publication_activity.append(_terminal_timeline_activity(event))
+        if publication_activity != [comment_descriptor]:
+            raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
+        descriptor = {
+            "schema": "twinfinity-terminal-live-evidence/v1",
+            "closeout_key": closeout_key,
+            "packet_sha256": str(packet["packet_sha256"]),
+            "repository": str(packet["repository"]),
+            "issue_number": int(packet["issue_number"]),
+            "source_payload_sha256": digest_json(issue_payload),
+            "source_material_sha256": digest_json(
+                _terminal_issue_material_payload(issue_payload)
+            ),
+            "source_updated_at": source_updated_at,
+            "current_main_sha": current_main_sha,
+            "publication_comment_sha256": digest_json(comment_descriptor),
+            "publication_comment_id": comment_id,
+            "publication_comment_created_at": comment_created_at,
+            "publication_comment_updated_at": comment_updated_at,
+            "publication_publisher_login": comment_publisher_login,
+            "publication_issue_url": comment_issue_url,
+            "publication_activity_sha256": digest_json(publication_activity),
+            "observed_at": observed_at,
+        }
+        return {**descriptor, "evidence_sha256": digest_json(descriptor)}
+
+    def _validate_terminal_live_evidence(
+        self,
+        *,
+        evidence: dict[str, Any] | None,
+        packet: sqlite3.Row,
+        validated_at: str,
+    ) -> tuple[str, str]:
+        fields = {
+            "schema",
+            "closeout_key",
+            "packet_sha256",
+            "repository",
+            "issue_number",
+            "source_payload_sha256",
+            "source_material_sha256",
+            "source_updated_at",
+            "current_main_sha",
+            "publication_comment_sha256",
+            "publication_comment_id",
+            "publication_comment_created_at",
+            "publication_comment_updated_at",
+            "publication_publisher_login",
+            "publication_issue_url",
+            "publication_activity_sha256",
+            "observed_at",
+            "evidence_sha256",
+        }
+        if not isinstance(evidence, dict) or set(evidence) != fields:
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_REQUIRED")
+        descriptor = {
+            key: evidence[key] for key in fields if key != "evidence_sha256"
+        }
+        evidence_sha256 = evidence.get("evidence_sha256")
+        if (
+            evidence.get("schema") != "twinfinity-terminal-live-evidence/v1"
+            or not isinstance(evidence_sha256, str)
+            or SHA256.fullmatch(evidence_sha256) is None
+            or digest_json(descriptor) != evidence_sha256
+        ):
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_DIGEST_MISMATCH")
+        if (
+            evidence.get("closeout_key") != packet["closeout_key"]
+            or evidence.get("packet_sha256") != packet["packet_sha256"]
+            or evidence.get("repository") != packet["repository"]
+            or evidence.get("issue_number") != int(packet["issue_number"])
+        ):
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_LINEAGE_MISMATCH")
+        if (
+            not isinstance(evidence.get("source_payload_sha256"), str)
+            or SHA256.fullmatch(evidence["source_payload_sha256"]) is None
+            or not isinstance(evidence.get("source_material_sha256"), str)
+            or SHA256.fullmatch(evidence["source_material_sha256"]) is None
+            or not isinstance(evidence.get("source_updated_at"), str)
+            or not evidence["source_updated_at"]
+            or not isinstance(evidence.get("current_main_sha"), str)
+            or GIT_SHA.fullmatch(evidence["current_main_sha"]) is None
+            or not isinstance(evidence.get("observed_at"), str)
+            or not isinstance(evidence.get("publication_comment_sha256"), str)
+            or SHA256.fullmatch(evidence["publication_comment_sha256"]) is None
+            or not isinstance(evidence.get("publication_comment_id"), int)
+            or evidence["publication_comment_id"] <= 0
+            or not isinstance(
+                evidence.get("publication_comment_created_at"), str
+            )
+            or not isinstance(
+                evidence.get("publication_comment_updated_at"), str
+            )
+            or not isinstance(evidence.get("publication_publisher_login"), str)
+            or not evidence["publication_publisher_login"]
+            or not isinstance(evidence.get("publication_issue_url"), str)
+            or not evidence["publication_issue_url"]
+            or not isinstance(evidence.get("publication_activity_sha256"), str)
+            or SHA256.fullmatch(evidence["publication_activity_sha256"]) is None
+        ):
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        _utc_timestamp(
+            evidence["publication_comment_created_at"],
+            error="TERMINAL_LIVE_EVIDENCE_INVALID",
+        )
+        _utc_timestamp(
+            evidence["publication_comment_updated_at"],
+            error="TERMINAL_LIVE_EVIDENCE_INVALID",
+        )
+        observed = _utc_timestamp(
+            evidence["observed_at"], error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        committed = _utc_timestamp(
+            validated_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        age = (committed - observed).total_seconds()
+        if age < 0 or age > TERMINAL_LIVE_EVIDENCE_MAX_AGE_SECONDS:
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_STALE")
+        return evidence_sha256, canonical_json(evidence)
+
+    def commit_terminal_closeout(
+        self,
+        *,
+        closeout_key: str,
+        attempt_id: str,
+        executor_token: str,
+        _test_failpoint: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        if self.connection.in_transaction:
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_TRANSACTION_ACTIVE")
+        preflight_packet = self.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_packets "
+            "WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        if preflight_packet is None:
+            raise CoordinationError("TERMINAL_CLOSEOUT_NOT_FOUND")
+        preflight_commit = self.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_commits "
+            "WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        preflight_attempt = self._require_terminal_lineage_attempt(
+            attempt_id=attempt_id,
+            executor_token=executor_token,
+            repository=preflight_packet["repository"],
+            issue_number=int(preflight_packet["issue_number"]),
+            generation=int(preflight_packet["generation"]),
+            lease_manifest_sha256=preflight_packet["lease_manifest_sha256"],
+            allowed_targets={
+                ("message", str(preflight_packet["activation_message_id"])),
+                ("terminal_watch", str(preflight_packet["terminal_watch_key"])),
+            },
+            completed_replay_attempt_ids=(
+                set()
+                if preflight_commit is None
+                else {str(preflight_commit["finalizer_attempt_id"])}
+            ),
+        )
+        if str(preflight_attempt["role"]) != preflight_packet["accountable_role"]:
+            raise CoordinationError("TERMINAL_ATTEMPT_ROLE_MISMATCH")
+        live_evidence = (
+            None
+            if preflight_commit is not None
+            else self._acquire_terminal_live_evidence(closeout_key=closeout_key)
+        )
+        with self.transaction():
+            packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE closeout_key=?",
+                (closeout_key,),
+            ).fetchone()
+            if packet is None:
+                raise CoordinationError("TERMINAL_CLOSEOUT_NOT_FOUND")
+            existing_commit = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_commits "
+                "WHERE closeout_key=?",
+                (closeout_key,),
+            ).fetchone()
+            attempt = self._require_terminal_lineage_attempt(
+                attempt_id=attempt_id,
+                executor_token=executor_token,
+                repository=packet["repository"],
+                issue_number=int(packet["issue_number"]),
+                generation=int(packet["generation"]),
+                lease_manifest_sha256=packet["lease_manifest_sha256"],
+                allowed_targets={
+                    ("message", str(packet["activation_message_id"])),
+                    ("terminal_watch", str(packet["terminal_watch_key"])),
+                },
+                completed_replay_attempt_ids=(
+                    set()
+                    if existing_commit is None
+                    else {str(existing_commit["finalizer_attempt_id"])}
+                ),
+            )
+            if str(attempt["role"]) != packet["accountable_role"]:
+                raise CoordinationError("TERMINAL_ATTEMPT_ROLE_MISMATCH")
+            if existing_commit is not None:
+                return self.terminal_closeout_status(closeout_key)
+            if attempt["state"] != "RUNNING":
+                raise CoordinationError("TERMINAL_ATTEMPT_NOT_EXECUTABLE")
+            commit_now = utc_now()
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (packet["outbox_id"],)
+            ).fetchone()
+            readback = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_readbacks "
+                "WHERE outbox_id=?",
+                (packet["outbox_id"],),
+            ).fetchone()
+            publisher = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (packet["outbox_id"],),
+            ).fetchone()
+            receipt = json.loads(packet["terminal_receipt_json"])
+            cleanup = json.loads(packet["cleanup_evidence_json"])
+            expected_publication_body = terminal_publication_body(
+                closeout_key=closeout_key,
+                terminal_receipt=receipt,
+                cleanup_evidence=cleanup,
+            )
+            published_body = terminal_published_body(
+                expected_publication_body, closeout_key
+            )
+            if (
+                outbox is None
+                or outbox["state"] != "COMPLETE"
+                or not isinstance(outbox["remote_receipt"], str)
+                or REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"])
+                is None
+                or outbox["idempotency_key"] != closeout_key
+                or outbox["repository"] != packet["repository"]
+                or outbox["object_kind"] != "issue"
+                or int(outbox["object_number"]) != int(packet["issue_number"])
+                or outbox["expected_source_sha256"]
+                != packet["source_payload_sha256"]
+                or outbox["payload_sha256"] != packet["outbox_payload_sha256"]
+                or outbox["payload_json"]
+                != canonical_json({"body": expected_publication_body})
+                or readback is None
+                or readback["closeout_key"] != closeout_key
+                or readback["remote_receipt"] != outbox["remote_receipt"]
+                or readback["remote_receipt_sha256"]
+                != hashlib.sha256(
+                    str(outbox["remote_receipt"]).encode("utf-8")
+                ).hexdigest()
+                or readback["published_body_sha256"]
+                != hashlib.sha256(published_body.encode("utf-8")).hexdigest()
+                or not isinstance(readback["publisher_login"], str)
+                or not readback["publisher_login"]
+                or publisher is None
+                or publisher["closeout_key"] != closeout_key
+                or publisher["publisher_login"] != readback["publisher_login"]
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
+            live_evidence_sha256, live_evidence_json = (
+                self._validate_terminal_live_evidence(
+                    evidence=live_evidence,
+                    packet=packet,
+                    validated_at=commit_now,
+                )
+            )
+            if validate_terminal_receipt(
+                receipt,
+                repository=packet["repository"],
+                issue_number=int(packet["issue_number"]),
+                generation=int(packet["generation"]),
+                source_payload_sha256=packet["source_payload_sha256"],
+                lease_manifest_sha256=packet["lease_manifest_sha256"],
+                role=packet["accountable_role"],
+            ) != packet["terminal_receipt_sha256"] or validate_terminal_cleanup_evidence(
+                cleanup,
+                repository=packet["repository"],
+                issue_number=int(packet["issue_number"]),
+                generation=int(packet["generation"]),
+                lease_manifest_sha256=packet["lease_manifest_sha256"],
+                role=packet["accountable_role"],
+            ) != packet["cleanup_evidence_sha256"]:
+                raise CoordinationError("TERMINAL_CLOSEOUT_EVIDENCE_DRIFT")
+            item = self.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (packet["repository"], packet["issue_number"]),
+            ).fetchone()
+            watch = self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (packet["terminal_watch_key"],),
+            ).fetchone()
+            activation = self.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?",
+                (packet["activation_message_id"],),
+            ).fetchone()
+            try:
+                activation_payload = (
+                    None
+                    if activation is None
+                    else json.loads(activation["payload_json"])
+                )
+            except (TypeError, json.JSONDecodeError):
+                activation_payload = None
+            claim_binding = (
+                None
+                if watch is None
+                else self.connection.execute(
+                    "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                    (watch["claim_attempt_id"],),
+                ).fetchone()
+            )
+            current_source = self.current_snapshot(
+                str(packet["repository"]), "issue", int(packet["issue_number"])
+            )
+            if current_source is None or (
+                current_source.payload_sha256 != packet["source_payload_sha256"]
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
+            expected_publication_issue_url = (
+                f"https://api.github.com/repos/{packet['repository']}"
+                f"/issues/{packet['issue_number']}"
+            )
+            publication_comment_descriptor = {
+                "id": int(str(outbox["remote_receipt"]).split(":", 1)[1]),
+                "event": "commented",
+                "body_sha256": readback["published_body_sha256"],
+                "publisher_login": readback["publisher_login"],
+                "created_at": live_evidence["publication_comment_created_at"],
+                "updated_at": live_evidence["publication_comment_updated_at"],
+                "issue_url": expected_publication_issue_url,
+            }
+            if (
+                live_evidence["publication_comment_id"]
+                != publication_comment_descriptor["id"]
+                or live_evidence["publication_publisher_login"]
+                != publication_comment_descriptor["publisher_login"]
+                or live_evidence["publication_issue_url"]
+                != expected_publication_issue_url
+                or live_evidence["publication_comment_sha256"]
+                != digest_json(publication_comment_descriptor)
+                or live_evidence["publication_activity_sha256"]
+                != digest_json([publication_comment_descriptor])
+                or live_evidence["publication_comment_created_at"]
+                != live_evidence["publication_comment_updated_at"]
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
+            exact_source = (
+                live_evidence["source_payload_sha256"]
+                == packet["source_payload_sha256"]
+                == current_source.payload_sha256
+                and live_evidence["source_updated_at"]
+                == current_source.source_updated_at
+            )
+            publication_timestamp_only = (
+                live_evidence["source_payload_sha256"]
+                != packet["source_payload_sha256"]
+                and live_evidence["source_material_sha256"]
+                == digest_json(
+                    _terminal_issue_material_payload(current_source.payload)
+                )
+                and live_evidence["source_updated_at"]
+                != current_source.source_updated_at
+                and _utc_timestamp(
+                    live_evidence["source_updated_at"],
+                    error="TERMINAL_LIVE_EVIDENCE_INVALID",
+                )
+                > _utc_timestamp(
+                    current_source.source_updated_at,
+                    error="TERMINAL_LIVE_EVIDENCE_INVALID",
+                )
+                and live_evidence["source_updated_at"]
+                == live_evidence["publication_comment_created_at"]
+                == live_evidence["publication_comment_updated_at"]
+                and live_evidence["publication_comment_id"]
+                == int(str(outbox["remote_receipt"]).split(":", 1)[1])
+                and live_evidence["publication_publisher_login"]
+                == readback["publisher_login"]
+            )
+            if not exact_source and not publication_timestamp_only:
+                raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
+            current_graph = self._current_terminal_graph_binding(
+                repository=str(packet["repository"]),
+                issue_number=int(packet["issue_number"]),
+                source_payload_sha256=str(packet["source_payload_sha256"]),
+            )
+            if (
+                not packet["graph_version"]
+                or int(packet["graph_version"]) != current_graph["graph_version"]
+                or packet["graph_sha256"] != current_graph["graph_sha256"]
+                or packet["graph_main_sha"] != current_graph["graph_main_sha"]
+                or packet["graph_node_key"] != current_graph["graph_node_key"]
+                or packet["graph_binding_sha256"]
+                != current_graph["graph_binding_sha256"]
+                or live_evidence["current_main_sha"] != packet["graph_main_sha"]
+                or live_evidence["current_main_sha"]
+                != current_graph["graph_main_sha"]
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_GRAPH_DRIFT")
+            rotation_chain_valid = (
+                item is not None
+                and self._terminal_endpoint_rotation_chain_valid(
+                    packet=packet,
+                    item=item,
+                    current_endpoint_id=str(attempt["endpoint_id"]),
+                )
+            )
+            if (
+                item is None
+                or item["status"] != "PUBLICATION_PENDING"
+                or item["allocation_class"] != "ACTIVE"
+                or int(item["generation"]) != int(packet["generation"])
+                or not rotation_chain_valid
+                or item["source_payload_sha256"] != packet["source_payload_sha256"]
+                or item["lease_manifest_sha256"] != packet["lease_manifest_sha256"]
+                or item["accountable_session_id"] != attempt["endpoint_id"]
+                or watch is None
+                or watch["state"] != "ACTIVE"
+                or watch["repository"] != packet["repository"]
+                or int(watch["issue_number"]) != int(packet["issue_number"])
+                or int(watch["generation"]) != int(packet["generation"])
+                or watch["accountable_session_id"] != attempt["endpoint_id"]
+                or watch["lease_manifest_sha256"] != packet["lease_manifest_sha256"]
+                or int(watch["admission_message_id"] or 0)
+                != int(packet["activation_message_id"])
+                or watch["admission_payload_sha256"]
+                != packet["activation_payload_sha256"]
+                or activation is None
+                or not isinstance(activation_payload, dict)
+                or digest_json(activation_payload)
+                != packet["activation_payload_sha256"]
+                or activation["payload_sha256"]
+                != packet["activation_payload_sha256"]
+                or activation["state"] != "CLAIMED"
+                or activation["recipient_session_id"] != packet["endpoint_id"]
+                or activation["claimed_by"] != packet["endpoint_id"]
+                or claim_binding is None
+                or claim_binding["role"] != packet["accountable_role"]
+                or claim_binding["endpoint_id"] != packet["endpoint_id"]
+                or claim_binding["state"] not in {"RUNNING", "COMPLETE", "HOLD"}
+                or claim_binding["target_kind"] != "message"
+                or claim_binding["target_key"]
+                != str(packet["activation_message_id"])
+                or claim_binding["lineage_repository"] != packet["repository"]
+                or int(claim_binding["lineage_issue_number"] or -1)
+                != int(packet["issue_number"])
+                or int(claim_binding["lineage_generation"] or -1)
+                != int(packet["generation"])
+                or claim_binding["lineage_lease_sha256"]
+                != packet["lease_manifest_sha256"]
+                or (
+                    attempt["target_kind"] == "message"
+                    and claim_binding["attempt_id"] != attempt["attempt_id"]
+                )
+                or (
+                    attempt["target_kind"] == "terminal_watch"
+                    and claim_binding["state"] not in {"COMPLETE", "HOLD"}
+                )
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_LINEAGE_DRIFT")
+            if self.connection.execute(
+                "SELECT 1 FROM coordination_pre_push_publications "
+                "WHERE repository=? AND issue_number=? AND state='RESERVED' LIMIT 1",
+                (packet["repository"], packet["issue_number"]),
+            ).fetchone() is not None:
+                raise CoordinationError("PREPUSH_PUBLICATION_RESERVED")
+            if self.connection.execute(
+                "SELECT 1 FROM coordination_artifacts WHERE repository=? "
+                "AND issue_number=? AND state IN ('MOVE_RESERVED','PURGE_RESERVED') "
+                "LIMIT 1",
+                (packet["repository"], packet["issue_number"]),
+            ).fetchone() is not None:
+                raise CoordinationError("ARTIFACT_GC_INFLIGHT")
+            completed_activation = self.connection.execute(
+                """
+                UPDATE coordination_messages
+                SET state='COMPLETE', updated_at=?, last_error=NULL
+                WHERE id=? AND state='CLAIMED' AND claimed_by=?
+                  AND payload_sha256=?
+                """,
+                (
+                    commit_now,
+                    packet["activation_message_id"],
+                    packet["endpoint_id"],
+                    packet["activation_payload_sha256"],
+                ),
+            )
+            if completed_activation.rowcount != 1:
+                raise CoordinationError("TERMINAL_CLOSEOUT_MESSAGE_CONFLICT")
+            self._terminal_failpoint(_test_failpoint, "commit.after_message")
+            self._event(
+                "MESSAGE_COMPLETED",
+                f"message:{packet['activation_message_id']}",
+                {
+                    "session_id": packet["endpoint_id"],
+                    "terminal_closeout_key": closeout_key,
+                },
+                commit_now,
+            )
+            self._terminal_failpoint(_test_failpoint, "commit.after_message_event")
+            done_item_version = int(item["version"]) + 1
+            item_update = self.connection.execute(
+                """
+                UPDATE coordination_items
+                SET status='DONE', allocation_class='NONE',
+                    accountable_session_id=NULL, lease_manifest_sha256=NULL,
+                    development_units=0, shared_units=0, sre_units=0,
+                    version=?, updated_at=?
+                WHERE repository=? AND issue_number=?
+                  AND status='PUBLICATION_PENDING' AND allocation_class='ACTIVE'
+                  AND generation=? AND version=?
+                  AND source_payload_sha256=? AND lease_manifest_sha256=?
+                """,
+                (
+                    done_item_version,
+                    commit_now,
+                    packet["repository"],
+                    packet["issue_number"],
+                    packet["generation"],
+                    item["version"],
+                    packet["source_payload_sha256"],
+                    packet["lease_manifest_sha256"],
+                ),
+            )
+            if item_update.rowcount != 1:
+                raise CoordinationError("TERMINAL_CLOSEOUT_ITEM_CONFLICT")
+            self._terminal_failpoint(_test_failpoint, "commit.after_item")
+            watch_update = self.connection.execute(
+                """
+                UPDATE coordination_terminal_watches
+                SET state='COMPLETE', process_id=NULL, updated_at=?, last_error=NULL
+                WHERE watch_key=? AND state='ACTIVE'
+                  AND admission_message_id=? AND admission_payload_sha256=?
+                  AND lease_manifest_sha256=?
+                """,
+                (
+                    commit_now,
+                    packet["terminal_watch_key"],
+                    packet["activation_message_id"],
+                    packet["activation_payload_sha256"],
+                    packet["lease_manifest_sha256"],
+                ),
+            )
+            if watch_update.rowcount != 1:
+                raise CoordinationError("TERMINAL_CLOSEOUT_WATCH_CONFLICT")
+            self._terminal_failpoint(_test_failpoint, "commit.after_watch")
+            dirty_event_id = self._enqueue_portfolio_dirty_event(
+                repository=packet["repository"],
+                issue_number=int(packet["issue_number"]),
+                release_item_version=done_item_version,
+                release_source_sha256=packet["source_payload_sha256"],
+                prior_allocation_class=str(item["allocation_class"]),
+                status="DONE",
+                generation=int(packet["generation"]),
+                now=commit_now,
+            )
+            self._terminal_failpoint(_test_failpoint, "commit.after_dirty_event")
+            remote_receipt_sha256 = hashlib.sha256(
+                str(outbox["remote_receipt"]).encode("utf-8")
+            ).hexdigest()
+            commit_descriptor = {
+                "schema": "twinfinity-terminal-closeout-commit/v1",
+                "closeout_key": closeout_key,
+                "packet_sha256": packet["packet_sha256"],
+                "finalizer_attempt_id": attempt["attempt_id"],
+                "finalizer_attempt_version": int(attempt["version"]),
+                "live_evidence_sha256": live_evidence_sha256,
+                "remote_receipt_sha256": remote_receipt_sha256,
+                "prior_item_version": int(item["version"]),
+                "done_item_version": done_item_version,
+                "dirty_event_id": dirty_event_id,
+            }
+            commit_sha256 = digest_json(commit_descriptor)
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_closeout_commits(
+                    closeout_key, commit_sha256, finalizer_attempt_id,
+                    finalizer_attempt_version, live_evidence_sha256,
+                    live_evidence_json, remote_receipt,
+                    remote_receipt_sha256, prior_item_version,
+                    done_item_version, dirty_event_id, committed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    closeout_key,
+                    commit_sha256,
+                    attempt["attempt_id"],
+                    int(attempt["version"]),
+                    live_evidence_sha256,
+                    live_evidence_json,
+                    outbox["remote_receipt"],
+                    remote_receipt_sha256,
+                    int(item["version"]),
+                    done_item_version,
+                    dirty_event_id,
+                    commit_now,
+                ),
+            )
+            self._terminal_failpoint(_test_failpoint, "commit.after_commit")
+            self._event(
+                "TERMINAL_CLOSEOUT_COMMITTED",
+                closeout_key,
+                {
+                    "commit_sha256": commit_sha256,
+                    "done_item_version": done_item_version,
+                    "dirty_event_id": dirty_event_id,
+                },
+                commit_now,
+            )
+            self._terminal_failpoint(_test_failpoint, "commit.after_event")
+        return self.terminal_closeout_status(closeout_key)
 
     def _readiness_decision_notice_bound(self, message_id: int) -> bool:
         table = self.connection.execute(
@@ -4620,6 +6721,8 @@ class CoordinationStore:
         now: str,
         *,
         gateway: object | None = None,
+        attempt_id: str | None = None,
+        executor_token: str | None = None,
     ) -> dict[str, Any]:
         if not self.connection.in_transaction:
             raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
@@ -4650,6 +6753,8 @@ class CoordinationStore:
         ):
             raise CoordinationError("MESSAGE_STATE_CONFLICT")
         payload = json.loads(row["payload_json"])
+        if digest_json(payload) != row["payload_sha256"]:
+            raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
         if not readiness_bound and not resolution_bound:
             self._validate_message_source(payload)
         self._validate_message_contract(
@@ -4657,6 +6762,51 @@ class CoordinationStore:
             recipient_session_id=row["recipient_session_id"],
             payload=payload,
         )
+        watch = None
+        claim_attempt = None
+        if row["topic"] in {"development.admission", "sre.admission"}:
+            source = payload.get("source", {})
+            watch_key = terminal_watch_key(
+                str(source.get("repository")),
+                int(payload.get("issue_number", 0)),
+                int(payload.get("generation", -1)),
+            )
+            watch = self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (watch_key,),
+            ).fetchone()
+            fixture_preclaimed = bool(
+                watch is not None
+                and watch["state"] == "ACTIVE"
+                and watch["claim_attempt_id"] is None
+                and Path("/tmp") in self.path.resolve().parents
+            )
+            if (
+                watch is None
+                or (
+                    watch["state"]
+                    != ("PENDING_CLAIM" if row["state"] == "PREPARED" else "ACTIVE")
+                    and not fixture_preclaimed
+                )
+                or int(watch["admission_message_id"] or 0) != message_id
+                or watch["admission_payload_sha256"] != row["payload_sha256"]
+                or watch["accountable_session_id"] != canonical_session_id
+                or watch["lease_manifest_sha256"]
+                != payload.get("lease_manifest_sha256")
+            ):
+                raise CoordinationError("TERMINAL_WATCH_CLAIM_BINDING_MISMATCH")
+            if not fixture_preclaimed:
+                claim_attempt = self._require_running_lineage_attempt(
+                    attempt_id=attempt_id,
+                    executor_token=executor_token,
+                    repository=str(source["repository"]),
+                    issue_number=int(payload["issue_number"]),
+                    generation=int(payload["generation"]),
+                    lease_manifest_sha256=str(payload["lease_manifest_sha256"]),
+                    allowed_targets={("message", str(message_id))},
+                )
+                if claim_attempt["endpoint_id"] != canonical_session_id:
+                    raise CoordinationError("TERMINAL_ATTEMPT_ENDPOINT_MISMATCH")
         if row["state"] == "PREPARED":
             changed = self.connection.execute(
                 "UPDATE coordination_messages SET state='CLAIMED', claimed_by=?, "
@@ -4665,6 +6815,52 @@ class CoordinationStore:
             ).rowcount
             if changed != 1:
                 raise CoordinationError("MESSAGE_STATE_CONFLICT")
+            if watch is not None and claim_attempt is not None:
+                activated_watch = self.connection.execute(
+                    """
+                    UPDATE coordination_terminal_watches
+                    SET state='ACTIVE', claim_attempt_id=?, attempts=0,
+                        process_id=NULL, last_heartbeat_at=?, next_wake_at=?,
+                        updated_at=?, last_error=NULL
+                    WHERE watch_key=? AND state='PENDING_CLAIM'
+                      AND admission_message_id=?
+                      AND admission_payload_sha256=?
+                      AND claim_attempt_id IS NULL
+                    """,
+                    (
+                        claim_attempt["attempt_id"],
+                        now,
+                        timestamp_after(now, 60),
+                        now,
+                        watch["watch_key"],
+                        message_id,
+                        row["payload_sha256"],
+                    ),
+                )
+                if activated_watch.rowcount != 1:
+                    raise CoordinationError("TERMINAL_WATCH_CLAIM_CONFLICT")
+        elif watch is not None and claim_attempt is not None:
+            rebound_watch = self.connection.execute(
+                """
+                UPDATE coordination_terminal_watches
+                SET claim_attempt_id=?, attempts=0, process_id=NULL,
+                    last_heartbeat_at=?, next_wake_at=?, updated_at=?,
+                    last_error=NULL
+                WHERE watch_key=? AND state='ACTIVE'
+                  AND admission_message_id=? AND admission_payload_sha256=?
+                """,
+                (
+                    claim_attempt["attempt_id"],
+                    now,
+                    timestamp_after(now, 60),
+                    now,
+                    watch["watch_key"],
+                    message_id,
+                    row["payload_sha256"],
+                ),
+            )
+            if rebound_watch.rowcount != 1:
+                raise CoordinationError("TERMINAL_WATCH_CLAIM_CONFLICT")
         claimed = self.connection.execute(
             "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
         ).fetchone()
@@ -4701,12 +6897,22 @@ class CoordinationStore:
         )
 
     def claim_message(
-        self, message_id: int, session_id: str, now: str
+        self,
+        message_id: int,
+        session_id: str,
+        now: str,
+        *,
+        attempt_id: str | None = None,
+        executor_token: str | None = None,
     ) -> dict[str, Any]:
         try:
             with self.transaction():
                 return self._claim_message_in_transaction(
-                    message_id, session_id, now
+                    message_id,
+                    session_id,
+                    now,
+                    attempt_id=attempt_id,
+                    executor_token=executor_token,
                 )
         except CoordinationError as exc:
             error = str(exc)
@@ -4715,6 +6921,8 @@ class CoordinationStore:
                 "MESSAGE_SOURCE_DRIFT",
                 "MESSAGE_CONTRACT_INVALID",
                 "MESSAGE_ITEM_STATE_MISMATCH",
+                "MESSAGE_PAYLOAD_MISMATCH",
+                "TERMINAL_CLOSEOUT_TOPIC_RETIRED",
             }:
                 with self.transaction():
                     self.connection.execute(
@@ -4753,6 +6961,10 @@ class CoordinationStore:
             )
         ):
             raise CoordinationError("MESSAGE_STATE_CONFLICT")
+        if row["topic"] in ADMISSION_WATCH_TOPICS:
+            # Admission rows are immutable terminal lineage. Their only
+            # CLAIMED -> COMPLETE authority is commit_terminal_closeout.
+            raise CoordinationError("TERMINAL_FINALIZATION_REQUIRED")
         readiness_bound = self._readiness_decision_notice_bound(message_id)
         resolution_bound = self._readiness_resolution_notice_bound(message_id)
         if readiness_bound:
@@ -5179,6 +7391,413 @@ class CoordinationStore:
             )
         return str(inventory["inventory_sha256"]), outbox_id
 
+    def terminal_outbox_context(self, outbox_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT packet.closeout_key, packet.packet_sha256, packet.created_at,
+                   recovery.readback_attempts, recovery.retry_rounds,
+                   recovery.next_retry_at, recovery.state AS recovery_state,
+                   publisher.publisher_login,
+                   publisher.binding_sha256 AS publisher_binding_sha256
+            FROM coordination_terminal_closeout_packets packet
+            LEFT JOIN coordination_terminal_outbox_recovery recovery
+              ON recovery.outbox_id=packet.outbox_id
+            LEFT JOIN coordination_terminal_outbox_publishers publisher
+              ON publisher.outbox_id=packet.outbox_id
+            WHERE packet.outbox_id=?
+            """,
+            (outbox_id,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def bind_terminal_outbox_publisher(
+        self, *, outbox_id: int, publisher_login: str, now: str
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(publisher_login, str)
+            or not publisher_login
+            or len(publisher_login) > 100
+            or any(character.isspace() for character in publisher_login)
+        ):
+            raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            recovery = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_recovery "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if outbox is None or packet is None or recovery is None:
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
+            descriptor = {
+                "schema": "twinfinity-terminal-outbox-publisher/v1",
+                "outbox_id": outbox_id,
+                "closeout_key": str(packet["closeout_key"]),
+                "publisher_login": publisher_login,
+            }
+            binding_sha256 = digest_json(descriptor)
+            if existing is not None:
+                if (
+                    existing["closeout_key"] != packet["closeout_key"]
+                    or existing["publisher_login"] != publisher_login
+                    or existing["binding_sha256"] != binding_sha256
+                ):
+                    raise CoordinationError(
+                        "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                    )
+                return dict(existing)
+            if (
+                outbox["state"] != "PREPARED"
+                or outbox["remote_receipt"] is not None
+                or recovery["state"] not in {"PENDING", "RETRY_READY"}
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_UNBOUND")
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_outbox_publishers(
+                    outbox_id, closeout_key, publisher_login,
+                    binding_sha256, bound_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    packet["closeout_key"],
+                    publisher_login,
+                    binding_sha256,
+                    now,
+                ),
+            )
+            self._event(
+                "TERMINAL_OUTBOX_PUBLISHER_BOUND",
+                f"outbox:{outbox_id}",
+                {"binding_sha256": binding_sha256},
+                now,
+            )
+            bound = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+        return dict(bound)
+
+    def hold_terminal_outbox_publisher_identity(
+        self,
+        *,
+        outbox_id: int,
+        observed_publisher_login: str,
+        error: str,
+        now: str,
+    ) -> None:
+        if error not in {
+            "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH",
+            "TERMINAL_OUTBOX_PUBLISHER_UNBOUND",
+        }:
+            raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_ERROR_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT 1 FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            publisher = self.connection.execute(
+                "SELECT publisher_login FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if (
+                outbox is None
+                or packet is None
+                or outbox["state"] not in {"PREPARED", "INFLIGHT", "HOLD"}
+                or outbox["remote_receipt"] is not None
+                or (
+                    error == "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                    and (
+                        publisher is None
+                        or publisher["publisher_login"]
+                        == observed_publisher_login
+                    )
+                )
+                or (
+                    error == "TERMINAL_OUTBOX_PUBLISHER_UNBOUND"
+                    and publisher is not None
+                )
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_STATE_CONFLICT")
+            self.connection.execute(
+                "UPDATE github_outbox SET state='HOLD', updated_at=?, "
+                "last_error=? WHERE id=?",
+                (now, error, outbox_id),
+            )
+            self.connection.execute(
+                "UPDATE coordination_terminal_outbox_recovery "
+                "SET state='HOLD', updated_at=?, last_error=? WHERE outbox_id=?",
+                (now, error, outbox_id),
+            )
+            self._event(
+                "TERMINAL_OUTBOX_PUBLISHER_HELD",
+                f"outbox:{outbox_id}",
+                {"error": error},
+                now,
+            )
+
+    def complete_terminal_outbox_from_readback(
+        self,
+        *,
+        outbox_id: int,
+        remote_receipt: str,
+        published_body: str,
+        publisher_login: str,
+        now: str,
+    ) -> None:
+        if (
+            REMOTE_COMMENT_RECEIPT.fullmatch(remote_receipt or "") is None
+            or not isinstance(published_body, str)
+            or not published_body
+            or not isinstance(publisher_login, str)
+            or not publisher_login
+        ):
+            raise CoordinationError("TERMINAL_OUTBOX_READBACK_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            publisher = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if outbox is None or packet is None:
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
+            if (
+                publisher is None
+                or publisher["closeout_key"] != packet["closeout_key"]
+                or publisher["publisher_login"] != publisher_login
+            ):
+                raise CoordinationError(
+                    "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                )
+            receipt_sha256 = hashlib.sha256(
+                remote_receipt.encode("utf-8")
+            ).hexdigest()
+            body_sha256 = hashlib.sha256(published_body.encode("utf-8")).hexdigest()
+            expected_body = terminal_published_body(
+                json.loads(outbox["payload_json"])["body"], outbox["idempotency_key"]
+            )
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_readbacks "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    outbox["state"] != "COMPLETE"
+                    or outbox["remote_receipt"] != remote_receipt
+                    or existing["closeout_key"] != packet["closeout_key"]
+                    or existing["remote_receipt"] != remote_receipt
+                    or existing["remote_receipt_sha256"] != receipt_sha256
+                    or existing["published_body_sha256"] != body_sha256
+                    or existing["publisher_login"] != publisher_login
+                    or published_body != expected_body
+                ):
+                    raise CoordinationError("TERMINAL_OUTBOX_READBACK_CONFLICT")
+                return
+            if (
+                outbox["state"] not in {"PREPARED", "INFLIGHT", "HOLD"}
+                or outbox["remote_receipt"] is not None
+                or outbox["idempotency_key"] != packet["closeout_key"]
+                or published_body != expected_body
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_READBACK_CONFLICT")
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_outbox_readbacks(
+                    outbox_id, closeout_key, remote_receipt,
+                    remote_receipt_sha256, published_body_sha256,
+                    publisher_login, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    packet["closeout_key"],
+                    remote_receipt,
+                    receipt_sha256,
+                    body_sha256,
+                    publisher_login,
+                    now,
+                ),
+            )
+            cursor = self.connection.execute(
+                """
+                UPDATE github_outbox
+                SET state='COMPLETE', remote_receipt=?, updated_at=?,
+                    last_error=NULL
+                WHERE id=? AND state IN ('PREPARED','INFLIGHT','HOLD')
+                  AND remote_receipt IS NULL
+                """,
+                (remote_receipt, now, outbox_id),
+            )
+            if cursor.rowcount != 1:
+                raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET state='COMPLETE', updated_at=?, last_error=NULL
+                WHERE outbox_id=?
+                """,
+                (now, outbox_id),
+            )
+            self._event(
+                "OUTBOX_COMPLETED",
+                f"outbox:{outbox_id}",
+                {"remote_receipt": remote_receipt, "readback": "EXACT_MARKER"},
+                now,
+            )
+
+    def record_terminal_outbox_readback_miss(
+        self,
+        *,
+        outbox_id: int,
+        error: str,
+        publisher_login: str,
+        now: str,
+    ) -> dict[str, Any]:
+        if error not in {"GITHUB_READBACK_MISSING", "GITHUB_READBACK_DUPLICATE"}:
+            raise CoordinationError("TERMINAL_OUTBOX_RECOVERY_ERROR_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            recovery = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_recovery "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            publisher = self.connection.execute(
+                "SELECT publisher_login FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if outbox is None or packet is None or recovery is None:
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
+            if publisher is None:
+                raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_UNBOUND")
+            if publisher["publisher_login"] != publisher_login:
+                raise CoordinationError(
+                    "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                )
+            if outbox["state"] not in {"PREPARED", "INFLIGHT", "HOLD"}:
+                raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            if recovery["state"] == "COMPLETE":
+                raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            if recovery["next_retry_at"] > now:
+                raise CoordinationError("TERMINAL_OUTBOX_RETRY_NOT_DUE")
+            attempts = int(recovery["readback_attempts"]) + 1
+            rounds = int(recovery["retry_rounds"])
+            outbox_state = "HOLD"
+            recovery_state = "RETRY_WAIT"
+            next_retry_at = timestamp_after(now, min(60 * (2 ** (attempts - 1)), 900))
+            if error == "GITHUB_READBACK_DUPLICATE":
+                recovery_state = "HOLD"
+                next_retry_at = timestamp_after(now, 900)
+            elif attempts >= TERMINAL_OUTBOX_READBACK_ATTEMPTS_PER_RETRY:
+                try:
+                    binding = self._current_terminal_graph_binding(
+                        repository=str(packet["repository"]),
+                        issue_number=int(packet["issue_number"]),
+                        source_payload_sha256=str(packet["source_payload_sha256"]),
+                    )
+                except CoordinationError:
+                    binding = None
+                current_source = self.current_snapshot(
+                    str(packet["repository"]), "issue", int(packet["issue_number"])
+                )
+                if (
+                    rounds < TERMINAL_OUTBOX_MAX_RETRY_ROUNDS
+                    and binding is not None
+                    and current_source is not None
+                    and current_source.payload_sha256 == packet["source_payload_sha256"]
+                    and int(packet["graph_version"] or 0) == binding["graph_version"]
+                    and packet["graph_binding_sha256"]
+                    == binding["graph_binding_sha256"]
+                ):
+                    attempts = 0
+                    rounds += 1
+                    outbox_state = "PREPARED"
+                    recovery_state = "RETRY_READY"
+                    next_retry_at = now
+                else:
+                    recovery_state = "HOLD"
+                    next_retry_at = timestamp_after(now, 900)
+            self.connection.execute(
+                """
+                UPDATE github_outbox
+                SET state=?, updated_at=?, last_error=?
+                WHERE id=? AND state IN ('PREPARED','INFLIGHT','HOLD')
+                  AND remote_receipt IS NULL
+                """,
+                (outbox_state, now, error, outbox_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET readback_attempts=?, retry_rounds=?, next_retry_at=?,
+                    state=?, updated_at=?, last_error=?
+                WHERE outbox_id=?
+                """,
+                (
+                    attempts,
+                    rounds,
+                    next_retry_at,
+                    recovery_state,
+                    now,
+                    error,
+                    outbox_id,
+                ),
+            )
+            self._event(
+                "TERMINAL_OUTBOX_RECONCILED",
+                f"outbox:{outbox_id}",
+                {
+                    "error": error,
+                    "readback_attempts": attempts,
+                    "retry_rounds": rounds,
+                    "state": recovery_state,
+                },
+                now,
+            )
+        return {
+            "outbox_id": outbox_id,
+            "state": recovery_state,
+            "readback_attempts": attempts,
+            "retry_rounds": rounds,
+            "next_retry_at": next_retry_at,
+        }
+
     def reserve_outbox(self, outbox_id: int, now: str) -> dict[str, Any]:
         with self.transaction():
             row = self.connection.execute(
@@ -5193,8 +7812,46 @@ class CoordinationStore:
             )
             if source is None or source.payload_sha256 != row["expected_source_sha256"]:
                 raise CoordinationError("SOURCE_SNAPSHOT_DRIFT")
+            terminal_packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if terminal_packet is not None:
+                publisher = self.connection.execute(
+                    "SELECT closeout_key FROM coordination_terminal_outbox_publishers "
+                    "WHERE outbox_id=?",
+                    (outbox_id,),
+                ).fetchone()
+                if (
+                    publisher is None
+                    or publisher["closeout_key"] != terminal_packet["closeout_key"]
+                ):
+                    raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_UNBOUND")
+                binding = self._current_terminal_graph_binding(
+                    repository=str(terminal_packet["repository"]),
+                    issue_number=int(terminal_packet["issue_number"]),
+                    source_payload_sha256=str(
+                        terminal_packet["source_payload_sha256"]
+                    ),
+                )
+                if (
+                    int(terminal_packet["graph_version"] or 0)
+                    != binding["graph_version"]
+                    or terminal_packet["graph_binding_sha256"]
+                    != binding["graph_binding_sha256"]
+                ):
+                    raise CoordinationError("TERMINAL_CLOSEOUT_GRAPH_DRIFT")
             self.connection.execute(
                 "UPDATE github_outbox SET state='INFLIGHT', updated_at=? WHERE id=? AND state='PREPARED'",
+                (now, outbox_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET state='PENDING', updated_at=?, last_error=NULL
+                WHERE outbox_id=? AND state='RETRY_READY'
+                """,
                 (now, outbox_id),
             )
             reserved = self.connection.execute(
@@ -5207,6 +7864,12 @@ class CoordinationStore:
         if not remote_receipt:
             raise CoordinationError("INVALID_REMOTE_RECEIPT")
         with self.transaction():
+            if self.connection.execute(
+                "SELECT 1 FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone() is not None:
+                raise CoordinationError("TERMINAL_OUTBOX_READBACK_REQUIRED")
             cursor = self.connection.execute(
                 "UPDATE github_outbox SET state='COMPLETE', remote_receipt=?, updated_at=?, last_error=NULL WHERE id=? AND state='INFLIGHT'",
                 (remote_receipt, now, outbox_id),
@@ -5225,6 +7888,14 @@ class CoordinationStore:
             )
             if cursor.rowcount != 1:
                 raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET state='HOLD', updated_at=?, last_error=?
+                WHERE outbox_id=?
+                """,
+                (now, error, outbox_id),
+            )
             self._event("OUTBOX_HELD", f"outbox:{outbox_id}", {"error": error}, now)
 
     def summary(self, repository: str | None = None) -> dict[str, Any]:
@@ -5548,6 +8219,8 @@ def main() -> int:
     recovery_activation.add_argument("--session-id", required=True)
     terminal_closeout = subparsers.add_parser("prepare-terminal-closeout")
     terminal_closeout.add_argument("--transaction-file", type=Path, required=True)
+    terminal_commit = subparsers.add_parser("commit-terminal-closeout")
+    terminal_commit.add_argument("--closeout-key", required=True)
     heartbeat = subparsers.add_parser("heartbeat-terminal-watch")
     heartbeat.add_argument("--watch-key", required=True)
     heartbeat.add_argument("--session-id", required=True)
@@ -5608,7 +8281,13 @@ def main() -> int:
             )
             print(canonical_json({"phase": "COMPLETE", **result}))
         elif args.command == "claim-message":
-            row = store.claim_message(args.message_id, args.session_id, utc_now())
+            row = store.claim_message(
+                args.message_id,
+                args.session_id,
+                utc_now(),
+                attempt_id=os.environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID"),
+                executor_token=os.environ.get("TWINFINITY_EXECUTOR_TOKEN"),
+            )
             print(
                 canonical_json(
                     {
@@ -5684,6 +8363,8 @@ def main() -> int:
                 message_id=args.message_id,
                 session_id=args.session_id,
                 now=utc_now(),
+                attempt_id=os.environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID"),
+                executor_token=os.environ.get("TWINFINITY_EXECUTOR_TOKEN"),
             )
             print(
                 canonical_json(
@@ -5697,20 +8378,22 @@ def main() -> int:
             )
         elif args.command == "prepare-terminal-closeout":
             payload = json.loads(args.transaction_file.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict) or set(payload) != {"outbox", "message"}:
+            if not isinstance(payload, dict) or set(payload) != {"packet"}:
                 raise CoordinationError("INVALID_TERMINAL_CLOSEOUT_TRANSACTION")
-            outbox_id, message_id = store.prepare_terminal_closeout(
-                outbox=payload["outbox"], message=payload["message"], now=utc_now()
+            status = store.prepare_terminal_closeout(
+                packet=payload["packet"],
+                attempt_id=os.environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID", ""),
+                executor_token=os.environ.get("TWINFINITY_EXECUTOR_TOKEN", ""),
+                now=utc_now(),
             )
-            print(
-                canonical_json(
-                    {
-                        "phase": "PREPARED",
-                        "outbox_id": outbox_id,
-                        "message_id": message_id,
-                    }
-                )
+            print(canonical_json({"phase": status["state"], "closeout": status}))
+        elif args.command == "commit-terminal-closeout":
+            status = store.commit_terminal_closeout(
+                closeout_key=args.closeout_key,
+                attempt_id=os.environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID", ""),
+                executor_token=os.environ.get("TWINFINITY_EXECUTOR_TOKEN", ""),
             )
+            print(canonical_json({"phase": status["state"], "closeout": status}))
         elif args.command == "heartbeat-terminal-watch":
             watch = store.heartbeat_terminal_watch(
                 watch_key=args.watch_key,

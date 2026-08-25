@@ -17,7 +17,10 @@ from coordination_store import (  # noqa: E402
     CoordinationStore,
     canonical_json,
     digest_json,
+    terminal_published_body,
+    terminal_publication_body,
 )
+import coordination_store as coordination_store_module  # noqa: E402
 from coordination_supervisor import (  # noqa: E402
     CoordinationSupervisor,
     SchedulerLaunchPolicy,
@@ -27,14 +30,20 @@ from coordination_supervisor import (  # noqa: E402
 )
 from executor_registry import (  # noqa: E402
     AttemptLineage,
+    SystemdUnitEvidence,
+    attempt_lineage_for_target,
     load_registry_config,
     reserve_attempt,
     stable_systemd_unit,
+    transition_attempt,
 )
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
     load_legacy_alias_fixture,
+)
+from tests.reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    reviewed_current_endpoint_catalog,
 )
 
 
@@ -52,12 +61,12 @@ NONCANONICAL_SESSION = "01a00000-0000-7000-8000-000000000001"
 class CoordinationSupervisorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        catalog = reviewed_current_endpoint_catalog(ROOT, Path(self.temp.name))
+        config = catalog.__enter__()
+        self.addCleanup(catalog.__exit__, None, None, None)
         directory = Path(self.temp.name) / "coordinator"
         directory.mkdir(mode=0o700)
         self.store = CoordinationStore(directory / "state.sqlite3")
-        config = load_registry_config(
-            ROOT / "references" / "twinfinity-executor-registry.toml"
-        )
         aliases, alias_sha = load_legacy_alias_fixture(
             ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
         )
@@ -92,6 +101,155 @@ class CoordinationSupervisorTests(unittest.TestCase):
             process_checker=lambda *_: False,
         )
 
+    def seed_current_graph(self, source_sha256: str) -> None:
+        main_sha = "a" * 40
+        graph_sha = digest_json({"issue": 92, "source": source_sha256})
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_revisions VALUES (?,?,NULL,?,?,?,?,?)",
+            (
+                REPOSITORY, 1, main_sha, graph_sha,
+                '{"milestones":[]}', "[]", "2026-08-22T10:00:01Z",
+            ),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO portfolio_graph_nodes VALUES (
+                ?,1,'issue-92',92,'DELIVERY','STANDALONE',NULL,NULL,NULL,
+                'issue-92',0,1,1,1,1,1,0,?,'2026-08-22T10:00:01Z'
+            )
+            """,
+            (REPOSITORY, source_sha256),
+        )
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_current VALUES (?,1,?,'CURRENT',?,NULL)",
+            (REPOSITORY, main_sha, "2026-08-22T10:00:01Z"),
+        )
+
+    def bound_development_admission(
+        self, *, complete: bool
+    ) -> tuple[object, int, str, object, str]:
+        source = self.snapshot()
+        active = self.store._set_issue_status_for_test_fixture(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="ACTIVE_FENCED",
+            allocation_class="ACTIVE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_SESSION,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=1,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-22T10:00:02Z",
+        )
+        payload = {
+            "source": {
+                "repository": REPOSITORY,
+                "object_kind": "issue",
+                "object_number": 92,
+                "payload_sha256": source.payload_sha256,
+            },
+            "issue_number": 92,
+            "generation": 1,
+            "item_version": active["version"],
+            "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+            "base_sha": "a" * 40,
+            "branch": "codex/92-supervisor-terminal-binding",
+            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-92",
+            "opaque_worktree_id": "issue-92-supervisor-terminal-binding",
+            "accountable_session_id": DEVELOPMENT_SESSION,
+            "lease_manifest_sha256": LEASE,
+            "authority_sha256": "7" * 64,
+            "capacity": {
+                "development_units": 1,
+                "shared_units": 1,
+                "sre_units": 0,
+            },
+            "writer": "accountable-writer",
+            "reviewer_plan": ["Different-session exact-head review."],
+            "collision_proof": ["Closed lease is collision-free."],
+            "environment_rule": "Use only an issue-owned environment.",
+            "routine_chain": ["Continue through routine closeout."],
+            "hard_stops": ["Stop on any binding drift."],
+        }
+        message_id = self.store.enqueue_message(
+            idempotency_key="supervisor-terminal-binding",
+            recipient_session_id=DEVELOPMENT_SESSION,
+            topic="development.admission",
+            payload=payload,
+            now="2026-08-22T10:00:03Z",
+        )
+        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:1"
+        self.store.connection.execute(
+            """
+            UPDATE coordination_terminal_watches
+            SET state='PENDING_CLAIM', admission_message_id=?,
+                admission_payload_sha256=?, claim_attempt_id=NULL
+            WHERE watch_key=?
+            """,
+            (message_id, digest_json(payload), watch_key),
+        )
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=str(message_id),
+            now="2026-08-22T10:00:04Z",
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "message", str(message_id)
+            ),
+        )
+        unit = stable_systemd_unit("development", "message", str(message_id))
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id="a" * 32,
+            systemd_control_group=f"/user.slice/{unit}",
+            now="2026-08-22T10:00:05Z",
+        )
+        running = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=9200,
+            now="2026-08-22T10:00:06Z",
+        )
+        if complete:
+            self.store.claim_message(
+                message_id,
+                DEVELOPMENT_SESSION,
+                "2026-08-22T10:00:07Z",
+                attempt_id=running["attempt_id"],
+                executor_token=token,
+            )
+            # Historical pre-atomic-closeout rows can still be observed by the
+            # supervisor.  Construct that legacy state directly; the public
+            # completion API is intentionally fenced for current admissions.
+            self.store.connection.execute(
+                "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+                "WHERE id=? AND state='CLAIMED'",
+                ("2026-08-22T10:00:08Z", message_id),
+            )
+            running = transition_attempt(
+                self.store.connection,
+                attempt_id=running["attempt_id"],
+                token=token,
+                expected_version=running["version"],
+                new_state="COMPLETE",
+                exit_code=0,
+                now="2026-08-22T10:00:09Z",
+            )
+        return source, message_id, watch_key, running, token
+
     def tearDown(self) -> None:
         self.store.close()
         self.temp.cleanup()
@@ -101,7 +259,11 @@ class CoordinationSupervisorTests(unittest.TestCase):
             repository=REPOSITORY,
             object_kind="issue",
             object_number=92,
-            payload={"number": 92, "title": "Issue 92"},
+            payload={
+                "number": 92,
+                "title": "Issue 92",
+                "updated_at": "2026-08-22T10:00:00Z",
+            },
             source_updated_at="2026-08-22T10:00:00Z",
             fetched_at="2026-08-22T10:00:01Z",
         )
@@ -144,7 +306,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
     def claimed_admission(self) -> tuple[object, int]:
         source = self.snapshot()
-        active = self.store.set_issue_status(
+        active = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="ACTIVE_FENCED",
@@ -189,8 +351,67 @@ class CoordinationSupervisorTests(unittest.TestCase):
             },
             now="2026-08-22T10:00:03Z",
         )
+        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:1"
+        message = self.store.connection.execute(
+            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        self.store.connection.execute(
+            """
+            UPDATE coordination_terminal_watches
+            SET state='PENDING_CLAIM', admission_message_id=?,
+                admission_payload_sha256=?, claim_attempt_id=NULL
+            WHERE watch_key=?
+            """,
+            (message_id, message["payload_sha256"], watch_key),
+        )
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=str(message_id),
+            now="2026-08-22T10:00:03Z",
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "message", str(message_id)
+            ),
+        )
+        unit = stable_systemd_unit("development", "message", str(message_id))
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id="b" * 32,
+            systemd_control_group=f"/user.slice/{unit}",
+            now="2026-08-22T10:00:03Z",
+        )
+        running = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=9100,
+            now="2026-08-22T10:00:03Z",
+        )
         self.store.claim_message(
-            message_id, DEVELOPMENT_SESSION, "2026-08-22T10:00:04Z"
+            message_id,
+            DEVELOPMENT_SESSION,
+            "2026-08-22T10:00:04Z",
+            attempt_id=running["attempt_id"],
+            executor_token=token,
+        )
+        transition_attempt(
+            self.store.connection,
+            attempt_id=running["attempt_id"],
+            token=token,
+            expected_version=running["version"],
+            new_state="COMPLETE",
+            exit_code=0,
+            now="2026-08-22T10:00:04Z",
         )
         return source, message_id
 
@@ -615,22 +836,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
 
     def test_terminal_watch_launch_failures_exhaust_into_typed_hold(self) -> None:
-        source = self.snapshot()
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
-        )
+        self.bound_development_admission(complete=True)
         failures: list[str] = []
 
         def fail_watch(_session_id: str, watch_key: str) -> int:
@@ -646,9 +852,9 @@ class CoordinationSupervisorTests(unittest.TestCase):
         results = [
             supervisor.run_once(timestamp)
             for timestamp in (
-                "2026-08-22T10:01:03Z",
-                "2026-08-22T10:02:04Z",
-                "2026-08-22T10:03:05Z",
+                "2026-08-22T10:01:08Z",
+                "2026-08-22T10:02:09Z",
+                "2026-08-22T10:03:10Z",
             )
         ]
 
@@ -664,25 +870,9 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
 
     def test_third_terminal_watch_failure_rereads_progress_before_exhaustion(self) -> None:
-        source = self.snapshot()
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+        _source, _message_id, watch_key, _attempt, _token = (
+            self.bound_development_admission(complete=True)
         )
-        watch_key = str(self.store.connection.execute(
-            "SELECT watch_key FROM coordination_terminal_watches"
-        ).fetchone()["watch_key"])
         failures: list[str] = []
 
         def fail_after_progress(_session_id: str, candidate_watch_key: str) -> int:
@@ -693,7 +883,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
                     session_id=DEVELOPMENT_SESSION,
                     generation=1,
                     delay_seconds=600,
-                    now="2026-08-22T10:03:05Z",
+                    now="2026-08-22T10:03:10Z",
                 )
             raise OSError("watch launch failed")
 
@@ -704,9 +894,9 @@ class CoordinationSupervisorTests(unittest.TestCase):
             process_checker=lambda *_: False,
         )
         for timestamp in (
-            "2026-08-22T10:01:03Z",
-            "2026-08-22T10:02:04Z",
-            "2026-08-22T10:03:05Z",
+            "2026-08-22T10:01:08Z",
+            "2026-08-22T10:02:09Z",
+            "2026-08-22T10:03:10Z",
         ):
             supervisor.run_once(timestamp)
 
@@ -717,52 +907,219 @@ class CoordinationSupervisorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("ACTIVE", watch["state"])
         self.assertEqual(0, watch["attempts"])
-        self.assertEqual("2026-08-22T10:13:05Z", watch["next_wake_at"])
+        self.assertEqual("2026-08-22T10:13:10Z", watch["next_wake_at"])
         self.assertEqual(
             "TERMINAL_WATCH_WAKE_FAILED_AFTER_PROGRESS", watch["last_error"]
         )
         self.assertEqual(3, len(failures))
 
-        retry = supervisor.run_once("2026-08-22T10:13:06Z")
+        retry = supervisor.run_once("2026-08-22T10:13:11Z")
         self.assertEqual(1, retry["launch_attempts"]["terminal_watches"])
         self.assertEqual(4, len(failures))
 
     def test_capacity_release_consumes_dirty_event_without_planner_notice(self) -> None:
-        source = self.snapshot()
-        active = self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+        source, message_id, watch_key, running, token = (
+            self.bound_development_admission(complete=False)
         )
-        self.supervisor.run_once("2026-08-22T10:00:03Z")
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="DONE",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=0,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=active["version"],
-            now="2026-08-22T10:00:04Z",
+        self.store.claim_message(
+            message_id,
+            DEVELOPMENT_SESSION,
+            "2026-08-22T10:00:07Z",
+            attempt_id=running["attempt_id"],
+            executor_token=token,
         )
+        self.seed_current_graph(source.payload_sha256)
+        receipt = {
+            "schema": "twinfinity-terminal-receipt/v1",
+            "repository": REPOSITORY,
+            "issue_number": 92,
+            "generation": 1,
+            "source_payload_sha256": source.payload_sha256,
+            "lease_manifest_sha256": LEASE,
+            "outcome": "ACCEPTED",
+            "accepted_head_sha": "c" * 40,
+            "operational_state_sha256": None,
+            "acceptance_evidence_sha256": "d" * 64,
+            "residual_risks": [],
+        }
+        cleanup = {
+            "schema": "twinfinity-terminal-cleanup/v1",
+            "repository": REPOSITORY,
+            "issue_number": 92,
+            "generation": 1,
+            "lease_manifest_sha256": LEASE,
+            "owned_resources_absent": True,
+            "temporary_resources_absent": True,
+            "worktree_disposition": "ABSENT",
+            "local_branch_disposition": "ABSENT",
+            "remote_branch_disposition": "ABSENT",
+            "residuals": [],
+        }
+        closeout_key = f"terminal-closeout:{REPOSITORY}:issue:92:generation:1"
+        prepared = self.store.prepare_terminal_closeout(
+            packet={
+                "schema": "twinfinity-terminal-closeout-packet/v1",
+                "repository": REPOSITORY,
+                "issue_number": 92,
+                "generation": 1,
+                "expected_item_version": 1,
+                "source_payload_sha256": source.payload_sha256,
+                "lease_manifest_sha256": LEASE,
+                "terminal_watch_key": watch_key,
+                "activation_message_id": message_id,
+                "terminal_receipt": receipt,
+                "cleanup_evidence": cleanup,
+                "outbox": {
+                    "idempotency_key": closeout_key,
+                    "body": terminal_publication_body(
+                        closeout_key=closeout_key,
+                        terminal_receipt=receipt,
+                        cleanup_evidence=cleanup,
+                    ),
+                },
+            },
+            attempt_id=running["attempt_id"],
+            executor_token=token,
+            now="2026-08-22T10:00:08Z",
+        )
+        original_attempt = self.store.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?",
+            (running["attempt_id"],),
+        ).fetchone()
+        inactive = SystemdUnitEvidence(
+            unit=original_attempt["systemd_unit"],
+            load_state="loaded",
+            active_state="inactive",
+            sub_state="dead",
+            invocation_id=original_attempt["systemd_invocation_id"],
+            control_group=original_attempt["systemd_control_group"],
+            result="exit-code",
+        )
+        recovery_supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: self.fail(
+                "packet-aware recovery must not relaunch the admission"
+            ),
+            terminal_watch_launcher=lambda session, key: (
+                self.terminal_watch_launches.append((session, key)) or 2999
+            ),
+            process_checker=lambda *_: False,
+            stale_attempt_evidence_reader=lambda _unit: inactive,
+        )
+        recovered = recovery_supervisor.run_once("2026-08-22T10:20:00Z")
+        self.assertEqual("RECOVERED", recovered["recovered_active_attempts"][0]["phase"])
+        self.assertEqual([(DEVELOPMENT_SESSION, watch_key)], self.terminal_watch_launches)
+        self.assertEqual(
+            "CLAIMED",
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()[0],
+        )
+        self.store.bind_terminal_outbox_publisher(
+            outbox_id=prepared["outbox_id"],
+            publisher_login="twinfinity-bot",
+            now="2026-08-22T10:20:01Z",
+        )
+        self.store.reserve_outbox(prepared["outbox_id"], "2026-08-22T10:20:01Z")
+        outbox = self.store.connection.execute(
+            "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
+            (prepared["outbox_id"],),
+        ).fetchone()
+        published_body = terminal_published_body(
+            json.loads(outbox["payload_json"])["body"],
+            outbox["idempotency_key"],
+        )
+        self.store.complete_terminal_outbox_from_readback(
+            outbox_id=prepared["outbox_id"],
+            remote_receipt="comment:123",
+            published_body=published_body,
+            publisher_login="twinfinity-bot",
+            now="2026-08-22T10:20:02Z",
+        )
+        fresh, fresh_token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="terminal_watch",
+            target_key=watch_key,
+            now="2026-08-22T10:20:03Z",
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "terminal_watch", watch_key
+            ),
+        )
+        unit = stable_systemd_unit("development", "terminal_watch", watch_key)
+        fresh_launching = transition_attempt(
+            self.store.connection,
+            attempt_id=fresh["attempt_id"],
+            token=fresh_token,
+            expected_version=fresh["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id="f" * 32,
+            systemd_control_group=f"/user.slice/{unit}",
+            now="2026-08-22T10:20:03Z",
+        )
+        fresh_running = transition_attempt(
+            self.store.connection,
+            attempt_id=fresh["attempt_id"],
+            token=fresh_token,
+            expected_version=fresh_launching["version"],
+            new_state="RUNNING",
+            process_id=2999,
+            now="2026-08-22T10:20:04Z",
+        )
+        with (
+            patch.object(
+                coordination_store_module,
+                "_fetch_terminal_live_observation",
+                return_value=(
+                    {**source.payload, "updated_at": "2026-08-22T10:20:02Z"},
+                    {
+                        "ref": "refs/heads/main",
+                        "object": {"sha": "a" * 40},
+                    },
+                    {
+                        "id": 123,
+                        "body": published_body,
+                        "created_at": "2026-08-22T10:20:02Z",
+                        "updated_at": "2026-08-22T10:20:02Z",
+                        "issue_url": (
+                            f"https://api.github.com/repos/{REPOSITORY}/issues/92"
+                        ),
+                        "user": {"login": "twinfinity-bot"},
+                    },
+                    [
+                        {
+                            "id": 123,
+                            "event": "commented",
+                            "body": published_body,
+                            "created_at": "2026-08-22T10:20:02Z",
+                            "updated_at": "2026-08-22T10:20:02Z",
+                            "issue_url": (
+                                f"https://api.github.com/repos/{REPOSITORY}"
+                                "/issues/92"
+                            ),
+                            "user": {"login": "twinfinity-bot"},
+                        }
+                    ],
+                ),
+            ) as live_observation,
+            patch.object(
+                coordination_store_module,
+                "utc_now",
+                return_value="2026-08-22T10:20:05Z",
+            ),
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=fresh_running["attempt_id"],
+                executor_token=fresh_token,
+            )
+        live_observation.assert_called_once_with(REPOSITORY, 92, "comment:123")
 
-        result = self.supervisor.run_once("2026-08-22T10:00:05Z")
-        repeated = self.supervisor.run_once("2026-08-22T10:00:06Z")
+        result = self.supervisor.run_once("2026-08-22T10:20:06Z")
+        repeated = self.supervisor.run_once("2026-08-22T10:20:07Z")
 
         self.assertEqual("RETRY", result["portfolio_convergence"][0]["state"])
         self.assertEqual([], self.launches)
@@ -775,8 +1132,24 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
 
     def test_missing_active_terminal_watch_is_backfilled_and_wakes_owner(self) -> None:
+        _source, _message_id, key, _attempt, _token = (
+            self.bound_development_admission(complete=True)
+        )
+        self.store.connection.execute("DELETE FROM coordination_terminal_watches")
+
+        result = self.supervisor.run_once("2026-08-22T10:06:10Z")
+
+        self.assertEqual([key], result["opened_terminal_watches"])
+        self.assertEqual([(DEVELOPMENT_SESSION, key)], self.terminal_watch_launches)
+        watch = self.store.connection.execute(
+            "SELECT state, attempts, process_id FROM coordination_terminal_watches WHERE watch_key=?",
+            (key,),
+        ).fetchone()
+        self.assertEqual(("ACTIVE", 1, 2001), tuple(watch))
+
+    def test_missing_watch_without_exact_admission_is_held_and_never_wakes(self) -> None:
         source = self.snapshot()
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="ACTIVE",
@@ -793,49 +1166,51 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
         self.store.connection.execute("DELETE FROM coordination_terminal_watches")
 
-        result = self.supervisor.run_once("2026-08-22T10:01:03Z")
+        result = self.supervisor.run_once("2026-08-22T10:06:10Z")
 
         key = f"terminal:{REPOSITORY}:issue:92:generation:1"
-        self.assertEqual([key], result["opened_terminal_watches"])
-        self.assertEqual([(DEVELOPMENT_SESSION, key)], self.terminal_watch_launches)
+        self.assertEqual([], result["opened_terminal_watches"])
+        self.assertEqual([], result["terminal_watch_launches"])
         watch = self.store.connection.execute(
-            "SELECT state, attempts, process_id FROM coordination_terminal_watches WHERE watch_key=?",
+            "SELECT state,attempts,process_id,last_error "
+            "FROM coordination_terminal_watches WHERE watch_key=?",
             (key,),
         ).fetchone()
-        self.assertEqual(("ACTIVE", 1, 2001), tuple(watch))
+        self.assertEqual(
+            ("HOLD", 0, None, "TERMINAL_WATCH_BACKFILL_INVALID_LINEAGE"),
+            tuple(watch),
+        )
+
+    def test_prepared_admission_keeps_terminal_watch_pending_and_unwoken(self) -> None:
+        _source, _message_id, watch_key, _attempt, _token = (
+            self.bound_development_admission(complete=False)
+        )
+
+        result = self.supervisor.run_once("2026-08-22T10:06:10Z")
+
+        self.assertEqual([], result["terminal_watch_launches"])
+        self.assertEqual([], self.terminal_watch_launches)
+        watch = self.store.connection.execute(
+            "SELECT state,attempts,process_id,claim_attempt_id "
+            "FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        self.assertEqual(("PENDING_CLAIM", 0, None, None), tuple(watch))
 
     def test_active_message_lineage_suppresses_duplicate_terminal_watch_launch(self) -> None:
-        source = self.snapshot()
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+        _source, message_id, watch_key, running, token = (
+            self.bound_development_admission(complete=False)
         )
-        reserve_attempt(
-            self.store.connection,
-            role="development",
-            endpoint_id=DEVELOPMENT_SESSION,
-            target_kind="message",
-            target_key="already-running-lineage",
-            now="2026-08-22T10:00:03Z",
-            precondition=lambda _connection: AttemptLineage(
-                REPOSITORY, 92, 1, LEASE
-            ),
+        self.store.claim_message(
+            message_id,
+            DEVELOPMENT_SESSION,
+            "2026-08-22T10:00:07Z",
+            attempt_id=running["attempt_id"],
+            executor_token=token,
         )
 
-        result = self.supervisor.run_once("2026-08-22T10:01:03Z")
+        result = self.supervisor.run_once("2026-08-22T10:06:10Z")
 
-        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:1"
         self.assertEqual([], result["opened_terminal_watches"])
         self.assertEqual([], result["terminal_watch_launches"])
         self.assertEqual([], self.terminal_watch_launches)
@@ -846,21 +1221,8 @@ class CoordinationSupervisorTests(unittest.TestCase):
         self.assertEqual(("ACTIVE", 0, None), tuple(watch))
 
     def test_running_exact_target_suppresses_terminal_watch_wake(self) -> None:
-        source = self.snapshot()
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+        _source, _message_id, _watch_key, _attempt, _token = (
+            self.bound_development_admission(complete=True)
         )
         running = CoordinationSupervisor(
             self.store,
@@ -871,14 +1233,14 @@ class CoordinationSupervisorTests(unittest.TestCase):
             ),
         )
 
-        result = running.run_once("2026-08-22T10:01:03Z")
+        result = running.run_once("2026-08-22T10:06:10Z")
 
         self.assertEqual([], result["terminal_watch_launches"])
         self.assertEqual([], self.terminal_watch_launches)
 
     def test_recovery_reopen_closes_message_wake_and_resumes_terminal_wake(self) -> None:
         source = self.snapshot()
-        active = self.store.set_issue_status(
+        active = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="ACTIVE",
@@ -893,7 +1255,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-22T10:00:00Z",
         )
-        held = self.store.set_issue_status(
+        held = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="HOLD",
@@ -961,10 +1323,45 @@ class CoordinationSupervisorTests(unittest.TestCase):
         message_launch = self.supervisor.run_once("2026-08-22T10:00:07Z")
         self.assertEqual(1, len(message_launch["launched"]))
 
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=str(commit),
+            now="2026-08-22T10:00:07Z",
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "message", str(commit)
+            ),
+        )
+        unit = stable_systemd_unit("development", "message", str(commit))
+        launching_attempt = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id="c" * 32,
+            systemd_control_group=f"/user.slice/{unit}",
+            now="2026-08-22T10:00:07Z",
+        )
+        running_attempt = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching_attempt["version"],
+            new_state="RUNNING",
+            process_id=9202,
+            now="2026-08-22T10:00:07Z",
+        )
+
         self.store.activate_recovery(
             message_id=commit,
             session_id=DEVELOPMENT_SESSION,
             now="2026-08-22T10:00:08Z",
+            attempt_id=running_attempt["attempt_id"],
+            executor_token=token,
         )
         running = CoordinationSupervisor(
             self.store,
@@ -983,6 +1380,16 @@ class CoordinationSupervisorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("COMPLETE", message_wake["state"])
 
+        transition_attempt(
+            self.store.connection,
+            attempt_id=running_attempt["attempt_id"],
+            token=token,
+            expected_version=running_attempt["version"],
+            new_state="COMPLETE",
+            exit_code=0,
+            now="2026-08-22T10:01:09Z",
+        )
+
         after_exit = self.supervisor.run_once("2026-08-22T10:01:10Z")
         watch_key = f"terminal:{REPOSITORY}:issue:92:generation:2"
         self.assertEqual(
@@ -997,43 +1404,34 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
         self.assertEqual([(DEVELOPMENT_SESSION, watch_key)], self.terminal_watch_launches)
 
-    def test_terminal_item_transition_completes_watch(self) -> None:
-        source = self.snapshot()
-        active = self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+    def test_done_item_without_terminal_commit_holds_watch(self) -> None:
+        _source, _message_id, watch_key, _attempt, _token = (
+            self.bound_development_admission(complete=True)
         )
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="DONE",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=0,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=active["version"],
-            now="2026-08-22T10:00:03Z",
+        self.store.connection.execute(
+            """
+            UPDATE coordination_items
+            SET status='DONE', allocation_class='NONE',
+                accountable_session_id=NULL, lease_manifest_sha256=NULL,
+                development_units=0, shared_units=0, sre_units=0,
+                version=version+1, updated_at='2026-08-22T10:06:00Z'
+            WHERE repository=? AND issue_number=92
+            """,
+            (REPOSITORY,),
         )
 
+        result = self.supervisor.run_once("2026-08-22T10:06:10Z")
+
         watch = self.store.connection.execute(
-            "SELECT state FROM coordination_terminal_watches"
+            "SELECT state,last_error FROM coordination_terminal_watches "
+            "WHERE watch_key=?",
+            (watch_key,),
         ).fetchone()
-        self.assertEqual("COMPLETE", watch["state"])
+        self.assertEqual([], result["terminal_watch_launches"])
+        self.assertEqual(
+            ("HOLD", "TERMINAL_WATCH_ITEM_STATE_WITHOUT_CLOSEOUT_COMMIT"),
+            tuple(watch),
+        )
 
     def test_stale_prepared_message_is_held_without_wake(self) -> None:
         source = self.snapshot()
@@ -1172,22 +1570,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
 
     def test_launch_policy_reserves_terminal_watch_and_leaves_overflow_untouched(self) -> None:
-        source = self.snapshot()
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
-        )
+        self.bound_development_admission(complete=True)
         message_ids = [
             self.notice(
                 idempotency_key=f"launch-budget-{issue_number}",
@@ -1196,7 +1579,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             for issue_number in (101, 102, 103, 104)
         ]
 
-        first = self.supervisor.run_once("2026-08-22T10:01:03Z")
+        first = self.supervisor.run_once("2026-08-22T10:01:08Z")
 
         self.assertEqual(
             {"total": 4, "messages": 3, "terminal_watches": 1},
@@ -1222,7 +1605,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
-        second = self.supervisor.run_once("2026-08-22T10:01:04Z")
+        second = self.supervisor.run_once("2026-08-22T10:01:09Z")
         self.assertEqual([message_ids[3]], [row["message_id"] for row in second["launched"]])
         self.assertEqual(
             1,

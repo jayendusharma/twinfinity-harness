@@ -290,7 +290,7 @@ class ApprovalGuardTests(unittest.TestCase):
     def test_sre_admission_consumes_exact_effective_decision_digest(self) -> None:
         decision_sha256, _ = self.effective()
         current = self.store.current_snapshot(REPOSITORY, "issue", 143)
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=143,
             status="ACTIVE_FENCED",

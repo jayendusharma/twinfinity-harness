@@ -106,7 +106,7 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             now="2026-08-24T09:59:59Z",
         )
         self.sources = {number: self._snapshot(number) for number in (1, 2)}
-        self.release_item = self.store.set_issue_status(
+        self.release_item = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=1,
             status="ACTIVE",

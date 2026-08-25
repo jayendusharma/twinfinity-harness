@@ -143,7 +143,7 @@ def activate_transfer(
             or set(release) != ITEM_KEYS
             or release["repository"] != repository
             or release["allocation_class"] != "NONE"
-            or release["status"] not in {"MONITOR", "DONE"}
+            or release["status"] != "MONITOR"
             or release["accountable_session_id"] is not None
             or release["lease_manifest_sha256"] is not None
             or any(
@@ -300,9 +300,11 @@ def activate_transfer(
             ).fetchone()
             if (
                 watch is None
-                or watch["state"] != "ACTIVE"
+                or watch["state"] not in {"PENDING_CLAIM", "ACTIVE"}
                 or watch["accountable_session_id"] != item["accountable_session_id"]
                 or watch["lease_manifest_sha256"] != item["lease_manifest_sha256"]
+                or int(watch["admission_message_id"] or 0) != int(existing["id"])
+                or watch["admission_payload_sha256"] != existing["payload_sha256"]
             ):
                 raise CoordinationError("TRANSFER_REPLAY_WATCH_DRIFT")
             return {
@@ -325,10 +327,14 @@ def activate_transfer(
             now,
         )
         released = [
-            store.set_issue_status(**entry, now=now, _transaction=False)
+            store._set_issue_status_from_transfer(
+                **entry, now=now, pending_claim=False
+            )
             for entry in releases
         ]
-        activated = store.set_issue_status(**item, now=now, _transaction=False)
+        activated = store._set_issue_status_from_transfer(
+            **item, now=now, pending_claim=True
+        )
         if (
             payload.get("item_version") != activated["version"]
             or payload.get("issue_number") != activated["issue_number"]
@@ -343,6 +349,23 @@ def activate_transfer(
             now=now,
             _transaction=False,
         )
+        watch_key = terminal_watch_key(
+            activated["repository"],
+            activated["issue_number"],
+            activated["generation"],
+        )
+        bound_watch = store.connection.execute(
+            """
+            UPDATE coordination_terminal_watches
+            SET admission_message_id=?,admission_payload_sha256=?,updated_at=?
+            WHERE watch_key=? AND state='PENDING_CLAIM'
+              AND admission_message_id IS NULL
+              AND admission_payload_sha256 IS NULL
+            """,
+            (message_id, digest_json(payload), now, watch_key),
+        )
+        if bound_watch.rowcount != 1:
+            raise CoordinationError("TRANSFER_WATCH_BINDING_CONFLICT")
         transfer_record = {
             **comment_record,
             "successor_admission_message_id": message_id,

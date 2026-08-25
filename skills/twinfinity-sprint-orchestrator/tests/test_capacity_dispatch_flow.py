@@ -15,7 +15,12 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from coordination_store import CoordinationStore  # noqa: E402
+from coordination_store import (  # noqa: E402
+    CoordinationStore,
+    terminal_published_body,
+    terminal_publication_body,
+)
+import coordination_store as coordination_store_module  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from executor_registry import (  # noqa: E402
     RegistryError,
@@ -60,15 +65,50 @@ class _FlowHarness:
         self.database = self.root / "state.sqlite3"
         self.store = CoordinationStore(self.database)
         self.sources: dict[int, str] = {}
+        self.remote_issues: dict[int, dict[str, object]] = {}
+        self.remote_comments: dict[int, dict[str, object]] = {}
+        self.remote_timelines: dict[int, list[dict[str, object]]] = {}
         self.items: dict[int, dict[str, object]] = {}
         self.attempts_by_message: dict[int, tuple[dict[str, object], str]] = {}
         self.message_by_issue: dict[int, int] = {}
         self.next_process_id = 4000
+        self.live_observation_patcher = patch.object(
+            coordination_store_module,
+            "_fetch_terminal_live_observation",
+            side_effect=self._terminal_live_observation,
+        )
+        self.live_observation_patcher.start()
         self._migrate_registry()
 
     def close(self) -> None:
+        self.live_observation_patcher.stop()
         self.store.close()
         self.temporary.cleanup()
+
+    def _terminal_live_observation(
+        self, repository: str, issue_number: int, remote_receipt: str
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        list[dict[str, object]],
+    ]:
+        self.assert_repository(repository)
+        comment_id = int(remote_receipt.split(":", 1)[1])
+        return (
+            dict(self.remote_issues[issue_number]),
+            {
+                "ref": "refs/heads/main",
+                "object": {"sha": MAIN},
+            },
+            dict(self.remote_comments[comment_id]),
+            [dict(event) for event in self.remote_timelines[issue_number]],
+        )
+
+    @staticmethod
+    def assert_repository(repository: str) -> None:
+        if repository != REPOSITORY:
+            raise AssertionError(f"unexpected repository: {repository}")
 
     def _migrate_registry(self) -> None:
         skill_root = Path(__file__).resolve().parents[1]
@@ -107,22 +147,24 @@ class _FlowHarness:
         )
 
     def snapshot(self, issue_number: int) -> str:
+        payload = {
+            "_projection_version": 3,
+            "number": issue_number,
+            "title": f"Vertical slice {issue_number}",
+            "state": "open",
+            "updated_at": "2026-08-24T10:00:00Z",
+            "milestone": {
+                "number": 1,
+                "title": "Throughput simulation",
+                "state": "open",
+            },
+        }
+        self.remote_issues[issue_number] = dict(payload)
         observed = self.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
             object_number=issue_number,
-            payload={
-                "_projection_version": 3,
-                "number": issue_number,
-                "title": f"Vertical slice {issue_number}",
-                "state": "open",
-                "updated_at": "2026-08-24T10:00:00Z",
-                "milestone": {
-                    "number": 1,
-                    "title": "Throughput simulation",
-                    "state": "open",
-                },
-            },
+            payload=payload,
             source_updated_at="2026-08-24T10:00:00Z",
             fetched_at="2026-08-24T10:00:00Z",
         )
@@ -157,7 +199,7 @@ class _FlowHarness:
                 if allocation == "ACTIVE"
                 else None
             )
-            self.items[issue] = self.store.set_issue_status(
+            self.items[issue] = self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=issue,
                 status=status,
@@ -454,8 +496,130 @@ class _FlowHarness:
         message_id = self.message_by_issue[issue_number]
         running, token = self.attempts_by_message[message_id]
         endpoint = str(running["endpoint_id"])
-        self.store.claim_message(message_id, endpoint, now)
-        self.store.complete_message(message_id, endpoint, now)
+        self.store.claim_message(
+            message_id,
+            endpoint,
+            now,
+            attempt_id=str(running["attempt_id"]),
+            executor_token=token,
+        )
+        item = dict(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (REPOSITORY, issue_number),
+            ).fetchone()
+        )
+        lease = str(item["lease_manifest_sha256"])
+        generation = int(item["generation"])
+        watch_key = (
+            f"terminal:{REPOSITORY}:issue:{issue_number}:generation:{generation}"
+        )
+        receipt = {
+            "schema": "twinfinity-terminal-receipt/v1",
+            "repository": REPOSITORY,
+            "issue_number": issue_number,
+            "generation": generation,
+            "source_payload_sha256": self.sources[issue_number],
+            "lease_manifest_sha256": lease,
+            "outcome": "ACCEPTED",
+            "accepted_head_sha": MAIN if endpoint == DEVELOPMENT_ENDPOINT else None,
+            "operational_state_sha256": (
+                None if endpoint == DEVELOPMENT_ENDPOINT else "e" * 64
+            ),
+            "acceptance_evidence_sha256": "d" * 64,
+            "residual_risks": [],
+        }
+        cleanup = {
+            "schema": "twinfinity-terminal-cleanup/v1",
+            "repository": REPOSITORY,
+            "issue_number": issue_number,
+            "generation": generation,
+            "lease_manifest_sha256": lease,
+            "owned_resources_absent": True,
+            "temporary_resources_absent": True,
+            "worktree_disposition": (
+                "ABSENT" if endpoint == DEVELOPMENT_ENDPOINT else "NOT_APPLICABLE"
+            ),
+            "local_branch_disposition": (
+                "ABSENT" if endpoint == DEVELOPMENT_ENDPOINT else "NOT_APPLICABLE"
+            ),
+            "remote_branch_disposition": (
+                "ABSENT" if endpoint == DEVELOPMENT_ENDPOINT else "NOT_APPLICABLE"
+            ),
+            "residuals": [],
+        }
+        closeout_key = (
+            f"terminal-closeout:{REPOSITORY}:issue:{issue_number}:generation:{generation}"
+        )
+        prepared = self.store.prepare_terminal_closeout(
+            packet={
+                "schema": "twinfinity-terminal-closeout-packet/v1",
+                "repository": REPOSITORY,
+                "issue_number": issue_number,
+                "generation": generation,
+                "expected_item_version": int(item["version"]),
+                "source_payload_sha256": self.sources[issue_number],
+                "lease_manifest_sha256": lease,
+                "terminal_watch_key": watch_key,
+                "activation_message_id": message_id,
+                "terminal_receipt": receipt,
+                "cleanup_evidence": cleanup,
+                "outbox": {
+                    "idempotency_key": closeout_key,
+                    "body": terminal_publication_body(
+                        closeout_key=closeout_key,
+                        terminal_receipt=receipt,
+                        cleanup_evidence=cleanup,
+                    ),
+                },
+            },
+            attempt_id=str(running["attempt_id"]),
+            executor_token=token,
+            now=now,
+        )
+        self.store.bind_terminal_outbox_publisher(
+            outbox_id=int(prepared["outbox_id"]),
+            publisher_login="twinfinity-bot",
+            now=now,
+        )
+        self.store.reserve_outbox(int(prepared["outbox_id"]), now)
+        outbox = self.store.connection.execute(
+            "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
+            (prepared["outbox_id"],),
+        ).fetchone()
+        body = json.loads(outbox["payload_json"])["body"]
+        published_body = terminal_published_body(
+            body, str(outbox["idempotency_key"])
+        )
+        comment = {
+            "id": issue_number,
+            "event": "commented",
+            "body": published_body,
+            "created_at": now,
+            "updated_at": now,
+            "issue_url": (
+                f"https://api.github.com/repos/{REPOSITORY}/issues/{issue_number}"
+            ),
+            "user": {"login": "twinfinity-bot"},
+        }
+        self.remote_comments[issue_number] = dict(comment)
+        self.remote_timelines[issue_number] = [dict(comment)]
+        self.store.complete_terminal_outbox_from_readback(
+            outbox_id=int(prepared["outbox_id"]),
+            remote_receipt=f"comment:{issue_number}",
+            published_body=published_body,
+            publisher_login="twinfinity-bot",
+            now=now,
+        )
+        self.remote_issues[issue_number] = {
+            **self.remote_issues[issue_number],
+            "updated_at": now,
+        }
+        self.store.commit_terminal_closeout(
+            closeout_key=closeout_key,
+            attempt_id=str(running["attempt_id"]),
+            executor_token=token,
+        )
         transition_attempt(
             self.store.connection,
             attempt_id=str(running["attempt_id"]),
@@ -471,21 +635,7 @@ class _FlowHarness:
                 (REPOSITORY, issue_number),
             ).fetchone()
         )
-        self.items[issue_number] = self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=issue_number,
-            status="DONE",
-            allocation_class="NONE",
-            generation=int(item["generation"]),
-            accountable_session_id=endpoint,
-            lease_manifest_sha256=str(item["lease_manifest_sha256"]),
-            development_units=0,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=self.sources[issue_number],
-            expected_version=int(item["version"]),
-            now=now,
-        )
+        self.items[issue_number] = item
 
 
 class CapacityDispatchFlowTests(unittest.TestCase):
