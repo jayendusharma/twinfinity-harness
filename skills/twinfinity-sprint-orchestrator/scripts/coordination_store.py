@@ -23,7 +23,7 @@ import pwd
 import re
 import sqlite3
 import stat
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from owner_safe_sqlite import UnsafeSQLitePathError, prepare_owner_database
 from approval_guard import (
@@ -99,6 +99,8 @@ STATUS_RANK = {
 }
 MESSAGE_STATES = {"PREPARED", "CLAIMED", "COMPLETE", "HOLD"}
 OUTBOX_STATES = {"PREPARED", "INFLIGHT", "COMPLETE", "HOLD"}
+TERMINAL_OUTBOX_READBACK_ATTEMPTS_PER_RETRY = 3
+TERMINAL_OUTBOX_MAX_RETRY_ROUNDS = 3
 ALLOCATION_CLASSES = {"ACTIVE", "RETAINED", "NONE"}
 ARTIFACT_RETENTION_CLASSES = {"EPHEMERAL", "CLOSEOUT_EVIDENCE", "RETAINED"}
 ARTIFACT_STATES = {
@@ -976,6 +978,13 @@ def terminal_publication_body(
     )
 
 
+def terminal_published_body(body: str, idempotency_key: str) -> str:
+    """Bind an externally published terminal body to its immutable outbox key."""
+
+    marker = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return f"{body}\n\n<!-- twinfinity-outbox:{marker} -->"
+
+
 def _notice_has_forbidden_content(value: Any) -> bool:
     if isinstance(value, dict):
         return any(
@@ -1552,6 +1561,11 @@ class CoordinationStore:
                 cleanup_evidence_json TEXT NOT NULL,
                 outbox_id INTEGER NOT NULL UNIQUE,
                 outbox_payload_sha256 TEXT NOT NULL,
+                graph_version INTEGER NOT NULL CHECK(graph_version > 0),
+                graph_sha256 TEXT NOT NULL,
+                graph_main_sha TEXT NOT NULL,
+                graph_node_key TEXT NOT NULL,
+                graph_binding_sha256 TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 UNIQUE(repository, issue_number, generation)
             );
@@ -1583,6 +1597,55 @@ class CoordinationStore:
             CREATE TRIGGER IF NOT EXISTS coordination_terminal_closeout_commit_immutable_delete
             BEFORE DELETE ON coordination_terminal_closeout_commits
             BEGIN SELECT RAISE(ABORT, 'TERMINAL_CLOSEOUT_COMMIT_IMMUTABLE'); END;
+            CREATE TABLE IF NOT EXISTS coordination_terminal_outbox_readbacks (
+                outbox_id INTEGER PRIMARY KEY,
+                closeout_key TEXT NOT NULL UNIQUE,
+                remote_receipt TEXT NOT NULL UNIQUE,
+                remote_receipt_sha256 TEXT NOT NULL,
+                published_body_sha256 TEXT NOT NULL,
+                publisher_login TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id),
+                FOREIGN KEY(closeout_key)
+                    REFERENCES coordination_terminal_closeout_packets(closeout_key)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_readback_immutable_update
+            BEFORE UPDATE ON coordination_terminal_outbox_readbacks
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_READBACK_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_readback_immutable_delete
+            BEFORE DELETE ON coordination_terminal_outbox_readbacks
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_READBACK_IMMUTABLE'); END;
+            CREATE TABLE IF NOT EXISTS coordination_terminal_outbox_recovery (
+                outbox_id INTEGER PRIMARY KEY,
+                readback_attempts INTEGER NOT NULL DEFAULT 0
+                    CHECK(readback_attempts >= 0),
+                retry_rounds INTEGER NOT NULL DEFAULT 0
+                    CHECK(retry_rounds >= 0),
+                next_retry_at TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'PENDING','RETRY_WAIT','RETRY_READY','COMPLETE','HOLD'
+                )),
+                updated_at TEXT NOT NULL,
+                last_error TEXT,
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_envelope_immutable
+            BEFORE UPDATE OF idempotency_key, repository, object_kind,
+                             object_number, operation, expected_source_sha256,
+                             payload_sha256, payload_json, created_at
+            ON github_outbox
+            WHEN EXISTS (
+                SELECT 1 FROM coordination_terminal_closeout_packets
+                WHERE outbox_id=OLD.id
+            )
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_ENVELOPE_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_complete_immutable
+            BEFORE UPDATE ON github_outbox
+            WHEN OLD.state='COMPLETE' AND EXISTS (
+                SELECT 1 FROM coordination_terminal_closeout_packets
+                WHERE outbox_id=OLD.id
+            )
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_COMPLETE_IMMUTABLE'); END;
             CREATE TABLE IF NOT EXISTS coordination_pre_push_gates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 repository TEXT NOT NULL,
@@ -1809,6 +1872,27 @@ class CoordinationStore:
                 COMMIT;
                 """
             )
+        packet_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(coordination_terminal_closeout_packets)"
+            )
+        }
+        # Historical packets remain immutable audit evidence.  Nullable
+        # additions deliberately make them non-finalizable until a fresh
+        # current-graph packet is prepared; no historical binding is guessed.
+        for column, declaration in (
+            ("graph_version", "INTEGER"),
+            ("graph_sha256", "TEXT"),
+            ("graph_main_sha", "TEXT"),
+            ("graph_node_key", "TEXT"),
+            ("graph_binding_sha256", "TEXT"),
+        ):
+            if column not in packet_columns:
+                self.connection.execute(
+                    f"ALTER TABLE coordination_terminal_closeout_packets "
+                    f"ADD COLUMN {column} {declaration}"
+                )
         columns = {
             row[1]
             for row in self.connection.execute("PRAGMA table_info(coordination_items)")
@@ -5010,6 +5094,172 @@ class CoordinationStore:
             raise CoordinationError("TERMINAL_ATTEMPT_LINEAGE_MISMATCH")
         return dict(attempt)
 
+    def _require_terminal_lineage_attempt(
+        self,
+        *,
+        attempt_id: str | None,
+        executor_token: str | None,
+        repository: str,
+        issue_number: int,
+        generation: int,
+        lease_manifest_sha256: str,
+        allowed_targets: set[tuple[str, str]],
+        completed_replay_attempt_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Authenticate a current watcher or one exact completed replay owner."""
+
+        if (
+            not isinstance(attempt_id, str)
+            or SESSION.fullmatch(attempt_id) is None
+            or not isinstance(executor_token, str)
+            or not executor_token
+            or not allowed_targets
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_REQUIRED")
+        attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        if attempt is None:
+            raise CoordinationError("TERMINAL_ATTEMPT_NOT_FOUND")
+        token_sha256 = hashlib.sha256(executor_token.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(str(attempt["token_sha256"]), token_sha256):
+            raise CoordinationError("TERMINAL_ATTEMPT_TOKEN_MISMATCH")
+        if (
+            str(attempt["role"]) not in {"development", "sre"}
+            or (str(attempt["target_kind"]), str(attempt["target_key"]))
+            not in allowed_targets
+            or attempt["lineage_repository"] != repository
+            or int(attempt["lineage_issue_number"] or -1) != issue_number
+            or int(attempt["lineage_generation"] or -1) != generation
+            or attempt["lineage_lease_sha256"] != lease_manifest_sha256
+            or not isinstance(attempt["lineage_sha256"], str)
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_LINEAGE_MISMATCH")
+        if attempt["state"] == "RUNNING":
+            endpoint = current_endpoint(self.connection, str(attempt["role"]))
+            if (
+                endpoint is None
+                or str(endpoint["endpoint_id"]) != str(attempt["endpoint_id"])
+            ):
+                raise CoordinationError("TERMINAL_ATTEMPT_ENDPOINT_MISMATCH")
+        elif (
+            attempt["state"] != "COMPLETE"
+            or attempt_id not in (completed_replay_attempt_ids or set())
+        ):
+            raise CoordinationError("TERMINAL_ATTEMPT_NOT_EXECUTABLE")
+        return dict(attempt)
+
+    def _current_terminal_graph_binding(
+        self,
+        *,
+        repository: str,
+        issue_number: int,
+        source_payload_sha256: str,
+    ) -> dict[str, Any]:
+        rows = self.connection.execute(
+            """
+            SELECT current.version, current.observed_main_sha, current.health,
+                   revision.accepted_main_sha, revision.graph_sha256,
+                   node.node_key, node.source_payload_sha256
+            FROM portfolio_graph_current current
+            JOIN portfolio_graph_revisions revision
+              ON revision.repository=current.repository
+             AND revision.version=current.version
+            JOIN portfolio_graph_nodes node
+              ON node.repository=current.repository
+             AND node.graph_version=current.version
+             AND node.issue_number=?
+            WHERE current.repository=?
+            ORDER BY node.node_key
+            """,
+            (issue_number, repository),
+        ).fetchall()
+        if len(rows) != 1:
+            raise CoordinationError("TERMINAL_GRAPH_BINDING_UNAVAILABLE")
+        row = rows[0]
+        if (
+            row["health"] != "CURRENT"
+            or row["observed_main_sha"] != row["accepted_main_sha"]
+            or row["source_payload_sha256"] != source_payload_sha256
+        ):
+            raise CoordinationError("TERMINAL_GRAPH_BINDING_DRIFT")
+        descriptor = {
+            "repository": repository,
+            "issue_number": issue_number,
+            "graph_version": int(row["version"]),
+            "graph_sha256": str(row["graph_sha256"]),
+            "graph_main_sha": str(row["observed_main_sha"]),
+            "graph_node_key": str(row["node_key"]),
+            "source_payload_sha256": source_payload_sha256,
+        }
+        descriptor["graph_binding_sha256"] = digest_json(descriptor)
+        return descriptor
+
+    def _terminal_failpoint(
+        self, callback: Callable[[str], None] | None, point: str
+    ) -> None:
+        if callback is None:
+            return
+        self._require_temporary_test_database()
+        callback(point)
+
+    def _terminal_endpoint_rotation_chain_valid(
+        self,
+        *,
+        packet: sqlite3.Row,
+        item: sqlite3.Row,
+        current_endpoint_id: str,
+    ) -> bool:
+        preparer = self.connection.execute(
+            "SELECT endpoint_id FROM executor_attempts WHERE attempt_id=?",
+            (packet["preparer_attempt_id"],),
+        ).fetchone()
+        if preparer is None or item["accountable_session_id"] != current_endpoint_id:
+            return False
+        cursor_version = int(packet["publication_pending_item_version"])
+        cursor_identity = str(preparer["endpoint_id"])
+        if (
+            int(item["version"]) == cursor_version
+            and cursor_identity == current_endpoint_id
+        ):
+            return True
+        for change in self.connection.execute(
+            """
+            SELECT before_state_json
+            FROM executor_registry_changes
+            WHERE state='APPLIED' AND created_at>=?
+            ORDER BY created_at, change_id
+            """,
+            (packet["created_at"],),
+        ).fetchall():
+            try:
+                plan = json.loads(change["before_state_json"])
+            except (TypeError, json.JSONDecodeError):
+                return False
+            candidates = [
+                candidate
+                for candidate in plan.get("item_changes", [])
+                if isinstance(candidate, dict)
+                and candidate.get("repository") == packet["repository"]
+                and candidate.get("issue_number") == int(packet["issue_number"])
+                and candidate.get("before_identity") == cursor_identity
+                and candidate.get("before_version") == cursor_version
+            ]
+            if not candidates:
+                continue
+            if len(candidates) != 1:
+                return False
+            candidate = candidates[0]
+            after_identity = candidate.get("after_identity")
+            if not isinstance(after_identity, str):
+                return False
+            cursor_identity = after_identity
+            cursor_version += 1
+        return (
+            cursor_version == int(item["version"])
+            and cursor_identity == current_endpoint_id
+        )
+
     def prepare_terminal_closeout(
         self,
         *,
@@ -5017,6 +5267,7 @@ class CoordinationStore:
         attempt_id: str,
         executor_token: str,
         now: str,
+        _test_failpoint: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         required = {
             "schema",
@@ -5072,6 +5323,11 @@ class CoordinationStore:
             f"terminal-closeout:{repository}:issue:{issue_number}:generation:{generation}"
         )
         with self.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE closeout_key=?",
+                (closeout_key,),
+            ).fetchone()
             activation = self.connection.execute(
                 "SELECT * FROM coordination_messages WHERE id=?",
                 (activation_message_id,),
@@ -5082,7 +5338,7 @@ class CoordinationStore:
             ).fetchone()
             if activation is None or watch is None:
                 raise CoordinationError("TERMINAL_CLOSEOUT_LINEAGE_MISMATCH")
-            attempt = self._require_running_lineage_attempt(
+            attempt = self._require_terminal_lineage_attempt(
                 attempt_id=attempt_id,
                 executor_token=executor_token,
                 repository=repository,
@@ -5093,6 +5349,11 @@ class CoordinationStore:
                     ("message", str(activation_message_id)),
                     ("terminal_watch", str(watch_key)),
                 },
+                completed_replay_attempt_ids=(
+                    set()
+                    if existing is None
+                    else {str(existing["preparer_attempt_id"])}
+                ),
             )
             role = str(attempt["role"])
             expected_topics = (
@@ -5102,6 +5363,10 @@ class CoordinationStore:
             )
             activation_payload = json.loads(activation["payload_json"])
             source = activation_payload.get("source", {})
+            activation_endpoint_id = str(activation["recipient_session_id"])
+            activation_role = coordination_identity_role(
+                self.connection, activation_endpoint_id
+            )
             claim_binding = self.connection.execute(
                 "SELECT * FROM executor_attempts WHERE attempt_id=?",
                 (watch["claim_attempt_id"],),
@@ -5109,9 +5374,9 @@ class CoordinationStore:
             if (
                 activation["topic"] not in expected_topics
                 or digest_json(activation_payload) != activation["payload_sha256"]
+                or activation_role != role
                 or activation["state"] not in {"CLAIMED", "COMPLETE"}
-                or activation["recipient_session_id"] != attempt["endpoint_id"]
-                or activation["claimed_by"] != attempt["endpoint_id"]
+                or activation["claimed_by"] != activation_endpoint_id
                 or activation_payload.get("issue_number") != issue_number
                 or activation_payload.get("generation") != generation
                 or activation_payload.get("lease_manifest_sha256")
@@ -5120,7 +5385,9 @@ class CoordinationStore:
                 or source.get("object_kind") != "issue"
                 or source.get("object_number") != issue_number
                 or source.get("payload_sha256") != source_payload_sha256
-                or watch["state"] != "ACTIVE"
+                or activation_payload.get("accountable_session_id")
+                != activation_endpoint_id
+                or watch["state"] not in {"ACTIVE", "COMPLETE"}
                 or watch["repository"] != repository
                 or int(watch["issue_number"]) != issue_number
                 or int(watch["generation"]) != generation
@@ -5129,11 +5396,10 @@ class CoordinationStore:
                 != activation_message_id
                 or watch["admission_payload_sha256"]
                 != activation["payload_sha256"]
-                or watch["accountable_session_id"] != attempt["endpoint_id"]
                 or claim_binding is None
                 or claim_binding["role"] != role
-                or claim_binding["endpoint_id"] != attempt["endpoint_id"]
-                or claim_binding["state"] not in {"RUNNING", "COMPLETE"}
+                or claim_binding["endpoint_id"] != activation_endpoint_id
+                or claim_binding["state"] not in {"RUNNING", "COMPLETE", "HOLD"}
                 or claim_binding["target_kind"] != "message"
                 or claim_binding["target_key"] != str(activation_message_id)
                 or claim_binding["lineage_repository"] != repository
@@ -5146,7 +5412,7 @@ class CoordinationStore:
                 )
                 or (
                     attempt["target_kind"] == "terminal_watch"
-                    and claim_binding["state"] != "COMPLETE"
+                    and claim_binding["state"] not in {"COMPLETE", "HOLD"}
                 )
             ):
                 raise CoordinationError("TERMINAL_CLOSEOUT_LINEAGE_MISMATCH")
@@ -5177,11 +5443,6 @@ class CoordinationStore:
                 or outbox["body"] != expected_publication_body
             ):
                 raise CoordinationError("TERMINAL_OUTBOX_POLICY_INVALID")
-            existing = self.connection.execute(
-                "SELECT * FROM coordination_terminal_closeout_packets "
-                "WHERE closeout_key=?",
-                (closeout_key,),
-            ).fetchone()
             if existing is not None:
                 outbox_row = self.connection.execute(
                     "SELECT * FROM github_outbox WHERE id=?",
@@ -5210,6 +5471,11 @@ class CoordinationStore:
                     "cleanup_evidence_sha256": cleanup_evidence_sha256,
                     "outbox_id": int(existing["outbox_id"]),
                     "outbox_payload_sha256": existing["outbox_payload_sha256"],
+                    "graph_version": int(existing["graph_version"] or 0),
+                    "graph_sha256": existing["graph_sha256"],
+                    "graph_main_sha": existing["graph_main_sha"],
+                    "graph_node_key": existing["graph_node_key"],
+                    "graph_binding_sha256": existing["graph_binding_sha256"],
                 }
                 if (
                     outbox_row is None
@@ -5220,10 +5486,13 @@ class CoordinationStore:
                     != canonical_json(packet["terminal_receipt"])
                     or existing["cleanup_evidence_json"]
                     != canonical_json(packet["cleanup_evidence"])
+                    or existing["endpoint_id"] != activation_endpoint_id
                     or digest_json(expected_descriptor) != existing["packet_sha256"]
                 ):
                     raise CoordinationError("TERMINAL_CLOSEOUT_IDEMPOTENCY_CONFLICT")
                 return self.terminal_closeout_status(closeout_key)
+            if attempt["state"] != "RUNNING":
+                raise CoordinationError("TERMINAL_ATTEMPT_NOT_EXECUTABLE")
             item = self.connection.execute(
                 "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
                 (repository, issue_number),
@@ -5244,8 +5513,16 @@ class CoordinationStore:
                 )
                 or current_source is None
                 or current_source.payload_sha256 != source_payload_sha256
+                or activation["state"] != "CLAIMED"
+                or watch["state"] != "ACTIVE"
+                or watch["accountable_session_id"] != attempt["endpoint_id"]
             ):
                 raise CoordinationError("TERMINAL_CLOSEOUT_ITEM_MISMATCH")
+            graph_binding = self._current_terminal_graph_binding(
+                repository=repository,
+                issue_number=issue_number,
+                source_payload_sha256=source_payload_sha256,
+            )
             outbox_id = self.enqueue_comment(
                 idempotency_key=outbox["idempotency_key"],
                 repository=repository,
@@ -5256,6 +5533,7 @@ class CoordinationStore:
                 now=now,
                 _transaction=False,
             )
+            self._terminal_failpoint(_test_failpoint, "prepare.after_outbox")
             outbox_row = self.connection.execute(
                 "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
             ).fetchone()
@@ -5276,32 +5554,7 @@ class CoordinationStore:
                 transaction=False,
                 gateway=_TERMINAL_FINALIZATION_GATEWAY,
             )
-            if activation["state"] == "CLAIMED":
-                completed_activation = self.connection.execute(
-                    """
-                    UPDATE coordination_messages
-                    SET state='COMPLETE', updated_at=?, last_error=NULL
-                    WHERE id=? AND state='CLAIMED' AND claimed_by=?
-                      AND payload_sha256=?
-                    """,
-                    (
-                        now,
-                        activation_message_id,
-                        attempt["endpoint_id"],
-                        activation["payload_sha256"],
-                    ),
-                )
-                if completed_activation.rowcount != 1:
-                    raise CoordinationError("TERMINAL_CLOSEOUT_MESSAGE_CONFLICT")
-                self._event(
-                    "MESSAGE_COMPLETED",
-                    f"message:{activation_message_id}",
-                    {
-                        "session_id": attempt["endpoint_id"],
-                        "terminal_closeout_key": closeout_key,
-                    },
-                    now,
-                )
+            self._terminal_failpoint(_test_failpoint, "prepare.after_item_pending")
             descriptor = {
                 "schema": "twinfinity-terminal-closeout-packet/v1",
                 "closeout_key": closeout_key,
@@ -5311,7 +5564,7 @@ class CoordinationStore:
                 "source_payload_sha256": source_payload_sha256,
                 "lease_manifest_sha256": lease_manifest_sha256,
                 "accountable_role": role,
-                "endpoint_id": attempt["endpoint_id"],
+                "endpoint_id": activation_endpoint_id,
                 "preparer_attempt_id": attempt["attempt_id"],
                 "preparer_attempt_version": int(attempt["version"]),
                 "terminal_watch_key": watch_key,
@@ -5323,6 +5576,7 @@ class CoordinationStore:
                 "cleanup_evidence_sha256": cleanup_evidence_sha256,
                 "outbox_id": outbox_id,
                 "outbox_payload_sha256": outbox_row["payload_sha256"],
+                **graph_binding,
             }
             packet_sha256 = digest_json(descriptor)
             self.connection.execute(
@@ -5336,8 +5590,10 @@ class CoordinationStore:
                     expected_item_version, publication_pending_item_version,
                     terminal_receipt_sha256, terminal_receipt_json,
                     cleanup_evidence_sha256, cleanup_evidence_json,
-                    outbox_id, outbox_payload_sha256, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    outbox_id, outbox_payload_sha256, graph_version,
+                    graph_sha256, graph_main_sha, graph_node_key,
+                    graph_binding_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     closeout_key,
@@ -5348,7 +5604,7 @@ class CoordinationStore:
                     source_payload_sha256,
                     lease_manifest_sha256,
                     role,
-                    attempt["endpoint_id"],
+                    activation_endpoint_id,
                     attempt["attempt_id"],
                     int(attempt["version"]),
                     watch_key,
@@ -5362,8 +5618,26 @@ class CoordinationStore:
                     canonical_json(packet["cleanup_evidence"]),
                     outbox_id,
                     outbox_row["payload_sha256"],
+                    graph_binding["graph_version"],
+                    graph_binding["graph_sha256"],
+                    graph_binding["graph_main_sha"],
+                    graph_binding["graph_node_key"],
+                    graph_binding["graph_binding_sha256"],
                     now,
                 ),
+            )
+            self._terminal_failpoint(_test_failpoint, "prepare.after_packet")
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_outbox_recovery(
+                    outbox_id, readback_attempts, retry_rounds, next_retry_at,
+                    state, updated_at, last_error
+                ) VALUES (?, 0, 0, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, now, now),
+            )
+            self._terminal_failpoint(
+                _test_failpoint, "prepare.after_outbox_recovery"
             )
             self._event(
                 "TERMINAL_CLOSEOUT_PREPARED",
@@ -5375,6 +5649,7 @@ class CoordinationStore:
                 },
                 now,
             )
+            self._terminal_failpoint(_test_failpoint, "prepare.after_event")
         return self.terminal_closeout_status(closeout_key)
 
     def _readiness_decision_notice_bound(self, message_id: int) -> bool:
@@ -5970,6 +6245,235 @@ class CoordinationStore:
             )
         return str(inventory["inventory_sha256"]), outbox_id
 
+    def terminal_outbox_context(self, outbox_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT packet.closeout_key, packet.packet_sha256, packet.created_at,
+                   recovery.readback_attempts, recovery.retry_rounds,
+                   recovery.next_retry_at, recovery.state AS recovery_state
+            FROM coordination_terminal_closeout_packets packet
+            LEFT JOIN coordination_terminal_outbox_recovery recovery
+              ON recovery.outbox_id=packet.outbox_id
+            WHERE packet.outbox_id=?
+            """,
+            (outbox_id,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def complete_terminal_outbox_from_readback(
+        self,
+        *,
+        outbox_id: int,
+        remote_receipt: str,
+        published_body: str,
+        publisher_login: str,
+        now: str,
+    ) -> None:
+        if (
+            REMOTE_COMMENT_RECEIPT.fullmatch(remote_receipt or "") is None
+            or not isinstance(published_body, str)
+            or not published_body
+            or not isinstance(publisher_login, str)
+            or not publisher_login
+        ):
+            raise CoordinationError("TERMINAL_OUTBOX_READBACK_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if outbox is None or packet is None:
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
+            receipt_sha256 = hashlib.sha256(
+                remote_receipt.encode("utf-8")
+            ).hexdigest()
+            body_sha256 = hashlib.sha256(published_body.encode("utf-8")).hexdigest()
+            expected_body = terminal_published_body(
+                json.loads(outbox["payload_json"])["body"], outbox["idempotency_key"]
+            )
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_readbacks "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    outbox["state"] != "COMPLETE"
+                    or outbox["remote_receipt"] != remote_receipt
+                    or existing["closeout_key"] != packet["closeout_key"]
+                    or existing["remote_receipt"] != remote_receipt
+                    or existing["remote_receipt_sha256"] != receipt_sha256
+                    or existing["published_body_sha256"] != body_sha256
+                    or existing["publisher_login"] != publisher_login
+                    or published_body != expected_body
+                ):
+                    raise CoordinationError("TERMINAL_OUTBOX_READBACK_CONFLICT")
+                return
+            if (
+                outbox["state"] not in {"INFLIGHT", "HOLD"}
+                or outbox["remote_receipt"] is not None
+                or outbox["idempotency_key"] != packet["closeout_key"]
+                or published_body != expected_body
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_READBACK_CONFLICT")
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_outbox_readbacks(
+                    outbox_id, closeout_key, remote_receipt,
+                    remote_receipt_sha256, published_body_sha256,
+                    publisher_login, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    packet["closeout_key"],
+                    remote_receipt,
+                    receipt_sha256,
+                    body_sha256,
+                    publisher_login,
+                    now,
+                ),
+            )
+            cursor = self.connection.execute(
+                """
+                UPDATE github_outbox
+                SET state='COMPLETE', remote_receipt=?, updated_at=?,
+                    last_error=NULL
+                WHERE id=? AND state IN ('INFLIGHT','HOLD')
+                  AND remote_receipt IS NULL
+                """,
+                (remote_receipt, now, outbox_id),
+            )
+            if cursor.rowcount != 1:
+                raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET state='COMPLETE', updated_at=?, last_error=NULL
+                WHERE outbox_id=?
+                """,
+                (now, outbox_id),
+            )
+            self._event(
+                "OUTBOX_COMPLETED",
+                f"outbox:{outbox_id}",
+                {"remote_receipt": remote_receipt, "readback": "EXACT_MARKER"},
+                now,
+            )
+
+    def record_terminal_outbox_readback_miss(
+        self, *, outbox_id: int, error: str, now: str
+    ) -> dict[str, Any]:
+        if error not in {"GITHUB_READBACK_MISSING", "GITHUB_READBACK_DUPLICATE"}:
+            raise CoordinationError("TERMINAL_OUTBOX_RECOVERY_ERROR_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            recovery = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_recovery "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if outbox is None or packet is None or recovery is None:
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
+            if outbox["state"] not in {"INFLIGHT", "HOLD"}:
+                raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            if recovery["state"] == "COMPLETE":
+                raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            if recovery["next_retry_at"] > now:
+                raise CoordinationError("TERMINAL_OUTBOX_RETRY_NOT_DUE")
+            attempts = int(recovery["readback_attempts"]) + 1
+            rounds = int(recovery["retry_rounds"])
+            outbox_state = "HOLD"
+            recovery_state = "RETRY_WAIT"
+            next_retry_at = timestamp_after(now, min(60 * (2 ** (attempts - 1)), 900))
+            if error == "GITHUB_READBACK_DUPLICATE":
+                recovery_state = "HOLD"
+                next_retry_at = timestamp_after(now, 900)
+            elif attempts >= TERMINAL_OUTBOX_READBACK_ATTEMPTS_PER_RETRY:
+                try:
+                    binding = self._current_terminal_graph_binding(
+                        repository=str(packet["repository"]),
+                        issue_number=int(packet["issue_number"]),
+                        source_payload_sha256=str(packet["source_payload_sha256"]),
+                    )
+                except CoordinationError:
+                    binding = None
+                current_source = self.current_snapshot(
+                    str(packet["repository"]), "issue", int(packet["issue_number"])
+                )
+                if (
+                    rounds < TERMINAL_OUTBOX_MAX_RETRY_ROUNDS
+                    and binding is not None
+                    and current_source is not None
+                    and current_source.payload_sha256 == packet["source_payload_sha256"]
+                    and int(packet["graph_version"] or 0) == binding["graph_version"]
+                    and packet["graph_binding_sha256"]
+                    == binding["graph_binding_sha256"]
+                ):
+                    attempts = 0
+                    rounds += 1
+                    outbox_state = "PREPARED"
+                    recovery_state = "RETRY_READY"
+                    next_retry_at = now
+                else:
+                    recovery_state = "HOLD"
+                    next_retry_at = timestamp_after(now, 900)
+            self.connection.execute(
+                """
+                UPDATE github_outbox
+                SET state=?, updated_at=?, last_error=?
+                WHERE id=? AND state IN ('INFLIGHT','HOLD')
+                  AND remote_receipt IS NULL
+                """,
+                (outbox_state, now, error, outbox_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET readback_attempts=?, retry_rounds=?, next_retry_at=?,
+                    state=?, updated_at=?, last_error=?
+                WHERE outbox_id=?
+                """,
+                (
+                    attempts,
+                    rounds,
+                    next_retry_at,
+                    recovery_state,
+                    now,
+                    error,
+                    outbox_id,
+                ),
+            )
+            self._event(
+                "TERMINAL_OUTBOX_RECONCILED",
+                f"outbox:{outbox_id}",
+                {
+                    "error": error,
+                    "readback_attempts": attempts,
+                    "retry_rounds": rounds,
+                    "state": recovery_state,
+                },
+                now,
+            )
+        return {
+            "outbox_id": outbox_id,
+            "state": recovery_state,
+            "readback_attempts": attempts,
+            "retry_rounds": rounds,
+            "next_retry_at": next_retry_at,
+        }
+
     def reserve_outbox(self, outbox_id: int, now: str) -> dict[str, Any]:
         with self.transaction():
             row = self.connection.execute(
@@ -5984,8 +6488,36 @@ class CoordinationStore:
             )
             if source is None or source.payload_sha256 != row["expected_source_sha256"]:
                 raise CoordinationError("SOURCE_SNAPSHOT_DRIFT")
+            terminal_packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if terminal_packet is not None:
+                binding = self._current_terminal_graph_binding(
+                    repository=str(terminal_packet["repository"]),
+                    issue_number=int(terminal_packet["issue_number"]),
+                    source_payload_sha256=str(
+                        terminal_packet["source_payload_sha256"]
+                    ),
+                )
+                if (
+                    int(terminal_packet["graph_version"] or 0)
+                    != binding["graph_version"]
+                    or terminal_packet["graph_binding_sha256"]
+                    != binding["graph_binding_sha256"]
+                ):
+                    raise CoordinationError("TERMINAL_CLOSEOUT_GRAPH_DRIFT")
             self.connection.execute(
                 "UPDATE github_outbox SET state='INFLIGHT', updated_at=? WHERE id=? AND state='PREPARED'",
+                (now, outbox_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET state='PENDING', updated_at=?, last_error=NULL
+                WHERE outbox_id=? AND state='RETRY_READY'
+                """,
                 (now, outbox_id),
             )
             reserved = self.connection.execute(
@@ -5998,6 +6530,12 @@ class CoordinationStore:
         if not remote_receipt:
             raise CoordinationError("INVALID_REMOTE_RECEIPT")
         with self.transaction():
+            if self.connection.execute(
+                "SELECT 1 FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone() is not None:
+                raise CoordinationError("TERMINAL_OUTBOX_READBACK_REQUIRED")
             cursor = self.connection.execute(
                 "UPDATE github_outbox SET state='COMPLETE', remote_receipt=?, updated_at=?, last_error=NULL WHERE id=? AND state='INFLIGHT'",
                 (remote_receipt, now, outbox_id),
@@ -6016,6 +6554,14 @@ class CoordinationStore:
             )
             if cursor.rowcount != 1:
                 raise CoordinationError("OUTBOX_STATE_CONFLICT")
+            self.connection.execute(
+                """
+                UPDATE coordination_terminal_outbox_recovery
+                SET state='HOLD', updated_at=?, last_error=?
+                WHERE outbox_id=?
+                """,
+                (now, error, outbox_id),
+            )
             self._event("OUTBOX_HELD", f"outbox:{outbox_id}", {"error": error}, now)
 
     def summary(self, repository: str | None = None) -> dict[str, Any]:

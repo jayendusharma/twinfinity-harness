@@ -1830,6 +1830,61 @@ class ExecutorRegistryTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM executor_attempts"
             ).fetchone()[0],
         )
+        self.store.connection.execute(
+            "UPDATE coordination_items SET lease_manifest_sha256=? "
+            "WHERE repository=? AND issue_number=92",
+            (LEASE, REPOSITORY),
+        )
+        old_endpoint = self.store.connection.execute(
+            "SELECT * FROM executor_role_endpoints WHERE endpoint_id=?",
+            (DEVELOPMENT_ENDPOINT,),
+        ).fetchone()
+        rotated_endpoint = "role.development.v4"
+        rotated_config = json.loads(old_endpoint["config_json"])
+        rotated_config["endpoint_id"] = rotated_endpoint
+        rotated_config["version"] = 4
+        self.store.connection.execute(
+            """
+            INSERT INTO executor_role_endpoints(
+                endpoint_id,role,version,executor_profile,codex_profile,
+                config_sha256,config_json,command_json,created_at
+            ) VALUES (?,'development',4,?,?,?,?,?,?)
+            """,
+            (
+                rotated_endpoint,
+                old_endpoint["executor_profile"],
+                old_endpoint["codex_profile"],
+                digest_json(rotated_config),
+                json.dumps(rotated_config, sort_keys=True, separators=(",", ":")),
+                old_endpoint["command_json"],
+                "2026-08-24T10:00:20Z",
+            ),
+        )
+        self.store.connection.execute(
+            "UPDATE executor_role_endpoint_current SET endpoint_id=?,"
+            "pointer_version=pointer_version+1,updated_at=? "
+            "WHERE role='development'",
+            (rotated_endpoint, "2026-08-24T10:00:20Z"),
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_items SET accountable_session_id=?,"
+            "version=version+1,updated_at=? WHERE repository=? AND issue_number=92",
+            (rotated_endpoint, "2026-08-24T10:00:20Z", REPOSITORY),
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_terminal_watches SET accountable_session_id=?,"
+            "updated_at=? WHERE watch_key=?",
+            (rotated_endpoint, "2026-08-24T10:00:20Z", watch_key),
+        )
+        lineage = run_role_executor._validate_target(
+            self.store.connection,
+            role="development",
+            endpoint_id=rotated_endpoint,
+            target_kind="terminal_watch",
+            target_key=watch_key,
+            allowed_topics={"development.admission"},
+        )
+        self.assertEqual(REPOSITORY, lineage.repository)
 
     def test_hosted_executor_revalidates_exact_sre_row_before_reservation(self) -> None:
         self.migrate()

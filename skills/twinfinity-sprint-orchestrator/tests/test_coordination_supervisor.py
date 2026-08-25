@@ -17,6 +17,7 @@ from coordination_store import (  # noqa: E402
     CoordinationStore,
     canonical_json,
     digest_json,
+    terminal_published_body,
     terminal_publication_body,
 )
 from coordination_supervisor import (  # noqa: E402
@@ -28,6 +29,7 @@ from coordination_supervisor import (  # noqa: E402
 )
 from executor_registry import (  # noqa: E402
     AttemptLineage,
+    SystemdUnitEvidence,
     attempt_lineage_for_target,
     load_registry_config,
     reserve_attempt,
@@ -96,6 +98,30 @@ class CoordinationSupervisorTests(unittest.TestCase):
             launcher=launcher,
             terminal_watch_launcher=terminal_watch_launcher,
             process_checker=lambda *_: False,
+        )
+
+    def seed_current_graph(self, source_sha256: str) -> None:
+        main_sha = "a" * 40
+        graph_sha = digest_json({"issue": 92, "source": source_sha256})
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_revisions VALUES (?,?,NULL,?,?,?,?,?)",
+            (
+                REPOSITORY, 1, main_sha, graph_sha,
+                '{"milestones":[]}', "[]", "2026-08-22T10:00:01Z",
+            ),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO portfolio_graph_nodes VALUES (
+                ?,1,'issue-92',92,'DELIVERY','STANDALONE',NULL,NULL,NULL,
+                'issue-92',0,1,1,1,1,1,0,?,'2026-08-22T10:00:01Z'
+            )
+            """,
+            (REPOSITORY, source_sha256),
+        )
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_current VALUES (?,1,?,'CURRENT',?,NULL)",
+            (REPOSITORY, main_sha, "2026-08-22T10:00:01Z"),
         )
 
     def bound_development_admission(
@@ -923,6 +949,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             attempt_id=running["attempt_id"],
             executor_token=token,
         )
+        self.seed_current_graph(source.payload_sha256)
         receipt = {
             "schema": "twinfinity-terminal-receipt/v1",
             "repository": REPOSITORY,
@@ -976,19 +1003,96 @@ class CoordinationSupervisorTests(unittest.TestCase):
             executor_token=token,
             now="2026-08-22T10:00:08Z",
         )
-        self.store.reserve_outbox(prepared["outbox_id"], "2026-08-22T10:00:09Z")
-        self.store.complete_outbox(
-            prepared["outbox_id"], "comment:123", "2026-08-22T10:00:10Z"
+        original_attempt = self.store.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?",
+            (running["attempt_id"],),
+        ).fetchone()
+        inactive = SystemdUnitEvidence(
+            unit=original_attempt["systemd_unit"],
+            load_state="loaded",
+            active_state="inactive",
+            sub_state="dead",
+            invocation_id=original_attempt["systemd_invocation_id"],
+            control_group=original_attempt["systemd_control_group"],
+            result="exit-code",
+        )
+        recovery_supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: self.fail(
+                "packet-aware recovery must not relaunch the admission"
+            ),
+            terminal_watch_launcher=lambda session, key: (
+                self.terminal_watch_launches.append((session, key)) or 2999
+            ),
+            process_checker=lambda *_: False,
+            stale_attempt_evidence_reader=lambda _unit: inactive,
+        )
+        recovered = recovery_supervisor.run_once("2026-08-22T10:20:00Z")
+        self.assertEqual("RECOVERED", recovered["recovered_active_attempts"][0]["phase"])
+        self.assertEqual([(DEVELOPMENT_SESSION, watch_key)], self.terminal_watch_launches)
+        self.assertEqual(
+            "CLAIMED",
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()[0],
+        )
+        self.store.reserve_outbox(prepared["outbox_id"], "2026-08-22T10:20:01Z")
+        outbox = self.store.connection.execute(
+            "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
+            (prepared["outbox_id"],),
+        ).fetchone()
+        self.store.complete_terminal_outbox_from_readback(
+            outbox_id=prepared["outbox_id"],
+            remote_receipt="comment:123",
+            published_body=terminal_published_body(
+                json.loads(outbox["payload_json"])["body"],
+                outbox["idempotency_key"],
+            ),
+            publisher_login="twinfinity-bot",
+            now="2026-08-22T10:20:02Z",
+        )
+        fresh, fresh_token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="terminal_watch",
+            target_key=watch_key,
+            now="2026-08-22T10:20:03Z",
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "terminal_watch", watch_key
+            ),
+        )
+        unit = stable_systemd_unit("development", "terminal_watch", watch_key)
+        fresh_launching = transition_attempt(
+            self.store.connection,
+            attempt_id=fresh["attempt_id"],
+            token=fresh_token,
+            expected_version=fresh["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id="f" * 32,
+            systemd_control_group=f"/user.slice/{unit}",
+            now="2026-08-22T10:20:03Z",
+        )
+        fresh_running = transition_attempt(
+            self.store.connection,
+            attempt_id=fresh["attempt_id"],
+            token=fresh_token,
+            expected_version=fresh_launching["version"],
+            new_state="RUNNING",
+            process_id=2999,
+            now="2026-08-22T10:20:04Z",
         )
         self.store.commit_terminal_closeout(
             closeout_key=closeout_key,
-            attempt_id=running["attempt_id"],
-            executor_token=token,
-            now="2026-08-22T10:00:11Z",
+            attempt_id=fresh_running["attempt_id"],
+            executor_token=fresh_token,
+            now="2026-08-22T10:20:05Z",
         )
 
-        result = self.supervisor.run_once("2026-08-22T10:00:12Z")
-        repeated = self.supervisor.run_once("2026-08-22T10:00:13Z")
+        result = self.supervisor.run_once("2026-08-22T10:20:06Z")
+        repeated = self.supervisor.run_once("2026-08-22T10:20:07Z")
 
         self.assertEqual("RETRY", result["portfolio_convergence"][0]["state"])
         self.assertEqual([], self.launches)

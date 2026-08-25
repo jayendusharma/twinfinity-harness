@@ -204,6 +204,14 @@ def _validate_target(
             "SELECT * FROM executor_attempts WHERE attempt_id=?",
             (row["claim_attempt_id"],),
         ).fetchone()
+        packet = connection.execute(
+            "SELECT 1 FROM coordination_terminal_closeout_packets "
+            "WHERE terminal_watch_key=?",
+            (target_key,),
+        ).fetchone()
+        original_endpoint = (
+            None if admission is None else admission["recipient_session_id"]
+        )
         if (
             admission is None
             or admission["topic"] not in expected_admission_topics
@@ -212,20 +220,24 @@ def _validate_target(
             or digest_json(admission_payload) != admission["payload_sha256"]
             or admission["payload_sha256"] != row["admission_payload_sha256"]
             or admission["state"] not in {"CLAIMED", "COMPLETE"}
-            or admission["recipient_session_id"] != endpoint_id
-            or admission["claimed_by"] != endpoint_id
+            or identity_role(connection, str(original_endpoint)) != role
+            or admission["claimed_by"] != original_endpoint
             or admission_source.get("repository") != row["repository"]
             or admission_source.get("object_kind") != "issue"
             or admission_source.get("object_number") != int(row["issue_number"])
             or admission_payload.get("issue_number") != int(row["issue_number"])
             or admission_payload.get("generation") != int(row["generation"])
-            or admission_payload.get("accountable_session_id") != endpoint_id
+            or admission_payload.get("accountable_session_id") != original_endpoint
             or admission_payload.get("lease_manifest_sha256")
             != row["lease_manifest_sha256"]
             or claim_attempt is None
             or claim_attempt["role"] != role
-            or claim_attempt["endpoint_id"] != endpoint_id
-            or claim_attempt["state"] not in {"RUNNING", "COMPLETE"}
+            or claim_attempt["endpoint_id"] != original_endpoint
+            or claim_attempt["state"] not in (
+                {"RUNNING", "COMPLETE", "HOLD"}
+                if packet is not None
+                else {"RUNNING", "COMPLETE"}
+            )
             or claim_attempt["target_kind"] != "message"
             or claim_attempt["target_key"] != str(row["admission_message_id"])
             or claim_attempt["lineage_repository"] != row["repository"]

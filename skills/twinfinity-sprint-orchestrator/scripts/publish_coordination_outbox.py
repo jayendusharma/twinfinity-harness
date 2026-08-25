@@ -8,7 +8,6 @@ row is readback-only and never blindly resends.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import subprocess
 from typing import Any
@@ -18,6 +17,7 @@ from coordination_store import (
     CoordinationStore,
     DEFAULT_DATABASE,
     canonical_json,
+    terminal_published_body,
     utc_now,
 )
 from sync_github_coordination import fetch_object
@@ -63,8 +63,7 @@ def _all_comments(repository: str, object_number: int) -> list[dict[str, Any]]:
 
 
 def _published_body(body: str, idempotency_key: str) -> str:
-    marker = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
-    return f"{body}\n\n<!-- twinfinity-outbox:{marker} -->"
+    return terminal_published_body(body, idempotency_key)
 
 
 def _matching_receipts(
@@ -96,18 +95,37 @@ def _complete_from_readback(
     *,
     publisher_login: str,
 ) -> dict[str, Any]:
+    terminal_context = store.terminal_outbox_context(int(row["id"]))
     matches = _matching_receipts(
         row["repository"],
         row["object_number"],
         body,
         publisher_login=publisher_login,
-        not_before=row["updated_at"],
+        not_before=(
+            str(terminal_context["created_at"])
+            if terminal_context is not None
+            else row["updated_at"]
+        ),
     )
     if len(matches) == 1:
-        store.complete_outbox(row["id"], matches[0], utc_now())
+        if terminal_context is None:
+            store.complete_outbox(row["id"], matches[0], utc_now())
+        else:
+            store.complete_terminal_outbox_from_readback(
+                outbox_id=int(row["id"]),
+                remote_receipt=matches[0],
+                published_body=body,
+                publisher_login=publisher_login,
+                now=utc_now(),
+            )
         return {"phase": "COMPLETE", "outbox_id": row["id"], "receipt": matches[0]}
     error = "GITHUB_READBACK_MISSING" if not matches else "GITHUB_READBACK_DUPLICATE"
-    store.hold_outbox(row["id"], error, utc_now())
+    if terminal_context is None:
+        store.hold_outbox(row["id"], error, utc_now())
+    else:
+        store.record_terminal_outbox_readback_miss(
+            outbox_id=int(row["id"]), error=error, now=utc_now()
+        )
     raise CoordinationError(error)
 
 
@@ -124,8 +142,6 @@ def publish(store: CoordinationStore, outbox_id: int) -> dict[str, Any]:
             "outbox_id": outbox_id,
             "receipt": row["remote_receipt"],
         }
-    if row["state"] == "HOLD":
-        raise CoordinationError("OUTBOX_STATE_CONFLICT")
     payload = json.loads(row["payload_json"])
     body = payload.get("body")
     if not isinstance(body, str) or not body:
@@ -137,7 +153,9 @@ def publish(store: CoordinationStore, outbox_id: int) -> dict[str, Any]:
     if not isinstance(publisher_login, str) or not publisher_login:
         raise CoordinationError("GITHUB_IDENTITY_INVALID")
 
-    if row["state"] == "INFLIGHT":
+    if row["state"] in {"INFLIGHT", "HOLD"}:
+        if row["state"] == "HOLD" and store.terminal_outbox_context(outbox_id) is None:
+            raise CoordinationError("OUTBOX_STATE_CONFLICT")
         return _complete_from_readback(
             store,
             row,
@@ -207,7 +225,16 @@ def publish(store: CoordinationStore, outbox_id: int) -> dict[str, Any]:
             publisher_login=publisher_login,
         )
     receipt = f"comment:{comment_id}"
-    store.complete_outbox(outbox_id, receipt, utc_now())
+    if store.terminal_outbox_context(outbox_id) is None:
+        store.complete_outbox(outbox_id, receipt, utc_now())
+    else:
+        store.complete_terminal_outbox_from_readback(
+            outbox_id=outbox_id,
+            remote_receipt=receipt,
+            published_body=published_body,
+            publisher_login=publisher_login,
+            now=utc_now(),
+        )
     return {"phase": "COMPLETE", "outbox_id": outbox_id, "receipt": receipt}
 
 

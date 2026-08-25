@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 import hashlib
 import fcntl
@@ -8,6 +10,7 @@ import sqlite3
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -20,6 +23,7 @@ from coordination_store import (  # noqa: E402
     CoordinationStore,
     artifact_registry_identity,
     digest_json,
+    terminal_published_body,
     terminal_publication_body,
 )
 from prepush_control import PrePushControl  # noqa: E402
@@ -86,6 +90,70 @@ class CoordinationStoreTests(unittest.TestCase):
             fetched_at="2026-08-22T10:00:01Z",
         )
 
+    def seed_current_graph(self, issue_number: int, source_sha256: str) -> dict:
+        graph_version = 1
+        main_sha = "a" * 40
+        node_key = f"issue-{issue_number}"
+        graph_sha256 = digest_json(
+            {"issue_number": issue_number, "source": source_sha256}
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO portfolio_graph_revisions(
+                repository,version,parent_version,accepted_main_sha,
+                graph_sha256,scope_json,exclusions_json,created_at
+            ) VALUES (?,1,NULL,?,?,?,?,'2026-08-22T10:00:01Z')
+            """,
+            (REPOSITORY, main_sha, graph_sha256, '{"milestones":[]}', "[]"),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO portfolio_graph_nodes(
+                repository,graph_version,node_key,issue_number,role,root_kind,
+                root_reason,milestone_title,milestone_rank,lane_key,lane_order,
+                dispatchable,priority_rank,estimate_units,development_units,
+                shared_units,sre_units,source_payload_sha256,ready_at
+            ) VALUES (?,1,?,?,'DELIVERY','STANDALONE',NULL,NULL,NULL,
+                      ?,0,1,1,1,1,1,1,?,'2026-08-22T10:00:01Z')
+            """,
+            (REPOSITORY, node_key, issue_number, node_key, source_sha256),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO portfolio_graph_current(
+                repository,version,observed_main_sha,health,updated_at,last_error
+            ) VALUES (?,1,?,'CURRENT','2026-08-22T10:00:01Z',NULL)
+            """,
+            (REPOSITORY, main_sha),
+        )
+        descriptor = {
+            "repository": REPOSITORY,
+            "issue_number": issue_number,
+            "graph_version": graph_version,
+            "graph_sha256": graph_sha256,
+            "graph_main_sha": main_sha,
+            "graph_node_key": node_key,
+            "source_payload_sha256": source_sha256,
+        }
+        descriptor["graph_binding_sha256"] = digest_json(descriptor)
+        return descriptor
+
+    def complete_terminal_outbox(
+        self, outbox_id: int, remote_receipt: str, now: str
+    ) -> None:
+        row = self.store.connection.execute(
+            "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
+            (outbox_id,),
+        ).fetchone()
+        body = json.loads(row["payload_json"])["body"]
+        self.store.complete_terminal_outbox_from_readback(
+            outbox_id=outbox_id,
+            remote_receipt=remote_receipt,
+            published_body=terminal_published_body(body, row["idempotency_key"]),
+            publisher_login="twinfinity-bot",
+            now=now,
+        )
+
     def install_all_current_endpoints(self) -> None:
         catalog = reviewed_current_endpoint_catalog(ROOT, Path(self.temp.name))
         config = catalog.__enter__()
@@ -145,12 +213,17 @@ class CoordinationStoreTests(unittest.TestCase):
         return running, token
 
     def running_terminal_watch_attempt(
-        self, watch_key: str, *, process_id: int = 9201
+        self,
+        watch_key: str,
+        *,
+        process_id: int = 9201,
+        endpoint_id: str = SESSION,
+        role: str = "development",
     ) -> tuple[dict, str]:
         reserved, token = reserve_attempt(
             self.store.connection,
-            role="development",
-            endpoint_id=SESSION,
+            role=role,
+            endpoint_id=endpoint_id,
             target_kind="terminal_watch",
             target_key=watch_key,
             now="2026-08-22T10:00:10Z",
@@ -158,7 +231,7 @@ class CoordinationStoreTests(unittest.TestCase):
                 connection, "terminal_watch", watch_key
             ),
         )
-        unit = stable_systemd_unit("development", "terminal_watch", watch_key)
+        unit = stable_systemd_unit(role, "terminal_watch", watch_key)
         launching = transition_attempt(
             self.store.connection,
             attempt_id=reserved["attempt_id"],
@@ -240,6 +313,16 @@ class CoordinationStoreTests(unittest.TestCase):
         packet_sha256 = digest_json(
             {"test_fixture": closeout_key, "outbox_id": outbox_id}
         )
+        graph_binding = {
+            "repository": REPOSITORY,
+            "issue_number": 92,
+            "graph_version": 1,
+            "graph_sha256": "a" * 64,
+            "graph_main_sha": "b" * 40,
+            "graph_node_key": "issue-92",
+            "source_payload_sha256": source_sha256,
+        }
+        graph_binding["graph_binding_sha256"] = digest_json(graph_binding)
         self.store.connection.execute(
             """
             INSERT INTO coordination_terminal_closeout_packets(
@@ -250,8 +333,10 @@ class CoordinationStoreTests(unittest.TestCase):
                 activation_payload_sha256,expected_item_version,
                 publication_pending_item_version,terminal_receipt_sha256,
                 terminal_receipt_json,cleanup_evidence_sha256,
-                cleanup_evidence_json,outbox_id,outbox_payload_sha256,created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                cleanup_evidence_json,outbox_id,outbox_payload_sha256,
+                graph_version,graph_sha256,graph_main_sha,graph_node_key,
+                graph_binding_sha256,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 closeout_key,
@@ -276,6 +361,11 @@ class CoordinationStoreTests(unittest.TestCase):
                 canonical_json(cleanup),
                 outbox_id,
                 outbox["payload_sha256"],
+                graph_binding["graph_version"],
+                graph_binding["graph_sha256"],
+                graph_binding["graph_main_sha"],
+                graph_binding["graph_node_key"],
+                graph_binding["graph_binding_sha256"],
                 "2026-08-22T10:00:04Z",
             ),
         )
@@ -1830,12 +1920,110 @@ class CoordinationStoreTests(unittest.TestCase):
                 },
             },
         }
-        prepared = self.store.prepare_terminal_closeout(
-            packet=packet,
-            attempt_id=running["attempt_id"],
-            executor_token=token,
-            now="2026-08-22T10:00:07Z",
+        def fail_at(target: str):
+            def callback(point: str) -> None:
+                if point == target:
+                    raise RuntimeError(target)
+            return callback
+
+        for failpoint in (
+            "prepare.after_outbox",
+            "prepare.after_item_pending",
+            "prepare.after_packet",
+            "prepare.after_outbox_recovery",
+            "prepare.after_event",
+        ):
+            with self.subTest(failpoint=failpoint), self.assertRaisesRegex(
+                RuntimeError, failpoint
+            ):
+                self.store.prepare_terminal_closeout(
+                    packet=packet,
+                    attempt_id=running["attempt_id"],
+                    executor_token=token,
+                    now="2026-08-22T10:00:07Z",
+                    _test_failpoint=fail_at(failpoint),
+                )
+            rolled_back = self.store.connection.execute(
+                "SELECT status,version FROM coordination_items "
+                "WHERE repository=? AND issue_number=92",
+                (REPOSITORY,),
+            ).fetchone()
+            self.assertEqual(("ACTIVE", active["version"]), tuple(rolled_back))
+            self.assertEqual(
+                0,
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_closeout_packets"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM github_outbox WHERE idempotency_key=?",
+                    (closeout_key,),
+                ).fetchone()[0],
+            )
+        conflicting_packet = copy.deepcopy(packet)
+        conflicting_packet["terminal_receipt"]["acceptance_evidence_sha256"] = (
+            "e" * 64
         )
+        conflicting_packet["outbox"]["body"] = terminal_publication_body(
+            closeout_key=closeout_key,
+            terminal_receipt=conflicting_packet["terminal_receipt"],
+            cleanup_evidence=conflicting_packet["cleanup_evidence"],
+        )
+        barrier = threading.Barrier(2)
+
+        def concurrent_prepare(candidate: dict):
+            concurrent_store = CoordinationStore(self.database)
+            try:
+                barrier.wait()
+                try:
+                    return (
+                        candidate,
+                        concurrent_store.prepare_terminal_closeout(
+                            packet=candidate,
+                            attempt_id=running["attempt_id"],
+                            executor_token=token,
+                            now="2026-08-22T10:00:07Z",
+                        ),
+                        None,
+                    )
+                except CoordinationError as exc:
+                    return candidate, None, str(exc)
+            finally:
+                concurrent_store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(concurrent_prepare, (packet, conflicting_packet))
+            )
+        successes = [outcome for outcome in outcomes if outcome[1] is not None]
+        failures = [outcome for outcome in outcomes if outcome[2] is not None]
+        self.assertEqual(1, len(successes))
+        self.assertEqual(1, len(failures))
+        self.assertEqual("TERMINAL_CLOSEOUT_IDEMPOTENCY_CONFLICT", failures[0][2])
+        packet, prepared, _ = successes[0]
+        exact_barrier = threading.Barrier(2)
+
+        def exact_replay(_: int):
+            concurrent_store = CoordinationStore(self.database)
+            try:
+                exact_barrier.wait()
+                return concurrent_store.prepare_terminal_closeout(
+                    packet=packet,
+                    attempt_id=running["attempt_id"],
+                    executor_token=token,
+                    now="2026-08-22T10:00:07Z",
+                )
+            finally:
+                concurrent_store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            exact_results = list(pool.map(exact_replay, (1, 2)))
+        self.assertEqual(exact_results[0], exact_results[1])
+        self.assertEqual(1, self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_terminal_closeout_packets"
+        ).fetchone()[0])
         self.assertEqual("PUBLICATION_PENDING", prepared["state"])
         pending = self.store.connection.execute(
             "SELECT * FROM coordination_items WHERE repository=? AND issue_number=92",
@@ -1869,7 +2057,7 @@ class CoordinationStoreTests(unittest.TestCase):
             ),
         )
         self.assertEqual("ACTIVE", pending_watch["state"])
-        self.assertEqual("COMPLETE", local_message["state"])
+        self.assertEqual("CLAIMED", local_message["state"])
         self.assertEqual(
             0,
             self.store.connection.execute(
@@ -1885,10 +2073,10 @@ class CoordinationStoreTests(unittest.TestCase):
             )
         outbox_id = prepared["outbox_id"]
         self.store.reserve_outbox(outbox_id, "2026-08-22T10:00:09Z")
-        self.store.complete_outbox(
+        self.complete_terminal_outbox(
             outbox_id, "comment:123", "2026-08-22T10:00:10Z"
         )
-        transition_attempt(
+        completed_preparer = transition_attempt(
             self.store.connection,
             attempt_id=running["attempt_id"],
             token=token,
@@ -1897,13 +2085,367 @@ class CoordinationStoreTests(unittest.TestCase):
             exit_code=0,
             now="2026-08-22T10:00:10Z",
         )
-        watcher, watcher_token = self.running_terminal_watch_attempt(watch_key)
-        committed = self.store.commit_terminal_closeout(
-            closeout_key=closeout_key,
-            attempt_id=watcher["attempt_id"],
-            executor_token=watcher_token,
-            now="2026-08-22T10:00:11Z",
+        self.assertEqual("COMPLETE", completed_preparer["state"])
+        replayed_prepare = self.store.prepare_terminal_closeout(
+            packet=packet,
+            attempt_id=running["attempt_id"],
+            executor_token=token,
+            now="2026-08-22T10:00:10Z",
         )
+        self.assertEqual("COMMIT_READY", replayed_prepare["state"])
+        self.assertEqual(prepared["packet_sha256"], replayed_prepare["packet_sha256"])
+        self.assertEqual(prepared["outbox_id"], replayed_prepare["outbox_id"])
+        old_endpoint = self.store.connection.execute(
+            "SELECT * FROM executor_role_endpoints WHERE endpoint_id=?",
+            (SESSION,),
+        ).fetchone()
+        endpoint_payload = json.loads(old_endpoint["config_json"])
+        endpoint_payload["endpoint_id"] = DEVELOPMENT_V4
+        endpoint_payload["version"] = 4
+        self.store.connection.execute(
+            """
+            INSERT INTO executor_role_endpoints(
+                endpoint_id,role,version,executor_profile,codex_profile,
+                config_sha256,config_json,command_json,created_at
+            ) VALUES (?, 'development', 4, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                DEVELOPMENT_V4,
+                old_endpoint["executor_profile"],
+                old_endpoint["codex_profile"],
+                digest_json(endpoint_payload),
+                canonical_json(endpoint_payload),
+                old_endpoint["command_json"],
+                "2026-08-22T10:00:10Z",
+            ),
+        )
+        before_rotation = self.store.connection.execute(
+            "SELECT version FROM coordination_items WHERE repository=? "
+            "AND issue_number=92",
+            (REPOSITORY,),
+        ).fetchone()[0]
+        rotation_plan = {
+            "item_changes": [
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": 92,
+                    "before_identity": SESSION,
+                    "after_identity": DEVELOPMENT_V4,
+                    "before_version": before_rotation,
+                    "after_version": before_rotation + 1,
+                }
+            ]
+        }
+        self.store.connection.execute(
+            "UPDATE executor_role_endpoint_current SET endpoint_id=?,"
+            "pointer_version=pointer_version+1,updated_at=? WHERE role='development'",
+            (DEVELOPMENT_V4, "2026-08-22T10:00:10Z"),
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_items SET accountable_session_id=?,"
+            "version=version+1,updated_at=? WHERE repository=? AND issue_number=92",
+            (DEVELOPMENT_V4, "2026-08-22T10:00:10Z", REPOSITORY),
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_terminal_watches SET accountable_session_id=?,"
+            "updated_at=? WHERE watch_key=?",
+            (DEVELOPMENT_V4, "2026-08-22T10:00:10Z", watch_key),
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO executor_registry_changes(
+                change_id,operation_key,config_sha256,before_state_sha256,
+                before_state_json,after_state_sha256,after_state_json,state,
+                version,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,'APPLIED',1,?,?)
+            """,
+            (
+                "endpoint-rotation-terminal-closeout",
+                "endpoint-rotation-terminal-closeout",
+                digest_json(endpoint_payload),
+                digest_json(rotation_plan),
+                canonical_json(rotation_plan),
+                digest_json({"endpoint": DEVELOPMENT_V4}),
+                canonical_json({"endpoint": DEVELOPMENT_V4}),
+                "2026-08-22T10:00:10Z",
+                "2026-08-22T10:00:10Z",
+            ),
+        )
+
+        def terminal_fingerprint() -> tuple:
+            item_state = tuple(self.store.connection.execute(
+                "SELECT status,allocation_class,version,accountable_session_id "
+                "FROM coordination_items WHERE repository=? AND issue_number=92",
+                (REPOSITORY,),
+            ).fetchone())
+            return (
+                item_state,
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (admission_id,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_terminal_watches WHERE watch_key=?",
+                    (watch_key,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM portfolio_dirty_events"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_events"
+                ).fetchone()[0],
+            )
+
+        def make_running_attempt(
+            role: str, endpoint: str, target_kind: str, target_key: str
+        ) -> tuple[dict, str]:
+            reserved, candidate_token = reserve_attempt(
+                self.store.connection,
+                role=role,
+                endpoint_id=endpoint,
+                target_kind=target_kind,
+                target_key=target_key,
+                now="2026-08-22T10:00:10Z",
+                precondition=(
+                    (lambda connection: attempt_lineage_for_target(
+                        connection, target_kind, target_key
+                    ))
+                    if target_kind == "terminal_watch"
+                    else (lambda _connection: None)
+                ),
+            )
+            candidate_unit = stable_systemd_unit(role, target_kind, target_key)
+            launching_candidate = transition_attempt(
+                self.store.connection,
+                attempt_id=reserved["attempt_id"],
+                token=candidate_token,
+                expected_version=reserved["version"],
+                new_state="LAUNCHING",
+                systemd_unit=candidate_unit,
+                systemd_invocation_id="1" * 32,
+                systemd_control_group=f"/user.slice/{candidate_unit}",
+                now="2026-08-22T10:00:10Z",
+            )
+            return transition_attempt(
+                self.store.connection,
+                attempt_id=reserved["attempt_id"],
+                token=candidate_token,
+                expected_version=launching_candidate["version"],
+                new_state="RUNNING",
+                process_id=9300,
+                now="2026-08-22T10:00:10Z",
+            ), candidate_token
+
+        for expected_error, invalid_role, invalid_endpoint, invalid_kind, invalid_key in (
+            (
+                "TERMINAL_ATTEMPT_ENDPOINT_MISMATCH",
+                "development",
+                SESSION,
+                "terminal_watch",
+                watch_key,
+            ),
+            (
+                "TERMINAL_ATTEMPT_ROLE_MISMATCH",
+                "sre",
+                SRE_SESSION,
+                "terminal_watch",
+                watch_key,
+            ),
+            (
+                "TERMINAL_ATTEMPT_LINEAGE_MISMATCH",
+                "development",
+                DEVELOPMENT_V4,
+                "message",
+                "999999",
+            ),
+        ):
+            if expected_error == "TERMINAL_ATTEMPT_ENDPOINT_MISMATCH":
+                self.store.connection.execute(
+                    "UPDATE executor_role_endpoint_current SET endpoint_id=? "
+                    "WHERE role='development'",
+                    (SESSION,),
+                )
+            invalid_attempt, invalid_token = make_running_attempt(
+                invalid_role,
+                invalid_endpoint,
+                invalid_kind,
+                invalid_key,
+            )
+            if expected_error == "TERMINAL_ATTEMPT_ENDPOINT_MISMATCH":
+                self.store.connection.execute(
+                    "UPDATE executor_role_endpoint_current SET endpoint_id=? "
+                    "WHERE role='development'",
+                    (DEVELOPMENT_V4,),
+                )
+            before_invalid = terminal_fingerprint()
+            with self.assertRaisesRegex(CoordinationError, expected_error):
+                self.store.commit_terminal_closeout(
+                    closeout_key=closeout_key,
+                    attempt_id=invalid_attempt["attempt_id"],
+                    executor_token=invalid_token,
+                    now="2026-08-22T10:00:10Z",
+                )
+            self.assertEqual(before_invalid, terminal_fingerprint())
+            transition_attempt(
+                self.store.connection,
+                attempt_id=invalid_attempt["attempt_id"],
+                token=invalid_token,
+                expected_version=invalid_attempt["version"],
+                new_state="HOLD",
+                last_error="TEST_INVALID_TERMINAL_ATTEMPT",
+                now="2026-08-22T10:00:10Z",
+            )
+        watcher, watcher_token = self.running_terminal_watch_attempt(
+            watch_key, endpoint_id=DEVELOPMENT_V4
+        )
+        for invalid_attempt_id, invalid_token, expected_error in (
+            (watcher["attempt_id"], "wrong-token", "TERMINAL_ATTEMPT_TOKEN_MISMATCH"),
+            (running["attempt_id"], token, "TERMINAL_ATTEMPT_NOT_EXECUTABLE"),
+        ):
+            before_invalid = terminal_fingerprint()
+            with self.assertRaisesRegex(CoordinationError, expected_error):
+                self.store.commit_terminal_closeout(
+                    closeout_key=closeout_key,
+                    attempt_id=invalid_attempt_id,
+                    executor_token=invalid_token,
+                    now="2026-08-22T10:00:10Z",
+                )
+            self.assertEqual(before_invalid, terminal_fingerprint())
+        rotated_pending_version = self.store.connection.execute(
+            "SELECT version FROM coordination_items WHERE repository=? "
+            "AND issue_number=92",
+            (REPOSITORY,),
+        ).fetchone()[0]
+        self.store.connection.execute(
+            "UPDATE portfolio_graph_current SET observed_main_sha=? "
+            "WHERE repository=?",
+            ("b" * 40, REPOSITORY),
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_GRAPH_BINDING_DRIFT"
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=watcher["attempt_id"],
+                executor_token=watcher_token,
+                now="2026-08-22T10:00:11Z",
+            )
+        self.assertEqual(
+            ("PUBLICATION_PENDING", "ACTIVE", "CLAIMED"),
+            tuple(
+                self.store.connection.execute(
+                    """
+                    SELECT item.status,item.allocation_class,message.state
+                    FROM coordination_items item
+                    JOIN coordination_messages message ON message.id=?
+                    WHERE item.repository=? AND item.issue_number=92
+                    """,
+                    (admission_id, REPOSITORY),
+                ).fetchone()
+            ),
+        )
+        self.store.connection.execute(
+            "UPDATE portfolio_graph_current SET observed_main_sha=? "
+            "WHERE repository=?",
+            ("a" * 40, REPOSITORY),
+        )
+        self.snapshot(updated="2026-08-22T10:00:20Z", title="Newer issue truth")
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_CLOSEOUT_SOURCE_DRIFT"
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=watcher["attempt_id"],
+                executor_token=watcher_token,
+                now="2026-08-22T10:00:21Z",
+            )
+        self.store.connection.execute(
+            """
+            UPDATE github_current
+            SET payload_sha256=?,source_updated_at=?,fetched_at=?
+            WHERE repository=? AND object_kind='issue' AND object_number=92
+            """,
+            (
+                active["source_payload_sha256"],
+                "2026-08-22T10:00:00Z",
+                "2026-08-22T10:00:21Z",
+                REPOSITORY,
+            ),
+        )
+        self.store.connection.execute(
+            "UPDATE portfolio_graph_current SET health='CURRENT',last_error=NULL "
+            "WHERE repository=?",
+            (REPOSITORY,),
+        )
+        for failpoint in (
+            "commit.after_message",
+            "commit.after_message_event",
+            "commit.after_item",
+            "commit.after_watch",
+            "commit.after_dirty_event",
+            "commit.after_commit",
+            "commit.after_event",
+        ):
+            with self.subTest(failpoint=failpoint), self.assertRaisesRegex(
+                RuntimeError, failpoint
+            ):
+                self.store.commit_terminal_closeout(
+                    closeout_key=closeout_key,
+                    attempt_id=watcher["attempt_id"],
+                    executor_token=watcher_token,
+                    now="2026-08-22T10:00:11Z",
+                    _test_failpoint=fail_at(failpoint),
+                )
+            rolled_back = self.store.connection.execute(
+                "SELECT status,allocation_class,version FROM coordination_items "
+                "WHERE repository=? AND issue_number=92",
+                (REPOSITORY,),
+            ).fetchone()
+            self.assertEqual(
+                ("PUBLICATION_PENDING", "ACTIVE", rotated_pending_version),
+                tuple(rolled_back),
+            )
+            self.assertEqual(
+                "CLAIMED",
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (admission_id,),
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM portfolio_dirty_events"
+                ).fetchone()[0],
+            )
+        commit_barrier = threading.Barrier(2)
+
+        def concurrent_commit(_: int):
+            concurrent_store = CoordinationStore(self.database)
+            try:
+                commit_barrier.wait()
+                return concurrent_store.commit_terminal_closeout(
+                    closeout_key=closeout_key,
+                    attempt_id=watcher["attempt_id"],
+                    executor_token=watcher_token,
+                    now="2026-08-22T10:00:11Z",
+                )
+            finally:
+                concurrent_store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            committed_results = list(pool.map(concurrent_commit, (1, 2)))
+        self.assertEqual(committed_results[0], committed_results[1])
+        committed = committed_results[0]
         self.assertEqual("COMPLETE", committed["state"])
         final_item = self.store.connection.execute(
             "SELECT * FROM coordination_items WHERE repository=? AND issue_number=92",
@@ -1932,6 +2474,16 @@ class CoordinationStoreTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM portfolio_dirty_events"
             ).fetchone()[0],
         )
+        completed_watcher = transition_attempt(
+            self.store.connection,
+            attempt_id=watcher["attempt_id"],
+            token=watcher_token,
+            expected_version=watcher["version"],
+            new_state="COMPLETE",
+            exit_code=0,
+            now="2026-08-22T10:00:12Z",
+        )
+        self.assertEqual("COMPLETE", completed_watcher["state"])
         replay = self.store.commit_terminal_closeout(
             closeout_key=closeout_key,
             attempt_id=watcher["attempt_id"],
@@ -1944,6 +2496,25 @@ class CoordinationStoreTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
             ).fetchone()[0],
+        )
+        self.assertEqual(
+            (1, 1, 1, "COMPLETE"),
+            (
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM github_outbox WHERE idempotency_key=?",
+                    (closeout_key,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_outbox_readbacks"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_outbox_recovery"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (admission_id,),
+                ).fetchone()[0],
+            ),
         )
 
     def test_message_queue_is_idempotent_and_recipient_fenced(self) -> None:

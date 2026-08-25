@@ -28,6 +28,7 @@ from coordination_store import (
 from executor_registry import (
     ENDPOINT_ID,
     RegistryError,
+    SystemdUnitEvidence,
     active_attempt_for_lineage,
     active_attempt_for_target,
     active_planner_attempt_for_repository,
@@ -530,6 +531,14 @@ class CoordinationSupervisor:
                 "SELECT * FROM executor_attempts WHERE attempt_id=?",
                 (watch["claim_attempt_id"],),
             ).fetchone()
+            packet = self.store.connection.execute(
+                "SELECT 1 FROM coordination_terminal_closeout_packets "
+                "WHERE terminal_watch_key=?",
+                (watch_key,),
+            ).fetchone()
+            original_endpoint = (
+                None if admission is None else admission["recipient_session_id"]
+            )
             if (
                 admission is None
                 or admission["topic"] not in expected_admission_topics
@@ -538,8 +547,10 @@ class CoordinationSupervisor:
                 or digest_json(admission_payload) != admission["payload_sha256"]
                 or admission["payload_sha256"] != watch["admission_payload_sha256"]
                 or admission["state"] not in {"CLAIMED", "COMPLETE"}
-                or admission["recipient_session_id"] != endpoint["endpoint_id"]
-                or admission["claimed_by"] != endpoint["endpoint_id"]
+                or coordination_identity_role(
+                    self.store.connection, str(original_endpoint)
+                ) != role
+                or admission["claimed_by"] != original_endpoint
                 or admission_source.get("repository") != watch["repository"]
                 or admission_source.get("object_kind") != "issue"
                 or admission_source.get("object_number")
@@ -549,13 +560,17 @@ class CoordinationSupervisor:
                 or admission_payload.get("generation")
                 != int(watch["generation"])
                 or admission_payload.get("accountable_session_id")
-                != endpoint["endpoint_id"]
+                != original_endpoint
                 or admission_payload.get("lease_manifest_sha256")
                 != watch["lease_manifest_sha256"]
                 or claim_attempt is None
                 or claim_attempt["role"] != role
-                or claim_attempt["endpoint_id"] != endpoint["endpoint_id"]
-                or claim_attempt["state"] not in {"RUNNING", "COMPLETE"}
+                or claim_attempt["endpoint_id"] != original_endpoint
+                or claim_attempt["state"] not in (
+                    {"RUNNING", "COMPLETE", "HOLD"}
+                    if packet is not None
+                    else {"RUNNING", "COMPLETE"}
+                )
                 or claim_attempt["target_kind"] != "message"
                 or claim_attempt["target_key"] != str(watch["admission_message_id"])
                 or claim_attempt["lineage_repository"] != watch["repository"]
@@ -885,6 +900,15 @@ class CoordinationSupervisor:
         if row["state"] == "PREPARED":
             return self._message_contract_error(row) is None
         if row["state"] != "CLAIMED" or row["topic"] not in MUTATING_MESSAGE_TOPICS:
+            return False
+        if self.store.connection.execute(
+            "SELECT 1 FROM coordination_terminal_closeout_packets "
+            "WHERE activation_message_id=?",
+            (row["id"],),
+        ).fetchone() is not None:
+            # A durable terminal packet is the typed continuation target.  A
+            # crashed original writer must not be relaunched against the
+            # admission row and race a fresh terminal watcher.
             return False
         return self._message_contract_error(row) is None
 
@@ -1389,6 +1413,15 @@ class CoordinationSupervisor:
             if endpoint is None:
                 continue
             current_identity = str(endpoint["endpoint_id"])
+            if row["state"] == "CLAIMED" and self.store.connection.execute(
+                "SELECT 1 FROM coordination_terminal_closeout_packets "
+                "WHERE activation_message_id=?",
+                (row["id"],),
+            ).fetchone() is not None:
+                # The immutable packet is now the sole continuation target.
+                # Do not revalidate or hold the historical admission against a
+                # rotated mutable item before the current watcher runs.
+                continue
             contract_error = self._message_contract_error(row)
             if contract_error is not None:
                 self._hold_stale_message(row, contract_error, observed_at)
