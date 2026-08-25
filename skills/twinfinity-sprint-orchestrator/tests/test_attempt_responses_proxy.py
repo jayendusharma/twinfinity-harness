@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -18,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 from attempt_responses_proxy import (  # noqa: E402
     ApprovedCredentialReference,
     AttemptBoundResponsesProxy,
+    AttemptMountPolicy,
     AttemptProxyContract,
     AttemptProxyLedger,
     Frame,
@@ -25,19 +28,27 @@ from attempt_responses_proxy import (  # noqa: E402
     HOLD_PROXY_DISABLED,
     HOLD_UPSTREAM_AMBIGUOUS,
     HOLD_UPSTREAM_AUTH_UNSUPPORTED,
+    IODeadline,
     ProxyActivation,
     ProxyError,
     ProxyHold,
+    ProxyIOTimeout,
     ProxyPermit,
     ProxyPolicyError,
     ProxyProtocolError,
+    ProxyProcessTerminalReceipt,
+    RelayBinding,
     SupplementalMount,
-    UpstreamNotSent,
+    UpstreamOpenResult,
+    UpstreamSendEvidence,
     build_uncredentialed_child_environment,
     canonical_json,
+    channel_hello,
     create_attempt_socketpair,
     preflight_before_reservation,
     preflight_then_reserve,
+    read_one_loopback_request,
+    receive_frame,
     relay_framed_http_request,
     relay_one_loopback_connection,
     required_namespace_masks,
@@ -92,6 +103,33 @@ def response_stream(
     return [encoded[:7], encoded[7:31], encoded[31:79], encoded[79:]]
 
 
+def event_wire(event: dict | str) -> bytes:
+    encoded = event if isinstance(event, str) else canonical_json(event)
+    return f"data: {encoded}\n\n".encode("utf-8")
+
+
+def created_event(response_id: str = RESPONSE_ID) -> dict:
+    return {"type": "response.created", "response": {"id": response_id}}
+
+
+def completed_event(
+    response_id: str = RESPONSE_ID,
+    *,
+    input_tokens: int = 20,
+    output_tokens: int = 10,
+) -> dict:
+    return {
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
+        },
+    }
+
+
 class FakeStream:
     def __init__(
         self,
@@ -131,7 +169,90 @@ class FakeTransport:
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome
+        if outcome == "ZERO_NOT_SENT":
+            return UpstreamOpenResult(
+                None,
+                UpstreamSendEvidence(
+                    request.attempt_id,
+                    request.permit_binding_sha256,
+                    request.request_sha256,
+                    request.operation_id,
+                    0,
+                    True,
+                    "BROKER_PROXY_UPSTREAM_NOT_SENT",
+                ),
+            )
+        if isinstance(outcome, UpstreamOpenResult):
+            return outcome
+        return UpstreamOpenResult(
+            outcome,
+            UpstreamSendEvidence(
+                request.attempt_id,
+                request.permit_binding_sha256,
+                request.request_sha256,
+                request.operation_id,
+                len(request.body),
+                False,
+            ),
+        )
+
+    def cancel_open(self, operation_id) -> None:
+        self.cancelled_operation_id = operation_id
+
+
+class BlockingOpenTransport:
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.cancelled_operation_id = None
+
+    def open(self, request, *, credential_reference, timeout_seconds):
+        self.release.wait(5)
+        raise RuntimeError("cancelled open")
+
+    def cancel_open(self, operation_id) -> None:
+        self.cancelled_operation_id = operation_id
+        self.release.set()
+
+
+class BlockingStream(FakeStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.release = threading.Event()
+
+    def receive(self, timeout_seconds: float) -> bytes | None:
+        self.release.wait(5)
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+        self.release.set()
+
+
+class ScriptedSlowClient:
+    def __init__(self, request: bytes) -> None:
+        self.request = bytearray(request)
+        self.release = threading.Event()
+        self.closed = False
+
+    def recv(self, size: int) -> bytes:
+        if not self.request:
+            return b""
+        value = bytes(self.request[:size])
+        del self.request[:size]
+        return value
+
+    def send(self, _value) -> int:
+        self.release.wait(5)
+        if self.closed:
+            raise OSError("closed")
+        return 0
+
+    def shutdown(self, _how) -> None:
+        self.closed = True
+        self.release.set()
+
+    def close(self) -> None:
+        self.shutdown(socket.SHUT_RDWR)
 
 
 class FakeClock:
@@ -216,6 +337,21 @@ def raw_request(
         "max_output_tokens": 100,
     }
     body = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    return raw_request_body(
+        body,
+        method=method,
+        path=path,
+        extra_headers=extra_headers,
+    )
+
+
+def raw_request_body(
+    body: bytes,
+    *,
+    method: str = "POST",
+    path: str = "/v1/responses",
+    extra_headers: tuple[tuple[str, str], ...] = (),
+) -> bytes:
     headers = [
         f"{method} {path} HTTP/1.1",
         "Host: 127.0.0.1:43121",
@@ -373,6 +509,13 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         )
         self.assertEqual("/usr/bin", environment["PATH"])
         self.assertEqual("/run/twinfinity-attempt/home", environment["HOME"])
+        with self.assertRaisesRegex(ProxyError, "CHILD_ENVIRONMENT_INVALID"):
+            build_uncredentialed_child_environment(
+                base,
+                contract=self.contract(),
+                machine_codex_home="/workspace",
+                loopback_port=43121,
+            )
         for forbidden in (
             "OPENAI_API_KEY",
             "CODEX_API_KEY",
@@ -382,57 +525,96 @@ class AttemptResponsesProxyTests(unittest.TestCase):
             "HTTPS_PROXY",
         ):
             self.assertNotIn(forbidden, environment)
+        fixture = Path(self.temp.name) / "mount-fixture"
+        repository_parent = fixture / "repositories"
+        repository = repository_parent / "exact-repository"
+        attempt_parent = fixture / "attempts"
+        attempt_root = attempt_parent / ATTEMPT_ID
+        for directory in (
+            repository_parent,
+            repository,
+            attempt_parent,
+            attempt_root,
+            attempt_root / "codex-home",
+            attempt_root / "out",
+            attempt_root / "runtime",
+            attempt_root / "home",
+        ):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for directory in (attempt_root / "out", attempt_root / "runtime", attempt_root / "home"):
+            directory.chmod(0o700)
+        (attempt_root / "contract.json").write_text("{}", encoding="utf-8")
+        (attempt_root / "codex-home" / "config.toml").write_text("", encoding="utf-8")
+        (attempt_root / "contract.json").chmod(0o600)
+        (attempt_root / "codex-home" / "config.toml").chmod(0o600)
+        policy = AttemptMountPolicy(
+            os.fspath(repository_parent),
+            os.fspath(repository),
+            os.fspath(attempt_parent),
+            os.fspath(attempt_root),
+        )
         valid = (
+            SupplementalMount("repository", os.fspath(repository), "/workspace", False),
             SupplementalMount(
-                "/tmp/attempt/repository", "/workspace", False
+                "attempt_contract",
+                os.fspath(attempt_root / "contract.json"),
+                "/run/twinfinity-attempt/contract.json",
+                False,
             ),
             SupplementalMount(
-                "/tmp/attempt/config.toml",
+                "provider_config",
+                os.fspath(attempt_root / "codex-home" / "config.toml"),
                 "/run/twinfinity-attempt/codex-home/config.toml",
                 False,
             ),
             SupplementalMount(
-                "/tmp/attempt/out", "/run/twinfinity-attempt/out", True
+                "receipt_output",
+                os.fspath(attempt_root / "out"),
+                "/run/twinfinity-attempt/out",
+                True,
             ),
             SupplementalMount(
-                "/tmp/attempt/home", "/run/twinfinity-attempt/home", True
+                "runtime",
+                os.fspath(attempt_root / "runtime"),
+                "/run/twinfinity-attempt/runtime",
+                True,
+            ),
+            SupplementalMount(
+                "private_home",
+                os.fspath(attempt_root / "home"),
+                "/run/twinfinity-attempt/home",
+                True,
             ),
         )
-        validate_supplemental_mounts(valid)
-        sensitive_name = "auth" + ".json"
-        with self.assertRaisesRegex(ProxyError, "MOUNT_CONTRACT_INVALID"):
-            validate_supplemental_mounts(
-                (
-                    SupplementalMount(
-                        f"/home/ubuntu/.codex/{sensitive_name}",
-                        "/run/twinfinity-attempt/contract.json",
-                        False,
-                    ),
-                )
-            )
-        with self.assertRaisesRegex(ProxyError, "MOUNT_CONTRACT_INVALID"):
-            validate_supplemental_mounts(
-                (
-                    SupplementalMount(
-                        "/home/ubuntu/.codex",
-                        "/workspace",
-                        False,
-                    ),
-                )
-            )
+        validate_supplemental_mounts(valid, policy=policy)
         self.assertEqual(
             ("/home/ubuntu", "/run/user/1000"), required_namespace_masks()
         )
-        with self.assertRaisesRegex(ProxyError, "MOUNT_CONTRACT_INVALID"):
-            validate_supplemental_mounts(
-                (
-                    SupplementalMount(
-                        "/home/ubuntu/.codex/twinfinity-coordination",
-                        "/workspace",
-                        True,
-                    ),
-                )
-            )
+
+        symlink = fixture / "repository-alias"
+        symlink.symlink_to(repository, target_is_directory=True)
+        attacks = (
+            SupplementalMount("repository", "/home/ubuntu", "/workspace", False),
+            SupplementalMount("repository", "/etc", "/workspace", False),
+            SupplementalMount("repository", "/proc/1/root/etc", "/workspace", False),
+            SupplementalMount(
+                "repository", os.fspath(repository / ".." / repository.name), "/workspace", False
+            ),
+            SupplementalMount("repository", os.fspath(symlink), "/workspace", False),
+            SupplementalMount("repository", os.fspath(repository), "/workspace", True),
+            SupplementalMount("repository", os.fspath(repository), "/etc", False),
+            SupplementalMount(
+                "receipt_output",
+                os.fspath(repository),
+                "/run/twinfinity-attempt/out",
+                True,
+            ),
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                mutated = tuple(attack if mount.role == attack.role else mount for mount in valid)
+                with self.assertRaises(ProxyError):
+                    validate_supplemental_mounts(mutated, policy=policy)
 
     def test_success_streams_sse_and_records_only_hashed_lineage(self) -> None:
         stream = FakeStream(response_stream(fragments=True))
@@ -549,13 +731,26 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                     self.assertEqual([], transport.calls)
 
     def test_http_smuggling_forms_fail_and_hop_headers_are_not_forwarded(self) -> None:
-        malformed = raw_request(
-            extra_headers=(("Transfer-Encoding", "chunked"),)
+        malformed_requests = (
+            raw_request(extra_headers=(("Transfer-Encoding", "chunked"),)),
+            raw_request().replace(b"Content-Length: ", b"Content-Length: +", 1),
         )
-        proxy, transport = self.proxy([FakeStream(response_stream())])
-        result = proxy.handle_raw_request(malformed, lambda _value: None)
-        self.assertEqual("FAILED", result.request_state)
-        self.assertEqual([], transport.calls)
+        for index, malformed in enumerate(malformed_requests):
+            with self.subTest(index=index):
+                root = Path(self.temp.name) / f"smuggling-{index}"
+                root.mkdir(mode=0o700)
+                with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
+                    contract = self.contract(
+                        attempt_id=f"13131313-1313-4313-8313-13131313131{index}"
+                    )
+                    transport = FakeTransport([FakeStream(response_stream())])
+                    proxy = AttemptBoundResponsesProxy(
+                        self.permit(contract), ledger, transport, monotonic=FakeClock()
+                    )
+                    proxy.start()
+                    result = proxy.handle_raw_request(malformed, lambda _value: None)
+                    self.assertEqual("FAILED", result.request_state)
+                    self.assertEqual([], transport.calls)
 
         separate_root = Path(self.temp.name) / "hop-header"
         separate_root.mkdir(mode=0o700)
@@ -682,8 +877,14 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         proxy, transport = self.proxy(
             [FakeStream(response_stream(output_tokens=101))], contract=contract
         )
-        result = proxy.handle_raw_request(raw_request(), lambda _value: None)
+        emitted: list[bytes] = []
+        result = proxy.handle_raw_request(raw_request(), emitted.append)
         self.assertEqual("FAILED", result.request_state)
+        self.assertNotIn(b"response.completed", b"".join(emitted))
+        self.assertEqual(
+            0,
+            self.ledger.request_rows(ATTEMPT_ID)[0]["completion_prepared"],
+        )
         row = self.ledger.proxy_row(ATTEMPT_ID)
         self.assertEqual(("HOLD", "BROKER_PROXY_BUDGET_OVERRUN"), (
             row["state"], row["hold_code"]
@@ -719,7 +920,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         self.assertEqual([], transport.calls)
         self.assertIn(b"BROKER_PROXY_WALL_TIMEOUT", b"".join(emitted))
 
-    def test_response_id_lineage_is_attempt_local(self) -> None:
+    def test_response_id_lineage_is_host_authored_and_attempt_local(self) -> None:
         second_response = "resp_attempt_two"
         proxy, transport = self.proxy(
             [
@@ -734,37 +935,196 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                 "model": MODEL,
                 "stream": True,
                 "input": "follow-up",
-                "previous_response_id": RESPONSE_ID,
                 "max_output_tokens": 100,
             }
         )
         second = proxy.handle_raw_request(chained, lambda _value: None)
         self.assertEqual("COMPLETE", second.request_state)
         self.assertEqual(2, len(transport.calls))
+        first_body = json.loads(transport.calls[0][0].body)
+        second_body = json.loads(transport.calls[1][0].body)
+        self.assertNotIn("previous_response_id", first_body)
+        self.assertEqual(RESPONSE_ID, second_body["previous_response_id"])
+        self.assertFalse(second_body["store"])
 
-    def test_unknown_response_id_fails_without_upstream(self) -> None:
-        proxy, transport = self.proxy([FakeStream(response_stream())])
-        request = raw_request(
-            {
-                "model": MODEL,
-                "stream": True,
-                "input": "follow-up",
-                "previous_response_id": "resp_from_another_attempt",
-                "max_output_tokens": 100,
-            }
+    def test_child_conversation_prompt_metadata_and_routing_fail_before_upstream(self) -> None:
+        forbidden = (
+            ("previous_response_id", "resp_from_another_attempt"),
+            ("conversation", "conv_child"),
+            ("prompt", {"id": "pmpt_child"}),
+            ("metadata", {"project": "child"}),
+            ("project_id", "proj_child"),
+            ("organization", "org_child"),
+            ("lineage_route", "child"),
+            ("service_tier", "priority"),
+            ("prompt_cache_key", "child-cache"),
         )
-        emitted: list[bytes] = []
-        result = proxy.handle_raw_request(request, emitted.append)
-        self.assertEqual("FAILED", result.request_state)
-        self.assertEqual([], transport.calls)
-        self.assertIn(b"BROKER_PROXY_RESPONSE_LINEAGE_REJECTED", b"".join(emitted))
+        for index, (field, value) in enumerate(forbidden):
+            with self.subTest(field=field):
+                root = Path(self.temp.name) / f"routing-{index}"
+                root.mkdir(mode=0o700)
+                with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
+                    contract = self.contract(
+                        attempt_id=f"88888888-8888-4888-8888-88888888888{index}"
+                    )
+                    transport = FakeTransport([FakeStream(response_stream())])
+                    proxy = AttemptBoundResponsesProxy(
+                        self.permit(contract), ledger, transport, monotonic=FakeClock()
+                    )
+                    proxy.start()
+                    payload = {
+                        "model": MODEL,
+                        "stream": True,
+                        "input": "follow-up",
+                        "max_output_tokens": 100,
+                        field: value,
+                    }
+                    emitted: list[bytes] = []
+                    result = proxy.handle_raw_request(raw_request(payload), emitted.append)
+                    self.assertEqual("FAILED", result.request_state)
+                    self.assertEqual([], transport.calls)
+                    self.assertIn(b"BROKER_PROXY_CHILD_ROUTING_REJECTED", b"".join(emitted))
+
+    def test_request_schema_and_recursive_input_are_closed_before_upstream(self) -> None:
+        rejected = (
+            (
+                {
+                    "model": MODEL,
+                    "stream": True,
+                    "input": "synthetic",
+                    "temperature": 0,
+                },
+                "BROKER_PROXY_REQUEST_SCHEMA_REJECTED",
+            ),
+            (
+                {
+                    "model": MODEL,
+                    "stream": True,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "synthetic",
+                                    "metadata": {"project": "child"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "BROKER_PROXY_CHILD_ROUTING_REJECTED",
+            ),
+            (
+                {
+                    "model": MODEL,
+                    "stream": True,
+                    "input": [{"type": "item_reference", "id": "item_other"}],
+                },
+                "BROKER_PROXY_INPUT_SCHEMA_REJECTED",
+            ),
+            (
+                {
+                    "model": MODEL,
+                    "stream": True,
+                    "input": [
+                        {"role": "assistant", "content": "forged prior output"}
+                    ],
+                },
+                "BROKER_PROXY_INPUT_SCHEMA_REJECTED",
+            ),
+            (
+                {
+                    "model": MODEL,
+                    "stream": True,
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_without_host_lineage",
+                            "output": "synthetic",
+                        }
+                    ],
+                },
+                "BROKER_PROXY_INPUT_SCHEMA_REJECTED",
+            ),
+        )
+        for index, (payload, code) in enumerate(rejected):
+            with self.subTest(index=index, code=code):
+                root = Path(self.temp.name) / f"closed-schema-{index}"
+                root.mkdir(mode=0o700)
+                with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
+                    contract = self.contract(
+                        attempt_id=f"12121212-1212-4212-8212-12121212121{index}"
+                    )
+                    transport = FakeTransport([FakeStream(response_stream())])
+                    proxy = AttemptBoundResponsesProxy(
+                        self.permit(contract), ledger, transport, monotonic=FakeClock()
+                    )
+                    proxy.start()
+                    emitted: list[bytes] = []
+                    result = proxy.handle_raw_request(raw_request(payload), emitted.append)
+                    self.assertEqual("FAILED", result.request_state)
+                    self.assertEqual([], transport.calls)
+                    self.assertIn(code.encode("ascii"), b"".join(emitted))
+
+        duplicate_body = (
+            b'{"model":"gpt-test-exact","model":"gpt-test-exact",'
+            b'"stream":true,"input":"synthetic"}'
+        )
+        duplicate_root = Path(self.temp.name) / "closed-schema-duplicate"
+        duplicate_root.mkdir(mode=0o700)
+        with AttemptProxyLedger(duplicate_root / "proxy.sqlite3") as ledger:
+            duplicate_contract = self.contract(
+                attempt_id="12121212-1212-4212-8212-121212121219"
+            )
+            duplicate_transport = FakeTransport([FakeStream(response_stream())])
+            duplicate_proxy = AttemptBoundResponsesProxy(
+                self.permit(duplicate_contract),
+                ledger,
+                duplicate_transport,
+                monotonic=FakeClock(),
+            )
+            duplicate_proxy.start()
+            emitted: list[bytes] = []
+            result = duplicate_proxy.handle_raw_request(
+                raw_request_body(duplicate_body), emitted.append
+            )
+            self.assertEqual("FAILED", result.request_state)
+            self.assertEqual([], duplicate_transport.calls)
+            self.assertIn(b"BROKER_PROXY_JSON_INVALID", b"".join(emitted))
+
+        safe_input = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "synthetic"}],
+            }
+        ]
+        proxy, transport = self.proxy([FakeStream(response_stream())])
+        accepted = proxy.handle_raw_request(
+            raw_request(
+                {
+                    "model": MODEL,
+                    "stream": True,
+                    "instructions": "synthetic evaluator",
+                    "input": safe_input,
+                    "max_output_tokens": 100,
+                }
+            ),
+            lambda _value: None,
+        )
+        self.assertEqual("COMPLETE", accepted.request_state)
+        self.assertEqual(safe_input, json.loads(transport.calls[0][0].body)["input"])
 
     def test_safe_not_sent_and_ambiguous_are_distinct_and_never_replayed(self) -> None:
-        proxy, transport = self.proxy([UpstreamNotSent("synthetic")])
+        proxy, transport = self.proxy(["ZERO_NOT_SENT"])
         safe = proxy.handle_raw_request(raw_request(), lambda _value: None)
         self.assertEqual("SAFE_NOT_SENT", safe.request_state)
         self.assertEqual("RUNNING", self.ledger.proxy_row(ATTEMPT_ID)["state"])
         self.assertEqual(1, len(transport.calls))
+        safe_row = self.ledger.request_rows(ATTEMPT_ID)[0]
+        self.assertEqual(0, safe_row["upstream_bytes_sent"])
+        self.assertRegex(safe_row["send_evidence_sha256"], r"^[0-9a-f]{64}$")
 
         separate_root = Path(self.temp.name) / "ambiguous"
         separate_root.mkdir(mode=0o700)
@@ -793,7 +1153,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
             self.assertEqual(1, len(ambiguous_transport.calls))
 
     def test_confirmed_process_loss_recovery_is_conservative_and_idempotent(self) -> None:
-        evidence_sha256 = "9" * 64
+        process_identity_sha256 = "9" * 64
         cases = (
             ("CREATED", "SAFE_NOT_SENT", "BROKER_PROXY_PROCESS_LOST"),
             ("UPSTREAM_STARTED", "AMBIGUOUS", HOLD_UPSTREAM_AMBIGUOUS),
@@ -809,6 +1169,11 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                     permit = self.permit(contract)
                     ledger.register(permit)
                     ledger.activate(contract.attempt_id)
+                    ledger.bind_process_identity(
+                        contract.attempt_id,
+                        permit_binding_sha256=permit.binding_sha256,
+                        process_identity_sha256=process_identity_sha256,
+                    )
                     sequence = ledger.begin_request(contract.attempt_id, "8" * 64)
                     if initial == "UPSTREAM_STARTED":
                         ledger.transition_request(
@@ -817,9 +1182,16 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                             expected_states={"CREATED"},
                             new_state="UPSTREAM_STARTED",
                         )
+                    receipt = ProxyProcessTerminalReceipt(
+                        contract.attempt_id,
+                        permit.binding_sha256,
+                        process_identity_sha256,
+                        "EXITED",
+                        "2026-08-25T10:02:00Z",
+                    )
                     recovered = ledger.recover_after_confirmed_process_loss(
                         contract.attempt_id,
-                        process_evidence_sha256=evidence_sha256,
+                        receipt=receipt,
                     )
                     self.assertEqual("HOLD", recovered["proxy_state"])
                     self.assertEqual(hold_code, recovered["hold_code"])
@@ -829,7 +1201,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                     )
                     repeated = ledger.recover_after_confirmed_process_loss(
                         contract.attempt_id,
-                        process_evidence_sha256=evidence_sha256,
+                        receipt=receipt,
                     )
                     self.assertEqual([], repeated["recovered_requests"])
                     events = ledger.request_events(contract.attempt_id, sequence)
@@ -837,10 +1209,24 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                         recovered_state,
                         events[-1]["to_state"],
                     )
-        with self.assertRaisesRegex(ProxyError, "RECOVERY_EVIDENCE_INVALID"):
-            self.ledger.recover_after_confirmed_process_loss(
-                ATTEMPT_ID, process_evidence_sha256="invalid"
-            )
+                    if recovered_state == "SAFE_NOT_SENT":
+                        row = ledger.request_rows(contract.attempt_id)[0]
+                        self.assertEqual(0, row["upstream_bytes_sent"])
+                        self.assertRegex(row["send_evidence_sha256"], r"^[0-9a-f]{64}$")
+                    wrong_receipt = ProxyProcessTerminalReceipt(
+                        contract.attempt_id,
+                        "e" * 64,
+                        process_identity_sha256,
+                        "EXITED",
+                        "2026-08-25T10:02:00Z",
+                    )
+                    with self.assertRaisesRegex(
+                        ProxyError, "RECOVERY_RECEIPT_BINDING_INVALID"
+                    ):
+                        ledger.recover_after_confirmed_process_loss(
+                            contract.attempt_id,
+                            receipt=wrong_receipt,
+                        )
 
     def test_sse_idle_and_truncation_become_ambiguous(self) -> None:
         for index, (stream, clock) in enumerate(
@@ -872,6 +1258,265 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                     self.assertEqual("AMBIGUOUS", result.request_state)
                     self.assertEqual("HOLD", ledger.proxy_row(contract.attempt_id)["state"])
 
+    def test_sse_order_duplicates_and_post_completion_events_never_escape(self) -> None:
+        delta = {"type": "response.output_text.delta", "delta": "late"}
+        cases = (
+            event_wire(completed_event()),
+            event_wire(created_event()) + event_wire(created_event()),
+            event_wire(created_event()) + event_wire(completed_event()) + event_wire(delta),
+            event_wire(created_event())
+            + event_wire(completed_event())
+            + event_wire(completed_event()),
+            event_wire(created_event())
+            + event_wire(completed_event())
+            + event_wire("[DONE]")
+            + event_wire(delta),
+            event_wire(created_event())
+            + event_wire(completed_event())
+            + b": forbidden heartbeat after completion\n\n",
+            b": forbidden heartbeat before creation\n\n"
+            + event_wire(created_event())
+            + event_wire(completed_event()),
+            event_wire(created_event())
+            + b'data: {"type":"response.completed","type":"response.output_text.delta"}\n\n',
+        )
+        for index, encoded in enumerate(cases):
+            with self.subTest(index=index):
+                root = Path(self.temp.name) / f"sse-order-{index}"
+                root.mkdir(mode=0o700)
+                with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
+                    contract = self.contract(
+                        attempt_id=f"99999999-9999-4999-8999-99999999999{index}"
+                    )
+                    transport = FakeTransport([FakeStream([encoded])])
+                    proxy = AttemptBoundResponsesProxy(
+                        self.permit(contract), ledger, transport, monotonic=FakeClock()
+                    )
+                    proxy.start()
+                    emitted: list[bytes] = []
+                    result = proxy.handle_raw_request(raw_request(), emitted.append)
+                    self.assertEqual("AMBIGUOUS", result.request_state)
+                    self.assertEqual("HOLD", ledger.proxy_row(contract.attempt_id)["state"])
+                    self.assertNotIn(b"response.completed", b"".join(emitted))
+
+    def test_upstream_chunk_event_and_total_response_bounds_are_hard(self) -> None:
+        cases = (
+            (
+                self.contract(
+                    attempt_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                    max_stream_chunk_bytes=1024,
+                    max_response_bytes=4096,
+                ),
+                [b"x" * 1025],
+                "BROKER_PROXY_SSE_CHUNK_LIMIT",
+            ),
+            (
+                self.contract(
+                    attempt_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+                    max_stream_chunk_bytes=1024,
+                    max_response_bytes=1024,
+                ),
+                [event_wire(created_event()), b": " + b"x" * 980 + b"\n\n"],
+                "BROKER_PROXY_RESPONSE_LIMIT",
+            ),
+            (
+                self.contract(
+                    attempt_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+                    max_stream_chunk_bytes=1024,
+                    max_response_bytes=4096,
+                    max_sse_event_bytes=1024,
+                ),
+                [b"data: " + b"x" * 700, b"y" * 400],
+                "BROKER_PROXY_SSE_EVENT_TOO_LARGE",
+            ),
+        )
+        for index, (contract, chunks, code) in enumerate(cases):
+            with self.subTest(code=code):
+                root = Path(self.temp.name) / f"response-bound-{index}"
+                root.mkdir(mode=0o700)
+                with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
+                    proxy = AttemptBoundResponsesProxy(
+                        self.permit(contract),
+                        ledger,
+                        FakeTransport([FakeStream(chunks)]),
+                        monotonic=FakeClock(),
+                    )
+                    proxy.start()
+                    result = proxy.handle_raw_request(raw_request(), lambda _value: None)
+                    self.assertEqual("AMBIGUOUS", result.request_state)
+                    self.assertEqual(code, ledger.request_rows(contract.attempt_id)[0]["error_code"])
+
+    def test_real_open_read_uds_and_loopback_deadlines_terminalize(self) -> None:
+        contract = self.contract(io_timeout_seconds=0.05, sse_idle_seconds=0.1)
+        transport = BlockingOpenTransport()
+        proxy = AttemptBoundResponsesProxy(
+            self.permit(contract),
+            self.ledger,
+            transport,
+            monotonic=FakeClock(),
+        )
+        proxy.start()
+        started = time.monotonic()
+        result = proxy.handle_raw_request(raw_request(), lambda _value: None)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual("AMBIGUOUS", result.request_state)
+        self.assertEqual("HOLD", self.ledger.proxy_row(ATTEMPT_ID)["state"])
+        self.assertTrue(transport.release.wait(0.5))
+        self.assertIsNotNone(transport.cancelled_operation_id)
+
+        root = Path(self.temp.name) / "blocking-read"
+        root.mkdir(mode=0o700)
+        with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
+            read_contract = self.contract(
+                attempt_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                io_timeout_seconds=0.05,
+                sse_idle_seconds=0.1,
+            )
+            stream = BlockingStream()
+            read_proxy = AttemptBoundResponsesProxy(
+                self.permit(read_contract),
+                ledger,
+                FakeTransport([stream]),
+                monotonic=FakeClock(),
+            )
+            read_proxy.start()
+            started = time.monotonic()
+            result = read_proxy.handle_raw_request(raw_request(), lambda _value: None)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual("AMBIGUOUS", result.request_state)
+            self.assertEqual("HOLD", ledger.proxy_row(read_contract.attempt_id)["state"])
+            self.assertTrue(stream.release.wait(0.5))
+
+        host, relay = memory_pair()
+        started = time.monotonic()
+        with self.assertRaises(ProxyIOTimeout):
+            receive_frame(host, deadline=IODeadline.after(0.05))
+        self.assertLess(time.monotonic() - started, 0.5)
+        host.close()
+        relay.close()
+
+        loopback_host, loopback_peer = memory_pair()
+        started = time.monotonic()
+        with self.assertRaises(ProxyIOTimeout):
+            read_one_loopback_request(
+                loopback_host,
+                max_header_bytes=4096,
+                max_body_bytes=4096,
+                deadline=IODeadline.after(0.05),
+            )
+        self.assertLess(time.monotonic() - started, 0.5)
+        loopback_host.close()
+        loopback_peer.close()
+
+    def test_slow_loopback_reader_is_backpressured_and_bounded(self) -> None:
+        contract = self.contract(io_timeout_seconds=0.05, sse_idle_seconds=0.1)
+        binding = self.permit(contract)
+        host, relay = memory_pair()
+        send_frame(host, Frame(FrameKind.RESPONSE_DATA, 1, b"bounded response"))
+        send_frame(
+            host,
+            Frame(
+                FrameKind.RESPONSE_END,
+                1,
+                canonical_json(
+                    {
+                        "http_status": 200,
+                        "request_state": "COMPLETE",
+                        "response_id_sha256": "d" * 64,
+                        "sequence": 1,
+                    }
+                ).encode("ascii"),
+            ),
+        )
+        client = ScriptedSlowClient(raw_request())
+        started = time.monotonic()
+        with self.assertRaises(ProxyIOTimeout):
+            relay_one_loopback_connection(
+                client,
+                relay,
+                contract,
+                RelayBinding.from_permit(binding),
+            )
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(client.closed)
+        host.close()
+        relay.close()
+
+    def test_hello_binding_covers_every_contract_and_permit_field_before_ledger(self) -> None:
+        proxy, _transport = self.proxy([FakeStream(response_stream())])
+        exact = proxy.relay_binding
+        mismatches = (
+            replace(exact, attempt_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            replace(exact, contract_sha256="c" * 64),
+            replace(exact, endpoint_sha256="c" * 64),
+            replace(exact, policy_sha256="c" * 64),
+            replace(exact, permit_binding_sha256="c" * 64),
+        )
+        for mismatch in mismatches:
+            with self.subTest(field=mismatch):
+                host, relay = memory_pair()
+                send_frame(relay, Frame(FrameKind.HELLO, 0, channel_hello(mismatch)))
+                with self.assertRaisesRegex(
+                    ProxyProtocolError, "CHANNEL_BINDING_MISMATCH"
+                ):
+                    serve_framed_proxy_exchange(host, exact, proxy)
+                self.assertEqual([], self.ledger.request_rows(ATTEMPT_ID))
+                host.close()
+                relay.close()
+
+                host, relay = memory_pair()
+                with self.assertRaisesRegex(
+                    ProxyProtocolError, "CHANNEL_BINDING_MISMATCH"
+                ):
+                    serve_framed_proxy_exchange(host, mismatch, proxy)
+                self.assertEqual([], self.ledger.request_rows(ATTEMPT_ID))
+                host.close()
+                relay.close()
+
+    def test_forged_send_evidence_is_ambiguous_not_safe_not_sent(self) -> None:
+        class ForgedTransport:
+            def open(inner_self, request, *, credential_reference, timeout_seconds):
+                return UpstreamOpenResult(
+                    None,
+                    UpstreamSendEvidence(
+                        request.attempt_id,
+                        "f" * 64,
+                        request.request_sha256,
+                        request.operation_id,
+                        0,
+                        True,
+                        "BROKER_PROXY_UPSTREAM_NOT_SENT",
+                    ),
+                )
+
+            def cancel_open(inner_self, operation_id):
+                pass
+
+        proxy = AttemptBoundResponsesProxy(
+            self.permit(), self.ledger, ForgedTransport(), monotonic=FakeClock()
+        )
+        proxy.start()
+        result = proxy.handle_raw_request(raw_request(), lambda _value: None)
+        self.assertEqual("AMBIGUOUS", result.request_state)
+        row = self.ledger.request_rows(ATTEMPT_ID)[0]
+        self.assertIsNone(row["send_evidence_sha256"])
+        self.assertIsNone(row["upstream_bytes_sent"])
+        self.assertEqual("HOLD", self.ledger.proxy_row(ATTEMPT_ID)["state"])
+
+    def test_request_state_graph_refuses_terminal_reopening(self) -> None:
+        proxy, _transport = self.proxy([FakeStream(response_stream())])
+        result = proxy.handle_raw_request(raw_request(), lambda _value: None)
+        self.assertEqual("COMPLETE", result.request_state)
+        with self.assertRaisesRegex(ProxyError, "REQUEST_TRANSITION_INVALID"):
+            self.ledger.transition_request(
+                ATTEMPT_ID,
+                1,
+                expected_states={"COMPLETE"},
+                new_state="FAILED",
+                error_code="SYNTHETIC_REOPEN",
+            )
+        self.assertEqual("COMPLETE", self.ledger.request_rows(ATTEMPT_ID)[0]["state"])
+
     def test_socketpair_framing_binds_exact_contract_and_streams(self) -> None:
         proxy, _transport = self.proxy([FakeStream(response_stream(fragments=True))])
         real_host, real_relay = create_attempt_socketpair()
@@ -885,7 +1530,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         def host_worker():
             try:
                 outcome["result"] = serve_framed_proxy_exchange(
-                    host, self.contract(), proxy
+                    host, proxy.relay_binding, proxy
                 )
             except Exception as exc:  # pragma: no cover - surfaced below
                 outcome["error"] = exc
@@ -893,7 +1538,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         thread = threading.Thread(target=host_worker)
         thread.start()
         response, terminal = relay_framed_http_request(
-            relay, self.contract(), raw_request()
+            relay, self.contract(), proxy.relay_binding, raw_request()
         )
         thread.join(timeout=5)
         host.close()
@@ -908,7 +1553,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         host, relay = memory_pair()
         send_frame(relay, Frame(FrameKind.HELLO, 0, b"{}"))
         with self.assertRaisesRegex(ProxyProtocolError, "CHANNEL_BINDING_MISMATCH"):
-            serve_framed_proxy_exchange(host, self.contract(), proxy)
+            serve_framed_proxy_exchange(host, proxy.relay_binding, proxy)
         self.assertEqual([], self.ledger.request_rows(ATTEMPT_ID))
         host.close()
         relay.close()
@@ -921,12 +1566,12 @@ class AttemptResponsesProxyTests(unittest.TestCase):
 
         def host_worker():
             outcomes["host"] = serve_framed_proxy_exchange(
-                host_channel, self.contract(), proxy
+                host_channel, proxy.relay_binding, proxy
             )
 
         def relay_worker():
             outcomes["relay"] = relay_one_loopback_connection(
-                loopback_side, relay_channel, self.contract()
+                loopback_side, relay_channel, self.contract(), proxy.relay_binding
             )
             loopback_side.close()
 

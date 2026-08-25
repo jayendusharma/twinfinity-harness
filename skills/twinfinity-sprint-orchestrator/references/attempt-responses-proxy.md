@@ -61,10 +61,15 @@ raw HTTP to loopback.
 
 The namespace initializer must tmpfs-mask `/home/ubuntu` and `/run/user/1000`
 before Codex starts. `HOME` and the XDG paths point into the attempt runtime,
-not the host home. The supplemental mount validator rejects the complete Codex
-home, SSH/GnuPG homes, runtime bus, coordination root, secret directories, and
-login-cache files even when a caller tries to bind one under an allowed child
-destination.
+not the host home. The supplemental mount validator requires six distinct,
+canonical, owner-controlled sources under two exact host-authored roots:
+read-only repository, contract, and provider configuration mounts plus separate
+writable receipt-output, runtime, and private-home mounts. It rejects missing or
+duplicate roles, traversal and symlink aliases, wrong destinations or access
+modes, writable repository aliases, broad roots such as `/home/ubuntu`, and
+sensitive roots including `/etc`, `/proc`, the Codex home, SSH/GnuPG homes, and
+the coordination root. A future launcher must consume this validated role map;
+it must not construct additional bind mounts from child input.
 
 ## Framed transport
 
@@ -74,9 +79,11 @@ namespace initializer, which starts a loopback relay inside the isolated network
 namespace and closes the descriptor before executing Codex.
 
 The relay holds no provider or coordination credential. It sends a protocol
-hello bound to the exact attempt ID, contract digest, endpoint digest, and proxy
-policy digest. Request and response bytes use bounded, versioned frames. A
-binding, version, frame-order, stream-ID, or size mismatch closes the channel
+hello bound to the exact attempt ID, contract digest, endpoint digest, proxy
+policy digest, and permit-binding digest. The host compares the supplied binding
+to both `proxy.contract` and `proxy.permit` before it reads a request start or
+creates a request row. Request and response bytes use bounded, versioned frames.
+A binding, version, frame-order, stream-ID, or size mismatch closes the channel
 before a request ledger row is created.
 
 The provided loopback function operates only on an already accepted socket. A
@@ -88,22 +95,41 @@ capabilities, and passing no relay descriptor to Codex.
 
 Every connection consumes the exact attempt's finite request budget. The proxy
 allows only HTTP/1.1 `POST /v1/responses` with one unambiguous content length and
-an `application/json` body. It rejects child authorization, cookies, API keys,
+an `application/json` body. JSON objects reject duplicate keys and non-finite
+numbers. The top-level request schema is closed to `model`, `stream`, `input`,
+optional string `instructions`, `background=false`, `store=false`,
+`max_output_tokens`, and the exact contract-hashed `tools` value. Input is
+closed recursively to text-only user, system, or developer messages and, only
+when the host has already established same-process response lineage,
+function-call outputs. Assistant history, item references, hosted media/file
+parts, unknown item or content types, and routing-shaped keys at any input depth
+are rejected. It also rejects child authorization, cookies, API keys,
 OpenAI account or project routing, header smuggling, background execution,
-stored responses, response includes, model drift, hosted tools, unknown response
-IDs, and non-streaming requests. Hop-by-hop and child metadata headers are not
-forwarded.
+stored responses, response includes, model drift, hosted tools, and
+non-streaming requests. Child-controlled conversations, prior-response IDs,
+stored-prompt IDs or cache keys, metadata, users, service tiers, and any project,
+organization, or lineage routing field are rejected before upstream open.
+Hop-by-hop and child metadata headers are not forwarded.
 
-The proxy forwards a canonical body with the exact model, `store=false`, an
-output-token ceiling, and at most the function-tool schema whose digest appears
-in the contract. Input is conservatively reserved at one token per UTF-8 byte.
-The owner ledger enforces request count, concurrency one, body bytes, cumulative
-input/output/total tokens, attempt wall time, and SSE idle time.
+The proxy forwards a canonical body with the exact model, host-authored
+same-process response lineage when available, `store=false`, an output-token
+ceiling, and at most the function-tool schema whose digest appears in the
+contract. Input is conservatively reserved at one token per UTF-8 byte. The
+owner ledger enforces request count, concurrency one, body bytes, cumulative
+input/output/total tokens, attempt wall time, per-I/O time, SSE idle time, stream
+chunk bytes, individual SSE event bytes, and total response bytes.
 
-A successful SSE stream must contain one consistent `resp_*` lineage ID and a
-terminal `response.completed` event with integer input and output usage. Only
-the response-ID digest is retained. A later `previous_response_id` is accepted
-only when its digest belongs to a completed request in the same attempt.
+A successful SSE stream must contain only strict duplicate-free JSON `data:`
+events, start with one `response.created`, retain one consistent `resp_*`
+lineage ID, and contain exactly one terminal
+`response.completed` event with integer input and output usage. Except for one
+optional `[DONE]`, comments and duplicate or reordered terminal events are
+rejected, as is every event after completion. Completion and `[DONE]` bytes are
+withheld until EOF
+and usage has passed the durable budget check, so an over-budget response never
+reaches the child as semantic success. Only the response-ID digest is retained;
+the raw ID remains in owner-process memory solely to author the next request in
+that same live attempt.
 
 ## Owner-only ledger and recovery
 
@@ -117,24 +143,37 @@ CREATED -> UPSTREAM_STARTED -> STREAMING -> COMPLETE
         -> FAILED
 ```
 
-The database stores policy and credential-reference hashes, request and response
-ID hashes, bounded counters, controlled error codes, timestamps, and transition
-hashes. It never stores request bodies, prompts, headers, SSE content, raw
-response IDs, cookies, or credentials.
+The transition graph is closed: terminal requests cannot reopen. The database
+stores policy and credential-reference hashes, request and response ID hashes,
+bounded counters, structured upstream byte-send evidence digests, controlled
+error codes, timestamps, and transition hashes. It never stores request bodies,
+prompts, headers, SSE content, raw response IDs, cookies, or credentials.
 
-`SAFE_NOT_SENT` is permitted only when the injected host transport proves zero
-upstream request bytes were sent. Any exception after possible forwarding,
-truncated or idle SSE stream, missing completion/usage, or child disconnect is
-`AMBIGUOUS`; the proxy enters `HOLD` and the same request is never replayed.
+`SAFE_NOT_SENT` is permitted only after the injected host transport returns and
+the ledger durably records exact attempt, permit, request, operation, terminal
+error, and zero-byte-send evidence. An exception cannot assert this state. Any
+exception after possible forwarding, invalid evidence, truncated or idle SSE
+stream, missing completion/usage, or child disconnect is `AMBIGUOUS`; the proxy
+enters `HOLD` and the same request is never replayed.
 Client and proxy stream retry counts remain zero. A terminal upstream rejection
 is `FAILED`; `401` and `403` additionally hold the proxy for credential
 resolution.
 
-Crash recovery requires a hash of positive broker/systemd process-terminal
-evidence; age or process discovery alone is not an input. A surviving `CREATED`
-request becomes `SAFE_NOT_SENT`. `UPSTREAM_STARTED` or `STREAMING` becomes
-`AMBIGUOUS`. In both cases the old proxy enters `HOLD`; recovery is idempotent
-and never restarts or replays that attempt.
+Crash recovery requires a structured process-terminal receipt bound to the
+exact attempt, permit binding, previously registered process identity, terminal
+status, and observation time; age or process discovery alone is not an input.
+A surviving `CREATED` request receives durable zero-byte recovery evidence and
+becomes `SAFE_NOT_SENT`. `UPSTREAM_STARTED` or `STREAMING` becomes `AMBIGUOUS`.
+In both cases the old proxy enters `HOLD`; recovery attaches the receipt digest,
+is idempotent for that exact receipt, and never restarts or replays the attempt.
+
+All upstream open/read/close, inherited-channel read/write, loopback read/write,
+and accept helpers use absolute real deadlines. Timeout closes or cancels the
+relevant transport, terminalizes any active request as `FAILED`, `AMBIGUOUS`, or
+an already durable `COMPLETE`, and never leaves a request active for replay.
+Response forwarding is frame-by-frame with backpressure; only one bounded SSE
+event, the bounded terminal pair, or the explicitly bounded test helper response
+may be buffered.
 
 The future broker may accept a child receipt only after all proxy requests are
 terminal and none is `AMBIGUOUS`. `complete_proxy` is the closed seam for that

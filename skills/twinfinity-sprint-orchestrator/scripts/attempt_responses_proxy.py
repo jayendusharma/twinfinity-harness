@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import socket
 import sqlite3
@@ -36,6 +37,7 @@ HOLD_PROXY_DISABLED = "BROKER_RESPONSES_PROXY_DISABLED"
 HOLD_UPSTREAM_AMBIGUOUS = "BROKER_UPSTREAM_AMBIGUOUS"
 HOLD_UPSTREAM_CREDENTIAL_REJECTED = "BROKER_UPSTREAM_CREDENTIAL_REJECTED"
 HOLD_PROXY_BUDGET_OVERRUN = "BROKER_PROXY_BUDGET_OVERRUN"
+HOLD_PROXY_IO_TIMEOUT = "BROKER_PROXY_IO_TIMEOUT"
 
 REQUEST_STATES = frozenset(
     {
@@ -52,6 +54,18 @@ TERMINAL_REQUEST_STATES = frozenset(
     {"COMPLETE", "SAFE_NOT_SENT", "AMBIGUOUS", "FAILED"}
 )
 PROXY_STATES = frozenset({"READY", "RUNNING", "COMPLETE", "HOLD"})
+
+LEGAL_REQUEST_TRANSITIONS: Mapping[str, frozenset[str]] = {
+    "CREATED": frozenset({"UPSTREAM_STARTED", "SAFE_NOT_SENT", "FAILED"}),
+    "UPSTREAM_STARTED": frozenset(
+        {"STREAMING", "SAFE_NOT_SENT", "AMBIGUOUS", "FAILED"}
+    ),
+    "STREAMING": frozenset({"COMPLETE", "AMBIGUOUS", "FAILED"}),
+    "COMPLETE": frozenset(),
+    "SAFE_NOT_SENT": frozenset(),
+    "AMBIGUOUS": frozenset(),
+    "FAILED": frozenset(),
+}
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$")
@@ -85,10 +99,46 @@ SAFE_CHILD_ENVIRONMENT_KEYS = frozenset(
     }
 )
 
+CHILD_CONTROLLED_ROUTING_FIELDS = frozenset(
+    {
+        "conversation",
+        "lineage",
+        "lineage_id",
+        "metadata",
+        "organization",
+        "organization_id",
+        "previous_response_id",
+        "project",
+        "project_id",
+        "prompt",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "service_tier",
+        "session",
+        "session_id",
+        "user",
+    }
+)
+
+ALLOWED_REQUEST_FIELDS = frozenset(
+    {
+        "background",
+        "input",
+        "instructions",
+        "max_output_tokens",
+        "model",
+        "store",
+        "stream",
+        "tools",
+    }
+)
+
 _FRAME_MAGIC = b"TFPX"
 _FRAME_HEADER = struct.Struct("!4sBBII")
 _MAX_FRAME_PAYLOAD = 64 * 1024
 _MAX_HELLO_BYTES = 4096
+_CHILD_CODEX_HOME = "/run/twinfinity-attempt/codex-home"
 
 
 class ProxyError(RuntimeError):
@@ -119,10 +169,6 @@ class ProxyProtocolError(ProxyError):
     """The inherited framed channel is malformed or cross-bound."""
 
 
-class UpstreamNotSent(ProxyError):
-    """The transport proves that zero request bytes reached upstream."""
-
-
 class UpstreamAmbiguous(ProxyError):
     """The request may have reached upstream and must not be replayed."""
 
@@ -137,6 +183,14 @@ class UpstreamRejected(ProxyError):
 
 class UpstreamTerminalFailure(ProxyError):
     """A valid SSE stream reported response.failed or response.incomplete."""
+
+
+class ProxyIOTimeout(ProxyError):
+    """A host, inherited-channel, or loopback operation exceeded its deadline."""
+
+    def __init__(self, code: str = HOLD_PROXY_IO_TIMEOUT) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class FrameKind(IntEnum):
@@ -230,6 +284,9 @@ class AttemptProxyContract:
     max_concurrency: int = 1
     max_header_bytes: int = 16 * 1024
     max_sse_event_bytes: int = 1024 * 1024
+    max_stream_chunk_bytes: int = 64 * 1024
+    max_response_bytes: int = 8 * 1024 * 1024
+    io_timeout_seconds: float = 5.0
     allowed_tools_sha256: str | None = None
 
     def __post_init__(self) -> None:
@@ -253,6 +310,9 @@ class AttemptProxyContract:
             or not 0.1 <= self.sse_idle_seconds <= self.max_wall_seconds
             or not 1024 <= self.max_header_bytes <= 256 * 1024
             or not 1024 <= self.max_sse_event_bytes <= 8 * 1024 * 1024
+            or not 1024 <= self.max_stream_chunk_bytes <= _MAX_FRAME_PAYLOAD
+            or not self.max_stream_chunk_bytes <= self.max_response_bytes <= 64 * 1024 * 1024
+            or not 0.01 <= self.io_timeout_seconds <= self.max_wall_seconds
             or (
                 self.allowed_tools_sha256 is not None
                 and SHA256.fullmatch(self.allowed_tools_sha256) is None
@@ -275,10 +335,13 @@ class AttemptProxyContract:
                     "max_input_tokens": self.max_input_tokens,
                     "max_output_tokens": self.max_output_tokens,
                     "max_requests": self.max_requests,
+                    "max_response_bytes": self.max_response_bytes,
                     "max_sse_event_bytes": self.max_sse_event_bytes,
+                    "max_stream_chunk_bytes": self.max_stream_chunk_bytes,
                     "max_total_tokens": self.max_total_tokens,
                     "max_wall_seconds": self.max_wall_seconds,
                     "model": self.model,
+                    "io_timeout_seconds": self.io_timeout_seconds,
                     "sse_idle_seconds": self.sse_idle_seconds,
                 }
             )
@@ -308,20 +371,206 @@ class ProxyPermit:
 
 
 @dataclass(frozen=True)
+class RelayBinding:
+    """Non-secret exact hello binding inherited by the isolated relay."""
+
+    attempt_id: str
+    contract_sha256: str
+    endpoint_sha256: str
+    policy_sha256: str
+    permit_binding_sha256: str
+
+    def __post_init__(self) -> None:
+        try:
+            parsed_attempt = uuid.UUID(self.attempt_id)
+        except (ValueError, AttributeError) as exc:
+            raise ProxyError("BROKER_PROXY_RELAY_BINDING_INVALID") from exc
+        if str(parsed_attempt) != self.attempt_id or any(
+            SHA256.fullmatch(value) is None
+            for value in (
+                self.contract_sha256,
+                self.endpoint_sha256,
+                self.policy_sha256,
+                self.permit_binding_sha256,
+            )
+        ):
+            raise ProxyError("BROKER_PROXY_RELAY_BINDING_INVALID")
+
+    @classmethod
+    def from_permit(cls, permit: ProxyPermit) -> "RelayBinding":
+        return cls(
+            attempt_id=permit.contract.attempt_id,
+            contract_sha256=permit.contract.contract_sha256,
+            endpoint_sha256=sha256_text(permit.contract.endpoint_id),
+            policy_sha256=permit.contract.policy_sha256,
+            permit_binding_sha256=permit.binding_sha256,
+        )
+
+    def as_payload(self) -> Mapping[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "contract_sha256": self.contract_sha256,
+            "endpoint_sha256": self.endpoint_sha256,
+            "permit_binding_sha256": self.permit_binding_sha256,
+            "policy_sha256": self.policy_sha256,
+            "protocol_version": PROXY_PROTOCOL_VERSION,
+        }
+
+
+@dataclass(frozen=True)
+class UpstreamSendEvidence:
+    """Transport-authored, request-bound evidence about bytes sent upstream."""
+
+    attempt_id: str
+    permit_binding_sha256: str
+    request_sha256: str
+    operation_id: str
+    bytes_sent: int
+    terminal: bool
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            parsed_attempt = uuid.UUID(self.attempt_id)
+        except (ValueError, AttributeError) as exc:
+            raise ProxyError("BROKER_PROXY_SEND_EVIDENCE_INVALID") from exc
+        if (
+            str(parsed_attempt) != self.attempt_id
+            or SHA256.fullmatch(self.permit_binding_sha256) is None
+            or SHA256.fullmatch(self.request_sha256) is None
+            or SHA256.fullmatch(self.operation_id) is None
+            or type(self.bytes_sent) is not int
+            or self.bytes_sent < 0
+            or type(self.terminal) is not bool
+            or (self.error_code is not None and SAFE_IDENTIFIER.fullmatch(self.error_code) is None)
+            or (self.bytes_sent == 0 and (not self.terminal or self.error_code is None))
+            or (self.bytes_sent > 0 and self.terminal)
+        ):
+            raise ProxyError("BROKER_PROXY_SEND_EVIDENCE_INVALID")
+
+    @property
+    def digest(self) -> str:
+        return sha256_text(
+            canonical_json(
+                {
+                    "attempt_id": self.attempt_id,
+                    "bytes_sent": self.bytes_sent,
+                    "error_code": self.error_code,
+                    "operation_id": self.operation_id,
+                    "permit_binding_sha256": self.permit_binding_sha256,
+                    "request_sha256": self.request_sha256,
+                    "terminal": self.terminal,
+                }
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ProxyProcessTerminalReceipt:
+    """Exact host-supervisor evidence that one bound proxy process is terminal."""
+
+    attempt_id: str
+    permit_binding_sha256: str
+    process_identity_sha256: str
+    terminal_status: str
+    observed_at: str
+
+    def __post_init__(self) -> None:
+        try:
+            parsed_attempt = uuid.UUID(self.attempt_id)
+        except (ValueError, AttributeError) as exc:
+            raise ProxyError("BROKER_PROXY_RECOVERY_RECEIPT_INVALID") from exc
+        if (
+            str(parsed_attempt) != self.attempt_id
+            or SHA256.fullmatch(self.permit_binding_sha256) is None
+            or SHA256.fullmatch(self.process_identity_sha256) is None
+            or self.terminal_status not in {"EXITED", "SIGNALED", "LAUNCH_FAILED"}
+            or type(self.observed_at) is not str
+            or not self.observed_at.endswith("Z")
+        ):
+            raise ProxyError("BROKER_PROXY_RECOVERY_RECEIPT_INVALID")
+
+    @property
+    def digest(self) -> str:
+        return sha256_text(
+            canonical_json(
+                {
+                    "attempt_id": self.attempt_id,
+                    "observed_at": self.observed_at,
+                    "permit_binding_sha256": self.permit_binding_sha256,
+                    "process_identity_sha256": self.process_identity_sha256,
+                    "terminal_status": self.terminal_status,
+                }
+            )
+        )
+
+
+@dataclass(frozen=True)
 class SupplementalMount:
+    role: str
     source: str
     destination: str
     writable: bool
 
 
 @dataclass(frozen=True)
+class AttemptMountPolicy:
+    """Host-authored exact source roots for one sandbox mount namespace."""
+
+    repository_parent: str
+    repository_root: str
+    attempt_parent: str
+    attempt_root: str
+
+    def expected_sources(self) -> Mapping[str, Path]:
+        repository_parent = _canonical_source_path(self.repository_parent)
+        repository_root = _canonical_source_path(self.repository_root)
+        attempt_parent = _canonical_source_path(self.attempt_parent)
+        attempt_root = _canonical_source_path(self.attempt_root)
+        if (
+            not _strictly_within(repository_root, repository_parent)
+            or not _strictly_within(attempt_root, attempt_parent)
+            or _paths_overlap(repository_root, attempt_root)
+            or _source_is_broad_or_sensitive(repository_parent)
+            or _source_is_broad_or_sensitive(repository_root)
+            or _source_is_broad_or_sensitive(attempt_parent)
+        ):
+            raise ProxyError("BROKER_PROXY_MOUNT_POLICY_INVALID")
+        for root in (repository_parent, repository_root, attempt_parent, attempt_root):
+            metadata = root.lstat()
+            if (
+                metadata.st_uid != os.getuid()
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise ProxyError("BROKER_PROXY_MOUNT_POLICY_INVALID")
+        return {
+            "repository": repository_root,
+            "attempt_contract": attempt_root / "contract.json",
+            "provider_config": attempt_root / "codex-home" / "config.toml",
+            "receipt_output": attempt_root / "out",
+            "runtime": attempt_root / "runtime",
+            "private_home": attempt_root / "home",
+        }
+
+
+@dataclass(frozen=True)
 class UpstreamRequest:
+    attempt_id: str
+    permit_binding_sha256: str
     method: str
     path: str
     headers: tuple[tuple[str, str], ...]
     body: bytes
     request_sha256: str
+    operation_id: str
     deadline_seconds: float
+
+
+@dataclass(frozen=True)
+class UpstreamOpenResult:
+    stream: "UpstreamStream | None"
+    send_evidence: UpstreamSendEvidence
 
 
 class UpstreamStream(Protocol):
@@ -342,8 +591,11 @@ class UpstreamTransport(Protocol):
         *,
         credential_reference: ApprovedCredentialReference,
         timeout_seconds: float,
-    ) -> UpstreamStream:
-        """Open one authenticated host-side request without exposing auth."""
+    ) -> UpstreamOpenResult:
+        """Return a stream plus durable exact send evidence, or zero-send evidence."""
+
+    def cancel_open(self, operation_id: str) -> None:
+        """Make a timed-out open terminal; it must not later send request bytes."""
 
 
 @dataclass(frozen=True)
@@ -370,6 +622,83 @@ class ProxyResult:
 
 
 T = TypeVar("T")
+
+
+class IODeadline:
+    """One absolute real-time deadline shared by every retry-free I/O loop."""
+
+    def __init__(
+        self,
+        expires_at: float,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.expires_at = expires_at
+        self.monotonic = monotonic
+
+    @classmethod
+    def after(
+        cls,
+        seconds: float,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> "IODeadline":
+        if type(seconds) not in {int, float} or seconds <= 0:
+            raise ProxyIOTimeout()
+        return cls(monotonic() + float(seconds), monotonic=monotonic)
+
+    def remaining(self) -> float:
+        remaining = self.expires_at - self.monotonic()
+        if remaining <= 0:
+            raise ProxyIOTimeout()
+        return remaining
+
+
+def _bounded_io_call(
+    operation: Callable[[], T],
+    deadline: IODeadline,
+    *,
+    timeout_code: str = HOLD_PROXY_IO_TIMEOUT,
+    on_timeout: Callable[[], None] | None = None,
+) -> T:
+    """Bound even transports that fail to implement their timeout parameter."""
+
+    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result.put_nowait((True, operation()))
+        except BaseException as exc:  # transported back to the owning thread
+            try:
+                result.put_nowait((False, exc))
+            except queue.Full:
+                pass
+
+    thread = threading.Thread(target=worker, daemon=True, name="attempt-proxy-io")
+    thread.start()
+    try:
+        succeeded, value = result.get(timeout=deadline.remaining())
+    except queue.Empty as exc:
+        if on_timeout is not None:
+            def cancel_worker() -> None:
+                try:
+                    on_timeout()
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=cancel_worker,
+                daemon=True,
+                name="attempt-proxy-io-cancel",
+            ).start()
+        raise ProxyIOTimeout(timeout_code) from exc
+    if succeeded:
+        return value
+    raise value
+
+
+def _default_io_deadline() -> IODeadline:
+    return IODeadline.after(5.0)
 
 
 def canonical_json(value: Any) -> str:
@@ -437,7 +766,7 @@ def build_uncredentialed_child_environment(
 ) -> dict[str, str]:
     """Build an allowlisted child environment containing no reusable authority."""
 
-    if not machine_codex_home.startswith("/") or not 1 <= loopback_port <= 65535:
+    if machine_codex_home != _CHILD_CODEX_HOME or not 1 <= loopback_port <= 65535:
         raise ProxyError("BROKER_PROXY_CHILD_ENVIRONMENT_INVALID")
     environment = {
         key: value
@@ -460,43 +789,155 @@ def build_uncredentialed_child_environment(
     return environment
 
 
-def validate_supplemental_mounts(mounts: Sequence[SupplementalMount]) -> None:
-    """Validate the only mounts added to the otherwise read-only sandbox root."""
-
-    allowed_read_only = {
-        "/workspace",
+_MOUNT_ROLE_POLICY: Mapping[str, tuple[str, bool, str]] = {
+    "repository": ("/workspace", False, "directory"),
+    "attempt_contract": (
         "/run/twinfinity-attempt/contract.json",
+        False,
+        "file",
+    ),
+    "provider_config": (
         "/run/twinfinity-attempt/codex-home/config.toml",
-    }
-    allowed_writable = {
-        "/run/twinfinity-attempt/home",
-        "/run/twinfinity-attempt/out",
-        "/run/twinfinity-attempt/runtime",
-    }
-    seen: set[str] = set()
-    forbidden_fragments = (
-        "/.ssh",
-        "/.gnupg",
-        "/.codex",
-        "/keyring",
-        "/secrets",
-        "/twinfinity-coordination",
-        "/run/user/",
-        "/" + "auth" + ".json",
+        False,
+        "file",
+    ),
+    "receipt_output": ("/run/twinfinity-attempt/out", True, "directory"),
+    "runtime": ("/run/twinfinity-attempt/runtime", True, "directory"),
+    "private_home": ("/run/twinfinity-attempt/home", True, "directory"),
+}
+
+_BROAD_OR_SENSITIVE_SOURCES = (
+    Path("/"),
+    Path("/tmp"),
+    Path("/home"),
+    Path("/home/ubuntu"),
+    Path("/etc"),
+    Path("/proc"),
+    Path("/sys"),
+    Path("/dev"),
+    Path("/run"),
+    Path("/var"),
+    Path("/home/ubuntu/.codex"),
+    Path("/home/ubuntu/.ssh"),
+    Path("/home/ubuntu/.gnupg"),
+)
+
+
+def _strictly_within(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return child != parent
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or _strictly_within(left, right) or _strictly_within(
+        right, left
     )
-    for mount in mounts:
-        source = os.path.normpath(mount.source)
-        destination = os.path.normpath(mount.destination)
-        lowered = f"{source}\n{destination}".casefold()
-        allowed = allowed_writable if mount.writable else allowed_read_only
+
+
+def _source_is_broad_or_sensitive(path: Path) -> bool:
+    if path in _BROAD_OR_SENSITIVE_SOURCES:
+        return True
+    return any(
+        root != Path("/") and _strictly_within(path, root)
+        for root in (
+            Path("/etc"),
+            Path("/proc"),
+            Path("/sys"),
+            Path("/dev"),
+            Path("/home/ubuntu/.codex"),
+            Path("/home/ubuntu/.ssh"),
+            Path("/home/ubuntu/.gnupg"),
+        )
+    )
+
+
+def _canonical_source_path(value: str) -> Path:
+    if type(value) is not str or not value.startswith("/"):
+        raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_INVALID")
+    if value != os.path.normpath(value) or "//" in value:
+        raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_ALIAS")
+    candidate = Path(value)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_MISSING") from exc
+    if resolved != candidate:
+        raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_ALIAS")
+    return resolved
+
+
+def _validate_mount_source_metadata(path: Path, expected_kind: str) -> tuple[int, int]:
+    metadata = path.lstat()
+    if (
+        metadata.st_uid != os.getuid()
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_UNSAFE")
+    if expected_kind == "file":
         if (
-            not source.startswith("/")
-            or destination not in allowed
-            or destination in seen
-            or any(fragment in lowered for fragment in forbidden_fragments)
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
-            raise ProxyError("BROKER_PROXY_MOUNT_CONTRACT_INVALID")
-        seen.add(destination)
+            raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_UNSAFE")
+    elif (
+        expected_kind != "directory"
+        or not stat.S_ISDIR(metadata.st_mode)
+        or (
+            path.name in {"out", "runtime", "home"}
+            and stat.S_IMODE(metadata.st_mode) != 0o700
+        )
+    ):
+        raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_UNSAFE")
+    return metadata.st_dev, metadata.st_ino
+
+
+def validate_supplemental_mounts(
+    mounts: Sequence[SupplementalMount],
+    *,
+    policy: AttemptMountPolicy,
+) -> None:
+    """Require one exact canonical source and access policy for every role."""
+
+    expected_sources = policy.expected_sources()
+    if len(mounts) != len(_MOUNT_ROLE_POLICY):
+        raise ProxyError("BROKER_PROXY_MOUNT_CONTRACT_INCOMPLETE")
+    seen_roles: set[str] = set()
+    seen_destinations: set[str] = set()
+    seen_inodes: set[tuple[int, int]] = set()
+    for mount in mounts:
+        if mount.role not in _MOUNT_ROLE_POLICY or mount.role in seen_roles:
+            raise ProxyError("BROKER_PROXY_MOUNT_ROLE_INVALID")
+        destination, writable, expected_kind = _MOUNT_ROLE_POLICY[mount.role]
+        if (
+            type(mount.destination) is not str
+            or not mount.destination.startswith("/")
+            or mount.destination != os.path.normpath(mount.destination)
+            or "//" in mount.destination
+            or mount.destination != destination
+            or mount.destination in seen_destinations
+            or mount.writable is not writable
+        ):
+            raise ProxyError("BROKER_PROXY_MOUNT_DESTINATION_INVALID")
+        source = _canonical_source_path(mount.source)
+        expected_source = _canonical_source_path(os.fspath(expected_sources[mount.role]))
+        if source != expected_source or _source_is_broad_or_sensitive(source):
+            raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_INVALID")
+        inode = _validate_mount_source_metadata(source, expected_kind)
+        if inode in seen_inodes:
+            raise ProxyError("BROKER_PROXY_MOUNT_SOURCE_ALIAS")
+        seen_roles.add(mount.role)
+        seen_destinations.add(mount.destination)
+        seen_inodes.add(inode)
+
+    repository = expected_sources["repository"]
+    for role in ("receipt_output", "runtime", "private_home"):
+        if _paths_overlap(repository, expected_sources[role]):
+            raise ProxyError("BROKER_PROXY_WRITABLE_REPOSITORY_ALIAS")
 
 
 def required_namespace_masks() -> tuple[str, str]:
@@ -579,20 +1020,66 @@ def create_attempt_socketpair() -> tuple[socket.socket, socket.socket]:
     return host_socket, relay_socket
 
 
-def _send_all(sock: socket.socket, value: bytes) -> None:
+def _socket_call(
+    sock: socket.socket,
+    operation: Callable[[], T],
+    deadline: IODeadline,
+) -> T:
+    if isinstance(sock, socket.socket):
+        prior_timeout = sock.gettimeout()
+        try:
+            sock.settimeout(deadline.remaining())
+            return operation()
+        except (socket.timeout, TimeoutError) as exc:
+            raise ProxyIOTimeout() from exc
+        finally:
+            try:
+                sock.settimeout(prior_timeout)
+            except OSError:
+                pass
+    def close_on_timeout() -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except (AttributeError, OSError):
+            pass
+        try:
+            sock.close()
+        except (AttributeError, OSError):
+            pass
+
+    return _bounded_io_call(operation, deadline, on_timeout=close_on_timeout)
+
+
+def _send_all(
+    sock: socket.socket,
+    value: bytes,
+    *,
+    deadline: IODeadline | None = None,
+) -> None:
+    resolved_deadline = deadline or _default_io_deadline()
     view = memoryview(value)
     while view:
-        sent = sock.send(view)
+        sent = _socket_call(sock, lambda: sock.send(view), resolved_deadline)
         if sent <= 0:
             raise ProxyProtocolError("PROXY_CHANNEL_CLOSED")
         view = view[sent:]
 
 
-def _receive_exact(sock: socket.socket, size: int) -> bytes:
+def _receive_exact(
+    sock: socket.socket,
+    size: int,
+    *,
+    deadline: IODeadline | None = None,
+) -> bytes:
+    resolved_deadline = deadline or _default_io_deadline()
     chunks: list[bytes] = []
     remaining = size
     while remaining:
-        chunk = sock.recv(remaining)
+        chunk = _socket_call(
+            sock,
+            lambda: sock.recv(remaining),
+            resolved_deadline,
+        )
         if not chunk:
             raise ProxyProtocolError("PROXY_CHANNEL_CLOSED")
         chunks.append(chunk)
@@ -600,7 +1087,12 @@ def _receive_exact(sock: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def send_frame(sock: socket.socket, frame: Frame) -> None:
+def send_frame(
+    sock: socket.socket,
+    frame: Frame,
+    *,
+    deadline: IODeadline | None = None,
+) -> None:
     header = _FRAME_HEADER.pack(
         _FRAME_MAGIC,
         PROXY_PROTOCOL_VERSION,
@@ -608,11 +1100,16 @@ def send_frame(sock: socket.socket, frame: Frame) -> None:
         frame.stream_id,
         len(frame.payload),
     )
-    _send_all(sock, header + frame.payload)
+    _send_all(sock, header + frame.payload, deadline=deadline)
 
 
-def receive_frame(sock: socket.socket) -> Frame:
-    encoded = _receive_exact(sock, _FRAME_HEADER.size)
+def receive_frame(
+    sock: socket.socket,
+    *,
+    deadline: IODeadline | None = None,
+) -> Frame:
+    resolved_deadline = deadline or _default_io_deadline()
+    encoded = _receive_exact(sock, _FRAME_HEADER.size, deadline=resolved_deadline)
     magic, version, raw_kind, stream_id, payload_size = _FRAME_HEADER.unpack(encoded)
     if magic != _FRAME_MAGIC or version != PROXY_PROTOCOL_VERSION:
         raise ProxyProtocolError("PROXY_FRAME_VERSION_INVALID")
@@ -622,19 +1119,15 @@ def receive_frame(sock: socket.socket) -> Frame:
         kind = FrameKind(raw_kind)
     except ValueError as exc:
         raise ProxyProtocolError("PROXY_FRAME_KIND_INVALID") from exc
-    return Frame(kind, stream_id, _receive_exact(sock, payload_size))
+    return Frame(
+        kind,
+        stream_id,
+        _receive_exact(sock, payload_size, deadline=resolved_deadline),
+    )
 
 
-def channel_hello(contract: AttemptProxyContract) -> bytes:
-    return canonical_json(
-        {
-            "attempt_id": contract.attempt_id,
-            "contract_sha256": contract.contract_sha256,
-            "endpoint_sha256": sha256_text(contract.endpoint_id),
-            "policy_sha256": contract.policy_sha256,
-            "protocol_version": PROXY_PROTOCOL_VERSION,
-        }
-    ).encode("ascii")
+def channel_hello(binding: RelayBinding) -> bytes:
+    return canonical_json(binding.as_payload()).encode("ascii")
 
 
 class AttemptProxyLedger:
@@ -677,6 +1170,7 @@ class AttemptProxyLedger:
                 endpoint_sha256 TEXT NOT NULL,
                 model_sha256 TEXT NOT NULL,
                 credential_ref_sha256 TEXT NOT NULL,
+                process_identity_sha256 TEXT,
                 state TEXT NOT NULL CHECK (state IN ('READY','RUNNING','COMPLETE','HOLD')),
                 max_requests INTEGER NOT NULL CHECK (max_requests > 0),
                 request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0),
@@ -706,6 +1200,10 @@ class AttemptProxyLedger:
                 input_tokens INTEGER,
                 output_tokens INTEGER,
                 response_id_sha256 TEXT,
+                upstream_bytes_sent INTEGER CHECK (upstream_bytes_sent >= 0),
+                send_evidence_sha256 TEXT,
+                completion_prepared INTEGER NOT NULL DEFAULT 0
+                    CHECK (completion_prepared IN (0, 1)),
                 error_code TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -746,6 +1244,9 @@ class AttemptProxyLedger:
             "input_tokens",
             "output_tokens",
             "response_id_sha256",
+            "upstream_bytes_sent",
+            "send_evidence_sha256",
+            "completion_prepared",
             "error_code",
             "created_at",
             "updated_at",
@@ -760,6 +1261,7 @@ class AttemptProxyLedger:
                 "endpoint_sha256",
                 "model_sha256",
                 "credential_ref_sha256",
+                "process_identity_sha256",
                 "state",
                 "max_requests",
                 "request_count",
@@ -857,6 +1359,46 @@ class AttemptProxyLedger:
                 ).rowcount
                 if updated != 1:
                     raise ProxyError("BROKER_PROXY_ACTIVATION_CONFLICT")
+                self._commit()
+            except Exception:
+                self._rollback()
+                raise
+
+    def bind_process_identity(
+        self,
+        attempt_id: str,
+        *,
+        permit_binding_sha256: str,
+        process_identity_sha256: str,
+        now: str | None = None,
+    ) -> None:
+        """Bind the supervisor's immutable process identity before execution."""
+
+        if (
+            SHA256.fullmatch(permit_binding_sha256) is None
+            or SHA256.fullmatch(process_identity_sha256) is None
+        ):
+            raise ProxyError("BROKER_PROXY_PROCESS_BINDING_INVALID")
+        timestamp = now or utc_now()
+        with self._lock:
+            self._begin()
+            try:
+                updated = self.connection.execute(
+                    """
+                    UPDATE executor_attempt_response_proxies
+                    SET process_identity_sha256=?, version=version+1, updated_at=?
+                    WHERE attempt_id=? AND binding_sha256=? AND state='RUNNING'
+                      AND process_identity_sha256 IS NULL
+                    """,
+                    (
+                        process_identity_sha256,
+                        timestamp,
+                        attempt_id,
+                        permit_binding_sha256,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise ProxyError("BROKER_PROXY_PROCESS_BINDING_CONFLICT")
                 self._commit()
             except Exception:
                 self._rollback()
@@ -1034,6 +1576,74 @@ class AttemptProxyLedger:
             ),
         )
 
+    @staticmethod
+    def _assert_transition(old_state: str, new_state: str) -> None:
+        if (
+            old_state not in LEGAL_REQUEST_TRANSITIONS
+            or new_state not in LEGAL_REQUEST_TRANSITIONS[old_state]
+        ):
+            raise ProxyError("BROKER_PROXY_REQUEST_TRANSITION_INVALID")
+
+    def record_send_evidence(
+        self,
+        attempt_id: str,
+        sequence: int,
+        evidence: UpstreamSendEvidence,
+        *,
+        expected_request_sha256: str,
+        expected_operation_id: str,
+        now: str | None = None,
+    ) -> None:
+        """Persist exact transport evidence before interpreting the open result."""
+
+        if (
+            evidence.attempt_id != attempt_id
+            or evidence.request_sha256 != expected_request_sha256
+            or evidence.operation_id != expected_operation_id
+        ):
+            raise ProxyError("BROKER_PROXY_SEND_EVIDENCE_BINDING_INVALID")
+        timestamp = now or utc_now()
+        with self._lock:
+            self._begin()
+            try:
+                row = self.connection.execute(
+                    """
+                    SELECT r.state, r.send_evidence_sha256, r.request_sha256,
+                           p.binding_sha256
+                    FROM executor_attempt_response_requests AS r
+                    JOIN executor_attempt_response_proxies AS p
+                      ON p.attempt_id=r.attempt_id
+                    WHERE r.attempt_id=? AND r.sequence=?
+                    """,
+                    (attempt_id, sequence),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "UPSTREAM_STARTED"
+                    or row["send_evidence_sha256"] is not None
+                    or row["binding_sha256"] != evidence.permit_binding_sha256
+                ):
+                    raise ProxyError("BROKER_PROXY_SEND_EVIDENCE_BINDING_INVALID")
+                self.connection.execute(
+                    """
+                    UPDATE executor_attempt_response_requests
+                    SET upstream_bytes_sent=?, send_evidence_sha256=?, updated_at=?
+                    WHERE attempt_id=? AND sequence=? AND state='UPSTREAM_STARTED'
+                      AND send_evidence_sha256 IS NULL
+                    """,
+                    (
+                        evidence.bytes_sent,
+                        evidence.digest,
+                        timestamp,
+                        attempt_id,
+                        sequence,
+                    ),
+                )
+                self._commit()
+            except Exception:
+                self._rollback()
+                raise
+
     def transition_request(
         self,
         attempt_id: str,
@@ -1047,7 +1657,12 @@ class AttemptProxyLedger:
         output_tokens: int | None = None,
         now: str | None = None,
     ) -> None:
-        if new_state not in REQUEST_STATES or not expected_states <= REQUEST_STATES:
+        if (
+            new_state not in REQUEST_STATES
+            or not expected_states <= REQUEST_STATES
+            or new_state == "COMPLETE"
+            or any(value is not None for value in (response_id, input_tokens, output_tokens))
+        ):
             raise ProxyError("BROKER_PROXY_REQUEST_TRANSITION_INVALID")
         timestamp = now or utc_now()
         with self._lock:
@@ -1055,7 +1670,7 @@ class AttemptProxyLedger:
             try:
                 row = self.connection.execute(
                     """
-                    SELECT state, estimated_input_tokens, reserved_output_tokens
+                    SELECT state, upstream_bytes_sent, send_evidence_sha256
                     FROM executor_attempt_response_requests
                     WHERE attempt_id=? AND sequence=?
                     """,
@@ -1063,83 +1678,34 @@ class AttemptProxyLedger:
                 ).fetchone()
                 if row is None or row["state"] not in expected_states:
                     raise ProxyError("BROKER_PROXY_REQUEST_STATE_CONFLICT")
-                response_digest = (
-                    sha256_text(response_id) if response_id is not None else None
-                )
+                self._assert_transition(row["state"], new_state)
+                if new_state == "SAFE_NOT_SENT" and (
+                    row["upstream_bytes_sent"] != 0
+                    or row["send_evidence_sha256"] is None
+                ):
+                    raise ProxyError("BROKER_PROXY_SAFE_NOT_SENT_UNPROVEN")
                 terminal_at = timestamp if new_state in TERMINAL_REQUEST_STATES else None
-                if new_state == "COMPLETE":
-                    if (
-                        response_id is None
-                        or RESPONSE_ID.fullmatch(response_id) is None
-                        or type(input_tokens) is not int
-                        or type(output_tokens) is not int
-                        or input_tokens < 0
-                        or output_tokens < 0
-                    ):
-                        raise ProxyError("BROKER_PROXY_COMPLETION_INVALID")
-                    proxy = self.connection.execute(
-                        """
-                        SELECT input_tokens, output_tokens, max_input_tokens,
-                               max_output_tokens, max_total_tokens
-                        FROM executor_attempt_response_proxies
-                        WHERE attempt_id=? AND state='RUNNING'
-                        """,
-                        (attempt_id,),
-                    ).fetchone()
-                    if proxy is None:
-                        raise ProxyError("BROKER_PROXY_NOT_RUNNING")
-                    next_input = proxy["input_tokens"] + input_tokens
-                    next_output = proxy["output_tokens"] + output_tokens
-                    if (
-                        input_tokens > row["estimated_input_tokens"]
-                        or output_tokens > row["reserved_output_tokens"]
-                        or next_input > proxy["max_input_tokens"]
-                        or next_output > proxy["max_output_tokens"]
-                        or next_input + next_output > proxy["max_total_tokens"]
-                    ):
-                        raise ProxyHold(HOLD_PROXY_BUDGET_OVERRUN)
-                    self.connection.execute(
-                        """
-                        UPDATE executor_attempt_response_proxies
-                        SET input_tokens=?, output_tokens=?, version=version+1,
-                            updated_at=?
-                        WHERE attempt_id=?
-                        """,
-                        (next_input, next_output, timestamp, attempt_id),
-                    )
                 self.connection.execute(
                     """
                     UPDATE executor_attempt_response_requests
-                    SET state=?, error_code=?, response_id_sha256=?,
-                        input_tokens=?, output_tokens=?, updated_at=?, terminal_at=?
+                    SET state=?, error_code=?, updated_at=?, terminal_at=?
                     WHERE attempt_id=? AND sequence=?
                     """,
                     (
                         new_state,
                         error_code,
-                        response_digest,
-                        input_tokens,
-                        output_tokens,
                         timestamp,
                         terminal_at,
                         attempt_id,
                         sequence,
                     ),
                 )
-                metadata = canonical_json(
-                    {
-                        "error_code": error_code,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "response_id_sha256": response_digest,
-                    }
-                )
                 self._append_event(
                     attempt_id,
                     sequence,
                     row["state"],
                     new_state,
-                    metadata,
+                    canonical_json({"error_code": error_code}),
                     timestamp,
                 )
                 if new_state == "AMBIGUOUS":
@@ -1150,13 +1716,156 @@ class AttemptProxyLedger:
                             updated_at=?, terminal_at=?
                         WHERE attempt_id=? AND state='RUNNING'
                         """,
-                        (
-                            HOLD_UPSTREAM_AMBIGUOUS,
-                            timestamp,
-                            timestamp,
-                            attempt_id,
-                        ),
+                        (HOLD_UPSTREAM_AMBIGUOUS, timestamp, timestamp, attempt_id),
                     )
+                self._commit()
+            except Exception:
+                self._rollback()
+                raise
+
+    def prepare_completion(
+        self,
+        attempt_id: str,
+        sequence: int,
+        *,
+        response_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        now: str | None = None,
+    ) -> None:
+        """Validate and debit usage before the terminal SSE event is emitted."""
+
+        if (
+            RESPONSE_ID.fullmatch(response_id) is None
+            or type(input_tokens) is not int
+            or type(output_tokens) is not int
+            or input_tokens < 0
+            or output_tokens < 0
+        ):
+            raise ProxyError("BROKER_PROXY_COMPLETION_INVALID")
+        timestamp = now or utc_now()
+        response_digest = sha256_text(response_id)
+        with self._lock:
+            self._begin()
+            try:
+                row = self.connection.execute(
+                    """
+                    SELECT state, estimated_input_tokens, reserved_output_tokens,
+                           completion_prepared
+                    FROM executor_attempt_response_requests
+                    WHERE attempt_id=? AND sequence=?
+                    """,
+                    (attempt_id, sequence),
+                ).fetchone()
+                proxy = self.connection.execute(
+                    """
+                    SELECT input_tokens, output_tokens, max_input_tokens,
+                           max_output_tokens, max_total_tokens
+                    FROM executor_attempt_response_proxies
+                    WHERE attempt_id=? AND state='RUNNING'
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or proxy is None
+                    or row["state"] != "STREAMING"
+                    or row["completion_prepared"] != 0
+                ):
+                    raise ProxyError("BROKER_PROXY_REQUEST_STATE_CONFLICT")
+                next_input = proxy["input_tokens"] + input_tokens
+                next_output = proxy["output_tokens"] + output_tokens
+                if (
+                    input_tokens > row["estimated_input_tokens"]
+                    or output_tokens > row["reserved_output_tokens"]
+                    or next_input > proxy["max_input_tokens"]
+                    or next_output > proxy["max_output_tokens"]
+                    or next_input + next_output > proxy["max_total_tokens"]
+                ):
+                    raise ProxyHold(HOLD_PROXY_BUDGET_OVERRUN)
+                self.connection.execute(
+                    """
+                    UPDATE executor_attempt_response_requests
+                    SET input_tokens=?, output_tokens=?, response_id_sha256=?,
+                        completion_prepared=1, updated_at=?
+                    WHERE attempt_id=? AND sequence=? AND state='STREAMING'
+                      AND completion_prepared=0
+                    """,
+                    (
+                        input_tokens,
+                        output_tokens,
+                        response_digest,
+                        timestamp,
+                        attempt_id,
+                        sequence,
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE executor_attempt_response_proxies
+                    SET input_tokens=?, output_tokens=?, version=version+1,
+                        updated_at=?
+                    WHERE attempt_id=? AND state='RUNNING'
+                    """,
+                    (next_input, next_output, timestamp, attempt_id),
+                )
+                self._commit()
+            except Exception:
+                self._rollback()
+                raise
+
+    def finalize_prepared_completion(
+        self,
+        attempt_id: str,
+        sequence: int,
+        *,
+        now: str | None = None,
+    ) -> None:
+        """Record COMPLETE only after the already-validated terminal bytes emit."""
+
+        timestamp = now or utc_now()
+        with self._lock:
+            self._begin()
+            try:
+                row = self.connection.execute(
+                    """
+                    SELECT state, completion_prepared, response_id_sha256,
+                           input_tokens, output_tokens
+                    FROM executor_attempt_response_requests
+                    WHERE attempt_id=? AND sequence=?
+                    """,
+                    (attempt_id, sequence),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "STREAMING"
+                    or row["completion_prepared"] != 1
+                ):
+                    raise ProxyError("BROKER_PROXY_REQUEST_STATE_CONFLICT")
+                self._assert_transition("STREAMING", "COMPLETE")
+                self.connection.execute(
+                    """
+                    UPDATE executor_attempt_response_requests
+                    SET state='COMPLETE', updated_at=?, terminal_at=?
+                    WHERE attempt_id=? AND sequence=? AND state='STREAMING'
+                      AND completion_prepared=1
+                    """,
+                    (timestamp, timestamp, attempt_id, sequence),
+                )
+                self._append_event(
+                    attempt_id,
+                    sequence,
+                    "STREAMING",
+                    "COMPLETE",
+                    canonical_json(
+                        {
+                            "input_tokens": row["input_tokens"],
+                            "output_tokens": row["output_tokens"],
+                            "response_id_sha256": row["response_id_sha256"],
+                        }
+                    ),
+                    timestamp,
+                )
                 self._commit()
             except Exception:
                 self._rollback()
@@ -1224,20 +1933,21 @@ class AttemptProxyLedger:
         self,
         attempt_id: str,
         *,
-        process_evidence_sha256: str,
+        receipt: ProxyProcessTerminalReceipt,
         now: str | None = None,
     ) -> dict[str, Any]:
         """Terminally hold a dead proxy; never infer death or replay a request."""
 
-        if SHA256.fullmatch(process_evidence_sha256) is None:
-            raise ProxyError("BROKER_PROXY_RECOVERY_EVIDENCE_INVALID")
+        if receipt.attempt_id != attempt_id:
+            raise ProxyError("BROKER_PROXY_RECOVERY_RECEIPT_BINDING_INVALID")
         timestamp = now or utc_now()
         with self._lock:
             self._begin()
             try:
                 proxy = self.connection.execute(
                     """
-                    SELECT state, hold_code
+                    SELECT state, hold_code, binding_sha256,
+                           process_identity_sha256, terminal_evidence_sha256
                     FROM executor_attempt_response_proxies
                     WHERE attempt_id=?
                     """,
@@ -1245,7 +1955,32 @@ class AttemptProxyLedger:
                 ).fetchone()
                 if proxy is None:
                     raise ProxyError("BROKER_PROXY_NOT_FOUND")
+                if (
+                    proxy["binding_sha256"] != receipt.permit_binding_sha256
+                    or proxy["process_identity_sha256"]
+                    != receipt.process_identity_sha256
+                ):
+                    raise ProxyError("BROKER_PROXY_RECOVERY_RECEIPT_BINDING_INVALID")
                 if proxy["state"] in {"COMPLETE", "HOLD"}:
+                    if (
+                        proxy["state"] == "HOLD"
+                        and proxy["terminal_evidence_sha256"] is None
+                    ):
+                        self.connection.execute(
+                            """
+                            UPDATE executor_attempt_response_proxies
+                            SET terminal_evidence_sha256=?, version=version+1,
+                                updated_at=?
+                            WHERE attempt_id=? AND state='HOLD'
+                              AND terminal_evidence_sha256 IS NULL
+                            """,
+                            (receipt.digest, timestamp, attempt_id),
+                        )
+                    elif (
+                        proxy["state"] == "HOLD"
+                        and proxy["terminal_evidence_sha256"] != receipt.digest
+                    ):
+                        raise ProxyError("BROKER_PROXY_RECOVERY_RECEIPT_CONFLICT")
                     self._commit()
                     return {
                         "attempt_id": attempt_id,
@@ -1256,7 +1991,7 @@ class AttemptProxyLedger:
                 active = list(
                     self.connection.execute(
                         """
-                        SELECT sequence, state
+                        SELECT sequence, state, request_sha256
                         FROM executor_attempt_response_requests
                         WHERE attempt_id=?
                           AND state IN ('CREATED','UPSTREAM_STARTED','STREAMING')
@@ -1272,21 +2007,41 @@ class AttemptProxyLedger:
                     new_state = (
                         "SAFE_NOT_SENT" if old_state == "CREATED" else "AMBIGUOUS"
                     )
+                    self._assert_transition(old_state, new_state)
                     error_code = (
                         "BROKER_PROXY_PROCESS_LOST_BEFORE_FORWARD"
                         if new_state == "SAFE_NOT_SENT"
                         else "BROKER_PROXY_PROCESS_LOST_AFTER_FORWARD"
                     )
                     ambiguous = ambiguous or new_state == "AMBIGUOUS"
+                    zero_send_evidence_sha256 = None
+                    if new_state == "SAFE_NOT_SENT":
+                        zero_send_evidence_sha256 = sha256_text(
+                            canonical_json(
+                                {
+                                    "attempt_id": attempt_id,
+                                    "bytes_sent": 0,
+                                    "permit_binding_sha256": receipt.permit_binding_sha256,
+                                    "process_terminal_receipt_sha256": receipt.digest,
+                                    "request_sha256": request["request_sha256"],
+                                    "sequence": request["sequence"],
+                                }
+                            )
+                        )
                     self.connection.execute(
                         """
                         UPDATE executor_attempt_response_requests
-                        SET state=?, error_code=?, updated_at=?, terminal_at=?
+                        SET state=?, error_code=?,
+                            upstream_bytes_sent=COALESCE(upstream_bytes_sent, ?),
+                            send_evidence_sha256=COALESCE(send_evidence_sha256, ?),
+                            updated_at=?, terminal_at=?
                         WHERE attempt_id=? AND sequence=? AND state=?
                         """,
                         (
                             new_state,
                             error_code,
+                            0 if new_state == "SAFE_NOT_SENT" else None,
+                            zero_send_evidence_sha256,
                             timestamp,
                             timestamp,
                             attempt_id,
@@ -1302,7 +2057,8 @@ class AttemptProxyLedger:
                         canonical_json(
                             {
                                 "error_code": error_code,
-                                "process_evidence_sha256": process_evidence_sha256,
+                                "process_terminal_receipt_sha256": receipt.digest,
+                                "send_evidence_sha256": zero_send_evidence_sha256,
                             }
                         ),
                         timestamp,
@@ -1327,7 +2083,7 @@ class AttemptProxyLedger:
                     """,
                     (
                         hold_code,
-                        process_evidence_sha256,
+                        receipt.digest,
                         timestamp,
                         timestamp,
                         attempt_id,
@@ -1437,8 +2193,11 @@ def parse_http_request(
         raise ProxyPolicyError("BROKER_PROXY_CHILD_AUTH_HEADER_REJECTED", 403)
     if "transfer-encoding" in headers or "content-length" not in headers:
         raise ProxyPolicyError("BROKER_PROXY_HTTP_LENGTH_INVALID")
+    encoded_content_length = headers["content-length"]
+    if not encoded_content_length or not encoded_content_length.isdigit():
+        raise ProxyPolicyError("BROKER_PROXY_HTTP_LENGTH_INVALID")
     try:
-        content_length = int(headers["content-length"])
+        content_length = int(encoded_content_length)
     except ValueError as exc:
         raise ProxyPolicyError("BROKER_PROXY_HTTP_LENGTH_INVALID") from exc
     if content_length < 0 or content_length != len(body) or len(body) > max_body_bytes:
@@ -1453,6 +2212,123 @@ def parse_http_request(
     return ParsedRequest(method, path, headers, body)
 
 
+def _request_field_is_routing(field: str) -> bool:
+    folded = field.casefold()
+    return folded in CHILD_CONTROLLED_ROUTING_FIELDS or any(
+        fragment in folded
+        for fragment in (
+            "conversation",
+            "lineage",
+            "metadata",
+            "organization",
+            "project",
+            "prompt",
+        )
+    )
+
+
+def _strict_json_loads(value: bytes) -> Any:
+    """Decode standards JSON and reject duplicate keys at every object depth."""
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    return json.loads(
+        value.decode("utf-8"),
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+
+
+def _load_closed_request_json(body: bytes) -> dict[str, Any]:
+    """Decode one closed Responses request object."""
+
+    try:
+        payload = _strict_json_loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise ProxyPolicyError("BROKER_PROXY_JSON_INVALID") from exc
+    if type(payload) is not dict:
+        raise ProxyPolicyError("BROKER_PROXY_JSON_INVALID")
+    return payload
+
+
+def _input_contains_routing_field(value: Any) -> bool:
+    """Inspect all child-authored input objects without recursive call depth."""
+
+    pending = [value]
+    while pending:
+        candidate = pending.pop()
+        if type(candidate) is dict:
+            if any(_request_field_is_routing(key) for key in candidate):
+                return True
+            pending.extend(candidate.values())
+        elif type(candidate) is list:
+            pending.extend(candidate)
+    return False
+
+
+def _validate_input_content(content: Any) -> None:
+    if type(content) is str:
+        return
+    if type(content) is not list or not content:
+        raise ProxyPolicyError("BROKER_PROXY_INPUT_SCHEMA_REJECTED", 403)
+    for part in content:
+        if (
+            type(part) is not dict
+            or set(part) != {"text", "type"}
+            or part.get("type") != "input_text"
+            or type(part.get("text")) is not str
+        ):
+            raise ProxyPolicyError("BROKER_PROXY_INPUT_SCHEMA_REJECTED", 403)
+
+
+def _validate_request_input(
+    request_input: Any,
+    *,
+    has_host_lineage: bool,
+) -> None:
+    """Allow only text messages and same-lineage function-call results."""
+
+    if type(request_input) is str:
+        return
+    if type(request_input) is not list or not request_input:
+        raise ProxyPolicyError("BROKER_PROXY_INPUT_SCHEMA_REJECTED", 403)
+    if _input_contains_routing_field(request_input):
+        raise ProxyPolicyError("BROKER_PROXY_CHILD_ROUTING_REJECTED", 403)
+    for item in request_input:
+        if type(item) is not dict:
+            raise ProxyPolicyError("BROKER_PROXY_INPUT_SCHEMA_REJECTED", 403)
+        item_type = item.get("type")
+        if item_type in {None, "message"}:
+            allowed = {"content", "role"} | ({"type"} if item_type is not None else set())
+            if (
+                set(item) != allowed
+                or item.get("role") not in {"developer", "system", "user"}
+            ):
+                raise ProxyPolicyError("BROKER_PROXY_INPUT_SCHEMA_REJECTED", 403)
+            _validate_input_content(item.get("content"))
+            continue
+        if item_type == "function_call_output":
+            if (
+                not has_host_lineage
+                or set(item) != {"call_id", "output", "type"}
+                or type(item.get("call_id")) is not str
+                or SAFE_IDENTIFIER.fullmatch(item["call_id"]) is None
+                or type(item.get("output")) is not str
+            ):
+                raise ProxyPolicyError("BROKER_PROXY_INPUT_SCHEMA_REJECTED", 403)
+            continue
+        raise ProxyPolicyError("BROKER_PROXY_INPUT_SCHEMA_REJECTED", 403)
+
+
 def _prepare_upstream_request(
     parsed: ParsedRequest,
     *,
@@ -1460,13 +2336,10 @@ def _prepare_upstream_request(
     ledger: AttemptProxyLedger,
     sequence: int,
     remaining_wall_seconds: float,
+    host_previous_response_id: str | None,
+    permit_binding_sha256: str,
 ) -> PreparedRequest:
-    try:
-        payload = json.loads(parsed.body)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProxyPolicyError("BROKER_PROXY_JSON_INVALID") from exc
-    if type(payload) is not dict:
-        raise ProxyPolicyError("BROKER_PROXY_JSON_INVALID")
+    payload = _load_closed_request_json(parsed.body)
     if payload.get("model") != contract.model:
         raise ProxyPolicyError("BROKER_PROXY_MODEL_MISMATCH", 403)
     if payload.get("stream") is not True:
@@ -1477,15 +2350,21 @@ def _prepare_upstream_request(
         raise ProxyPolicyError("BROKER_PROXY_STORE_REJECTED", 403)
     if "include" in payload:
         raise ProxyPolicyError("BROKER_PROXY_INCLUDE_REJECTED", 403)
-
-    previous_response_id = payload.get("previous_response_id")
-    if previous_response_id is not None:
-        if (
-            type(previous_response_id) is not str
-            or RESPONSE_ID.fullmatch(previous_response_id) is None
-            or not ledger.owns_response_id(contract.attempt_id, previous_response_id)
-        ):
-            raise ProxyPolicyError("BROKER_PROXY_RESPONSE_LINEAGE_REJECTED", 403)
+    routing_fields = {key for key in payload if _request_field_is_routing(key)}
+    if routing_fields:
+        raise ProxyPolicyError("BROKER_PROXY_CHILD_ROUTING_REJECTED", 403)
+    if not set(payload) <= ALLOWED_REQUEST_FIELDS or "input" not in payload:
+        raise ProxyPolicyError("BROKER_PROXY_REQUEST_SCHEMA_REJECTED", 403)
+    if "instructions" in payload and type(payload["instructions"]) is not str:
+        raise ProxyPolicyError("BROKER_PROXY_REQUEST_SCHEMA_REJECTED", 403)
+    _validate_request_input(
+        payload["input"],
+        has_host_lineage=host_previous_response_id is not None,
+    )
+    if host_previous_response_id is not None:
+        if RESPONSE_ID.fullmatch(host_previous_response_id) is None:
+            raise ProxyError("BROKER_PROXY_HOST_LINEAGE_INVALID")
+        payload["previous_response_id"] = host_previous_response_id
 
     tools = payload.get("tools", [])
     if type(tools) is not list:
@@ -1535,7 +2414,19 @@ def _prepare_upstream_request(
             }
         ).encode("ascii")
     )
+    operation_id = sha256_text(
+        canonical_json(
+            {
+                "attempt_id": contract.attempt_id,
+                "permit_policy_sha256": contract.policy_sha256,
+                "request_sha256": digest,
+                "sequence": sequence,
+            }
+        )
+    )
     upstream = UpstreamRequest(
+        attempt_id=contract.attempt_id,
+        permit_binding_sha256=permit_binding_sha256,
         method="POST",
         path=RESPONSES_PATH,
         headers=(
@@ -1544,13 +2435,14 @@ def _prepare_upstream_request(
         ),
         body=sanitized_body,
         request_sha256=digest,
+        operation_id=operation_id,
         deadline_seconds=remaining_wall_seconds,
     )
     return PreparedRequest(upstream, estimated_input_tokens, requested_output)
 
 
 class SSECompletionTracker:
-    """Incrementally extract one terminal response ID and usage from SSE."""
+    """Validate ordered SSE while withholding semantic completion bytes."""
 
     def __init__(self, max_event_bytes: int) -> None:
         self.max_event_bytes = max_event_bytes
@@ -1558,34 +2450,45 @@ class SSECompletionTracker:
         self.response_id: str | None = None
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.created = False
         self.completed = False
         self.done = False
+        self.terminal = bytearray()
 
     @staticmethod
     def _response_from_event(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
         response = event.get("response")
         return response if isinstance(response, dict) else None
 
-    def _consume_event(self, encoded_event: bytes) -> None:
+    def _consume_event(self, encoded_event: bytes, wire_event: bytes) -> bool:
+        """Return true only when this nonterminal event may be forwarded."""
+
         data_lines: list[bytes] = []
         for raw_line in encoded_event.replace(b"\r\n", b"\n").split(b"\n"):
-            if raw_line.startswith(b"data:"):
-                data_lines.append(raw_line[5:].lstrip(b" "))
-        if not data_lines:
-            return
+            if not raw_line.startswith(b"data:"):
+                raise UpstreamAmbiguous("BROKER_PROXY_SSE_NON_DATA_EVENT")
+            data_lines.append(raw_line[5:].lstrip(b" "))
         encoded_data = b"\n".join(data_lines)
         if encoded_data == b"[DONE]":
-            if not self.completed:
+            if not self.completed or self.done:
                 raise UpstreamAmbiguous("BROKER_PROXY_SSE_DONE_BEFORE_COMPLETE")
             self.done = True
-            return
+            self.terminal.extend(wire_event)
+            return False
         try:
-            event = json.loads(encoded_data)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            event = _strict_json_loads(encoded_data)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ) as exc:
             raise UpstreamAmbiguous("BROKER_PROXY_SSE_JSON_INVALID") from exc
         if not isinstance(event, dict) or type(event.get("type")) is not str:
             raise UpstreamAmbiguous("BROKER_PROXY_SSE_EVENT_INVALID")
         event_type = event["type"]
+        if self.completed:
+            raise UpstreamAmbiguous("BROKER_PROXY_SSE_EVENT_AFTER_COMPLETE")
         response = self._response_from_event(event)
         if response is not None and response.get("id") is not None:
             response_id = response.get("id")
@@ -1596,6 +2499,13 @@ class SSECompletionTracker:
             ):
                 raise UpstreamAmbiguous("BROKER_PROXY_RESPONSE_ID_INVALID")
             self.response_id = response_id
+        if event_type == "response.created":
+            if self.created or response is None or self.response_id is None:
+                raise UpstreamAmbiguous("BROKER_PROXY_SSE_CREATED_INVALID")
+            self.created = True
+            return True
+        if not self.created:
+            raise UpstreamAmbiguous("BROKER_PROXY_SSE_EVENT_BEFORE_CREATED")
         if event_type in {"response.failed", "response.incomplete"}:
             raise UpstreamTerminalFailure("BROKER_PROXY_UPSTREAM_TERMINAL_FAILURE")
         if event_type == "response.completed":
@@ -1616,13 +2526,17 @@ class SSECompletionTracker:
             self.input_tokens = input_tokens
             self.output_tokens = output_tokens
             self.completed = True
+            self.terminal.extend(wire_event)
+            return False
+        return True
 
-    def feed(self, chunk: bytes) -> None:
+    def feed(self, chunk: bytes) -> list[bytes]:
         if not chunk:
-            return
+            return []
         self.buffer.extend(chunk)
         if len(self.buffer) > self.max_event_bytes and b"\n\n" not in self.buffer:
             raise UpstreamAmbiguous("BROKER_PROXY_SSE_EVENT_TOO_LARGE")
+        forward: list[bytes] = []
         while True:
             lf_boundary = self.buffer.find(b"\n\n")
             crlf_boundary = self.buffer.find(b"\r\n\r\n")
@@ -1632,22 +2546,31 @@ class SSECompletionTracker:
             boundary = min(candidates)
             delimiter_size = 4 if self.buffer[boundary : boundary + 4] == b"\r\n\r\n" else 2
             event = bytes(self.buffer[:boundary])
+            wire_event = bytes(self.buffer[: boundary + delimiter_size])
             del self.buffer[: boundary + delimiter_size]
             if len(event) > self.max_event_bytes:
                 raise UpstreamAmbiguous("BROKER_PROXY_SSE_EVENT_TOO_LARGE")
-            self._consume_event(event)
+            if self._consume_event(event, wire_event):
+                forward.append(wire_event)
+        return forward
 
-    def finish(self) -> tuple[str, int, int]:
+    def finish(self) -> tuple[str, int, int, bytes]:
         if self.buffer.strip():
             raise UpstreamAmbiguous("BROKER_PROXY_SSE_TRUNCATED")
         if (
-            not self.completed
+            not self.created
+            or not self.completed
             or self.response_id is None
             or self.input_tokens is None
             or self.output_tokens is None
         ):
             raise UpstreamAmbiguous("BROKER_PROXY_SSE_COMPLETION_MISSING")
-        return self.response_id, self.input_tokens, self.output_tokens
+        return (
+            self.response_id,
+            self.input_tokens,
+            self.output_tokens,
+            bytes(self.terminal),
+        )
 
 
 def _http_response_head(status: int, content_type: str, body_length: int | None) -> bytes:
@@ -1693,20 +2616,41 @@ class AttemptBoundResponsesProxy:
         upstream: UpstreamTransport,
         *,
         monotonic: Callable[[], float] = time.monotonic,
+        io_monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.permit = permit
         self.contract = permit.contract
         self.ledger = ledger
         self.upstream = upstream
         self.monotonic = monotonic
+        self.io_monotonic = io_monotonic
         self.started_monotonic: float | None = None
+        self.started_io_monotonic: float | None = None
+        self._host_previous_response_id: str | None = None
 
-    def start(self, *, now: str | None = None) -> None:
+    @property
+    def relay_binding(self) -> RelayBinding:
+        return RelayBinding.from_permit(self.permit)
+
+    def start(
+        self,
+        *,
+        process_identity_sha256: str | None = None,
+        now: str | None = None,
+    ) -> None:
         """Register and activate only after the external attempt reservation."""
 
         self.ledger.register(self.permit, now=now)
         self.ledger.activate(self.contract.attempt_id, now=now)
+        if process_identity_sha256 is not None:
+            self.ledger.bind_process_identity(
+                self.contract.attempt_id,
+                permit_binding_sha256=self.permit.binding_sha256,
+                process_identity_sha256=process_identity_sha256,
+                now=now,
+            )
         self.started_monotonic = self.monotonic()
+        self.started_io_monotonic = self.io_monotonic()
 
     def complete(self, *, now: str | None = None) -> None:
         self.ledger.complete_proxy(self.contract.attempt_id, now=now)
@@ -1720,6 +2664,34 @@ class AttemptBoundResponsesProxy:
         if remaining <= 0:
             raise ProxyPolicyError("BROKER_PROXY_WALL_TIMEOUT", 504)
         return remaining
+
+    def _io_deadline(self, *, limit: float | None = None) -> IODeadline:
+        if self.started_io_monotonic is None:
+            raise ProxyHold("BROKER_PROXY_NOT_STARTED")
+        now = self.io_monotonic()
+        attempt_expiry = self.started_io_monotonic + self.contract.max_wall_seconds
+        operation_expiry = now + min(
+            self.contract.io_timeout_seconds,
+            limit if limit is not None else self.contract.io_timeout_seconds,
+        )
+        expires_at = min(attempt_expiry, operation_expiry)
+        deadline = IODeadline(expires_at, monotonic=self.io_monotonic)
+        deadline.remaining()
+        return deadline
+
+    def _emit_bounded(self, emit: Callable[[bytes], None], value: bytes) -> None:
+        _bounded_io_call(
+            lambda: emit(value),
+            self._io_deadline(),
+            timeout_code="BROKER_PROXY_CHILD_WRITE_TIMEOUT",
+        )
+
+    @staticmethod
+    def _close_stream(stream: UpstreamStream) -> None:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     def _transition_failure(
         self,
@@ -1742,7 +2714,7 @@ class AttemptBoundResponsesProxy:
         raw_request: bytes,
         emit: Callable[[bytes], None],
     ) -> ProxyResult:
-        """Validate, forward once, and stream a sanitized response to ``emit``."""
+        """Validate, forward once, and stream bounded, ordered SSE to ``emit``."""
 
         raw_limit = self.contract.max_header_bytes + self.contract.max_body_bytes + 4
         bounded_raw = raw_request[: raw_limit + 1]
@@ -1751,14 +2723,14 @@ class AttemptBoundResponsesProxy:
                 self.contract.attempt_id, sha256_bytes(bounded_raw)
             )
         except ProxyPolicyError as exc:
-            emit(_local_error_bytes(exc.status, exc.code))
+            self._emit_bounded(emit, _local_error_bytes(exc.status, exc.code))
             return ProxyResult(exc.status, "FAILED", 0)
         except ProxyHold as exc:
-            emit(_local_error_bytes(409, exc.code))
+            self._emit_bounded(emit, _local_error_bytes(409, exc.code))
             return ProxyResult(409, "FAILED", 0)
+
         emitted_response = False
         upstream_stream: UpstreamStream | None = None
-        request_state = "CREATED"
         try:
             if len(raw_request) > raw_limit:
                 raise ProxyPolicyError("BROKER_PROXY_BODY_LIMIT", 413)
@@ -1773,42 +2745,76 @@ class AttemptBoundResponsesProxy:
                 ledger=self.ledger,
                 sequence=sequence,
                 remaining_wall_seconds=self._remaining_wall(),
+                host_previous_response_id=self._host_previous_response_id,
+                permit_binding_sha256=self.permit.binding_sha256,
             )
-            upstream_timeout = self._remaining_wall()
             self.ledger.transition_request(
                 self.contract.attempt_id,
                 sequence,
                 expected_states={"CREATED"},
                 new_state="UPSTREAM_STARTED",
             )
-            request_state = "UPSTREAM_STARTED"
+
+            def cancel_open() -> None:
+                cancel = getattr(self.upstream, "cancel_open", None)
+                if callable(cancel):
+                    cancel(prepared.upstream.operation_id)
+
             try:
-                upstream_stream = self.upstream.open(
-                    prepared.upstream,
-                    credential_reference=self.permit.credential_reference,
-                    timeout_seconds=upstream_timeout,
+                open_deadline = self._io_deadline()
+                open_result = _bounded_io_call(
+                    lambda: self.upstream.open(
+                        prepared.upstream,
+                        credential_reference=self.permit.credential_reference,
+                        timeout_seconds=open_deadline.remaining(),
+                    ),
+                    open_deadline,
+                    timeout_code="BROKER_PROXY_UPSTREAM_OPEN_TIMEOUT",
+                    on_timeout=cancel_open,
                 )
-            except UpstreamNotSent:
+            except Exception as exc:
+                raise UpstreamAmbiguous(
+                    "BROKER_PROXY_UPSTREAM_OPEN_AMBIGUOUS"
+                ) from exc
+            if not isinstance(open_result, UpstreamOpenResult):
+                raise UpstreamAmbiguous("BROKER_PROXY_SEND_EVIDENCE_MISSING")
+            evidence = open_result.send_evidence
+            if (
+                evidence.attempt_id != self.contract.attempt_id
+                or evidence.permit_binding_sha256 != self.permit.binding_sha256
+                or evidence.request_sha256 != prepared.upstream.request_sha256
+                or evidence.operation_id != prepared.upstream.operation_id
+            ):
+                raise UpstreamAmbiguous("BROKER_PROXY_SEND_EVIDENCE_BINDING_INVALID")
+            self.ledger.record_send_evidence(
+                self.contract.attempt_id,
+                sequence,
+                evidence,
+                expected_request_sha256=prepared.upstream.request_sha256,
+                expected_operation_id=prepared.upstream.operation_id,
+            )
+            if evidence.bytes_sent == 0:
+                if open_result.stream is not None:
+                    raise UpstreamAmbiguous("BROKER_PROXY_SEND_EVIDENCE_CONFLICT")
                 self._transition_failure(
                     sequence,
                     expected_states={"UPSTREAM_STARTED"},
                     state="SAFE_NOT_SENT",
-                    code="BROKER_PROXY_UPSTREAM_NOT_SENT",
+                    code=evidence.error_code or "BROKER_PROXY_UPSTREAM_NOT_SENT",
                 )
-                emit(_local_error_bytes(503, "BROKER_PROXY_UPSTREAM_NOT_SENT"))
+                self._emit_bounded(
+                    emit,
+                    _local_error_bytes(503, evidence.error_code or "BROKER_PROXY_UPSTREAM_NOT_SENT"),
+                )
                 return ProxyResult(503, "SAFE_NOT_SENT", sequence)
-            except Exception as exc:
-                self._transition_failure(
-                    sequence,
-                    expected_states={"UPSTREAM_STARTED"},
-                    state="AMBIGUOUS",
-                    code="BROKER_PROXY_UPSTREAM_OPEN_AMBIGUOUS",
-                )
-                raise UpstreamAmbiguous(
-                    "BROKER_PROXY_UPSTREAM_OPEN_AMBIGUOUS"
-                ) from exc
+            if open_result.stream is None:
+                raise UpstreamAmbiguous("BROKER_PROXY_SEND_EVIDENCE_CONFLICT")
+            upstream_stream = open_result.stream
 
-            if type(upstream_stream.status) is not int or not 100 <= upstream_stream.status <= 599:
+            if (
+                type(upstream_stream.status) is not int
+                or not 100 <= upstream_stream.status <= 599
+            ):
                 raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_STATUS_INVALID")
             if upstream_stream.status != 200:
                 raise UpstreamRejected(upstream_stream.status)
@@ -1819,23 +2825,29 @@ class AttemptBoundResponsesProxy:
             if content_type != "text/event-stream":
                 raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_CONTENT_TYPE_INVALID")
 
-            emit(_http_response_head(200, "text/event-stream", None))
+            self._emit_bounded(emit, _http_response_head(200, "text/event-stream", None))
             emitted_response = True
             tracker = SSECompletionTracker(self.contract.max_sse_event_bytes)
             streamed = False
+            total_response_bytes = 0
             while True:
-                if self.started_monotonic is None:
-                    raise UpstreamAmbiguous("BROKER_PROXY_NOT_STARTED")
-                remaining = self.contract.max_wall_seconds - (
-                    self.monotonic() - self.started_monotonic
+                try:
+                    remaining = self._remaining_wall()
+                except ProxyPolicyError as exc:
+                    raise UpstreamAmbiguous("BROKER_PROXY_WALL_TIMEOUT") from exc
+                read_deadline = self._io_deadline(
+                    limit=min(self.contract.sse_idle_seconds, remaining)
                 )
-                if remaining <= 0:
-                    raise UpstreamAmbiguous("BROKER_PROXY_WALL_TIMEOUT")
-                timeout = min(self.contract.sse_idle_seconds, remaining)
-                before = self.monotonic()
-                chunk = upstream_stream.receive(timeout)
-                elapsed = self.monotonic() - before
-                if elapsed > timeout:
+                contract_started = self.monotonic()
+                chunk = _bounded_io_call(
+                    lambda: upstream_stream.receive(read_deadline.remaining()),
+                    read_deadline,
+                    timeout_code="BROKER_PROXY_SSE_IDLE_TIMEOUT",
+                    on_timeout=lambda: self._close_stream(upstream_stream),
+                )
+                if self.monotonic() - contract_started > min(
+                    self.contract.sse_idle_seconds, remaining
+                ):
                     raise UpstreamAmbiguous("BROKER_PROXY_SSE_IDLE_TIMEOUT")
                 if chunk is None:
                     break
@@ -1843,6 +2855,11 @@ class AttemptBoundResponsesProxy:
                     raise UpstreamAmbiguous("BROKER_PROXY_SSE_CHUNK_INVALID")
                 if not chunk:
                     continue
+                if len(chunk) > self.contract.max_stream_chunk_bytes:
+                    raise UpstreamAmbiguous("BROKER_PROXY_SSE_CHUNK_LIMIT")
+                total_response_bytes += len(chunk)
+                if total_response_bytes > self.contract.max_response_bytes:
+                    raise UpstreamAmbiguous("BROKER_PROXY_RESPONSE_LIMIT")
                 if not streamed:
                     self.ledger.transition_request(
                         self.contract.attempt_id,
@@ -1850,17 +2867,15 @@ class AttemptBoundResponsesProxy:
                         expected_states={"UPSTREAM_STARTED"},
                         new_state="STREAMING",
                     )
-                    request_state = "STREAMING"
                     streamed = True
-                tracker.feed(chunk)
-                emit(chunk)
-            response_id, input_tokens, output_tokens = tracker.finish()
+                for forward_event in tracker.feed(chunk):
+                    self._emit_bounded(emit, forward_event)
+
+            response_id, input_tokens, output_tokens, terminal_bytes = tracker.finish()
             try:
-                self.ledger.transition_request(
+                self.ledger.prepare_completion(
                     self.contract.attempt_id,
                     sequence,
-                    expected_states={"STREAMING"},
-                    new_state="COMPLETE",
                     response_id=response_id,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -1874,6 +2889,16 @@ class AttemptBoundResponsesProxy:
                 )
                 self.ledger.hold_proxy(self.contract.attempt_id, exc.code)
                 return ProxyResult(200, "FAILED", sequence)
+
+            # COMPLETE is durable before the withheld semantic completion is
+            # exposed.  A downstream write timeout can therefore never turn a
+            # delivered success into a FAILED/AMBIGUOUS request.
+            self.ledger.finalize_prepared_completion(
+                self.contract.attempt_id,
+                sequence,
+            )
+            self._emit_bounded(emit, terminal_bytes)
+            self._host_previous_response_id = response_id
             return ProxyResult(
                 200,
                 "COMPLETE",
@@ -1881,19 +2906,22 @@ class AttemptBoundResponsesProxy:
                 response_id_sha256=sha256_text(response_id),
             )
         except ProxyPolicyError as exc:
-            self._transition_failure(
-                sequence,
-                expected_states={request_state},
-                state="FAILED",
-                code=exc.code,
-            )
+            row = self.ledger.request_rows(self.contract.attempt_id)[-1]
+            if row["state"] not in TERMINAL_REQUEST_STATES:
+                self._transition_failure(
+                    sequence,
+                    expected_states={row["state"]},
+                    state="FAILED",
+                    code=exc.code,
+                )
             if not emitted_response:
-                emit(_local_error_bytes(exc.status, exc.code))
+                self._emit_bounded(emit, _local_error_bytes(exc.status, exc.code))
             return ProxyResult(exc.status, "FAILED", sequence)
         except UpstreamRejected as exc:
+            row = self.ledger.request_rows(self.contract.attempt_id)[-1]
             self._transition_failure(
                 sequence,
-                expected_states={request_state},
+                expected_states={row["state"]},
                 state="FAILED",
                 code=f"BROKER_PROXY_UPSTREAM_STATUS_{exc.status}",
             )
@@ -1904,40 +2932,48 @@ class AttemptBoundResponsesProxy:
             )
             self.ledger.hold_proxy(self.contract.attempt_id, hold_code)
             if not emitted_response:
-                emit(_local_error_bytes(502, hold_code))
+                self._emit_bounded(emit, _local_error_bytes(502, hold_code))
             return ProxyResult(502, "FAILED", sequence)
         except UpstreamTerminalFailure as exc:
             code = str(exc)
+            row = self.ledger.request_rows(self.contract.attempt_id)[-1]
             self._transition_failure(
                 sequence,
-                expected_states={request_state},
+                expected_states={row["state"]},
                 state="FAILED",
                 code=code,
             )
             self.ledger.hold_proxy(self.contract.attempt_id, code)
             if not emitted_response:
-                emit(_local_error_bytes(502, code))
+                self._emit_bounded(emit, _local_error_bytes(502, code))
             return ProxyResult(502, "FAILED", sequence)
-        except (UpstreamAmbiguous, ProxyHold) as exc:
-            code = exc.code if isinstance(exc, ProxyHold) else str(exc)
+        except (UpstreamAmbiguous, ProxyHold, ProxyIOTimeout) as exc:
+            code = exc.code if isinstance(exc, (ProxyHold, ProxyIOTimeout)) else str(exc)
             row = self.ledger.request_rows(self.contract.attempt_id)[-1]
-            if row["state"] not in TERMINAL_REQUEST_STATES:
+            terminal_state = row["state"]
+            if terminal_state not in TERMINAL_REQUEST_STATES:
+                terminal_state = "FAILED" if terminal_state == "CREATED" else "AMBIGUOUS"
                 self._transition_failure(
                     sequence,
                     expected_states={row["state"]},
-                    state="AMBIGUOUS",
+                    state=terminal_state,
                     code=code,
                 )
+            elif terminal_state == "COMPLETE":
+                proxy_row = self.ledger.proxy_row(self.contract.attempt_id)
+                if proxy_row is not None and proxy_row["state"] == "RUNNING":
+                    self.ledger.hold_proxy(self.contract.attempt_id, code)
             if not emitted_response:
-                emit(_local_error_bytes(502, code))
-            return ProxyResult(502, "AMBIGUOUS", sequence)
+                try:
+                    self._emit_bounded(emit, _local_error_bytes(504, code))
+                except ProxyIOTimeout:
+                    pass
+            return ProxyResult(504, terminal_state, sequence)
         except Exception:
             row = self.ledger.request_rows(self.contract.attempt_id)[-1]
             terminal_state = row["state"]
-            if row["state"] not in TERMINAL_REQUEST_STATES:
-                terminal_state = (
-                    "FAILED" if row["state"] == "CREATED" else "AMBIGUOUS"
-                )
+            if terminal_state not in TERMINAL_REQUEST_STATES:
+                terminal_state = "FAILED" if terminal_state == "CREATED" else "AMBIGUOUS"
                 self._transition_failure(
                     sequence,
                     expected_states={row["state"]},
@@ -1945,12 +2981,22 @@ class AttemptBoundResponsesProxy:
                     code="BROKER_PROXY_INTERNAL_FAILURE",
                 )
             if not emitted_response:
-                emit(_local_error_bytes(500, "BROKER_PROXY_INTERNAL_FAILURE"))
+                try:
+                    self._emit_bounded(
+                        emit,
+                        _local_error_bytes(500, "BROKER_PROXY_INTERNAL_FAILURE"),
+                    )
+                except ProxyIOTimeout:
+                    pass
             return ProxyResult(500, terminal_state, sequence)
         finally:
             if upstream_stream is not None:
                 try:
-                    upstream_stream.close()
+                    _bounded_io_call(
+                        upstream_stream.close,
+                        self._io_deadline(),
+                        timeout_code="BROKER_PROXY_UPSTREAM_CLOSE_TIMEOUT",
+                    )
                 except Exception:
                     pass
 
@@ -1961,35 +3007,43 @@ def _send_chunked_frames(
     kind: FrameKind,
     stream_id: int,
     payload: bytes,
+    deadline: IODeadline | None = None,
 ) -> None:
     if not payload:
         return
     for offset in range(0, len(payload), _MAX_FRAME_PAYLOAD):
-        send_frame(sock, Frame(kind, stream_id, payload[offset : offset + _MAX_FRAME_PAYLOAD]))
+        send_frame(
+            sock,
+            Frame(kind, stream_id, payload[offset : offset + _MAX_FRAME_PAYLOAD]),
+            deadline=deadline,
+        )
 
 
 def serve_framed_proxy_exchange(
     channel: socket.socket,
-    contract: AttemptProxyContract,
+    binding: RelayBinding,
     proxy: AttemptBoundResponsesProxy,
 ) -> ProxyResult:
     """Serve one request over the relay-only inherited UDS channel."""
 
-    hello = receive_frame(channel)
+    if binding != proxy.relay_binding:
+        raise ProxyProtocolError("PROXY_CHANNEL_BINDING_MISMATCH")
+    contract = proxy.contract
+    hello = receive_frame(channel, deadline=proxy._io_deadline())
     if (
         hello.kind is not FrameKind.HELLO
         or len(hello.payload) > _MAX_HELLO_BYTES
-        or hello.payload != channel_hello(contract)
+        or hello.payload != channel_hello(binding)
     ):
         raise ProxyProtocolError("PROXY_CHANNEL_BINDING_MISMATCH")
-    start = receive_frame(channel)
+    start = receive_frame(channel, deadline=proxy._io_deadline())
     if start.kind is not FrameKind.REQUEST_START or start.payload:
         raise ProxyProtocolError("PROXY_REQUEST_START_INVALID")
     stream_id = start.stream_id
     raw = bytearray()
     raw_limit = contract.max_header_bytes + contract.max_body_bytes + 4
     while True:
-        frame = receive_frame(channel)
+        frame = receive_frame(channel, deadline=proxy._io_deadline())
         if frame.stream_id != stream_id:
             raise ProxyProtocolError("PROXY_FRAME_STREAM_MISMATCH")
         if frame.kind is FrameKind.REQUEST_END:
@@ -2008,6 +3062,7 @@ def serve_framed_proxy_exchange(
             kind=FrameKind.RESPONSE_DATA,
             stream_id=stream_id,
             payload=value,
+            deadline=proxy._io_deadline(),
         )
 
     result = proxy.handle_raw_request(bytes(raw), emit)
@@ -2019,35 +3074,85 @@ def serve_framed_proxy_exchange(
             "sequence": result.sequence,
         }
     ).encode("ascii")
-    send_frame(channel, Frame(FrameKind.RESPONSE_END, stream_id, terminal_payload))
+    send_frame(
+        channel,
+        Frame(FrameKind.RESPONSE_END, stream_id, terminal_payload),
+        deadline=proxy._io_deadline(),
+    )
     return result
+
+
+def _validate_relay_binding(
+    contract: AttemptProxyContract,
+    binding: RelayBinding,
+) -> None:
+    if (
+        binding.attempt_id != contract.attempt_id
+        or binding.contract_sha256 != contract.contract_sha256
+        or binding.endpoint_sha256 != sha256_text(contract.endpoint_id)
+        or binding.policy_sha256 != contract.policy_sha256
+    ):
+        raise ProxyProtocolError("PROXY_CHANNEL_BINDING_MISMATCH")
+
+
+def _relay_io_deadline(
+    contract: AttemptProxyContract,
+    attempt_deadline: IODeadline,
+) -> IODeadline:
+    return IODeadline(
+        min(
+            attempt_deadline.expires_at,
+            time.monotonic() + contract.io_timeout_seconds,
+        )
+    )
 
 
 def relay_framed_http_request(
     channel: socket.socket,
     contract: AttemptProxyContract,
+    binding: RelayBinding,
     raw_request: bytes,
     *,
     stream_id: int = 1,
 ) -> tuple[bytes, Mapping[str, Any]]:
     """Trusted relay side of one loopback-to-UDS exchange."""
 
-    send_frame(channel, Frame(FrameKind.HELLO, 0, channel_hello(contract)))
-    send_frame(channel, Frame(FrameKind.REQUEST_START, stream_id))
+    _validate_relay_binding(contract, binding)
+    attempt_deadline = IODeadline.after(contract.max_wall_seconds)
+    send_frame(
+        channel,
+        Frame(FrameKind.HELLO, 0, channel_hello(binding)),
+        deadline=_relay_io_deadline(contract, attempt_deadline),
+    )
+    send_frame(
+        channel,
+        Frame(FrameKind.REQUEST_START, stream_id),
+        deadline=_relay_io_deadline(contract, attempt_deadline),
+    )
     _send_chunked_frames(
         channel,
         kind=FrameKind.REQUEST_DATA,
         stream_id=stream_id,
         payload=raw_request,
+        deadline=_relay_io_deadline(contract, attempt_deadline),
     )
-    send_frame(channel, Frame(FrameKind.REQUEST_END, stream_id))
+    send_frame(
+        channel,
+        Frame(FrameKind.REQUEST_END, stream_id),
+        deadline=_relay_io_deadline(contract, attempt_deadline),
+    )
     response = bytearray()
     while True:
-        frame = receive_frame(channel)
+        frame = receive_frame(
+            channel,
+            deadline=_relay_io_deadline(contract, attempt_deadline),
+        )
         if frame.stream_id != stream_id:
             raise ProxyProtocolError("PROXY_FRAME_STREAM_MISMATCH")
         if frame.kind is FrameKind.RESPONSE_DATA:
             response.extend(frame.payload)
+            if len(response) > contract.max_response_bytes + contract.max_header_bytes:
+                raise ProxyProtocolError("PROXY_RESPONSE_FRAME_LIMIT")
             continue
         if frame.kind is FrameKind.RESPONSE_END:
             try:
@@ -2065,13 +3170,18 @@ def read_one_loopback_request(
     *,
     max_header_bytes: int,
     max_body_bytes: int,
+    deadline: IODeadline | None = None,
 ) -> bytes:
     """Read one bounded HTTP request from an already accepted loopback socket."""
 
     buffer = bytearray()
     boundary = -1
     while boundary < 0:
-        chunk = client.recv(min(8192, max_header_bytes + 4 - len(buffer)))
+        chunk = _socket_call(
+            client,
+            lambda: client.recv(min(8192, max_header_bytes + 4 - len(buffer))),
+            deadline or _default_io_deadline(),
+        )
         if not chunk:
             raise ProxyProtocolError("PROXY_LOOPBACK_REQUEST_TRUNCATED")
         buffer.extend(chunk)
@@ -2091,7 +3201,11 @@ def read_one_loopback_request(
         raise ProxyProtocolError("PROXY_LOOPBACK_BODY_LIMIT")
     expected = boundary + 4 + content_length
     while len(buffer) < expected:
-        chunk = client.recv(min(8192, expected - len(buffer)))
+        chunk = _socket_call(
+            client,
+            lambda: client.recv(min(8192, expected - len(buffer))),
+            deadline or _default_io_deadline(),
+        )
         if not chunk:
             raise ProxyProtocolError("PROXY_LOOPBACK_REQUEST_TRUNCATED")
         buffer.extend(chunk)
@@ -2104,25 +3218,85 @@ def relay_one_loopback_connection(
     client: socket.socket,
     channel: socket.socket,
     contract: AttemptProxyContract,
+    binding: RelayBinding,
     *,
     stream_id: int = 1,
 ) -> Mapping[str, Any]:
     """Relay one accepted in-namespace loopback connection without auth data."""
 
+    _validate_relay_binding(contract, binding)
+    attempt_deadline = IODeadline.after(contract.max_wall_seconds)
     raw_request = read_one_loopback_request(
         client,
         max_header_bytes=contract.max_header_bytes,
         max_body_bytes=contract.max_body_bytes,
+        deadline=_relay_io_deadline(contract, attempt_deadline),
     )
-    response, terminal = relay_framed_http_request(
-        channel, contract, raw_request, stream_id=stream_id
+    send_frame(
+        channel,
+        Frame(FrameKind.HELLO, 0, channel_hello(binding)),
+        deadline=_relay_io_deadline(contract, attempt_deadline),
     )
-    _send_all(client, response)
+    send_frame(
+        channel,
+        Frame(FrameKind.REQUEST_START, stream_id),
+        deadline=_relay_io_deadline(contract, attempt_deadline),
+    )
+    _send_chunked_frames(
+        channel,
+        kind=FrameKind.REQUEST_DATA,
+        stream_id=stream_id,
+        payload=raw_request,
+        deadline=_relay_io_deadline(contract, attempt_deadline),
+    )
+    send_frame(
+        channel,
+        Frame(FrameKind.REQUEST_END, stream_id),
+        deadline=_relay_io_deadline(contract, attempt_deadline),
+    )
+    delivered = 0
+    terminal: Mapping[str, Any] | None = None
+    while terminal is None:
+        frame = receive_frame(
+            channel,
+            deadline=_relay_io_deadline(contract, attempt_deadline),
+        )
+        if frame.stream_id != stream_id:
+            raise ProxyProtocolError("PROXY_FRAME_STREAM_MISMATCH")
+        if frame.kind is FrameKind.RESPONSE_DATA:
+            delivered += len(frame.payload)
+            if delivered > contract.max_response_bytes + contract.max_header_bytes:
+                raise ProxyProtocolError("PROXY_RESPONSE_FRAME_LIMIT")
+            _send_all(
+                client,
+                frame.payload,
+                deadline=_relay_io_deadline(contract, attempt_deadline),
+            )
+            continue
+        if frame.kind is not FrameKind.RESPONSE_END:
+            raise ProxyProtocolError("PROXY_RESPONSE_FRAME_INVALID")
+        try:
+            decoded = json.loads(frame.payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProxyProtocolError("PROXY_RESPONSE_END_INVALID") from exc
+        if type(decoded) is not dict:
+            raise ProxyProtocolError("PROXY_RESPONSE_END_INVALID")
+        terminal = decoded
     try:
         client.shutdown(socket.SHUT_WR)
     except OSError:
         pass
     return terminal
+
+
+def accept_loopback_connection(
+    listener: socket.socket,
+    *,
+    deadline: IODeadline,
+) -> tuple[socket.socket, tuple[str, int]]:
+    """Accept one client within an explicit real deadline."""
+
+    return _socket_call(listener, listener.accept, deadline)
 
 
 def open_loopback_listener(port: int = 0) -> socket.socket:
