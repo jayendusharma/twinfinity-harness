@@ -20,9 +20,11 @@ from coordination_store import (  # noqa: E402
 )
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from kanban_pull_buffer import (  # noqa: E402
+    PullBufferError,
     admission_binding_error,
     audit_pull_buffer,
     close_candidate_observations,
+    ensure_pull_buffer_schema,
     load_candidate_packets,
     register_candidate,
 )
@@ -36,6 +38,9 @@ from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
     load_legacy_alias_fixture,
+)
+from tests.canonical_ready_fixture import (  # noqa: E402
+    finalize_canonical_ready_candidate,
 )
 
 
@@ -90,7 +95,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.ready_item = self.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=2,
-            status="READY",
+            status="PREPARED",
             allocation_class="NONE",
             generation=1,
             accountable_session_id=DEVELOPMENT_SESSION,
@@ -231,7 +236,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             "shared_units": 0,
             "sre_units": 0,
             "expected_source_sha256": self.sources[2],
-            "expected_version": self.ready_item["version"],
+            "expected_version": self.ready_item["version"] + 1,
         }
         message = {
             "idempotency_key": "portfolio-convergence-issue-2",
@@ -246,7 +251,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
                 },
                 "issue_number": 2,
                 "generation": 1,
-                "item_version": self.ready_item["version"] + 1,
+                "item_version": self.ready_item["version"] + 2,
                 "base_sha": MAIN,
                 "branch": "codex/2-ready-successor",
                 "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-2",
@@ -282,7 +287,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             "source_payload_sha256": self.sources[2],
             "accepted_main_at_preparation": MAIN,
             "portfolio_graph_version": 1,
-            "state": "READY",
+            "state": "PREPARED_NOT_READY",
             "verticality": "END_TO_END",
             "owner_visible_outcome": "Deliver the next safe owner-visible slice.",
             "capacity_policy": {
@@ -307,35 +312,24 @@ class PortfolioConvergenceTests(unittest.TestCase):
             "promotion_checks_after_predecessor": ["Revalidate every local guard."],
             "hard_stops": ["Stop on any source, graph, lease, or capacity drift."],
             "promotion_trigger": "Issue 1 releases its capacity.",
-            "admission_transaction": {
+        }
+        result = finalize_canonical_ready_candidate(
+            self.store,
+            database=self.database,
+            artifact_root=self.root,
+            prepared_packet=packet,
+            admission_transaction={
                 "item": item,
                 "message": message,
                 **({} if existing_lease else {"artifacts": lease_artifacts}),
             },
-        }
-        packet_path = plans / "issue-2-pull-buffer.json"
-        packet_path.write_text(
-            json.dumps(packet, sort_keys=True), encoding="utf-8"
-        )
-        self.store.register_artifacts(
-            [
-                {
-                    "repository": REPOSITORY,
-                    "issue_number": 2,
-                    "generation": 1,
-                    "path": str(packet_path),
-                    "retention_class": "CLOSEOUT_EVIDENCE",
-                }
-            ],
+            worker_role="development",
+            worker_endpoint_id=DEVELOPMENT_SESSION,
             now="2026-08-24T10:00:02Z",
+            suffix="portfolio-convergence",
         )
-        register_candidate(
-            self.store.connection,
-            self.database,
-            packet_path,
-            now="2026-08-24T10:00:02Z",
-        )
-        return packet_path
+        self.ready_item = result["item"]
+        return result["ready_path"]
 
     def test_release_event_is_atomic_digest_bound_and_idempotent(self) -> None:
         with patch.object(
@@ -492,7 +486,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
         ]
         self.assertEqual("RETRY", result["state"])
         self.assertIn("MAIN_DRIFT:issue:2", result["blockers"])
-        self.assertEqual(("READY", "NONE"), tuple(candidate))
+        self.assertEqual(("PREPARED", "NONE"), tuple(candidate))
         self.assertIn("MAIN_CURSOR_ADVANCED", triggers)
 
     def test_dispatchable_depth_requires_complete_admission_binding(self) -> None:
@@ -519,11 +513,15 @@ class PortfolioConvergenceTests(unittest.TestCase):
         finally:
             close_candidate_observations(observations)
 
-        self.assertEqual(1, audit["executable_ready_depth"])
+        self.assertEqual(0, audit["executable_ready_depth"])
         self.assertEqual(0, audit["dispatchable_now_depth"])
         self.assertIn(
-            "ADMISSION_PACKET_BINDING_DRIFT:issue:2",
-            audit["deficit_reasons"],
+            "ADMISSION_PACKET_BINDING_DRIFT",
+            {
+                reason
+                for candidate in audit["invalid"]
+                for reason in candidate["reasons"]
+            },
         )
 
     def test_all_canonical_development_dispatch_bindings_are_required(self) -> None:
@@ -539,7 +537,9 @@ class PortfolioConvergenceTests(unittest.TestCase):
             admission = observation["packet"]["admission_transaction"]
             candidate = dict(
                 self.store.connection.execute(
-                    "SELECT * FROM portfolio_pull_buffer_candidates WHERE issue_number=2"
+                    "SELECT candidate.* FROM portfolio_pull_buffer_current pointer "
+                    "JOIN portfolio_pull_buffer_candidates candidate "
+                    "ON candidate.id=pointer.candidate_id WHERE pointer.issue_number=2"
                 ).fetchone()
             )
             changes_before = self.store.connection.total_changes
@@ -583,7 +583,9 @@ class PortfolioConvergenceTests(unittest.TestCase):
             admission = observation["packet"]["admission_transaction"]
             candidate = dict(
                 self.store.connection.execute(
-                    "SELECT * FROM portfolio_pull_buffer_candidates WHERE issue_number=2"
+                    "SELECT candidate.* FROM portfolio_pull_buffer_current pointer "
+                    "JOIN portfolio_pull_buffer_candidates candidate "
+                    "ON candidate.id=pointer.candidate_id WHERE pointer.issue_number=2"
                 ).fetchone()
             )
             wrong_types = {
@@ -655,7 +657,8 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual(
             0,
             self.store.connection.execute(
-                "SELECT COUNT(*) FROM coordination_messages"
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE topic IN ('development.admission','sre.admission')"
             ).fetchone()[0],
         )
         self.assertEqual(
@@ -665,7 +668,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            1,
+            0,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_current WHERE issue_number=2"
             ).fetchone()[0],
@@ -700,7 +703,8 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual(
             0,
             self.store.connection.execute(
-                "SELECT COUNT(*) FROM coordination_messages"
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE topic IN ('development.admission','sre.admission')"
             ).fetchone()[0],
         )
         self.assertEqual(
@@ -710,7 +714,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            1,
+            0,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_current WHERE issue_number=2"
             ).fetchone()[0],
@@ -729,7 +733,9 @@ class PortfolioConvergenceTests(unittest.TestCase):
             admission = observation["packet"]["admission_transaction"]
             candidate = dict(
                 self.store.connection.execute(
-                    "SELECT * FROM portfolio_pull_buffer_candidates WHERE issue_number=2"
+                    "SELECT candidate.* FROM portfolio_pull_buffer_current pointer "
+                    "JOIN portfolio_pull_buffer_candidates candidate "
+                    "ON candidate.id=pointer.candidate_id WHERE pointer.issue_number=2"
                 ).fetchone()
             )
             registered = observation["admission_artifacts"][0]["entry"][
@@ -845,7 +851,8 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual(
             0,
             self.store.connection.execute(
-                "SELECT COUNT(*) FROM coordination_messages"
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE topic IN ('development.admission','sre.admission')"
             ).fetchone()[0],
         )
 
@@ -861,7 +868,8 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual(
             1,
             self.store.connection.execute(
-                "SELECT COUNT(*) FROM coordination_messages"
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE topic IN ('development.admission','sre.admission')"
             ).fetchone()[0],
         )
 
@@ -893,7 +901,8 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual(
             1,
             self.store.connection.execute(
-                "SELECT COUNT(*) FROM coordination_messages"
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE topic IN ('development.admission','sre.admission')"
             ).fetchone()[0],
         )
 
@@ -939,7 +948,49 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual("ADMITTED", admitted["outcome"])
         self.assertEqual(2, admitted["admitted_issue_number"])
 
+    def test_public_ready_registration_cannot_mutate_identical_database_copy(self) -> None:
+        packet_path = self._register_ready_candidate()
+        copied_path = self.root / "unissued-copy.sqlite3"
+        copied = CoordinationStore(copied_path)
+        try:
+            self.store.connection.backup(copied.connection)
+            before = copied.connection.total_changes
+            before_rows = tuple(
+                copied.connection.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM portfolio_pull_buffer_candidates),"
+                    "(SELECT COUNT(*) FROM portfolio_ready_finalizations),"
+                    "(SELECT COUNT(*) FROM portfolio_dirty_events),"
+                    "(SELECT COUNT(*) FROM coordination_events)"
+                ).fetchone()
+            )
+            with self.assertRaisesRegex(
+                PullBufferError, "PULL_BUFFER_READY_FINALIZER_REQUIRED"
+            ):
+                register_candidate(
+                    copied.connection,
+                    copied_path,
+                    packet_path,
+                    now="2026-08-24T10:00:03Z",
+                )
+            self.assertEqual(before, copied.connection.total_changes)
+            self.assertEqual(
+                before_rows,
+                tuple(
+                    copied.connection.execute(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM portfolio_pull_buffer_candidates),"
+                        "(SELECT COUNT(*) FROM portfolio_ready_finalizations),"
+                        "(SELECT COUNT(*) FROM portfolio_dirty_events),"
+                        "(SELECT COUNT(*) FROM coordination_events)"
+                    ).fetchone()
+                ),
+            )
+        finally:
+            copied.close()
+
     def test_ready_successor_registration_marks_promotion_from_prepared_pointer(self) -> None:
+        ensure_pull_buffer_schema(self.store.connection)
         audit_pull_buffer(
             self.store.connection,
             REPOSITORY,

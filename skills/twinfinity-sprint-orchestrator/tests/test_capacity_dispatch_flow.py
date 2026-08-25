@@ -29,7 +29,6 @@ from hosted_operation_control import (  # noqa: E402
     HostedOperationControl,
     run_supervisor as run_hosted_supervisor,
 )
-from kanban_pull_buffer import register_candidate  # noqa: E402
 from portfolio_convergence import PortfolioConvergence  # noqa: E402
 from portfolio_graph import replace_graph, schedule  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
@@ -38,6 +37,9 @@ from reconcile_routing_artifacts import (  # noqa: E402
     load_legacy_alias_fixture,
 )
 from role_executor_transport import launch_role_executor  # noqa: E402
+from tests.canonical_ready_fixture import (  # noqa: E402
+    finalize_canonical_ready_candidate,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
@@ -146,7 +148,8 @@ class _FlowHarness:
             issue = int(spec["issue"])
             self.snapshot(issue)
             units = dict(spec["units"])
-            status = str(spec.get("status", "READY"))
+            requested_status = str(spec.get("status", "READY"))
+            status = "PREPARED" if requested_status == "READY" else requested_status
             allocation = "ACTIVE" if status == "ACTIVE" else "NONE"
             endpoint = self._endpoint_for(units)
             lease = (
@@ -228,31 +231,6 @@ class _FlowHarness:
             now="2026-08-24T10:00:02Z",
         )
 
-    def mark_ready(self, issue_number: int, now: str) -> dict:
-        current = dict(
-            self.store.connection.execute(
-                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
-                (REPOSITORY, issue_number),
-            ).fetchone()
-        )
-        updated = self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=issue_number,
-            status="READY",
-            allocation_class="NONE",
-            generation=int(current["generation"]),
-            accountable_session_id=str(current["accountable_session_id"]),
-            lease_manifest_sha256=None,
-            development_units=int(current["development_units"]),
-            shared_units=int(current["shared_units"]),
-            sre_units=int(current["sre_units"]),
-            expected_source_sha256=self.sources[issue_number],
-            expected_version=int(current["version"]),
-            now=now,
-        )
-        self.items[issue_number] = updated
-        return updated
-
     def register_ready_candidate(self, issue_number: int, now: str) -> dict:
         item = dict(
             self.store.connection.execute(
@@ -309,7 +287,7 @@ class _FlowHarness:
             },
             "issue_number": issue_number,
             "generation": int(item["generation"]),
-            "item_version": int(item["version"]) + 1,
+            "item_version": int(item["version"]) + 2,
             "base_sha": MAIN,
             "branch": branch,
             "worktree_path": worktree,
@@ -341,7 +319,7 @@ class _FlowHarness:
             "source_payload_sha256": self.sources[issue_number],
             "accepted_main_at_preparation": MAIN,
             "portfolio_graph_version": 1,
-            "state": "READY",
+            "state": "PREPARED_NOT_READY",
             "verticality": "END_TO_END",
             "owner_visible_outcome": f"Deliver vertical slice {issue_number}.",
             "capacity_policy": {
@@ -364,45 +342,41 @@ class _FlowHarness:
             ],
             "hard_stops": ["Stop on any controlling-state drift."],
             "promotion_trigger": "Capacity and hard dependencies are satisfied.",
-            "admission_transaction": {
-                "item": {
-                    "repository": REPOSITORY,
-                    "issue_number": issue_number,
-                    "status": "ACTIVE",
-                    "allocation_class": "ACTIVE",
-                    "generation": int(item["generation"]),
-                    "accountable_session_id": endpoint,
-                    "lease_manifest_sha256": lease_sha,
-                    **units,
-                    "expected_source_sha256": self.sources[issue_number],
-                    "expected_version": int(item["version"]),
-                },
-                "message": {
-                    "idempotency_key": f"capacity-flow-issue-{issue_number}",
-                    "recipient_session_id": endpoint,
-                    "topic": topic,
-                    "payload": payload,
-                },
-                "artifacts": [artifact],
-            },
         }
-        packet_path = plans / f"issue-{issue_number}-pull-buffer.json"
-        packet_path.write_text(json.dumps(packet, sort_keys=True), encoding="utf-8")
-        self.store.register_artifacts(
-            [
-                {
-                    "repository": REPOSITORY,
-                    "issue_number": issue_number,
-                    "generation": int(item["generation"]),
-                    "path": str(packet_path),
-                    "retention_class": "CLOSEOUT_EVIDENCE",
-                }
-            ],
+        admission_transaction = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": issue_number,
+                "status": "ACTIVE",
+                "allocation_class": "ACTIVE",
+                "generation": int(item["generation"]),
+                "accountable_session_id": endpoint,
+                "lease_manifest_sha256": lease_sha,
+                **units,
+                "expected_source_sha256": self.sources[issue_number],
+                "expected_version": int(item["version"]) + 1,
+            },
+            "message": {
+                "idempotency_key": f"capacity-flow-issue-{issue_number}",
+                "recipient_session_id": endpoint,
+                "topic": topic,
+                "payload": payload,
+            },
+            "artifacts": [artifact],
+        }
+        result = finalize_canonical_ready_candidate(
+            self.store,
+            database=self.database,
+            artifact_root=self.root,
+            prepared_packet=packet,
+            admission_transaction=admission_transaction,
+            worker_role="sre" if units["sre_units"] else "development",
+            worker_endpoint_id=endpoint,
             now=now,
+            suffix="capacity-flow",
         )
-        return register_candidate(
-            self.store.connection, self.database, packet_path, now=now
-        )
+        self.items[issue_number] = result["item"]
+        return result["finalized"]
 
     def _reserve_running(
         self, role: str, endpoint: str, target_kind: str, target_key: str
@@ -644,6 +618,7 @@ class CapacityDispatchFlowTests(unittest.TestCase):
                 ],
                 relations=[(100, 101, "COLLISION"), (103, 104, "HARD_BLOCK")],
             )
+            harness.register_ready_candidate(102, "2026-08-24T10:00:03Z")
             decision = schedule(
                 harness.store.connection,
                 REPOSITORY,
@@ -653,9 +628,14 @@ class CapacityDispatchFlowTests(unittest.TestCase):
             )
 
             self.assertEqual(["issue:102"], decision["selected"])
+            self.assertEqual([], decision["skipped"])
             self.assertEqual(
-                [{"node_key": "issue:101", "reason": "COLLISION"}],
-                decision["skipped"],
+                "PREPARED",
+                harness.store.connection.execute(
+                    "SELECT status FROM coordination_items WHERE repository=? "
+                    "AND issue_number=101",
+                    (REPOSITORY,),
+                ).fetchone()[0],
             )
             self.assertNotIn("issue:104", decision["ordered_ready"])
             self.assertGreaterEqual(decision["remaining_capacity"]["development"], 0)
@@ -696,7 +676,7 @@ class CapacityDispatchFlowTests(unittest.TestCase):
             ] + [
                 {
                     "issue": refill,
-                    "status": "QUEUED",
+                    "status": "PREPARED",
                     "priority": 10,
                     "units": {"development": 1, "shared": 1, "sre": 0},
                 }
@@ -704,6 +684,10 @@ class CapacityDispatchFlowTests(unittest.TestCase):
             harness.install_portfolio(specs)
             expected_issues = development + sre
             expected_nodes = [f"issue:{issue}" for issue in expected_issues]
+            for offset, issue in enumerate(expected_issues, 4):
+                harness.register_ready_candidate(
+                    issue, f"2026-08-24T10:00:{offset:02d}Z"
+                )
             selected = schedule(
                 harness.store.connection,
                 REPOSITORY,
@@ -716,11 +700,6 @@ class CapacityDispatchFlowTests(unittest.TestCase):
                 {"development": 0, "shared": 0, "sre": 0},
                 selected["remaining_capacity"],
             )
-            for offset, issue in enumerate(expected_issues, 4):
-                harness.register_ready_candidate(
-                    issue, f"2026-08-24T10:00:{offset:02d}Z"
-                )
-
             supervisor = harness.supervisor()
             results = [
                 supervisor.run_once("2026-08-24T10:01:00Z"),
@@ -804,7 +783,7 @@ class CapacityDispatchFlowTests(unittest.TestCase):
                 )
 
             harness.complete_issue(development[0], "2026-08-24T10:02:00Z")
-            harness.mark_ready(refill, "2026-08-24T10:02:01Z")
+            harness.register_ready_candidate(refill, "2026-08-24T10:02:03Z")
             refill_decision = schedule(
                 harness.store.connection,
                 REPOSITORY,
@@ -813,7 +792,6 @@ class CapacityDispatchFlowTests(unittest.TestCase):
                 now="2026-08-24T10:02:02Z",
             )
             self.assertEqual([f"issue:{refill}"], refill_decision["selected"])
-            harness.register_ready_candidate(refill, "2026-08-24T10:02:03Z")
             refill_result = harness.supervisor().run_once("2026-08-24T10:02:04Z")
             refill_launches = [
                 int(json.loads(harness.store.connection.execute(

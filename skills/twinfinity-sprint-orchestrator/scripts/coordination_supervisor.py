@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sqlite3
 import subprocess
 from dataclasses import dataclass
 from typing import Callable
@@ -40,6 +41,13 @@ from portfolio_convergence import (
     DEFAULT_CONVERGENCE_LIMIT,
     MAX_CONVERGENCE_LIMIT,
     PortfolioConvergence,
+)
+from approval_ledger import enqueue_published_readiness_decision_notices
+from kanban_readiness import (
+    ReadinessError,
+    enqueue_due_readiness_revisits,
+    pickup_due_receipts,
+    stop_revoked_readiness_successors,
 )
 
 
@@ -1032,9 +1040,66 @@ class CoordinationSupervisor:
 
     def run_once(self, now: str | None = None) -> dict[str, object]:
         observed_at = now or utc_now()
-        # Release events are committed by coordination_store with the item
-        # transition. Consume them before housekeeping or ordinary inbox wakes;
-        # a successful admission is durable before its canonical session launch.
+        try:
+            readiness_receipt_pickup: dict[str, object] = pickup_due_receipts(
+                self.store, now=observed_at
+            )
+        except (ReadinessError, sqlite3.Error, OSError) as exc:
+            readiness_receipt_pickup = {
+                "mode": "HOLD",
+                "error": (
+                    str(exc)
+                    if isinstance(exc, ReadinessError)
+                    else "READINESS_RECEIPT_PICKUP_FAILED"
+                ),
+            }
+        try:
+            readiness_decision_notices: dict[str, object] = (
+                enqueue_published_readiness_decision_notices(
+                    self.store, now=observed_at
+                )
+            )
+        except (CoordinationError, sqlite3.Error) as exc:
+            readiness_decision_notices = {
+                "mode": "HOLD",
+                "error": (
+                    str(exc)
+                    if isinstance(exc, CoordinationError)
+                    else "READINESS_DECISION_NOTICE_FAILED"
+                ),
+            }
+        try:
+            readiness_revisits: dict[str, object] = enqueue_due_readiness_revisits(
+                self.store, now=observed_at
+            )
+        except (ReadinessError, CoordinationError, sqlite3.Error) as exc:
+            readiness_revisits = {
+                "mode": "HOLD",
+                "error": (
+                    str(exc)
+                    if isinstance(exc, (ReadinessError, CoordinationError))
+                    else "READINESS_REVISIT_NOTICE_FAILED"
+                ),
+            }
+        try:
+            readiness_revocations: dict[str, object] = (
+                stop_revoked_readiness_successors(
+                    self.store, now=observed_at
+                )
+            )
+        except (ReadinessError, CoordinationError, sqlite3.Error) as exc:
+            readiness_revocations = {
+                "mode": "HOLD",
+                "error": (
+                    str(exc)
+                    if isinstance(exc, (ReadinessError, CoordinationError))
+                    else "READINESS_REVOCATION_STOP_FAILED"
+                ),
+            }
+        # A revoked readiness authority must stop its resumed lineage before a
+        # READY dirty event is allowed to select it. Activation repeats the
+        # approval-effectivity guard inside its own transaction for the race
+        # between this scan-level stop and admission.
         convergence_results = self.convergence.consume_due(
             limit=self.convergence_limit, now=observed_at
         )
@@ -1265,6 +1330,10 @@ class CoordinationSupervisor:
                 "terminal_watches": terminal_watch_launch_attempts,
             },
             "artifact_gc": artifact_gc,
+            "readiness_receipt_pickup": readiness_receipt_pickup,
+            "readiness_decision_notices": readiness_decision_notices,
+            "readiness_revisits": readiness_revisits,
+            "readiness_revocations": readiness_revocations,
             "portfolio_convergence": convergence_results,
             "opened_terminal_watches": opened_watches,
             "held_terminal_watch_backfills": held_watch_backfills,

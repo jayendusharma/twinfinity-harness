@@ -11,6 +11,7 @@ has been published and read back successfully.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 import os
@@ -43,6 +44,8 @@ from sync_github_coordination import fetch_object
 
 
 SCHEMA = "twinfinity.approval-proposal.v1"
+REVIEW_BATCH_SCHEMA = "twinfinity.approval-review-batch.v2"
+BATCH_ANSWER_SCHEMA = "twinfinity.approval-batch-answer-map.v1"
 DECISIONS = {"APPROVE", "REJECT", "COURSE_CORRECT", "DEFER"}
 USER_EVENT_SOURCES = {
     "CODEX_DIRECT_USER_TURN",
@@ -51,7 +54,9 @@ USER_EVENT_SOURCES = {
 }
 PRIORITIES = {"P0", "P1", "P2"}
 URGENCIES = {"ACTIVE_BLOCKER", "READY_BLOCKER", "FUTURE", "INFORMATIONAL"}
-WORKSTREAMS = {"DEVELOPMENT", "SRE", "PLANNER", "PORTFOLIO", "CLIENT"}
+WORKSTREAMS = {
+    "DEVELOPMENT", "SRE", "PLANNER", "PORTFOLIO", "CLIENT", "READINESS"
+}
 WORKSTREAM_ROLES = {
     "DEVELOPMENT": "development",
     "SRE": "sre",
@@ -206,12 +211,22 @@ def validate_packet(packet: Any) -> dict[str, Any]:
         or packet["urgency"] not in URGENCIES
     ):
         raise CoordinationError("APPROVAL_PACKET_FIELD_INVALID")
-    expected_role = WORKSTREAM_ROLES[packet["workstream"]]
-    if (
-        configured_identity_role(packet["requester_session_id"]) != expected_role
-        or configured_identity_role(packet["recipient_session_id"]) != expected_role
-    ):
-        raise CoordinationError("APPROVAL_CANONICAL_PARENT_REQUIRED")
+    if packet["workstream"] == "READINESS":
+        if (
+            configured_identity_role(packet["requester_session_id"])
+            not in {"development", "sre"}
+            or configured_identity_role(packet["recipient_session_id"]) != "planner"
+        ):
+            raise CoordinationError("APPROVAL_READINESS_ROUTE_REQUIRED")
+    else:
+        expected_role = WORKSTREAM_ROLES[packet["workstream"]]
+        if (
+            configured_identity_role(packet["requester_session_id"])
+            != expected_role
+            or configured_identity_role(packet["recipient_session_id"])
+            != expected_role
+        ):
+            raise CoordinationError("APPROVAL_CANONICAL_PARENT_REQUIRED")
 
     normalized = dict(packet)
     for field in (
@@ -252,7 +267,9 @@ def validate_packet(packet: Any) -> dict[str, Any]:
     normalized_options: list[dict[str, str]] = []
     option_ids: set[str] = set()
     for option in options:
-        if not isinstance(option, dict) or set(option) != {"id", "label", "effect"}:
+        if not isinstance(option, dict) or set(option) != {
+            "id", "label", "effect", "machine_outcome"
+        }:
             raise CoordinationError("APPROVAL_OPTIONS_INVALID")
         option_id = option["id"]
         if (
@@ -267,8 +284,11 @@ def validate_packet(packet: Any) -> dict[str, Any]:
                 "id": option_id,
                 "label": _validate_text(option["label"], "option", maximum=120),
                 "effect": _validate_text(option["effect"], "option", maximum=800),
+                "machine_outcome": option["machine_outcome"],
             }
         )
+        if option["machine_outcome"] not in DECISIONS:
+            raise CoordinationError("APPROVAL_OPTION_OUTCOME_INVALID")
     normalized["options"] = normalized_options
     if packet["recommendation"] not in option_ids:
         raise CoordinationError("APPROVAL_RECOMMENDATION_INVALID")
@@ -360,6 +380,9 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             user_event_id TEXT NOT NULL,
             user_input_sha256 TEXT NOT NULL,
             planner_session_id TEXT NOT NULL,
+            batch_sha256 TEXT,
+            batch_answer_map_sha256 TEXT,
+            batch_answer_map_json TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY(user_event_source, user_event_id)
         );
@@ -368,9 +391,13 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             decision_sha256 TEXT NOT NULL UNIQUE,
             decision TEXT NOT NULL CHECK(decision IN ('APPROVE','REJECT','COURSE_CORRECT','DEFER')),
             selected_option_id TEXT NOT NULL,
+            selected_option_machine_outcome TEXT,
             revisit_trigger TEXT,
             recipient_set_sha256 TEXT NOT NULL,
             execution_scope_sha256 TEXT NOT NULL,
+            batch_sha256 TEXT,
+            batch_answer_map_sha256 TEXT,
+            option_map_sha256 TEXT,
             decision_note TEXT NOT NULL,
             user_input_sha256 TEXT NOT NULL,
             user_event_source TEXT NOT NULL,
@@ -419,6 +446,27 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(proposal_sha256) REFERENCES approval_proposals(proposal_sha256),
             FOREIGN KEY(message_id) REFERENCES coordination_messages(id)
         );
+        CREATE TABLE IF NOT EXISTS approval_delivery_notices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_sha256 TEXT NOT NULL,
+            submission_sha256 TEXT NOT NULL,
+            decision_sha256 TEXT NOT NULL,
+            recipient_session_id TEXT NOT NULL,
+            readiness_campaign_id INTEGER NOT NULL CHECK(readiness_campaign_id > 0),
+            readiness_receipt_id INTEGER NOT NULL CHECK(readiness_receipt_id > 0),
+            expected_readiness_version INTEGER NOT NULL
+                CHECK(expected_readiness_version > 0),
+            source_payload_sha256 TEXT NOT NULL,
+            routed_endpoint_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            UNIQUE(readiness_campaign_id, decision_sha256,
+                   source_payload_sha256, routed_endpoint_id),
+            FOREIGN KEY(submission_sha256)
+                REFERENCES approval_submissions(submission_sha256),
+            FOREIGN KEY(decision_sha256) REFERENCES approval_decisions(decision_sha256),
+            FOREIGN KEY(message_id) REFERENCES coordination_messages(id)
+        );
         CREATE TABLE IF NOT EXISTS approval_effectivity (
             proposal_sha256 TEXT PRIMARY KEY,
             decision_sha256 TEXT NOT NULL UNIQUE,
@@ -433,6 +481,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             repository TEXT NOT NULL,
             proposal_sha256_json TEXT NOT NULL,
             proposal_count INTEGER NOT NULL CHECK(proposal_count >= 0),
+            batch_json TEXT,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS approval_events (
@@ -486,9 +535,47 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS approval_effectivity_immutable_delete
         BEFORE DELETE ON approval_effectivity
         BEGIN SELECT RAISE(ABORT, 'APPROVAL_EFFECTIVITY_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_delivery_notices_immutable_update
+        BEFORE UPDATE ON approval_delivery_notices
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_DELIVERY_NOTICE_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_delivery_notices_immutable_delete
+        BEFORE DELETE ON approval_delivery_notices
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_DELIVERY_NOTICE_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_review_batches_immutable_update
+        BEFORE UPDATE ON approval_review_batches
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_REVIEW_BATCH_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_review_batches_immutable_delete
+        BEFORE DELETE ON approval_review_batches
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_REVIEW_BATCH_IMMUTABLE'); END;
         COMMIT;
             """
         )
+        additions = {
+            "approval_user_events": {
+                "batch_sha256": "TEXT",
+                "batch_answer_map_sha256": "TEXT",
+                "batch_answer_map_json": "TEXT",
+            },
+            "approval_decisions": {
+                "selected_option_machine_outcome": "TEXT",
+                "batch_sha256": "TEXT",
+                "batch_answer_map_sha256": "TEXT",
+                "option_map_sha256": "TEXT",
+            },
+            "approval_review_batches": {"batch_json": "TEXT"},
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        for table, columns in additions.items():
+            present = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for column, declaration in columns.items():
+                if column not in present:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                    )
+        connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
@@ -667,21 +754,50 @@ def _record_interest(
 
 
 def submit_proposal(
-    store: CoordinationStore, packet: dict[str, Any], now: str
+    store: CoordinationStore,
+    packet: dict[str, Any],
+    now: str,
+    *,
+    _transaction: bool = True,
+    _readiness_binding: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    ensure_schema(store.connection)
+    if _transaction:
+        ensure_schema(store.connection)
+    elif not store.connection.in_transaction:
+        raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
     packet = validate_packet(packet)
     packet = dict(packet)
-    packet["requester_session_id"] = canonicalize_coordination_identity(
-        store.connection, packet["requester_session_id"]
-    )
-    packet["recipient_session_id"] = canonicalize_coordination_identity(
-        store.connection, packet["recipient_session_id"]
-    )
+    if packet["workstream"] == "READINESS":
+        if not isinstance(_readiness_binding, dict) or set(_readiness_binding) != {
+            "requester_session_id",
+            "recipient_session_id",
+            "execution_scope_sha256",
+        }:
+            raise CoordinationError("APPROVAL_READINESS_SUPERVISOR_REQUIRED")
+        planner_endpoint = _current_role_route(store, "planner")
+        if (
+            packet["requester_session_id"]
+            != _readiness_binding["requester_session_id"]
+            or packet["recipient_session_id"]
+            != _readiness_binding["recipient_session_id"]
+            or packet["execution_scope_sha256"]
+            != _readiness_binding["execution_scope_sha256"]
+            or planner_endpoint != packet["recipient_session_id"]
+        ):
+            raise CoordinationError("APPROVAL_READINESS_BINDING_MISMATCH")
+    else:
+        if _readiness_binding is not None:
+            raise CoordinationError("APPROVAL_READINESS_BINDING_UNEXPECTED")
+        packet["requester_session_id"] = canonicalize_coordination_identity(
+            store.connection, packet["requester_session_id"]
+        )
+        packet["recipient_session_id"] = canonicalize_coordination_identity(
+            store.connection, packet["recipient_session_id"]
+        )
     submission_sha256 = digest_json(packet)
     semantic_sha256 = digest_json(_semantic_packet(packet))
     proposal_sha256 = semantic_sha256
-    with store.transaction():
+    with store.transaction() if _transaction else nullcontext():
         if not _source_is_current(store, packet):
             raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_DRIFT")
         submission = store.connection.execute(
@@ -689,10 +805,18 @@ def submit_proposal(
             (submission_sha256,),
         ).fetchone()
         if submission is not None:
+            notice = store.connection.execute(
+                "SELECT message_id FROM approval_proposal_notices "
+                "WHERE proposal_sha256=?",
+                (submission["proposal_sha256"],),
+            ).fetchone()
             return {
                 "proposal_sha256": submission["proposal_sha256"],
                 "submission_sha256": submission_sha256,
                 "state": "PENDING",
+                "planner_message_id": (
+                    None if notice is None else int(notice["message_id"])
+                ),
                 "idempotent": True,
             }
         current = store.connection.execute(
@@ -725,10 +849,18 @@ def submit_proposal(
                 packet=packet,
                 now=now,
             )
+            notice = store.connection.execute(
+                "SELECT message_id FROM approval_proposal_notices "
+                "WHERE proposal_sha256=?",
+                (proposal_sha256,),
+            ).fetchone()
             return {
                 "proposal_sha256": proposal_sha256,
                 "submission_sha256": submission_sha256,
                 "state": "DECIDED" if current["decision"] else "PENDING",
+                "planner_message_id": (
+                    None if notice is None else int(notice["message_id"])
+                ),
                 "idempotent": False,
                 "clustered": True,
             }
@@ -828,9 +960,40 @@ def submit_proposal(
         "proposal_sha256": proposal_sha256,
         "submission_sha256": submission_sha256,
         "state": "PENDING",
+        "planner_message_id": message_id,
         "idempotent": False,
         "clustered": False,
     }
+
+
+def submit_readiness_proposal_in_transaction(
+    store: CoordinationStore,
+    packet: dict[str, Any],
+    *,
+    expected_requester_session_id: str,
+    expected_recipient_session_id: str,
+    expected_execution_scope_sha256: str,
+    now: str,
+) -> dict[str, Any]:
+    """Submit one terminal-worker packet without granting worker authority.
+
+    The caller must already hold the receipt-pickup transaction after proving
+    the exact worker message and attempt terminal.  Historical worker endpoint
+    identity is preserved, while the recipient must still be the current
+    Planner endpoint.
+    """
+
+    return submit_proposal(
+        store,
+        packet,
+        now,
+        _transaction=False,
+        _readiness_binding={
+            "requester_session_id": expected_requester_session_id,
+            "recipient_session_id": expected_recipient_session_id,
+            "execution_scope_sha256": expected_execution_scope_sha256,
+        },
+    )
 
 
 def _pending_rows(
@@ -942,6 +1105,180 @@ def _pending_rows(
     return result
 
 
+def _proposal_batch_binding(
+    store: CoordinationStore,
+    proposal_sha256: str,
+    packet: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if packet is None:
+        row = store.connection.execute(
+            "SELECT packet_json FROM approval_proposals WHERE proposal_sha256=?",
+            (proposal_sha256,),
+        ).fetchone()
+        if row is None:
+            raise CoordinationError("APPROVAL_PROPOSAL_NOT_FOUND")
+        try:
+            packet = validate_packet(
+                json.loads(row["packet_json"], object_pairs_hook=_strict_object)
+            )
+        except (json.JSONDecodeError, CoordinationError) as exc:
+            raise CoordinationError("APPROVAL_BATCH_PROPOSAL_INVALID") from exc
+    recipients = sorted({
+        canonicalize_coordination_identity(
+            store.connection,
+            _historical_identity_current_route(
+                store, str(interest["recipient_session_id"])
+            ),
+        )
+        for interest in store.connection.execute(
+            "SELECT recipient_session_id FROM approval_interests "
+            "WHERE proposal_sha256=? ORDER BY recipient_session_id",
+            (proposal_sha256,),
+        )
+    })
+    if not recipients:
+        raise CoordinationError("APPROVAL_RECIPIENT_MISSING")
+    option_map = [
+        {
+            "id": option["id"],
+            "label": option["label"],
+            "effect": option["effect"],
+            "machine_outcome": option["machine_outcome"],
+        }
+        for option in packet["options"]
+    ]
+    return {
+        "proposal_sha256": proposal_sha256,
+        "source_snapshot_sha256": packet["source_snapshot_sha256"],
+        "execution_scope_sha256": packet["execution_scope_sha256"],
+        "recipient_session_ids": recipients,
+        "recipient_set_sha256": digest_json(recipients),
+        "option_map": option_map,
+        "option_map_sha256": digest_json(option_map),
+    }
+
+
+def _load_review_batch(
+    store: CoordinationStore,
+    batch_sha256: str,
+    proposal_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(batch_sha256, str) or not SHA256.fullmatch(batch_sha256):
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_REQUIRED")
+    row = store.connection.execute(
+        "SELECT * FROM approval_review_batches WHERE batch_sha256=?",
+        (batch_sha256,),
+    ).fetchone()
+    if row is None or row["batch_json"] is None:
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_REQUIRED")
+    try:
+        batch = json.loads(row["batch_json"], object_pairs_hook=_strict_object)
+    except (TypeError, json.JSONDecodeError, CoordinationError) as exc:
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_INVALID") from exc
+    if (
+        not isinstance(batch, dict)
+        or set(batch) != {"schema", "repository", "proposals"}
+        or batch.get("schema") != REVIEW_BATCH_SCHEMA
+        or canonical_json(batch) != row["batch_json"]
+        or digest_json(batch) != batch_sha256
+        or batch.get("repository") != row["repository"]
+        or not isinstance(batch.get("proposals"), list)
+        or len(batch["proposals"]) != int(row["proposal_count"])
+        or canonical_json(
+            [entry.get("proposal_sha256") for entry in batch["proposals"]]
+        ) != row["proposal_sha256_json"]
+    ):
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_INVALID")
+    matches = [
+        entry
+        for entry in batch["proposals"]
+        if isinstance(entry, dict)
+        and entry.get("proposal_sha256") == proposal_sha256
+    ]
+    if len(matches) != 1:
+        raise CoordinationError("APPROVAL_PROPOSAL_NOT_IN_BATCH")
+    frozen = matches[0]
+    if set(frozen) != {
+        "proposal_sha256", "source_snapshot_sha256",
+        "execution_scope_sha256", "recipient_session_ids",
+        "recipient_set_sha256", "option_map", "option_map_sha256",
+    }:
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_INVALID")
+    current = _proposal_batch_binding(store, proposal_sha256)
+    current_recipients = list(current["recipient_session_ids"])
+    frozen_recipients = list(frozen["recipient_session_ids"])
+    unmatched_frozen = list(frozen_recipients)
+    if len(current_recipients) != len(frozen_recipients):
+        raise CoordinationError("APPROVAL_BATCH_RECIPIENT_SET_DRIFT")
+    for recipient in current_recipients:
+        equivalent_index = next(
+            (
+                index
+                for index, frozen_recipient in enumerate(unmatched_frozen)
+                if identities_role_equivalent(
+                    store.connection, recipient, frozen_recipient
+                )
+            ),
+            None,
+        )
+        if equivalent_index is None:
+            raise CoordinationError("APPROVAL_BATCH_RECIPIENT_SET_DRIFT")
+        del unmatched_frozen[equivalent_index]
+    binding_keys = {
+        "proposal_sha256",
+        "source_snapshot_sha256",
+        "execution_scope_sha256",
+        "option_map",
+        "option_map_sha256",
+    }
+    if any(current[key] != frozen[key] for key in binding_keys):
+        raise CoordinationError("APPROVAL_BATCH_PROPOSAL_BINDING_DRIFT")
+    return batch, frozen
+
+
+def _validate_batch_answer_map(
+    batch: dict[str, Any],
+    answer_map: Any,
+) -> tuple[dict[str, str], str, str]:
+    if (
+        not isinstance(answer_map, dict)
+        or set(answer_map) != {"schema", "batch_sha256", "answers"}
+        or answer_map.get("schema") != BATCH_ANSWER_SCHEMA
+        or answer_map.get("batch_sha256") != digest_json(batch)
+        or not isinstance(answer_map.get("answers"), list)
+        or not answer_map["answers"]
+    ):
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+    proposal_order = {
+        entry["proposal_sha256"]: index
+        for index, entry in enumerate(batch["proposals"])
+    }
+    answers: dict[str, str] = {}
+    observed_order: list[int] = []
+    for answer in answer_map["answers"]:
+        if not isinstance(answer, dict) or set(answer) != {
+            "proposal_sha256", "selected_option_id"
+        }:
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+        proposal = answer.get("proposal_sha256")
+        option_id = answer.get("selected_option_id")
+        if (
+            proposal not in proposal_order
+            or proposal in answers
+            or not isinstance(option_id, str)
+        ):
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+        frozen = batch["proposals"][proposal_order[proposal]]
+        if option_id not in {option["id"] for option in frozen["option_map"]}:
+            raise CoordinationError("APPROVAL_SELECTED_OPTION_INVALID")
+        answers[proposal] = option_id
+        observed_order.append(proposal_order[proposal])
+    if observed_order != sorted(observed_order):
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+    canonical = canonical_json(answer_map)
+    return answers, digest_json(answer_map), canonical
+
+
 def create_review_batch(
     store: CoordinationStore, repository: str, now: str
 ) -> dict[str, Any]:
@@ -950,21 +1287,35 @@ def create_review_batch(
     ensure_schema(store.connection)
     with store.transaction():
         proposals = _pending_rows(store, repository, now=now)
-        digests = [
-            entry["proposal_sha256"]
+        selected = [
+            entry
             for entry in proposals
             if entry["source_current"] and not entry["expired"]
         ]
-        batch = {"repository": repository, "proposal_sha256": digests}
+        bindings = [
+            _proposal_batch_binding(
+                store, str(entry["proposal_sha256"]), packet=entry
+            )
+            for entry in selected
+        ]
+        digests = [entry["proposal_sha256"] for entry in bindings]
+        batch = {
+            "schema": REVIEW_BATCH_SCHEMA,
+            "repository": repository,
+            "proposals": bindings,
+        }
         batch_sha256 = digest_json(batch)
         cursor = store.connection.execute(
             """
             INSERT OR IGNORE INTO approval_review_batches(
                 batch_sha256, repository, proposal_sha256_json,
-                proposal_count, created_at
-            ) VALUES (?,?,?,?,?)
+                proposal_count, batch_json, created_at
+            ) VALUES (?,?,?,?,?,?)
             """,
-            (batch_sha256, repository, canonical_json(digests), len(digests), now),
+            (
+                batch_sha256, repository, canonical_json(digests), len(digests),
+                canonical_json(batch), now,
+            ),
         )
         if cursor.rowcount == 1:
             _event(
@@ -976,10 +1327,9 @@ def create_review_batch(
             )
     return {
         "batch_sha256": batch_sha256,
+        "batch": batch,
         "pending_count": len(digests),
-        "proposals": [
-            entry for entry in proposals if entry["source_current"] and not entry["expired"]
-        ],
+        "proposals": selected,
         "held": [
             {
                 "proposal_sha256": entry["proposal_sha256"],
@@ -995,7 +1345,8 @@ def _decision_comment(
     packet: dict[str, Any], proposal_sha256: str, decision: str, note: str,
     *, selected_option_id: str, revisit_trigger: str | None,
     recipients: list[str], recipient_set_sha256: str, user_input_sha256: str,
-    user_event_source: str, user_event_id: str,
+    user_event_source: str, user_event_id: str, batch_sha256: str,
+    batch_answer_map_sha256: str, option_map_sha256: str,
 ) -> str:
     prohibited = "\n".join(
         f"- {value}" for value in packet["prohibited_side_effects"]
@@ -1005,6 +1356,9 @@ def _decision_comment(
         f"- Decision: `{decision}`\n"
         f"- Selected option: `{selected_option_id}`\n"
         f"- Proposal digest: `{proposal_sha256}`\n"
+        f"- Review-batch digest: `{batch_sha256}`\n"
+        f"- Batch-answer-map digest: `{batch_answer_map_sha256}`\n"
+        f"- Frozen option-map digest: `{option_map_sha256}`\n"
         f"- Decision key: `{packet['decision_key']}`\n"
         f"- Boundary: `{packet['boundary']}`\n"
         f"- Exact target: {packet['target']}\n"
@@ -1025,10 +1379,31 @@ def _decision_comment(
     )
 
 
+def _readiness_revisit_at(value: str | None) -> str:
+    """Validate the one machine-evaluable readiness DEFER trigger: UTC AT."""
+
+    text = _validate_text(value, "revisit_trigger")
+    if not text.endswith("Z"):
+        raise CoordinationError("APPROVAL_READINESS_REVISIT_TRIGGER_INVALID")
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError as exc:
+        raise CoordinationError(
+            "APPROVAL_READINESS_REVISIT_TRIGGER_INVALID"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise CoordinationError("APPROVAL_READINESS_REVISIT_TRIGGER_INVALID")
+    if parsed.microsecond:
+        raise CoordinationError("APPROVAL_READINESS_REVISIT_TRIGGER_INVALID")
+    return parsed.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def record_decision(
     store: CoordinationStore,
     *,
     proposal_sha256: str,
+    batch_sha256: str | None = None,
+    batch_answer_map: dict[str, Any] | None = None,
     decision: str,
     selected_option_id: str,
     revisit_trigger: str | None,
@@ -1047,8 +1422,12 @@ def record_decision(
     )
     if decision not in DECISIONS:
         raise CoordinationError("APPROVAL_DECISION_INVALID")
-    if not SHA256.fullmatch(proposal_sha256) or not SHA256.fullmatch(user_input_sha256):
+    if not SHA256.fullmatch(proposal_sha256) or not SHA256.fullmatch(
+        user_input_sha256
+    ):
         raise CoordinationError("APPROVAL_DIGEST_INVALID")
+    if not isinstance(batch_sha256, str) or not SHA256.fullmatch(batch_sha256):
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_REQUIRED")
     if (
         user_event_source not in USER_EVENT_SOURCES
         or not isinstance(user_event_id, str)
@@ -1082,24 +1461,42 @@ def record_decision(
             raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_DRIFT")
         if _expired(packet, now):
             raise CoordinationError("APPROVAL_PROPOSAL_EXPIRED")
-        if selected_option_id not in {option["id"] for option in packet["options"]}:
+        batch, frozen = _load_review_batch(
+            store, batch_sha256, proposal_sha256
+        )
+        answers, answer_map_sha256, answer_map_json = (
+            _validate_batch_answer_map(batch, batch_answer_map)
+        )
+        frozen_selected_option_id = answers.get(proposal_sha256)
+        if frozen_selected_option_id is None:
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MISSING")
+        if selected_option_id != frozen_selected_option_id:
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MISMATCH")
+        selected_options = [
+            option
+            for option in frozen["option_map"]
+            if option["id"] == frozen_selected_option_id
+        ]
+        if len(selected_options) != 1:
             raise CoordinationError("APPROVAL_SELECTED_OPTION_INVALID")
-        recipients = sorted({
-            canonicalize_coordination_identity(
-                store.connection,
-                _historical_identity_current_route(
-                    store, str(interest["recipient_session_id"])
-                ),
-            )
-            for interest in store.connection.execute(
-                "SELECT recipient_session_id FROM approval_interests "
-                "WHERE proposal_sha256=? ORDER BY recipient_session_id",
+        machine_outcome = str(selected_options[0]["machine_outcome"])
+        if decision != machine_outcome:
+            raise CoordinationError("APPROVAL_OPTION_OUTCOME_MISMATCH")
+        decision = machine_outcome
+        readiness_submission_recipients = [
+            str(submission["recipient_session_id"])
+            for submission in store.connection.execute(
+                "SELECT recipient_session_id FROM approval_submissions "
+                "WHERE proposal_sha256=? AND workstream='READINESS'",
                 (proposal_sha256,),
             )
-        })
+        ]
+        if decision == "DEFER" and readiness_submission_recipients:
+            revisit_trigger = _readiness_revisit_at(revisit_trigger)
+        recipients = list(frozen["recipient_session_ids"])
         if not recipients:
             raise CoordinationError("APPROVAL_RECIPIENT_MISSING")
-        recipient_set_sha256 = digest_json(recipients)
+        recipient_set_sha256 = str(frozen["recipient_set_sha256"])
         existing = store.connection.execute(
             "SELECT * FROM approval_decisions WHERE proposal_sha256=?",
             (proposal_sha256,),
@@ -1108,9 +1505,13 @@ def record_decision(
             "proposal_sha256": proposal_sha256,
             "decision": decision,
             "selected_option_id": selected_option_id,
+            "selected_option_machine_outcome": machine_outcome,
             "revisit_trigger": revisit_trigger,
             "recipient_set_sha256": recipient_set_sha256,
-            "execution_scope_sha256": packet["execution_scope_sha256"],
+            "execution_scope_sha256": frozen["execution_scope_sha256"],
+            "batch_sha256": batch_sha256,
+            "batch_answer_map_sha256": answer_map_sha256,
+            "option_map_sha256": frozen["option_map_sha256"],
             "decision_note": decision_note,
             "user_input_sha256": user_input_sha256,
             "user_event_source": user_event_source,
@@ -1139,16 +1540,27 @@ def record_decision(
             "SELECT * FROM approval_user_events WHERE user_event_source=? AND user_event_id=?",
             (user_event_source, user_event_id),
         ).fetchone()
-        if user_event is not None and (
-            user_event["user_input_sha256"] != user_input_sha256
-            or user_event["planner_session_id"] != planner_session_id
-        ):
-            raise CoordinationError("APPROVAL_USER_EVENT_CONFLICT")
+        if user_event is not None:
+            if user_event["batch_sha256"] != batch_sha256:
+                raise CoordinationError("APPROVAL_USER_EVENT_CROSS_BATCH_REUSE")
+            if (
+                user_event["user_input_sha256"] != user_input_sha256
+                or user_event["planner_session_id"] != planner_session_id
+                or user_event["batch_answer_map_sha256"] != answer_map_sha256
+                or user_event["batch_answer_map_json"] != answer_map_json
+            ):
+                raise CoordinationError("APPROVAL_USER_EVENT_CONFLICT")
         if user_event is None:
             store.connection.execute(
                 "INSERT INTO approval_user_events(user_event_source,user_event_id,"
-                "user_input_sha256,planner_session_id,created_at) VALUES (?,?,?,?,?)",
-                (user_event_source, user_event_id, user_input_sha256, planner_session_id, now),
+                "user_input_sha256,planner_session_id,batch_sha256,"
+                "batch_answer_map_sha256,batch_answer_map_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    user_event_source, user_event_id, user_input_sha256,
+                    planner_session_id, batch_sha256, answer_map_sha256,
+                    answer_map_json, now,
+                ),
             )
         body = _decision_comment(
             packet,
@@ -1162,6 +1574,9 @@ def record_decision(
             user_input_sha256=user_input_sha256,
             user_event_source=user_event_source,
             user_event_id=user_event_id,
+            batch_sha256=batch_sha256,
+            batch_answer_map_sha256=answer_map_sha256,
+            option_map_sha256=str(frozen["option_map_sha256"]),
         )
         outbox_id = store.enqueue_comment(
             idempotency_key=f"approval-decision:{decision_sha256}",
@@ -1177,20 +1592,26 @@ def record_decision(
             """
             INSERT INTO approval_decisions(
                 proposal_sha256, decision_sha256, decision, selected_option_id,
-                revisit_trigger, recipient_set_sha256, execution_scope_sha256,
+                selected_option_machine_outcome, revisit_trigger,
+                recipient_set_sha256, execution_scope_sha256,
+                batch_sha256, batch_answer_map_sha256, option_map_sha256,
                 decision_note,
                 user_input_sha256, user_event_source, user_event_id,
                 planner_session_id, owner_outbox_id, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 proposal_sha256,
                 decision_sha256,
                 decision,
                 selected_option_id,
+                machine_outcome,
                 revisit_trigger,
                 recipient_set_sha256,
-                packet["execution_scope_sha256"],
+                frozen["execution_scope_sha256"],
+                batch_sha256,
+                answer_map_sha256,
+                frozen["option_map_sha256"],
                 decision_note,
                 user_input_sha256,
                 user_event_source,
@@ -1200,14 +1621,29 @@ def record_decision(
                 now,
             ),
         )
-        delivery_state = "HOLD" if decision == "DEFER" else "WAITING_PUBLICATION"
-        delivery_error = "APPROVAL_DEFERRED" if decision == "DEFER" else None
+        # Only the exact readiness recipient must consume DEFER after the
+        # published/read-back boundary.  Historical non-readiness DEFER
+        # deliveries preserve their canonical immediate durable HOLD.
+        delivery_rows: list[tuple[str, str, str | None]] = []
+        for recipient in recipients:
+            readiness_delivery = any(
+                identities_role_equivalent(
+                    store.connection, historical_recipient, recipient
+                )
+                for historical_recipient in readiness_submission_recipients
+            )
+            if decision == "DEFER" and not readiness_delivery:
+                delivery_rows.append(
+                    (recipient, "HOLD", "APPROVAL_DEFERRED")
+                )
+            else:
+                delivery_rows.append((recipient, "WAITING_PUBLICATION", None))
         store.connection.executemany(
             "INSERT INTO approval_deliveries(proposal_sha256,decision_sha256,"
             "recipient_session_id,state,updated_at,last_error) VALUES (?,?,?,?,?,?)",
             [
-                (proposal_sha256, decision_sha256, recipient, delivery_state, now, delivery_error)
-                for recipient in recipients
+                (proposal_sha256, decision_sha256, recipient, state, now, error)
+                for recipient, state, error in delivery_rows
             ],
         )
         _retire_planner_notice(store, proposal_sha256, now)
@@ -1222,7 +1658,9 @@ def record_decision(
         "proposal_sha256": proposal_sha256,
         "decision_sha256": decision_sha256,
         "owner_outbox_id": outbox_id,
-        "delivery_states": {recipient: delivery_state for recipient in recipients},
+        "delivery_states": {
+            recipient: state for recipient, state, _error in delivery_rows
+        },
         "idempotent": False,
     }
 
@@ -1295,7 +1733,8 @@ def revoke_decision(
             (user_event_source, user_event_id),
         ).fetchone()
         if user_event is not None and (
-            user_event["user_input_sha256"] != user_input_sha256
+            user_event["batch_sha256"] is not None
+            or user_event["user_input_sha256"] != user_input_sha256
             or user_event["planner_session_id"] != planner_session_id
         ):
             raise CoordinationError("APPROVAL_USER_EVENT_CONFLICT")
@@ -1359,6 +1798,268 @@ def revoke_decision(
     }
 
 
+def enqueue_published_readiness_decision_notices(
+    store: CoordinationStore,
+    *,
+    now: str,
+    limit: int = 8,
+) -> dict[str, Any]:
+    """Enqueue one idempotent Planner delivery wake after exact publication.
+
+    This is a mechanical supervisor operation.  The notice is deliberately
+    non-authorizing: the Planner handler must atomically claim the immutable
+    ledger delivery before changing readiness state.
+    """
+
+    if type(limit) is not int or limit <= 0 or limit > 64:
+        raise CoordinationError("APPROVAL_NOTICE_LIMIT_INVALID")
+    ensure_schema(store.connection)
+    if not all(
+        store.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        for name in (
+            "portfolio_readiness_campaigns",
+            "portfolio_readiness_receipts",
+            "portfolio_readiness_current",
+            "portfolio_readiness_approval_requests",
+            "portfolio_readiness_approval_consumptions",
+        )
+    ):
+        return {"limit": limit, "enqueued": []}
+    enqueued: list[dict[str, Any]] = []
+    with store.transaction():
+        planner_endpoint = _current_role_route(store, "planner")
+        rows = store.connection.execute(
+            """
+            SELECT DISTINCT request.proposal_sha256, request.submission_sha256,
+                   x.decision_sha256,
+                   x.recipient_session_id, d.decision, d.selected_option_id,
+                   d.revisit_trigger, d.execution_scope_sha256,
+                   d.owner_outbox_id, o.remote_receipt,
+                   request.repository, request.issue_number AS owning_issue,
+                   request.boundary,
+                   request.campaign_id AS readiness_campaign_id,
+                   request.receipt_id AS readiness_receipt_id,
+                   request.expected_approval_pending_version
+                       AS expected_readiness_version,
+                   current.payload_sha256 AS current_source_sha256,
+                   revocation.decision_sha256 AS revoked_decision_sha256
+            FROM portfolio_readiness_approval_requests request
+            JOIN approval_submissions submission
+              ON submission.submission_sha256=request.submission_sha256
+             AND submission.proposal_sha256=request.proposal_sha256
+             AND submission.requester_session_id=request.requester_session_id
+             AND submission.recipient_session_id=request.packet_recipient_session_id
+             AND submission.workstream='READINESS'
+            JOIN approval_proposals p
+              ON p.proposal_sha256=request.proposal_sha256
+            JOIN approval_deliveries x
+              ON x.proposal_sha256=request.proposal_sha256
+            JOIN approval_decisions d
+              USING(proposal_sha256, decision_sha256)
+            JOIN portfolio_readiness_receipts receipt
+              ON receipt.id=request.receipt_id
+             AND receipt.campaign_id=request.campaign_id
+             AND receipt.verdict='APPROVAL_REQUIRED'
+             AND receipt.approval_proposal_sha256=request.proposal_sha256
+            JOIN portfolio_readiness_current readiness
+              ON readiness.receipt_id=request.receipt_id
+             AND readiness.campaign_id=request.campaign_id
+             AND readiness.state='APPROVAL_PENDING'
+             AND readiness.version=request.expected_approval_pending_version
+            JOIN portfolio_readiness_campaigns campaign
+              ON campaign.id=request.campaign_id
+             AND campaign.repository=request.repository
+             AND campaign.issue_number=request.issue_number
+             AND campaign.source_payload_sha256=request.source_payload_sha256
+            JOIN github_outbox o ON o.id=d.owner_outbox_id
+            JOIN github_current current
+              ON current.repository=request.repository
+             AND current.object_kind='issue'
+             AND current.object_number=request.issue_number
+            LEFT JOIN approval_revocations revocation
+              USING(proposal_sha256, decision_sha256)
+            LEFT JOIN portfolio_readiness_approval_consumptions consumption
+              ON consumption.request_campaign_id=request.campaign_id
+            WHERE consumption.request_campaign_id IS NULL
+              AND (
+                  x.state='WAITING_PUBLICATION'
+                  OR (x.state='HOLD' AND revocation.decision_sha256 IS NOT NULL)
+              )
+              AND p.repository=request.repository
+              AND p.owning_issue=request.issue_number
+              AND p.source_snapshot_sha256=request.source_payload_sha256
+              AND p.boundary=request.boundary
+              AND d.execution_scope_sha256=request.execution_scope_sha256
+              AND json_extract(submission.packet_json,
+                               '$.execution_scope_sha256')
+                    =request.execution_scope_sha256
+              AND json_extract(submission.packet_json, '$.boundary')
+                    =request.boundary
+              AND json_extract(submission.packet_json,
+                               '$.source_snapshot_sha256')
+                    =request.source_payload_sha256
+              AND o.state='COMPLETE' AND o.remote_receipt IS NOT NULL
+            ORDER BY d.created_at, request.campaign_id, x.recipient_session_id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            if not identities_role_equivalent(
+                store.connection,
+                str(row["recipient_session_id"]),
+                planner_endpoint,
+            ):
+                # A semantically clustered proposal may also have an ordinary
+                # Development/SRE delivery.  Its endpoint owns that delivery;
+                # this supervisor path wakes only the readiness Planner.
+                continue
+            prior = store.connection.execute(
+                """
+                SELECT notice.*, message.state AS message_state
+                FROM approval_delivery_notices notice
+                JOIN coordination_messages message ON message.id=notice.message_id
+                WHERE notice.readiness_campaign_id=?
+                  AND notice.decision_sha256=?
+                ORDER BY notice.id DESC
+                """,
+                (
+                    int(row["readiness_campaign_id"]),
+                    row["decision_sha256"],
+                ),
+            ).fetchall()
+            exact_prior = next(
+                (
+                    notice
+                    for notice in prior
+                    if notice["source_payload_sha256"]
+                    == row["current_source_sha256"]
+                    and notice["routed_endpoint_id"] == planner_endpoint
+                ),
+                None,
+            )
+            if exact_prior is not None:
+                continue
+            for notice in prior:
+                if notice["message_state"] in {"PREPARED", "CLAIMED"}:
+                    store.connection.execute(
+                        "UPDATE coordination_messages SET state='HOLD', "
+                        "updated_at=?, last_error='READINESS_DECISION_NOTICE_SUPERSEDED' "
+                        "WHERE id=? AND state IN ('PREPARED','CLAIMED')",
+                        (now, int(notice["message_id"])),
+                    )
+            message_id = store.enqueue_message(
+                idempotency_key=(
+                    "readiness-decision-disposition:"
+                    f"{int(row['readiness_campaign_id'])}:"
+                    f"{row['decision_sha256']}:{row['current_source_sha256']}:"
+                    f"{planner_endpoint}"
+                ),
+                recipient_session_id=planner_endpoint,
+                topic="coordination.notice",
+                payload={
+                    "source": {
+                        "repository": row["repository"],
+                        "object_kind": "issue",
+                        "object_number": int(row["owning_issue"]),
+                        "payload_sha256": row["current_source_sha256"],
+                    },
+                    "notice_kind": "planning_request",
+                    "mutation_authority": False,
+                    "subject": (
+                        "published-readiness-decision:"
+                        f"{row['proposal_sha256']}"
+                    ),
+                    "summary": (
+                        "A material readiness decision is published and "
+                        "awaits one atomic Planner disposition."
+                    ),
+                    "evidence": {
+                        "proposal_sha256": row["proposal_sha256"],
+                        "submission_sha256": row["submission_sha256"],
+                        "decision_sha256": row["decision_sha256"],
+                        "decision": row["decision"],
+                        "selected_option_id": row["selected_option_id"],
+                        "revisit_trigger": row["revisit_trigger"],
+                        "execution_scope_sha256": row[
+                            "execution_scope_sha256"
+                        ],
+                        "boundary": row["boundary"],
+                        "readiness_campaign_id": int(
+                            row["readiness_campaign_id"]
+                        ),
+                        "readiness_receipt_id": int(
+                            row["readiness_receipt_id"]
+                        ),
+                        "expected_readiness_version": int(
+                            row["expected_readiness_version"]
+                        ),
+                        "owner_outbox_id": int(row["owner_outbox_id"]),
+                        "remote_receipt": row["remote_receipt"],
+                        "revoked": row["revoked_decision_sha256"] is not None,
+                    },
+                    "requested_evidence": [
+                        "Atomic ledger claim and readiness disposition receipt."
+                    ],
+                    "next_observation": (
+                        "The exact delivery and notice become terminal together."
+                    ),
+                },
+                now=now,
+                _transaction=False,
+            )
+            store.connection.execute(
+                """
+                INSERT INTO approval_delivery_notices(
+                    proposal_sha256, submission_sha256, decision_sha256,
+                    recipient_session_id,
+                    readiness_campaign_id, readiness_receipt_id,
+                    expected_readiness_version, source_payload_sha256,
+                    routed_endpoint_id, message_id, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    row["proposal_sha256"],
+                    row["submission_sha256"],
+                    row["decision_sha256"],
+                    row["recipient_session_id"],
+                    int(row["readiness_campaign_id"]),
+                    int(row["readiness_receipt_id"]),
+                    int(row["expected_readiness_version"]),
+                    row["current_source_sha256"],
+                    planner_endpoint,
+                    message_id,
+                    now,
+                ),
+            )
+            _event(
+                store.connection,
+                "READINESS_DECISION_NOTICE_ENQUEUED",
+                f"approval:{row['proposal_sha256']}",
+                {
+                    "decision_sha256": row["decision_sha256"],
+                    "message_id": message_id,
+                    "readiness_campaign_id": int(
+                        row["readiness_campaign_id"]
+                    ),
+                    "routed_endpoint_id": planner_endpoint,
+                },
+                now,
+            )
+            enqueued.append(
+                {
+                    "proposal_sha256": row["proposal_sha256"],
+                    "decision_sha256": row["decision_sha256"],
+                    "message_id": message_id,
+                    "routed_endpoint_id": planner_endpoint,
+                }
+            )
+    return {"limit": limit, "enqueued": enqueued}
+
+
 def delivery_recipient_for_role(
     store: CoordinationStore, proposal_sha256: str, requested_identity: str
 ) -> str:
@@ -1400,6 +2101,8 @@ def claim_decision_in_transaction(
     refreshed_payload_sha256: str,
     now: str,
     allow_acknowledged_replay: bool = False,
+    ingest_refreshed_source: bool = True,
+    expected_current_source_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Claim a delivery and bind effectivity inside an existing transaction."""
 
@@ -1414,10 +2117,18 @@ def claim_decision_in_transaction(
         raise CoordinationError("APPROVAL_SOURCE_REFRESH_INVALID")
     if digest_json(refreshed_payload) != refreshed_payload_sha256:
         raise CoordinationError("APPROVAL_SOURCE_REFRESH_DIGEST_DRIFT")
+    if (
+        expected_current_source_sha256 is not None
+        and not SHA256.fullmatch(expected_current_source_sha256)
+    ):
+        raise CoordinationError("APPROVAL_EXPECTED_CURRENT_SOURCE_INVALID")
     row = store.connection.execute(
         """
-        SELECT x.*, d.decision, d.selected_option_id, d.revisit_trigger,
+        SELECT x.*, d.decision, d.selected_option_id,
+               d.selected_option_machine_outcome, d.revisit_trigger,
                d.execution_scope_sha256, d.decision_note, d.owner_outbox_id,
+               d.batch_sha256, d.batch_answer_map_sha256,
+               d.option_map_sha256, d.user_event_source, d.user_event_id,
                o.state AS outbox_state, o.remote_receipt,
                p.packet_json, p.source_snapshot_sha256,
                c.proposal_sha256 AS current_sha,
@@ -1454,17 +2165,51 @@ def claim_decision_in_transaction(
         raise CoordinationError("APPROVAL_ALREADY_ACKNOWLEDGED")
 
     packet = json.loads(row["packet_json"])
-    refreshed = store.ingest_snapshot_in_transaction(
-        repository=packet["repository"],
-        object_kind="issue",
-        object_number=packet["owning_issue"],
-        payload=refreshed_payload,
-        source_updated_at=refreshed_payload.get(
-            "_projection_updated_at", refreshed_payload.get("updated_at", "")
-        ),
-        fetched_at=now,
-        expected_payload_sha256=refreshed_payload_sha256,
+    batch, frozen = _load_review_batch(
+        store, row["batch_sha256"], proposal_sha256
     )
+    user_event = store.connection.execute(
+        "SELECT * FROM approval_user_events WHERE user_event_source=? "
+        "AND user_event_id=?",
+        (row["user_event_source"], row["user_event_id"]),
+    ).fetchone()
+    if (
+        user_event is None
+        or user_event["batch_sha256"] != row["batch_sha256"]
+        or user_event["batch_answer_map_sha256"]
+        != row["batch_answer_map_sha256"]
+        or user_event["batch_answer_map_json"] is None
+    ):
+        raise CoordinationError("APPROVAL_BATCH_DECISION_BINDING_INVALID")
+    try:
+        answer_map = json.loads(
+            user_event["batch_answer_map_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, CoordinationError) as exc:
+        raise CoordinationError(
+            "APPROVAL_BATCH_DECISION_BINDING_INVALID"
+        ) from exc
+    answers, answer_map_sha256, answer_map_json = _validate_batch_answer_map(
+        batch, answer_map
+    )
+    selected = next(
+        (
+            option for option in frozen["option_map"]
+            if option["id"] == answers.get(proposal_sha256)
+        ),
+        None,
+    )
+    if (
+        selected is None
+        or answers[proposal_sha256] != row["selected_option_id"]
+        or selected["machine_outcome"] != row["decision"]
+        or row["selected_option_machine_outcome"] != row["decision"]
+        or row["execution_scope_sha256"] != frozen["execution_scope_sha256"]
+        or row["option_map_sha256"] != frozen["option_map_sha256"]
+        or answer_map_sha256 != row["batch_answer_map_sha256"]
+        or answer_map_json != user_event["batch_answer_map_json"]
+    ):
+        raise CoordinationError("APPROVAL_BATCH_DECISION_BINDING_INVALID")
     original_row = store.connection.execute(
         """
         SELECT payload_json FROM github_snapshots
@@ -1480,12 +2225,43 @@ def claim_decision_in_transaction(
     if original_row is None:
         raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_MISSING")
     original_payload = json.loads(original_row["payload_json"])
-    if _stable_source_payload(original_payload) != _stable_source_payload(
-        refreshed.payload
+    current = store.current_snapshot(
+        packet["repository"], "issue", packet["owning_issue"]
+    )
+    if current is None:
+        raise CoordinationError("APPROVAL_CURRENT_SOURCE_MISSING")
+    if (
+        expected_current_source_sha256 is not None
+        and current.payload_sha256 != expected_current_source_sha256
+    ):
+        raise CoordinationError("APPROVAL_CURRENT_SOURCE_DIGEST_DRIFT")
+    if _stable_source_payload(current.payload) != _stable_source_payload(
+        refreshed_payload
     ):
         raise CoordinationError("APPROVAL_SOURCE_DRIFT_AFTER_PUBLICATION")
+    if _stable_source_payload(original_payload) != _stable_source_payload(
+        refreshed_payload
+    ):
+        raise CoordinationError("APPROVAL_SOURCE_DRIFT_AFTER_PUBLICATION")
+    if ingest_refreshed_source:
+        refreshed = store.ingest_snapshot_in_transaction(
+            repository=packet["repository"],
+            object_kind="issue",
+            object_number=packet["owning_issue"],
+            payload=refreshed_payload,
+            source_updated_at=refreshed_payload.get(
+                "_projection_updated_at", refreshed_payload.get("updated_at", "")
+            ),
+            fetched_at=now,
+            expected_payload_sha256=refreshed_payload_sha256,
+        )
+        effective_payload = refreshed.payload
+    else:
+        # Readiness consumes authority against a canonical stable comparison
+        # without advancing the planning source cursor for comment-only churn.
+        effective_payload = refreshed_payload
 
-    effective_source_sha256 = digest_json(_stable_source_payload(refreshed.payload))
+    effective_source_sha256 = digest_json(_stable_source_payload(effective_payload))
     effectivity = store.connection.execute(
         "SELECT * FROM approval_effectivity WHERE proposal_sha256=?",
         (proposal_sha256,),
@@ -1881,6 +2657,41 @@ def load_packet(path: Path) -> dict[str, Any]:
     return validate_packet(packet)
 
 
+def load_batch_answer_map(path: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 256 * 1024
+        ):
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_FILE_UNSAFE")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        value = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            object_pairs_hook=_strict_object,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not isinstance(value, dict):
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1893,6 +2704,8 @@ def main() -> int:
 
     decide = subparsers.add_parser("decide")
     decide.add_argument("--proposal-sha256", required=True)
+    decide.add_argument("--batch-sha256", required=True)
+    decide.add_argument("--batch-answer-map", type=Path, required=True)
     decide.add_argument("--decision", choices=sorted(DECISIONS), required=True)
     decide.add_argument("--selected-option-id", required=True)
     decide.add_argument("--revisit-trigger")
@@ -1935,6 +2748,8 @@ def main() -> int:
             result = record_decision(
                 store,
                 proposal_sha256=args.proposal_sha256,
+                batch_sha256=args.batch_sha256,
+                batch_answer_map=load_batch_answer_map(args.batch_answer_map),
                 decision=args.decision,
                 selected_option_id=args.selected_option_id,
                 revisit_trigger=args.revisit_trigger,

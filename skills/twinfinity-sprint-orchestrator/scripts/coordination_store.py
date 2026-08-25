@@ -122,6 +122,14 @@ PREPARED_MESSAGE_HOLD_REASONS = {
     "SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER",
 }
 ACTIVE_EXECUTION_STATUSES = {"ACTIVE", "ACTIVE_FENCED", "MONITOR"}
+_READY_FINALIZATION_GATEWAY = object()
+_READINESS_DECISION_GATEWAY = object()
+_READINESS_RESOLUTION_GATEWAY = object()
+_TEST_FIXTURE_FORBIDDEN_ITEM_STATES = {
+    "READY",
+    "READY_ELIGIBLE",
+    "FINALIZED",
+}
 MESSAGE_TOPICS = {
     "coordination.notice",
     "development.admission",
@@ -871,6 +879,13 @@ class CoordinationStore:
     def close(self) -> None:
         self.connection.close()
 
+    def _require_temporary_test_database(self) -> None:
+        """Fence fixture-only mechanical helpers away from owner-live state."""
+
+        resolved = self.path.resolve()
+        if resolved == Path("/tmp") or Path("/tmp") not in resolved.parents:
+            raise CoordinationError("TEST_FIXTURE_DATABASE_REQUIRED")
+
     @contextmanager
     def _schema_initialization_lock(self) -> Iterator[None]:
         """Serialize idempotent schema creation across same-host sessions."""
@@ -948,6 +963,30 @@ class CoordinationStore:
     ) -> dict[str, Any]:
         _validate_repository(repository)
         return dict(self._ensure_capacity_policy(repository, now or utc_now()))
+
+    def _set_capacity_policy_for_test_fixture(
+        self,
+        *,
+        repository: str,
+        development_limit: int,
+        shared_limit: int,
+        sre_limit: int,
+        authority_sha256: str,
+        expected_version: int,
+        now: str,
+    ) -> dict[str, Any]:
+        """Seed synthetic capacity state; never accepts a production database."""
+
+        self._require_temporary_test_database()
+        return self.set_capacity_policy(
+            repository=repository,
+            development_limit=development_limit,
+            shared_limit=shared_limit,
+            sre_limit=sre_limit,
+            authority_sha256=authority_sha256,
+            expected_version=expected_version,
+            now=now,
+        )
 
     def set_capacity_policy(
         self,
@@ -2699,6 +2738,200 @@ class CoordinationStore:
             "held": held,
         }
 
+    def _ready_finalization_attestation_error(
+        self,
+        *,
+        repository: str,
+        issue_number: int,
+        generation: int,
+        ready_item_version: int,
+        source_payload_sha256: str,
+    ) -> str | None:
+        required_objects = {
+            ("table", "portfolio_readiness_current"),
+            ("table", "portfolio_readiness_campaigns"),
+            ("table", "portfolio_readiness_receipts"),
+            ("table", "portfolio_pull_buffer_candidates"),
+            ("table", "portfolio_pull_buffer_current"),
+            ("table", "portfolio_ready_finalizations"),
+            ("table", "portfolio_dirty_events"),
+            ("trigger", "portfolio_ready_finalizations_immutable_update"),
+            ("trigger", "portfolio_ready_finalizations_immutable_delete"),
+        }
+        installed = {
+            (str(row["type"]), str(row["name"]))
+            for row in self.connection.execute(
+                "SELECT type,name FROM sqlite_master WHERE type IN ('table','trigger')"
+            )
+        }
+        if not required_objects.issubset(installed):
+            return "READY_FINALIZATION_ATTESTATION_SCHEMA_MISSING"
+        row = self.connection.execute(
+            """
+            SELECT finalization.generation AS finalization_generation,
+                   finalization.campaign_id, finalization.receipt_id,
+                   finalization.dirty_event_id,
+                   finalization.finalization_sha256,
+                   finalization.payload_json AS finalization_payload_json,
+                   current.state AS readiness_state,
+                   current.campaign_id AS current_campaign_id,
+                   current.receipt_id AS current_receipt_id,
+                   current.finalized_candidate_id,
+                   current.finalized_event_id,
+                   campaign.plan_sha256, campaign.transition_kind,
+                   campaign.approval_proposal_sha256,
+                   campaign.approval_decision_sha256,
+                   campaign.approval_recipient_session_id,
+                   campaign.approval_execution_scope_sha256,
+                   receipt.verdict, receipt.receipt_sha256,
+                   receipt.receipt_json,
+                   candidate.id AS candidate_id,
+                   candidate.state AS candidate_state,
+                   candidate.repository AS candidate_repository,
+                   candidate.issue_number AS candidate_issue_number,
+                   candidate.generation AS candidate_generation,
+                   candidate.item_version AS candidate_item_version,
+                   candidate.source_payload_sha256 AS candidate_source_sha256,
+                   candidate.candidate_sha256,
+                   candidate.readiness_campaign_id,
+                   candidate.readiness_plan_sha256,
+                   candidate.readiness_receipt_id,
+                   candidate.readiness_receipt_sha256,
+                   pointer.candidate_id AS pointer_candidate_id,
+                   dirty.id AS observed_dirty_event_id
+            FROM portfolio_readiness_current current
+            JOIN portfolio_ready_finalizations finalization
+              ON finalization.repository=current.repository
+             AND finalization.issue_number=current.issue_number
+             AND finalization.campaign_id=current.campaign_id
+             AND finalization.ready_candidate_id=current.finalized_candidate_id
+             AND finalization.dirty_event_id=current.finalized_event_id
+            JOIN portfolio_readiness_campaigns campaign
+              ON campaign.id=finalization.campaign_id
+            JOIN portfolio_readiness_receipts receipt
+              ON receipt.id=finalization.receipt_id
+            JOIN portfolio_pull_buffer_candidates candidate
+              ON candidate.id=finalization.ready_candidate_id
+            JOIN portfolio_pull_buffer_current pointer
+              ON pointer.repository=finalization.repository
+             AND pointer.issue_number=finalization.issue_number
+             AND pointer.candidate_id=finalization.ready_candidate_id
+            JOIN portfolio_dirty_events dirty
+              ON dirty.id=finalization.dirty_event_id
+            WHERE finalization.repository=? AND finalization.issue_number=?
+              AND finalization.generation=?
+            """,
+            (repository, issue_number, generation),
+        ).fetchone()
+        if row is None:
+            return "READY_FINALIZATION_ATTESTATION_MISSING"
+        try:
+            receipt_payload = json.loads(row["receipt_json"])
+            finalization_payload = json.loads(row["finalization_payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            return "READY_FINALIZATION_ATTESTATION_DRIFT"
+        exact = (
+            row["readiness_state"] == "FINALIZED"
+            and int(row["current_campaign_id"]) == int(row["campaign_id"])
+            and int(row["current_receipt_id"]) == int(row["receipt_id"])
+            and int(row["finalized_candidate_id"]) == int(row["candidate_id"])
+            and int(row["finalized_event_id"]) == int(row["dirty_event_id"])
+            and int(row["observed_dirty_event_id"]) == int(row["dirty_event_id"])
+            and row["verdict"] == "PASS"
+            and digest_json(receipt_payload) == row["receipt_sha256"]
+            and row["candidate_state"] == "READY"
+            and row["candidate_repository"] == repository
+            and int(row["candidate_issue_number"]) == issue_number
+            and int(row["candidate_generation"]) == generation
+            and int(row["candidate_item_version"]) == ready_item_version
+            and row["candidate_source_sha256"] == source_payload_sha256
+            and int(row["pointer_candidate_id"]) == int(row["candidate_id"])
+            and int(row["readiness_campaign_id"]) == int(row["campaign_id"])
+            and row["readiness_plan_sha256"] == row["plan_sha256"]
+            and int(row["readiness_receipt_id"]) == int(row["receipt_id"])
+            and row["readiness_receipt_sha256"] == row["receipt_sha256"]
+            and finalization_payload.get("schema")
+            == "twinfinity-kanban-ready-finalization/v1"
+            and finalization_payload.get("repository") == repository
+            and finalization_payload.get("issue_number") == issue_number
+            and finalization_payload.get("generation") == generation
+            and finalization_payload.get("ready_item_version")
+            == ready_item_version
+            and finalization_payload.get("source_payload_sha256")
+            == source_payload_sha256
+            and finalization_payload.get("ready_candidate_sha256")
+            == row["candidate_sha256"]
+            and finalization_payload.get("readiness_campaign_id")
+            == int(row["campaign_id"])
+            and finalization_payload.get("readiness_receipt_id")
+            == int(row["receipt_id"])
+            and digest_json(finalization_payload) == row["finalization_sha256"]
+        )
+        if not exact:
+            return "READY_FINALIZATION_ATTESTATION_DRIFT"
+        if row["transition_kind"] == "APPROVAL_RESUME":
+            planner = self.connection.execute(
+                """
+                SELECT endpoint.endpoint_id
+                FROM executor_role_endpoint_current current
+                JOIN executor_role_endpoints endpoint
+                  ON endpoint.endpoint_id=current.endpoint_id
+                 AND endpoint.role=current.role
+                WHERE current.role='planner'
+                """
+            ).fetchone()
+            boundary = self.connection.execute(
+                "SELECT boundary FROM approval_proposals "
+                "WHERE proposal_sha256=?",
+                (row["approval_proposal_sha256"],),
+            ).fetchone()
+            if planner is None or boundary is None:
+                return "READY_APPROVAL_AUTHORITY_MISSING"
+            try:
+                require_effective_approval(
+                    self.connection,
+                    repository=repository,
+                    issue_number=issue_number,
+                    recipient_session_id=str(
+                        row["approval_recipient_session_id"]
+                    ),
+                    actor_session_id=str(planner["endpoint_id"]),
+                    execution_scope_sha256=str(
+                        row["approval_execution_scope_sha256"]
+                    ),
+                    authority_sha256=str(row["approval_decision_sha256"]),
+                    required_proposal_sha256=str(
+                        row["approval_proposal_sha256"]
+                    ),
+                    required_workstream="READINESS",
+                    required_boundary=str(boundary["boundary"]),
+                    required_current_recipient_role="planner",
+                    required=True,
+                )
+            except ApprovalGuardError as exc:
+                return "READY_APPROVAL_AUTHORITY_" + str(exc)
+        return None
+
+    def _require_ready_finalization_attestation(
+        self,
+        *,
+        repository: str,
+        issue_number: int,
+        generation: int,
+        ready_item_version: int,
+        source_payload_sha256: str,
+    ) -> None:
+        error = self._ready_finalization_attestation_error(
+            repository=repository,
+            issue_number=issue_number,
+            generation=generation,
+            ready_item_version=ready_item_version,
+            source_payload_sha256=source_payload_sha256,
+        )
+        if error is not None:
+            raise CoordinationError(error)
+
+
     def set_issue_status(
         self,
         *,
@@ -2716,6 +2949,7 @@ class CoordinationStore:
         now: str,
         sre_units: int = 0,
         _transaction: bool = True,
+        _gateway: object | None = None,
     ) -> dict[str, Any]:
         _validate_repository(repository)
         _validate_sha256(expected_source_sha256)
@@ -2784,6 +3018,11 @@ class CoordinationStore:
                 )
             except PortfolioGraphError as exc:
                 raise CoordinationError(str(exc)) from exc
+            creating_ready = status == "READY" and (
+                current is None or current["status"] != "READY"
+            )
+            if creating_ready and _gateway is not _READY_FINALIZATION_GATEWAY:
+                raise CoordinationError("READY_FINALIZATION_REQUIRED")
             reserved = self.connection.execute(
                 """
                 SELECT COALESCE(SUM(development_units), 0) AS development,
@@ -2986,6 +3225,40 @@ class CoordinationStore:
             self._event("ISSUE_STATUS_CHANGED", f"{repository}:issue:{issue_number}", result, now)
         return result
 
+    def _set_issue_status_from_ready_finalizer(
+        self, **item: Any
+    ) -> dict[str, Any]:
+        """Commit READY only from an already recorded exact finalization."""
+
+        if not self.connection.in_transaction:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+        self._require_ready_finalization_attestation(
+            repository=item["repository"],
+            issue_number=item["issue_number"],
+            generation=item["generation"],
+            ready_item_version=item["expected_version"] + 1,
+            source_payload_sha256=item["expected_source_sha256"],
+        )
+        return self.set_issue_status(
+            **item,
+            _transaction=False,
+            _gateway=_READY_FINALIZATION_GATEWAY,
+        )
+
+    def _set_issue_status_for_test_fixture(
+        self, **item: Any
+    ) -> dict[str, Any]:
+        """Seed non-readiness item states only on a temporary database."""
+
+        status = item.get("status")
+        if (
+            isinstance(status, str)
+            and status.upper() in _TEST_FIXTURE_FORBIDDEN_ITEM_STATES
+        ):
+            raise CoordinationError("READY_FINALIZATION_REQUIRED")
+        self._require_temporary_test_database()
+        return self.set_issue_status(**item)
+
     def apply_issue_plan(
         self, entries: list[dict[str, Any]], *, now: str
     ) -> list[dict[str, Any]]:
@@ -3068,6 +3341,7 @@ class CoordinationStore:
         recipient_session_id: str,
         payload: dict[str, Any],
         current_write: bool = False,
+        projected_item: dict[str, Any] | None = None,
     ) -> None:
         if topic not in MESSAGE_TOPICS:
             raise CoordinationError("MESSAGE_TOPIC_INVALID")
@@ -3509,10 +3783,12 @@ class CoordinationStore:
             development_units != 0 or shared_units != 0 or sre_units <= 0
         ):
             raise CoordinationError("MESSAGE_CAPACITY_CLASS_MISMATCH")
-        item = self.connection.execute(
-            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
-            (payload["source"]["repository"], issue_number),
-        ).fetchone()
+        item = projected_item
+        if item is None:
+            item = self.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (payload["source"]["repository"], issue_number),
+            ).fetchone()
         allowed_statuses = (
             {"ACTIVE", "ACTIVE_FENCED"}
             if topic in {"development.admission", "sre.admission"}
@@ -3767,6 +4043,59 @@ class CoordinationStore:
             "state": "HOLD",
         }
 
+    def _require_admission_readiness_approval_precondition(
+        self, item: dict[str, Any]
+    ) -> None:
+        """Recheck an approval-bound READY lineage inside activation."""
+
+        tables = {
+            str(row["name"])
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                "('portfolio_readiness_current','portfolio_readiness_campaigns')"
+            )
+        }
+        if tables != {
+            "portfolio_readiness_current",
+            "portfolio_readiness_campaigns",
+        }:
+            return
+        repository = item.get("repository")
+        issue_number = item.get("issue_number")
+        approval_bound = self.connection.execute(
+            """
+            SELECT 1
+            FROM portfolio_readiness_current current
+            JOIN portfolio_readiness_campaigns campaign
+              ON campaign.id=current.campaign_id
+            WHERE current.repository=? AND current.issue_number=?
+              AND campaign.transition_kind='APPROVAL_RESUME'
+            """,
+            (repository, issue_number),
+        ).fetchone()
+        if approval_bound is None:
+            return
+        current = self.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        if current is None or current["status"] != "READY":
+            raise CoordinationError("ADMISSION_READY_REQUIRED")
+        if (
+            item.get("expected_version") != int(current["version"])
+            or item.get("generation") != int(current["generation"])
+            or item.get("expected_source_sha256")
+            != current["source_payload_sha256"]
+        ):
+            raise CoordinationError("ADMISSION_READY_BINDING_MISMATCH")
+        self._require_ready_finalization_attestation(
+            repository=str(repository),
+            issue_number=int(issue_number),
+            generation=int(current["generation"]),
+            ready_item_version=int(current["version"]),
+            source_payload_sha256=str(current["source_payload_sha256"]),
+        )
+
     def activate_admission(
         self,
         *,
@@ -3807,6 +4136,7 @@ class CoordinationStore:
             ):
                 raise CoordinationError("MESSAGE_ROLE_MISMATCH")
             validate_admission_dispatch_bindings(payload, topic=message["topic"])
+            self._require_admission_readiness_approval_precondition(item)
             artifact_paths: list[Path] = []
             if artifact_observations is not None:
                 if not artifact_observations:
@@ -4256,118 +4586,289 @@ class CoordinationStore:
             )
         return outbox_id, message_id
 
-    def claim_message(self, message_id: int, session_id: str, now: str) -> dict[str, Any]:
+    def _readiness_decision_notice_bound(self, message_id: int) -> bool:
+        table = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='approval_delivery_notices'"
+        ).fetchone()
+        return bool(
+            table
+            and self.connection.execute(
+                "SELECT 1 FROM approval_delivery_notices WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+        )
+
+    def _readiness_resolution_notice_bound(self, message_id: int) -> bool:
+        table = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='portfolio_readiness_resolution_notices'"
+        ).fetchone()
+        return bool(
+            table
+            and self.connection.execute(
+                "SELECT 1 FROM portfolio_readiness_resolution_notices "
+                "WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+        )
+
+    def _claim_message_in_transaction(
+        self,
+        message_id: int,
+        session_id: str,
+        now: str,
+        *,
+        gateway: object | None = None,
+    ) -> dict[str, Any]:
+        if not self.connection.in_transaction:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
         _validate_coordination_identity(session_id)
         canonical_session_id = canonicalize_coordination_identity(
             self.connection, session_id
         )
-        held_error: str | None = None
-        with self.transaction():
-            row = self.connection.execute(
-                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
-            ).fetchone()
-            if row is None:
-                raise CoordinationError("MESSAGE_NOT_FOUND")
-            if not identities_role_equivalent(
-                self.connection, row["recipient_session_id"], session_id
-            ):
-                raise CoordinationError("WRONG_MESSAGE_RECIPIENT")
-            if row["state"] not in {"PREPARED", "CLAIMED"} or (
-                row["state"] == "CLAIMED"
-                and not identities_role_equivalent(
-                    self.connection, row["claimed_by"], session_id
-                )
-            ):
+        row = self.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        ).fetchone()
+        if row is None:
+            raise CoordinationError("MESSAGE_NOT_FOUND")
+        readiness_bound = self._readiness_decision_notice_bound(message_id)
+        resolution_bound = self._readiness_resolution_notice_bound(message_id)
+        if readiness_bound and gateway is not _READINESS_DECISION_GATEWAY:
+            raise CoordinationError("READINESS_DECISION_HANDLER_REQUIRED")
+        if resolution_bound and gateway is not _READINESS_RESOLUTION_GATEWAY:
+            raise CoordinationError("READINESS_RESOLUTION_HANDLER_REQUIRED")
+        if not identities_role_equivalent(
+            self.connection, row["recipient_session_id"], session_id
+        ):
+            raise CoordinationError("WRONG_MESSAGE_RECIPIENT")
+        if row["state"] not in {"PREPARED", "CLAIMED"} or (
+            row["state"] == "CLAIMED"
+            and not identities_role_equivalent(
+                self.connection, row["claimed_by"], session_id
+            )
+        ):
+            raise CoordinationError("MESSAGE_STATE_CONFLICT")
+        payload = json.loads(row["payload_json"])
+        if not readiness_bound and not resolution_bound:
+            self._validate_message_source(payload)
+        self._validate_message_contract(
+            topic=row["topic"],
+            recipient_session_id=row["recipient_session_id"],
+            payload=payload,
+        )
+        if row["state"] == "PREPARED":
+            changed = self.connection.execute(
+                "UPDATE coordination_messages SET state='CLAIMED', claimed_by=?, "
+                "updated_at=? WHERE id=? AND state='PREPARED'",
+                (canonical_session_id, now, message_id),
+            ).rowcount
+            if changed != 1:
                 raise CoordinationError("MESSAGE_STATE_CONFLICT")
-            payload = json.loads(row["payload_json"])
-            try:
-                self._validate_message_source(payload)
-                self._validate_message_contract(
-                    topic=row["topic"],
-                    recipient_session_id=row["recipient_session_id"],
-                    payload=payload,
-                )
-            except CoordinationError as exc:
-                held_error = str(exc)
-                self.connection.execute(
-                    "UPDATE coordination_messages SET state='HOLD', updated_at=?, last_error=? WHERE id=? AND state IN ('PREPARED', 'CLAIMED')",
-                    (now, held_error, message_id),
-                )
-                self._event(
-                    "MESSAGE_HELD",
-                    f"message:{message_id}",
-                    {"error": held_error},
-                    now,
-                )
-            if held_error is None and row["state"] == "PREPARED":
-                self.connection.execute(
-                    "UPDATE coordination_messages SET state='CLAIMED', claimed_by=?, updated_at=? WHERE id=? AND state='PREPARED'",
-                    (canonical_session_id, now, message_id),
-                )
-            claimed = self.connection.execute(
-                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
-            ).fetchone()
-            if held_error is None:
-                self._event("MESSAGE_CLAIMED", f"message:{message_id}", {"session_id": session_id}, now)
-        if held_error is not None:
-            raise CoordinationError(held_error)
+        claimed = self.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        ).fetchone()
+        self._event(
+            "MESSAGE_CLAIMED",
+            f"message:{message_id}",
+            {"session_id": session_id},
+            now,
+        )
         return dict(claimed)
 
-    def complete_message(self, message_id: int, session_id: str, now: str) -> None:
+    def claim_readiness_decision_message_in_transaction(
+        self, message_id: int, session_id: str, now: str
+    ) -> dict[str, Any]:
+        """Claim one bound readiness disposition inside its all-or-none write."""
+
+        return self._claim_message_in_transaction(
+            message_id,
+            session_id,
+            now,
+            gateway=_READINESS_DECISION_GATEWAY,
+        )
+
+    def claim_readiness_resolution_message_in_transaction(
+        self, message_id: int, session_id: str, now: str
+    ) -> dict[str, Any]:
+        """Claim one bound consolidated resolution through its exact handler."""
+
+        return self._claim_message_in_transaction(
+            message_id,
+            session_id,
+            now,
+            gateway=_READINESS_RESOLUTION_GATEWAY,
+        )
+
+    def claim_message(
+        self, message_id: int, session_id: str, now: str
+    ) -> dict[str, Any]:
+        try:
+            with self.transaction():
+                return self._claim_message_in_transaction(
+                    message_id, session_id, now
+                )
+        except CoordinationError as exc:
+            error = str(exc)
+            if error in {
+                "SOURCE_SNAPSHOT_DRIFT",
+                "MESSAGE_SOURCE_DRIFT",
+                "MESSAGE_CONTRACT_INVALID",
+                "MESSAGE_ITEM_STATE_MISMATCH",
+            }:
+                with self.transaction():
+                    self.connection.execute(
+                        "UPDATE coordination_messages SET state='HOLD', "
+                        "updated_at=?, last_error=? WHERE id=? "
+                        "AND state IN ('PREPARED','CLAIMED')",
+                        (now, error, message_id),
+                    )
+                    self._event(
+                        "MESSAGE_HELD",
+                        f"message:{message_id}",
+                        {"error": error},
+                        now,
+                    )
+            raise
+
+    def _complete_message_in_transaction(
+        self,
+        message_id: int,
+        session_id: str,
+        now: str,
+        *,
+        gateway: object | None = None,
+    ) -> None:
+        if not self.connection.in_transaction:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
         session_id = canonicalize_coordination_identity(self.connection, session_id)
-        held_error: str | None = None
-        with self.transaction():
-            row = self.connection.execute(
-                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        row = self.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] != "CLAIMED"
+            or not identities_role_equivalent(
+                self.connection, row["claimed_by"], session_id
+            )
+        ):
+            raise CoordinationError("MESSAGE_STATE_CONFLICT")
+        readiness_bound = self._readiness_decision_notice_bound(message_id)
+        resolution_bound = self._readiness_resolution_notice_bound(message_id)
+        if readiness_bound:
+            if gateway is not _READINESS_DECISION_GATEWAY:
+                raise CoordinationError("READINESS_DECISION_CONSUMPTION_REQUIRED")
+            consumption_table = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='portfolio_readiness_approval_consumptions'"
+            ).fetchone()
+            if not consumption_table or self.connection.execute(
+                "SELECT 1 FROM portfolio_readiness_approval_consumptions "
+                "WHERE notice_message_id=?",
+                (message_id,),
+            ).fetchone() is None:
+                raise CoordinationError("READINESS_DECISION_CONSUMPTION_REQUIRED")
+        if resolution_bound:
+            if gateway is not _READINESS_RESOLUTION_GATEWAY:
+                raise CoordinationError("READINESS_RESOLUTION_CONSUMPTION_REQUIRED")
+            cycle_table = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='portfolio_readiness_resolution_cycles'"
+            ).fetchone()
+            if not cycle_table or self.connection.execute(
+                "SELECT 1 FROM portfolio_readiness_resolution_cycles "
+                "WHERE notice_message_id=?",
+                (message_id,),
+            ).fetchone() is None:
+                raise CoordinationError("READINESS_RESOLUTION_CONSUMPTION_REQUIRED")
+        payload = json.loads(row["payload_json"])
+        if row["topic"] == "development.terminal_closeout":
+            outbox = self.connection.execute(
+                "SELECT state, remote_receipt FROM github_outbox WHERE id=?",
+                (payload.get("outbox_id"),),
             ).fetchone()
             if (
-                row is None
-                or row["state"] != "CLAIMED"
-                or not identities_role_equivalent(
-                    self.connection, row["claimed_by"], session_id
-                )
+                outbox is None
+                or outbox["state"] != "COMPLETE"
+                or not outbox["remote_receipt"]
             ):
-                raise CoordinationError("MESSAGE_STATE_CONFLICT")
-            claimed_by = row["claimed_by"]
-            payload = json.loads(row["payload_json"])
-            if row["topic"] == "development.terminal_closeout":
-                outbox = self.connection.execute(
-                    "SELECT state, remote_receipt FROM github_outbox WHERE id=?",
-                    (payload.get("outbox_id"),),
-                ).fetchone()
-                if (
-                    outbox is None
-                    or outbox["state"] != "COMPLETE"
-                    or not outbox["remote_receipt"]
-                ):
-                    raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
-            try:
-                self._validate_message_source(payload)
-                self._validate_message_contract(
-                    topic=row["topic"],
-                    recipient_session_id=row["recipient_session_id"],
-                    payload=payload,
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
+        if not readiness_bound and not resolution_bound:
+            self._validate_message_source(payload)
+        self._validate_message_contract(
+            topic=row["topic"],
+            recipient_session_id=row["recipient_session_id"],
+            payload=payload,
+        )
+        changed = self.connection.execute(
+            "UPDATE coordination_messages SET state='COMPLETE', updated_at=? "
+            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+            (now, message_id, row["claimed_by"]),
+        ).rowcount
+        if changed != 1:
+            raise CoordinationError("MESSAGE_STATE_CONFLICT")
+        self._event(
+            "MESSAGE_COMPLETED",
+            f"message:{message_id}",
+            {"session_id": session_id},
+            now,
+        )
+
+    def complete_readiness_decision_message_in_transaction(
+        self, message_id: int, session_id: str, now: str
+    ) -> None:
+        """Complete a bound readiness notice after immutable consumption."""
+
+        self._complete_message_in_transaction(
+            message_id,
+            session_id,
+            now,
+            gateway=_READINESS_DECISION_GATEWAY,
+        )
+
+    def complete_readiness_resolution_message_in_transaction(
+        self, message_id: int, session_id: str, now: str
+    ) -> None:
+        """Complete one resolution notice after its immutable cycle receipt."""
+
+        self._complete_message_in_transaction(
+            message_id,
+            session_id,
+            now,
+            gateway=_READINESS_RESOLUTION_GATEWAY,
+        )
+
+    def complete_message(self, message_id: int, session_id: str, now: str) -> None:
+        try:
+            with self.transaction():
+                self._complete_message_in_transaction(
+                    message_id, session_id, now
                 )
-            except CoordinationError as exc:
-                held_error = str(exc)
-                self.connection.execute(
-                    "UPDATE coordination_messages SET state='HOLD', updated_at=?, last_error=? WHERE id=? AND state='CLAIMED' AND claimed_by=?",
-                    (now, held_error, message_id, claimed_by),
+        except CoordinationError as exc:
+            error = str(exc)
+            if error in {
+                "SOURCE_SNAPSHOT_DRIFT",
+                "MESSAGE_SOURCE_DRIFT",
+                "MESSAGE_CONTRACT_INVALID",
+                "MESSAGE_ITEM_STATE_MISMATCH",
+            }:
+                canonical_session_id = canonicalize_coordination_identity(
+                    self.connection, session_id
                 )
-                self._event(
-                    "MESSAGE_HELD",
-                    f"message:{message_id}",
-                    {"error": held_error},
-                    now,
-                )
-            if held_error is None:
-                self.connection.execute(
-                    "UPDATE coordination_messages SET state='COMPLETE', updated_at=? WHERE id=? AND state='CLAIMED' AND claimed_by=?",
-                    (now, message_id, claimed_by),
-                )
-                self._event("MESSAGE_COMPLETED", f"message:{message_id}", {"session_id": session_id}, now)
-        if held_error is not None:
-            raise CoordinationError(held_error)
+                with self.transaction():
+                    self.connection.execute(
+                        "UPDATE coordination_messages SET state='HOLD', "
+                        "updated_at=?, last_error=? WHERE id=? AND state='CLAIMED' "
+                        "AND claimed_by=?",
+                        (now, error, message_id, canonical_session_id),
+                    )
+                    self._event(
+                        "MESSAGE_HELD",
+                        f"message:{message_id}",
+                        {"error": error},
+                        now,
+                    )
+            raise
 
     def enqueue_comment(
         self,

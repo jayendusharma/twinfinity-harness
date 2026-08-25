@@ -110,6 +110,7 @@ def supervise(
             record=True,
             now=utc_now(),
             database=database,
+            store=store,
         )
         return {
             "repository": repository,

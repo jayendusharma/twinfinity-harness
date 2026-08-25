@@ -64,6 +64,7 @@ def enqueue_convergence_dirty_event(
     generation: int,
     now: str,
     details: dict[str, Any] | None = None,
+    require_pending: bool = False,
 ) -> int | None:
     """Append an idempotent wake when the coordination schema is installed."""
 
@@ -84,7 +85,7 @@ def enqueue_convergence_dirty_event(
     }
     event_sha256 = digest_json(payload)
     event_key = f"portfolio-dirty:{trigger_kind}:{repository}:{event_sha256}"
-    connection.execute(
+    inserted = connection.execute(
         """
         INSERT OR IGNORE INTO portfolio_dirty_events(
             event_key, repository, issue_number, release_item_version,
@@ -107,7 +108,8 @@ def enqueue_convergence_dirty_event(
         ),
     )
     row = connection.execute(
-        "SELECT id, event_sha256, payload_json FROM portfolio_dirty_events WHERE event_key=?",
+        "SELECT id, event_sha256, payload_json, state "
+        "FROM portfolio_dirty_events WHERE event_key=?",
         (event_key,),
     ).fetchone()
     if (
@@ -116,10 +118,12 @@ def enqueue_convergence_dirty_event(
         or row["payload_json"] != canonical_json(payload)
     ):
         raise PortfolioGraphError("PORTFOLIO_DIRTY_EVENT_CONFLICT")
+    if require_pending and row["state"] != "PENDING":
+        raise PortfolioGraphError("PORTFOLIO_DIRTY_EVENT_NOT_PENDING")
     events_installed = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='coordination_events'"
     ).fetchone()
-    if events_installed is not None:
+    if events_installed is not None and inserted.rowcount == 1:
         connection.execute(
             "INSERT INTO coordination_events(event_type, entity_key, payload_sha256, created_at) "
             "VALUES ('PORTFOLIO_DIRTY_ENQUEUED', ?, ?, ?)",

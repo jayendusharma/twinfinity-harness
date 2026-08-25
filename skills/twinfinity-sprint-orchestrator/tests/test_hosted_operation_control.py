@@ -22,6 +22,7 @@ from approval_guard import (  # noqa: E402
 )
 from approval_ledger import (  # noqa: E402
     claim_decision,
+    create_review_batch,
     record_decision,
     revoke_decision,
     submit_proposal,
@@ -599,8 +600,18 @@ class HostedOperationControlTests(unittest.TestCase):
             "drift_guards": ["All scope evidence must remain exact."],
             "prohibited_side_effects": ["No source or workflow mutation."],
             "options": [
-                {"id": "RETRY", "label": "Retry", "effect": "Retry once."},
-                {"id": "HOLD", "label": "Hold", "effect": "Do not retry."},
+                {
+                    "id": "RETRY",
+                    "label": "Retry",
+                    "effect": "Retry once.",
+                    "machine_outcome": "APPROVE",
+                },
+                {
+                    "id": "HOLD",
+                    "label": "Hold",
+                    "effect": "Do not retry.",
+                    "machine_outcome": "REJECT",
+                },
             ],
             "recommendation": "RETRY",
             "expires_at": None,
@@ -608,14 +619,29 @@ class HostedOperationControlTests(unittest.TestCase):
         proposal = submit_proposal(
             self.control.store, packet, "2026-08-23T10:00:02Z"
         )["proposal_sha256"]
+        batch = create_review_batch(
+            self.control.store, REPOSITORY, "2026-08-23T10:00:03Z"
+        )
+        answer_map = {
+            "schema": "twinfinity.approval-batch-answer-map.v1",
+            "batch_sha256": batch["batch_sha256"],
+            "answers": [
+                {
+                    "proposal_sha256": proposal,
+                    "selected_option_id": "RETRY",
+                }
+            ],
+        }
         decision = record_decision(
             self.control.store,
             proposal_sha256=proposal,
+            batch_sha256=batch["batch_sha256"],
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="RETRY",
             revisit_trigger=None,
             decision_note="Approved for one exact retry.",
-            user_input_sha256="e" * 64,
+            user_input_sha256=digest_json(answer_map),
             user_event_source="CODEX_DIRECT_USER_TURN",
             user_event_id="planner-turn:atomic-clearance-approve",
             planner_session_id=PLANNER_SESSION,
@@ -1013,8 +1039,18 @@ class HostedOperationControlTests(unittest.TestCase):
             "drift_guards": ["All scope evidence must remain exact."],
             "prohibited_side_effects": ["No source or workflow mutation."],
             "options": [
-                {"id": "RETRY", "label": "Retry", "effect": "Retry once."},
-                {"id": "HOLD", "label": "Hold", "effect": "Do not retry."},
+                {
+                    "id": "RETRY",
+                    "label": "Retry",
+                    "effect": "Retry once.",
+                    "machine_outcome": "APPROVE",
+                },
+                {
+                    "id": "HOLD",
+                    "label": "Hold",
+                    "effect": "Do not retry.",
+                    "machine_outcome": "REJECT",
+                },
             ],
             "recommendation": "RETRY",
             "expires_at": None,
@@ -1022,14 +1058,29 @@ class HostedOperationControlTests(unittest.TestCase):
         proposal = submit_proposal(
             self.control.store, packet, "2026-08-23T10:00:02Z"
         )["proposal_sha256"]
+        batch = create_review_batch(
+            self.control.store, REPOSITORY, "2026-08-23T10:00:03Z"
+        )
+        answer_map = {
+            "schema": "twinfinity.approval-batch-answer-map.v1",
+            "batch_sha256": batch["batch_sha256"],
+            "answers": [
+                {
+                    "proposal_sha256": proposal,
+                    "selected_option_id": "RETRY",
+                }
+            ],
+        }
         decision = record_decision(
             self.control.store,
             proposal_sha256=proposal,
+            batch_sha256=batch["batch_sha256"],
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="RETRY",
             revisit_trigger=None,
             decision_note="Approved for one exact retry.",
-            user_input_sha256="e" * 64,
+            user_input_sha256=digest_json(answer_map),
             user_event_source="CODEX_DIRECT_USER_TURN",
             user_event_id="planner-turn:clearance-approve",
             planner_session_id=PLANNER_SESSION,
@@ -1543,8 +1594,18 @@ class HostedOperationControlTests(unittest.TestCase):
             "drift_guards": ["Issue and target must remain exact."],
             "prohibited_side_effects": ["No repository content or deployment mutation."],
             "options": [
-                {"id": "UPDATE", "label": "Update", "effect": "Apply only reviewed settings."},
-                {"id": "HOLD", "label": "Hold", "effect": "Leave settings unchanged."},
+                {
+                    "id": "UPDATE",
+                    "label": "Update",
+                    "effect": "Apply only reviewed settings.",
+                    "machine_outcome": "APPROVE",
+                },
+                {
+                    "id": "HOLD",
+                    "label": "Hold",
+                    "effect": "Leave settings unchanged.",
+                    "machine_outcome": "REJECT",
+                },
             ],
             "recommendation": "UPDATE",
             "expires_at": None,
@@ -1552,14 +1613,29 @@ class HostedOperationControlTests(unittest.TestCase):
         proposal = submit_proposal(
             self.control.store, packet, "2026-08-23T10:00:02Z"
         )["proposal_sha256"]
+        batch = create_review_batch(
+            self.control.store, REPOSITORY, "2026-08-23T10:00:03Z"
+        )
+        answer_map = {
+            "schema": "twinfinity.approval-batch-answer-map.v1",
+            "batch_sha256": batch["batch_sha256"],
+            "answers": [
+                {
+                    "proposal_sha256": proposal,
+                    "selected_option_id": "UPDATE",
+                }
+            ],
+        }
         decision = record_decision(
             self.control.store,
             proposal_sha256=proposal,
+            batch_sha256=batch["batch_sha256"],
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="UPDATE",
             revisit_trigger=None,
             decision_note="Approved only for the exact reviewed settings update.",
-            user_input_sha256="b" * 64,
+            user_input_sha256=digest_json(answer_map),
             user_event_source="CODEX_DIRECT_USER_TURN",
             user_event_id="planner-turn:hosted-race-approve",
             planner_session_id=PLANNER_SESSION,

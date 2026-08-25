@@ -16,17 +16,25 @@ sys.path.insert(0, str(SCRIPTS))
 from approval_ledger import (  # noqa: E402
     acknowledge_decision,
     claim_decision,
+    claim_decision_in_transaction,
     create_review_batch,
+    enqueue_published_readiness_decision_notices,
     ensure_schema,
     load_packet,
     record_decision,
     revoke_decision,
     submit_proposal,
+    submit_readiness_proposal_in_transaction,
     validate_packet,
+)
+from approval_guard import (  # noqa: E402
+    ApprovalGuardError,
+    require_effective_approval,
 )
 from coordination_store import (  # noqa: E402
     CoordinationError,
     CoordinationStore,
+    digest_json,
 )
 from executor_registry import load_registry_config  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
@@ -36,6 +44,7 @@ from reconcile_routing_artifacts import (  # noqa: E402
 )
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
+    reviewed_planner_rotation_catalog,
 )
 
 
@@ -52,7 +61,7 @@ class ApprovalLedgerTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
-        apply_reviewed_current_endpoint_catalog(
+        self.endpoint_config = apply_reviewed_current_endpoint_catalog(
             self.store.connection,
             ROOT,
             operation_key="approval-ledger-tests",
@@ -96,17 +105,86 @@ class ApprovalLedgerTests(unittest.TestCase):
             "drift_guards": ["Owning issue source digest must remain current."],
             "prohibited_side_effects": ["No hosted or provider mutation."],
             "options": [
-                {"id": "ENABLE", "label": "Enable", "effect": "Enable the bounded behavior."},
-                {"id": "HOLD", "label": "Hold", "effect": "Keep the behavior unchanged."},
+                {
+                    "id": "ENABLE", "label": "Enable",
+                    "effect": "Enable the bounded behavior.",
+                    "machine_outcome": "APPROVE",
+                },
+                {
+                    "id": "HOLD", "label": "Hold",
+                    "effect": "Keep the behavior unchanged.",
+                    "machine_outcome": "REJECT",
+                },
+                {
+                    "id": "DEFER", "label": "Defer",
+                    "effect": "Hold until the named revisit trigger.",
+                    "machine_outcome": "DEFER",
+                },
+                {
+                    "id": "REVISE", "label": "Revise",
+                    "effect": "Return for a materially corrected proposal.",
+                    "machine_outcome": "COURSE_CORRECT",
+                },
             ],
             "recommendation": "ENABLE",
             "expires_at": None,
         }
 
+    def readiness_packet(self) -> dict:
+        packet = self.packet(key="issue-58:readiness-material-choice")
+        packet.update(
+            {
+                "requester_session_id": DEVELOPMENT_SESSION,
+                "recipient_session_id": PLANNER_SESSION,
+                "workstream": "READINESS",
+                "urgency": "READY_BLOCKER",
+            }
+        )
+        return packet
+
+    def submit_readiness(self, packet: dict | None = None) -> dict:
+        packet = self.readiness_packet() if packet is None else packet
+        ensure_schema(self.store.connection)
+        with self.store.transaction():
+            return submit_readiness_proposal_in_transaction(
+                self.store,
+                packet,
+                expected_requester_session_id=DEVELOPMENT_SESSION,
+                expected_recipient_session_id=PLANNER_SESSION,
+                expected_execution_scope_sha256=packet[
+                    "execution_scope_sha256"
+                ],
+                now="2026-08-24T04:00:02Z",
+            )
+
+    def batch_answer(
+        self,
+        proposal_sha256: str,
+        selected_option_id: str,
+        *,
+        now: str = "2026-08-24T04:00:03Z",
+    ) -> tuple[str, dict]:
+        batch = create_review_batch(self.store, REPOSITORY, now)
+        return batch["batch_sha256"], {
+            "schema": "twinfinity.approval-batch-answer-map.v1",
+            "batch_sha256": batch["batch_sha256"],
+            "answers": [
+                {
+                    "proposal_sha256": proposal_sha256,
+                    "selected_option_id": selected_option_id,
+                }
+            ],
+        }
+
     def decide(self, proposal_sha256: str) -> dict:
+        batch_sha256, answer_map = self.batch_answer(
+            proposal_sha256, "ENABLE"
+        )
         return record_decision(
             self.store,
             proposal_sha256=proposal_sha256,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="ENABLE",
             revisit_trigger=None,
@@ -127,6 +205,45 @@ class ApprovalLedgerTests(unittest.TestCase):
     @staticmethod
     def refreshed_source(*_args) -> dict:
         return {"number": 58, "updated_at": "2026-08-24T04:00:05Z"}
+
+    def install_registry(self, operation_key: str) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = self.endpoint_config
+        aliases, alias_sha = load_legacy_alias_fixture(
+            root / "tests" / "fixtures" / "legacy-role-aliases.json"
+        )
+        plan = build_plan(
+            self.store.connection,
+            config,
+            aliases,
+            alias_fixture_sha256=alias_sha,
+        )
+        apply_plan(
+            self.store.connection,
+            plan=plan,
+            operation_key=operation_key,
+            expected_plan_sha256=plan["plan_sha256"],
+            now="2026-08-24T04:00:06Z",
+        )
+
+    def rotate_planner_to_v3(self, config, operation_key: str) -> None:
+        root = Path(__file__).resolve().parents[1]
+        aliases, alias_sha = load_legacy_alias_fixture(
+            root / "tests" / "fixtures" / "legacy-role-aliases.json"
+        )
+        plan = build_plan(
+            self.store.connection,
+            config,
+            aliases,
+            alias_fixture_sha256=alias_sha,
+        )
+        apply_plan(
+            self.store.connection,
+            plan=plan,
+            operation_key=operation_key,
+            expected_plan_sha256=plan["plan_sha256"],
+            now="2026-08-24T04:00:07Z",
+        )
 
     def test_submit_and_review_batch_are_prioritized_and_idempotent(self) -> None:
         submitted = submit_proposal(
@@ -149,6 +266,411 @@ class ApprovalLedgerTests(unittest.TestCase):
             [(PLANNER_SESSION, "coordination.notice", "PREPARED")],
             [tuple(row) for row in notice],
         )
+
+    def test_decision_requires_frozen_batch_and_matching_option_outcome(self) -> None:
+        proposal = submit_proposal(
+            self.store, self.packet(), "2026-08-24T04:00:02Z"
+        )["proposal_sha256"]
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_REVIEW_BATCH_REQUIRED"
+        ):
+            record_decision(
+                self.store,
+                proposal_sha256=proposal,
+                decision="APPROVE",
+                selected_option_id="ENABLE",
+                revisit_trigger=None,
+                decision_note="Must not decide without a frozen batch.",
+                user_input_sha256="1" * 64,
+                user_event_source="CODEX_DIRECT_USER_TURN",
+                user_event_id="planner-turn:unbatched-2026-08-24",
+                planner_session_id=PLANNER_SESSION,
+                now="2026-08-24T04:00:03Z",
+            )
+
+        cases = (("APPROVE", "HOLD"), ("REJECT", "ENABLE"))
+        for index, (decision, option_id) in enumerate(cases):
+            batch_sha256, answer_map = self.batch_answer(proposal, option_id)
+            with self.subTest(decision=decision, option_id=option_id), self.assertRaisesRegex(
+                CoordinationError, "APPROVAL_OPTION_OUTCOME_MISMATCH"
+            ):
+                record_decision(
+                    self.store,
+                    proposal_sha256=proposal,
+                    batch_sha256=batch_sha256,
+                    batch_answer_map=answer_map,
+                    decision=decision,
+                    selected_option_id=option_id,
+                    revisit_trigger=None,
+                    decision_note="Caller outcome must match the frozen option.",
+                    user_input_sha256=str(index + 2) * 64,
+                    user_event_source="CODEX_DIRECT_USER_TURN",
+                    user_event_id=f"planner-turn:mismatch-{index}-2026-08-24",
+                    planner_session_id=PLANNER_SESSION,
+                    now="2026-08-24T04:00:03Z",
+                )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM approval_decisions"
+            ).fetchone()[0],
+        )
+
+    def test_batch_rejects_late_recipient_and_cross_batch_event_reuse(self) -> None:
+        proposal = submit_proposal(
+            self.store, self.packet(), "2026-08-24T04:00:02Z"
+        )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
+        sre_packet = self.packet()
+        sre_packet["requester_session_id"] = SRE_SESSION
+        sre_packet["recipient_session_id"] = SRE_SESSION
+        sre_packet["workstream"] = "SRE"
+        submit_proposal(self.store, sre_packet, "2026-08-24T04:00:03Z")
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_BATCH_RECIPIENT_SET_DRIFT"
+        ):
+            record_decision(
+                self.store,
+                proposal_sha256=proposal,
+                batch_sha256=batch_sha256,
+                batch_answer_map=answer_map,
+                decision="APPROVE",
+                selected_option_id="ENABLE",
+                revisit_trigger=None,
+                decision_note="Late recipients require a fresh review batch.",
+                user_input_sha256="4" * 64,
+                user_event_source="CODEX_DIRECT_USER_TURN",
+                user_event_id="planner-turn:late-recipient-2026-08-24",
+                planner_session_id=PLANNER_SESSION,
+                now="2026-08-24T04:00:04Z",
+            )
+
+        fresh_batch_sha256, fresh_answer_map = self.batch_answer(
+            proposal, "ENABLE", now="2026-08-24T04:00:05Z"
+        )
+        first = record_decision(
+            self.store,
+            proposal_sha256=proposal,
+            batch_sha256=fresh_batch_sha256,
+            batch_answer_map=fresh_answer_map,
+            decision="APPROVE",
+            selected_option_id="ENABLE",
+            revisit_trigger=None,
+            decision_note="Approve the freshly frozen recipient set.",
+            user_input_sha256="5" * 64,
+            user_event_source="CODEX_DIRECT_USER_TURN",
+            user_event_id="planner-turn:cross-batch-2026-08-24",
+            planner_session_id=PLANNER_SESSION,
+            now="2026-08-24T04:00:05Z",
+        )
+        self.assertFalse(first["idempotent"])
+        second_packet = self.packet(key="issue-58:second-material-choice")
+        second = submit_proposal(
+            self.store, second_packet, "2026-08-24T04:00:06Z"
+        )["proposal_sha256"]
+        second_batch_sha256, second_answer_map = self.batch_answer(
+            second, "ENABLE", now="2026-08-24T04:00:07Z"
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_USER_EVENT_CROSS_BATCH_REUSE"
+        ):
+            record_decision(
+                self.store,
+                proposal_sha256=second,
+                batch_sha256=second_batch_sha256,
+                batch_answer_map=second_answer_map,
+                decision="APPROVE",
+                selected_option_id="ENABLE",
+                revisit_trigger=None,
+                decision_note="A different batch needs a different user event.",
+                user_input_sha256="5" * 64,
+                user_event_source="CODEX_DIRECT_USER_TURN",
+                user_event_id="planner-turn:cross-batch-2026-08-24",
+                planner_session_id=PLANNER_SESSION,
+                now="2026-08-24T04:00:07Z",
+            )
+
+    def test_readiness_packet_can_only_be_submitted_by_terminal_pickup_path(self) -> None:
+        packet = self.readiness_packet()
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_READINESS_SUPERVISOR_REQUIRED"
+        ):
+            submit_proposal(self.store, packet, "2026-08-24T04:00:02Z")
+
+        submitted = self.submit_readiness(packet)
+        proposal = self.store.connection.execute(
+            "SELECT requester_session_id,recipient_session_id,workstream "
+            "FROM approval_proposals WHERE proposal_sha256=?",
+            (submitted["proposal_sha256"],),
+        ).fetchone()
+        self.assertEqual(
+            (DEVELOPMENT_SESSION, PLANNER_SESSION, "READINESS"),
+            tuple(proposal),
+        )
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM approval_proposal_notices"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_items "
+                "WHERE allocation_class IN ('ACTIVE','RETAINED')"
+            ).fetchone()[0],
+        )
+
+    def test_readiness_submission_rejects_wrong_exact_route_and_scope(self) -> None:
+        packet = self.readiness_packet()
+        ensure_schema(self.store.connection)
+        cases = (
+            {
+                "requester_session_id": SRE_SESSION,
+                "recipient_session_id": PLANNER_SESSION,
+                "execution_scope_sha256": packet["execution_scope_sha256"],
+            },
+            {
+                "requester_session_id": DEVELOPMENT_SESSION,
+                "recipient_session_id": "role.planner.v3",
+                "execution_scope_sha256": packet["execution_scope_sha256"],
+            },
+            {
+                "requester_session_id": DEVELOPMENT_SESSION,
+                "recipient_session_id": PLANNER_SESSION,
+                "execution_scope_sha256": "8" * 64,
+            },
+        )
+        for binding in cases:
+            with self.subTest(binding=binding), self.assertRaisesRegex(
+                CoordinationError, "APPROVAL_READINESS_BINDING_MISMATCH"
+            ):
+                with self.store.transaction():
+                    submit_readiness_proposal_in_transaction(
+                        self.store,
+                        packet,
+                        expected_requester_session_id=binding[
+                            "requester_session_id"
+                        ],
+                        expected_recipient_session_id=binding[
+                            "recipient_session_id"
+                        ],
+                        expected_execution_scope_sha256=binding[
+                            "execution_scope_sha256"
+                        ],
+                        now="2026-08-24T04:00:02Z",
+                    )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM approval_proposals"
+            ).fetchone()[0],
+        )
+
+    def test_readiness_decision_wake_requires_exact_campaign_request(self) -> None:
+        proposal = self.submit_readiness()["proposal_sha256"]
+        decision = self.decide(proposal)
+        before = enqueue_published_readiness_decision_notices(
+            self.store, now="2026-08-24T04:00:04Z"
+        )
+        self.assertEqual([], before["enqueued"])
+
+        self.publish(decision["owner_outbox_id"])
+        first = enqueue_published_readiness_decision_notices(
+            self.store, now="2026-08-24T04:00:06Z"
+        )
+        replay = enqueue_published_readiness_decision_notices(
+            self.store, now="2026-08-24T04:00:07Z"
+        )
+        self.assertEqual([], first["enqueued"])
+        self.assertEqual([], replay["enqueued"])
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM approval_delivery_notices"
+            ).fetchone()
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_items "
+                "WHERE allocation_class IN ('ACTIVE','RETAINED')"
+            ).fetchone()[0],
+        )
+
+    def test_defer_remains_claimable_after_publication_and_gets_one_wake(self) -> None:
+        proposal = self.submit_readiness()["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "DEFER")
+        decision = record_decision(
+            self.store,
+            proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
+            decision="DEFER",
+            selected_option_id="DEFER",
+            revisit_trigger="2026-08-25T05:00:00Z",
+            decision_note="Defer until the named portfolio trigger occurs.",
+            user_input_sha256="c" * 64,
+            user_event_source="CODEX_DIRECT_USER_TURN",
+            user_event_id="planner-turn:2026-08-24T04:02:03Z",
+            planner_session_id=PLANNER_SESSION,
+            now="2026-08-24T04:02:03Z",
+        )
+        self.assertEqual(
+            {PLANNER_SESSION: "WAITING_PUBLICATION"},
+            decision["delivery_states"],
+        )
+        self.assertEqual(
+            [],
+            enqueue_published_readiness_decision_notices(
+                self.store, now="2026-08-24T04:02:04Z"
+            )["enqueued"],
+        )
+        self.publish(decision["owner_outbox_id"])
+        self.assertEqual(
+            [],
+            enqueue_published_readiness_decision_notices(
+                self.store, now="2026-08-24T04:02:06Z"
+            )["enqueued"],
+        )
+
+    def test_effective_guard_requires_exact_readiness_bindings(self) -> None:
+        packet = self.readiness_packet()
+        proposal = self.submit_readiness(packet)["proposal_sha256"]
+        decision = self.decide(proposal)
+        self.publish(decision["owner_outbox_id"])
+        claim_decision(
+            self.store,
+            proposal_sha256=proposal,
+            recipient_session_id=PLANNER_SESSION,
+            now="2026-08-24T04:00:06Z",
+            source_refresher=self.refreshed_source,
+        )
+        effective = require_effective_approval(
+            self.store.connection,
+            repository=REPOSITORY,
+            issue_number=58,
+            recipient_session_id=PLANNER_SESSION,
+            actor_session_id=PLANNER_SESSION,
+            execution_scope_sha256=packet["execution_scope_sha256"],
+            authority_sha256=decision["decision_sha256"],
+            required_proposal_sha256=proposal,
+            required_workstream="READINESS",
+            required_boundary="PRODUCT_BEHAVIOR",
+            required_current_recipient_role=None,
+            required=True,
+        )
+        self.assertEqual(proposal, effective["proposal_sha256"])
+
+        bad_cases = (
+            ("proposal", {"required_proposal_sha256": "8" * 64}),
+            ("workstream", {"required_workstream": "SRE"}),
+            ("boundary", {"required_boundary": "HOSTED_PROVIDER"}),
+            ("scope", {"execution_scope_sha256": "8" * 64}),
+        )
+        base = {
+            "repository": REPOSITORY,
+            "issue_number": 58,
+            "recipient_session_id": PLANNER_SESSION,
+            "actor_session_id": PLANNER_SESSION,
+            "execution_scope_sha256": packet["execution_scope_sha256"],
+            "authority_sha256": decision["decision_sha256"],
+            "required_proposal_sha256": proposal,
+            "required_workstream": "READINESS",
+            "required_boundary": "PRODUCT_BEHAVIOR",
+            "required_current_recipient_role": None,
+            "required": True,
+        }
+        for name, changed in bad_cases:
+            with self.subTest(name=name), self.assertRaises(ApprovalGuardError):
+                require_effective_approval(
+                    self.store.connection, **{**base, **changed}
+                )
+
+    def test_planner_rotation_before_decision_preserves_historical_packet(self) -> None:
+        packet = self.readiness_packet()
+        proposal = self.submit_readiness(packet)["proposal_sha256"]
+        root = Path(__file__).resolve().parents[1]
+        with reviewed_planner_rotation_catalog(
+            root, Path(self.temp.name)
+        ) as config:
+            self.rotate_planner_to_v3(config, "approval-planner-rotation-before")
+            batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
+            decision = record_decision(
+                self.store,
+                proposal_sha256=proposal,
+                batch_sha256=batch_sha256,
+                batch_answer_map=answer_map,
+                decision="APPROVE",
+                selected_option_id="ENABLE",
+                revisit_trigger=None,
+                decision_note="Approve the exact readiness boundary.",
+                user_input_sha256="6" * 64,
+                user_event_source="CODEX_DIRECT_USER_TURN",
+                user_event_id="planner-turn:2026-08-24T04:10:03Z",
+                planner_session_id="role.planner.v3",
+                now="2026-08-24T04:10:03Z",
+            )
+            self.publish(decision["owner_outbox_id"])
+            claim_decision(
+                self.store,
+                proposal_sha256=proposal,
+                recipient_session_id="role.planner.v3",
+                now="2026-08-24T04:10:06Z",
+                source_refresher=self.refreshed_source,
+            )
+            effective = require_effective_approval(
+                self.store.connection,
+                repository=REPOSITORY,
+                issue_number=58,
+                recipient_session_id="role.planner.v3",
+                actor_session_id="role.planner.v3",
+                execution_scope_sha256=packet["execution_scope_sha256"],
+                authority_sha256=decision["decision_sha256"],
+                required_proposal_sha256=proposal,
+                required_workstream="READINESS",
+                required_boundary="PRODUCT_BEHAVIOR",
+                required_current_recipient_role="planner",
+                required=True,
+            )
+            self.assertEqual("role.planner.v2", self.store.connection.execute(
+                "SELECT recipient_session_id FROM approval_proposals "
+                "WHERE proposal_sha256=?", (proposal,)
+            ).fetchone()[0])
+            self.assertEqual(proposal, effective["proposal_sha256"])
+
+    def test_planner_rotation_after_decision_consumes_historical_delivery(self) -> None:
+        packet = self.readiness_packet()
+        proposal = self.submit_readiness(packet)["proposal_sha256"]
+        decision = self.decide(proposal)
+        self.publish(decision["owner_outbox_id"])
+        root = Path(__file__).resolve().parents[1]
+        with reviewed_planner_rotation_catalog(
+            root, Path(self.temp.name)
+        ) as config:
+            self.rotate_planner_to_v3(config, "approval-planner-rotation-after")
+            claimed = claim_decision(
+                self.store,
+                proposal_sha256=proposal,
+                recipient_session_id="role.planner.v3",
+                now="2026-08-24T04:11:06Z",
+                source_refresher=self.refreshed_source,
+            )
+            self.assertEqual("CLAIMED", claimed["state"])
+            effective = require_effective_approval(
+                self.store.connection,
+                repository=REPOSITORY,
+                issue_number=58,
+                recipient_session_id="role.planner.v3",
+                actor_session_id="role.planner.v3",
+                execution_scope_sha256=packet["execution_scope_sha256"],
+                authority_sha256=decision["decision_sha256"],
+                required_proposal_sha256=proposal,
+                required_workstream="READINESS",
+                required_boundary="PRODUCT_BEHAVIOR",
+                required_current_recipient_role="planner",
+                required=True,
+            )
+            self.assertEqual(proposal, effective["proposal_sha256"])
 
     def test_stale_source_is_not_furnished(self) -> None:
         submitted = submit_proposal(
@@ -175,10 +697,13 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, self.packet(), "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
         with self.assertRaisesRegex(CoordinationError, "PLANNER_SESSION_REQUIRED"):
             record_decision(
                 self.store,
                 proposal_sha256=proposal,
+                batch_sha256=batch_sha256,
+                batch_answer_map=answer_map,
                 decision="APPROVE",
                 selected_option_id="ENABLE",
                 revisit_trigger=None,
@@ -305,9 +830,7 @@ class ApprovalLedgerTests(unittest.TestCase):
         decision = self.decide(submitted["proposal_sha256"])
         self.publish(decision["owner_outbox_id"])
         root = Path(__file__).resolve().parents[1]
-        config = load_registry_config(
-            root / "references" / "twinfinity-executor-registry.toml"
-        )
+        config = self.endpoint_config
         aliases, alias_sha = load_legacy_alias_fixture(
             root / "tests" / "fixtures" / "legacy-role-aliases.json"
         )
@@ -359,9 +882,7 @@ class ApprovalLedgerTests(unittest.TestCase):
 
     def test_post_migration_proposal_rejects_legacy_alias(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        config = load_registry_config(
-            root / "references" / "twinfinity-executor-registry.toml"
-        )
+        config = self.endpoint_config
         aliases, alias_sha = load_legacy_alias_fixture(
             root / "tests" / "fixtures" / "legacy-role-aliases.json"
         )
@@ -448,6 +969,77 @@ class ApprovalLedgerTests(unittest.TestCase):
             ("HOLD", "APPROVAL_SOURCE_DRIFT_AFTER_PUBLICATION"), tuple(delivery)
         )
 
+    def test_transactional_claim_cannot_trust_stale_caller_bytes_over_current(self) -> None:
+        original_payload = {
+            "number": 58,
+            "updated_at": "2026-08-24T04:00:00Z",
+        }
+        proposal = submit_proposal(
+            self.store, self.packet(), "2026-08-24T04:00:02Z"
+        )["proposal_sha256"]
+        decision = self.decide(proposal)
+        self.publish(decision["owner_outbox_id"])
+        materially_changed = {
+            "number": 58,
+            "title": "Materially changed contract",
+            "updated_at": "2026-08-24T04:00:06Z",
+        }
+        current = self.store.ingest_snapshot(
+            repository=REPOSITORY,
+            object_kind="issue",
+            object_number=58,
+            payload=materially_changed,
+            source_updated_at=materially_changed["updated_at"],
+            fetched_at="2026-08-24T04:00:06Z",
+        )
+
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_CURRENT_SOURCE_DIGEST_DRIFT"
+        ):
+            with self.store.transaction():
+                claim_decision_in_transaction(
+                    self.store,
+                    proposal_sha256=proposal,
+                    recipient_session_id=REQUESTER,
+                    refreshed_payload=materially_changed,
+                    refreshed_payload_sha256=digest_json(materially_changed),
+                    expected_current_source_sha256=self.snapshot.payload_sha256,
+                    now="2026-08-24T04:00:07Z",
+                    ingest_refreshed_source=False,
+                )
+
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_SOURCE_DRIFT_AFTER_PUBLICATION"
+        ):
+            with self.store.transaction():
+                claim_decision_in_transaction(
+                    self.store,
+                    proposal_sha256=proposal,
+                    recipient_session_id=REQUESTER,
+                    refreshed_payload=original_payload,
+                    refreshed_payload_sha256=digest_json(original_payload),
+                    expected_current_source_sha256=current.payload_sha256,
+                    now="2026-08-24T04:00:07Z",
+                    ingest_refreshed_source=False,
+                )
+
+        delivery = self.store.connection.execute(
+            "SELECT state,claimed_at FROM approval_deliveries "
+            "WHERE proposal_sha256=?",
+            (proposal,),
+        ).fetchone()
+        self.assertEqual(("WAITING_PUBLICATION", None), tuple(delivery))
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM approval_effectivity"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            current.payload_sha256,
+            self.store.current_snapshot(REPOSITORY, "issue", 58).payload_sha256,
+        )
+
     def test_semantic_request_clusters_across_workstreams_and_delivers_to_each(self) -> None:
         development = submit_proposal(
             self.store, self.packet(), "2026-08-24T04:00:02Z"
@@ -496,11 +1088,14 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, self.packet(), "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "DEFER")
         decision = record_decision(
             self.store,
             proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="DEFER",
-            selected_option_id="HOLD",
+            selected_option_id="DEFER",
             revisit_trigger="Revisit after issue #115 reaches READY.",
             decision_note="Defer until the named portfolio trigger occurs.",
             user_input_sha256="c" * 64,
@@ -509,7 +1104,10 @@ class ApprovalLedgerTests(unittest.TestCase):
             planner_session_id=PLANNER_SESSION,
             now="2026-08-24T04:02:03Z",
         )
-        self.assertEqual({DEVELOPMENT_SESSION: "HOLD"}, decision["delivery_states"])
+        self.assertEqual(
+            {DEVELOPMENT_SESSION: "HOLD"},
+            decision["delivery_states"],
+        )
         stored = self.store.connection.execute(
             "SELECT revisit_trigger FROM approval_decisions WHERE proposal_sha256=?",
             (proposal,),
@@ -587,11 +1185,14 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, self.packet(), "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "REVISE")
         decision = record_decision(
             self.store,
             proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="COURSE_CORRECT",
-            selected_option_id="HOLD",
+            selected_option_id="REVISE",
             revisit_trigger=None,
             decision_note="Use the non-recommended hold option and revise the proposal.",
             user_input_sha256="e" * 64,
@@ -609,7 +1210,7 @@ class ApprovalLedgerTests(unittest.TestCase):
             source_refresher=self.refreshed_source,
         )
         self.assertEqual("COURSE_CORRECT", claimed["decision"])
-        self.assertEqual("HOLD", claimed["selected_option_id"])
+        self.assertEqual("REVISE", claimed["selected_option_id"])
         self.assertIsNone(claimed["revisit_trigger"])
 
     def test_decision_freezes_recipient_set_but_allows_same_recipient_evidence(self) -> None:
@@ -620,9 +1221,12 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, planner, "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
         decision = record_decision(
             self.store,
             proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="ENABLE",
             revisit_trigger=None,
