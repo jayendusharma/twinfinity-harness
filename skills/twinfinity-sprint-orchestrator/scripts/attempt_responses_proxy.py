@@ -9,14 +9,19 @@ Responses endpoint, never a provider credential or coordination capability.
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
 import hashlib
 import json
+import math
+import multiprocessing
 import os
 from pathlib import Path
 import queue
 import re
+import select
+import signal
 import socket
 import sqlite3
 import stat
@@ -139,6 +144,8 @@ _FRAME_HEADER = struct.Struct("!4sBBII")
 _MAX_FRAME_PAYLOAD = 64 * 1024
 _MAX_HELLO_BYTES = 4096
 _CHILD_CODEX_HOME = "/run/twinfinity-attempt/codex-home"
+_UPSTREAM_WORKER_KILL_GRACE_SECONDS = 0.2
+_UPSTREAM_WORKER_FATAL_EXIT = 70
 
 
 class ProxyError(RuntimeError):
@@ -594,8 +601,313 @@ class UpstreamTransport(Protocol):
     ) -> UpstreamOpenResult:
         """Return a stream plus durable exact send evidence, or zero-send evidence."""
 
-    def cancel_open(self, operation_id: str) -> None:
-        """Make a timed-out open terminal; it must not later send request bytes."""
+
+def _arm_upstream_worker_parent_death(expected_parent_pid: int) -> None:
+    """Kill the credentialed worker if its owning proxy process disappears."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL) != 0 or os.getppid() != expected_parent_pid:
+        os._exit(_UPSTREAM_WORKER_FATAL_EXIT)
+
+
+def _isolated_upstream_worker_main(
+    child_connection: Any,
+    parent_connection: Any,
+    expected_parent_pid: int,
+    upstream: UpstreamTransport,
+    request: UpstreamRequest,
+    credential_reference: ApprovedCredentialReference,
+    timeout_seconds: float,
+) -> None:
+    """Own every credentialed transport operation in one killable process."""
+
+    parent_connection.close()
+    _arm_upstream_worker_parent_death(expected_parent_pid)
+    stream: UpstreamStream | None = None
+    try:
+        try:
+            result = upstream.open(
+                request,
+                credential_reference=credential_reference,
+                timeout_seconds=timeout_seconds,
+            )
+            if not isinstance(result, UpstreamOpenResult):
+                child_connection.send(("ERROR", "OPEN_RESULT_INVALID"))
+                return
+            stream = result.stream
+            if stream is None:
+                child_connection.send(("OPEN", result.send_evidence, False, None, ()))
+                return
+            child_connection.send(
+                (
+                    "OPEN",
+                    result.send_evidence,
+                    True,
+                    stream.status,
+                    tuple(stream.headers.items()),
+                )
+            )
+        except BaseException:
+            child_connection.send(("ERROR", "OPEN_FAILED"))
+            return
+
+        while True:
+            try:
+                command = child_connection.recv()
+            except EOFError:
+                return
+            if (
+                type(command) is tuple
+                and len(command) == 2
+                and command[0] == "RECEIVE"
+                and type(command[1]) in {int, float}
+                and command[1] > 0
+            ):
+                try:
+                    child_connection.send(
+                        ("RECEIVE", stream.receive(float(command[1])))
+                    )
+                except BaseException:
+                    child_connection.send(("ERROR", "RECEIVE_FAILED"))
+                    return
+                continue
+            if command == ("CLOSE",):
+                try:
+                    stream.close()
+                    stream = None
+                    child_connection.send(("CLOSED",))
+                except BaseException:
+                    child_connection.send(("ERROR", "CLOSE_FAILED"))
+                return
+            child_connection.send(("ERROR", "COMMAND_INVALID"))
+            return
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException:
+                pass
+        child_connection.close()
+
+
+class _IsolatedUpstreamSession:
+    """Bounded parent-side controller for one credentialed worker process."""
+
+    def __init__(
+        self,
+        upstream: UpstreamTransport,
+        request: UpstreamRequest,
+        credential_reference: ApprovedCredentialReference,
+        deadline: "IODeadline",
+        *,
+        on_terminal: Callable[[int], None],
+    ) -> None:
+        context = multiprocessing.get_context("spawn")
+        parent_connection, child_connection = context.Pipe(duplex=True)
+        self.connection = parent_connection
+        self.process = context.Process(
+            target=_isolated_upstream_worker_main,
+            args=(
+                child_connection,
+                parent_connection,
+                os.getpid(),
+                upstream,
+                request,
+                credential_reference,
+                deadline.remaining(),
+            ),
+            daemon=True,
+            name="attempt-proxy-upstream",
+        )
+        self.on_terminal = on_terminal
+        self.closed = False
+        try:
+            self.process.start()
+        except BaseException:
+            parent_connection.close()
+            child_connection.close()
+            raise
+        child_connection.close()
+
+    def _record_terminal(self) -> None:
+        if self.closed:
+            return
+        exitcode = self.process.exitcode
+        if self.process.is_alive() or exitcode is None:
+            raise ProxyError("BROKER_PROXY_UPSTREAM_WORKER_EXIT_UNPROVEN")
+        self.connection.close()
+        self.on_terminal(exitcode)
+        self.process.close()
+        self.closed = True
+
+    def _kill_and_verify(self) -> None:
+        if self.closed:
+            return
+        if self.process.is_alive():
+            self.process.kill()
+        self.process.join(_UPSTREAM_WORKER_KILL_GRACE_SECONDS)
+        if self.process.is_alive() or self.process.exitcode is None:
+            # Returning would permit an unproven credentialed operation to
+            # outlive its proxy decision.  Parent-death SIGKILL makes fail-stop
+            # safer than returning AMBIGUOUS while a worker remains live.
+            os._exit(_UPSTREAM_WORKER_FATAL_EXIT)
+        self._record_terminal()
+
+    def _join_or_kill(self, deadline: "IODeadline") -> None:
+        if self.closed:
+            return
+        try:
+            remaining = deadline.remaining()
+        except ProxyIOTimeout:
+            self._kill_and_verify()
+            raise
+        self.process.join(remaining)
+        if self.process.is_alive():
+            self._kill_and_verify()
+            raise ProxyIOTimeout("BROKER_PROXY_UPSTREAM_WORKER_EXIT_TIMEOUT")
+        self._record_terminal()
+
+    def _send_command(self, command: tuple[Any, ...], deadline: "IODeadline") -> None:
+        if self.closed:
+            raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_WORKER_TERMINAL")
+        try:
+            writable = select.select(
+                [], [self.connection.fileno()], [], deadline.remaining()
+            )[1]
+            if not writable:
+                raise ProxyIOTimeout("BROKER_PROXY_UPSTREAM_COMMAND_TIMEOUT")
+            self.connection.send(command)
+        except ProxyIOTimeout:
+            self._kill_and_verify()
+            raise
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            self._kill_and_verify()
+            raise UpstreamAmbiguous(
+                "BROKER_PROXY_UPSTREAM_WORKER_CHANNEL_FAILED"
+            ) from exc
+
+    def _receive_message(
+        self,
+        deadline: "IODeadline",
+        *,
+        timeout_code: str,
+    ) -> tuple[Any, ...]:
+        try:
+            if not self.connection.poll(deadline.remaining()):
+                raise ProxyIOTimeout(timeout_code)
+            message = self.connection.recv()
+        except ProxyIOTimeout:
+            self._kill_and_verify()
+            raise
+        except (EOFError, OSError) as exc:
+            self._kill_and_verify()
+            raise UpstreamAmbiguous(
+                "BROKER_PROXY_UPSTREAM_WORKER_CHANNEL_FAILED"
+            ) from exc
+        if type(message) is not tuple or not message:
+            self._kill_and_verify()
+            raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_WORKER_MESSAGE_INVALID")
+        return message
+
+    def receive(self, timeout_seconds: float) -> bytes | None:
+        deadline = IODeadline.after(timeout_seconds)
+        self._send_command(("RECEIVE", timeout_seconds), deadline)
+        message = self._receive_message(
+            deadline,
+            timeout_code="BROKER_PROXY_SSE_IDLE_TIMEOUT",
+        )
+        if message[0] == "ERROR":
+            self._join_or_kill(deadline)
+            raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_READ_AMBIGUOUS")
+        if len(message) != 2 or message[0] != "RECEIVE":
+            self._kill_and_verify()
+            raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_WORKER_MESSAGE_INVALID")
+        return message[1]
+
+    def close_with_deadline(self, deadline: "IODeadline") -> None:
+        if self.closed:
+            return
+        if not self.process.is_alive():
+            self.process.join(0)
+            self._record_terminal()
+            return
+        self._send_command(("CLOSE",), deadline)
+        message = self._receive_message(
+            deadline,
+            timeout_code="BROKER_PROXY_UPSTREAM_CLOSE_TIMEOUT",
+        )
+        if message != ("CLOSED",):
+            self._kill_and_verify()
+            raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_CLOSE_AMBIGUOUS")
+        self._join_or_kill(deadline)
+
+
+class _IsolatedUpstreamStream:
+    """UpstreamStream facade whose resource remains inside the worker."""
+
+    def __init__(
+        self,
+        session: _IsolatedUpstreamSession,
+        status: Any,
+        headers: tuple[Any, ...],
+    ) -> None:
+        self.session = session
+        self.status = status
+        try:
+            self.headers = dict(headers)
+        except (TypeError, ValueError) as exc:
+            session._kill_and_verify()
+            raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_HEADERS_INVALID") from exc
+
+    def receive(self, timeout_seconds: float) -> bytes | None:
+        return self.session.receive(timeout_seconds)
+
+    def close(self) -> None:
+        self.close_with_deadline(IODeadline.after(5.0))
+
+    def close_with_deadline(self, deadline: "IODeadline") -> None:
+        self.session.close_with_deadline(deadline)
+
+
+def _open_isolated_upstream(
+    upstream: UpstreamTransport,
+    request: UpstreamRequest,
+    credential_reference: ApprovedCredentialReference,
+    deadline: "IODeadline",
+    *,
+    on_terminal: Callable[[int], None],
+) -> UpstreamOpenResult:
+    session = _IsolatedUpstreamSession(
+        upstream,
+        request,
+        credential_reference,
+        deadline,
+        on_terminal=on_terminal,
+    )
+    message = session._receive_message(
+        deadline,
+        timeout_code="BROKER_PROXY_UPSTREAM_OPEN_TIMEOUT",
+    )
+    if message[0] == "ERROR":
+        session._join_or_kill(deadline)
+        raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_OPEN_AMBIGUOUS")
+    if len(message) != 5 or message[0] != "OPEN":
+        session._kill_and_verify()
+        raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_WORKER_MESSAGE_INVALID")
+    _, evidence, has_stream, status, headers = message
+    if type(has_stream) is not bool:
+        session._kill_and_verify()
+        raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_WORKER_MESSAGE_INVALID")
+    if not has_stream:
+        session._join_or_kill(deadline)
+        return UpstreamOpenResult(None, evidence)
+    if type(headers) is not tuple:
+        session._kill_and_verify()
+        raise UpstreamAmbiguous("BROKER_PROXY_UPSTREAM_WORKER_MESSAGE_INVALID")
+    return UpstreamOpenResult(
+        _IsolatedUpstreamStream(session, status, headers),
+        evidence,
+    )
 
 
 @dataclass(frozen=True)
@@ -654,14 +966,14 @@ class IODeadline:
         return remaining
 
 
-def _bounded_io_call(
+def _bounded_noncredentialed_io_call(
     operation: Callable[[], T],
     deadline: IODeadline,
     *,
     timeout_code: str = HOLD_PROXY_IO_TIMEOUT,
     on_timeout: Callable[[], None] | None = None,
 ) -> T:
-    """Bound even transports that fail to implement their timeout parameter."""
+    """Bound relay-only I/O; credentialed upstream work must never use this."""
 
     result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
@@ -702,7 +1014,13 @@ def _default_io_deadline() -> IODeadline:
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -1047,7 +1365,11 @@ def _socket_call(
         except (AttributeError, OSError):
             pass
 
-    return _bounded_io_call(operation, deadline, on_timeout=close_on_timeout)
+    return _bounded_noncredentialed_io_call(
+        operation,
+        deadline,
+        on_timeout=close_on_timeout,
+    )
 
 
 def _send_all(
@@ -2233,6 +2555,12 @@ def _strict_json_loads(value: bytes) -> Any:
     def reject_constant(_value: str) -> None:
         raise ValueError("non-finite JSON number")
 
+    def finite_float(encoded: str) -> float:
+        parsed = float(encoded)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite JSON number")
+        return parsed
+
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -2245,6 +2573,7 @@ def _strict_json_loads(value: bytes) -> Any:
         value.decode("utf-8"),
         object_pairs_hook=unique_object,
         parse_constant=reject_constant,
+        parse_float=finite_float,
     )
 
 
@@ -2627,10 +2956,17 @@ class AttemptBoundResponsesProxy:
         self.started_monotonic: float | None = None
         self.started_io_monotonic: float | None = None
         self._host_previous_response_id: str | None = None
+        self._upstream_worker_exitcodes: list[int] = []
 
     @property
     def relay_binding(self) -> RelayBinding:
         return RelayBinding.from_permit(self.permit)
+
+    @property
+    def upstream_worker_exitcodes(self) -> tuple[int, ...]:
+        """Expose terminal worker proof without retaining process identity."""
+
+        return tuple(self._upstream_worker_exitcodes)
 
     def start(
         self,
@@ -2680,18 +3016,11 @@ class AttemptBoundResponsesProxy:
         return deadline
 
     def _emit_bounded(self, emit: Callable[[bytes], None], value: bytes) -> None:
-        _bounded_io_call(
+        _bounded_noncredentialed_io_call(
             lambda: emit(value),
             self._io_deadline(),
             timeout_code="BROKER_PROXY_CHILD_WRITE_TIMEOUT",
         )
-
-    @staticmethod
-    def _close_stream(stream: UpstreamStream) -> None:
-        try:
-            stream.close()
-        except Exception:
-            pass
 
     def _transition_failure(
         self,
@@ -2755,29 +3084,17 @@ class AttemptBoundResponsesProxy:
                 new_state="UPSTREAM_STARTED",
             )
 
-            def cancel_open() -> None:
-                cancel = getattr(self.upstream, "cancel_open", None)
-                if callable(cancel):
-                    cancel(prepared.upstream.operation_id)
-
-            try:
-                open_deadline = self._io_deadline()
-                open_result = _bounded_io_call(
-                    lambda: self.upstream.open(
-                        prepared.upstream,
-                        credential_reference=self.permit.credential_reference,
-                        timeout_seconds=open_deadline.remaining(),
-                    ),
-                    open_deadline,
-                    timeout_code="BROKER_PROXY_UPSTREAM_OPEN_TIMEOUT",
-                    on_timeout=cancel_open,
-                )
-            except Exception as exc:
-                raise UpstreamAmbiguous(
-                    "BROKER_PROXY_UPSTREAM_OPEN_AMBIGUOUS"
-                ) from exc
+            open_deadline = self._io_deadline()
+            open_result = _open_isolated_upstream(
+                self.upstream,
+                prepared.upstream,
+                self.permit.credential_reference,
+                open_deadline,
+                on_terminal=self._upstream_worker_exitcodes.append,
+            )
             if not isinstance(open_result, UpstreamOpenResult):
                 raise UpstreamAmbiguous("BROKER_PROXY_SEND_EVIDENCE_MISSING")
+            upstream_stream = open_result.stream
             evidence = open_result.send_evidence
             if (
                 evidence.attempt_id != self.contract.attempt_id
@@ -2809,8 +3126,6 @@ class AttemptBoundResponsesProxy:
                 return ProxyResult(503, "SAFE_NOT_SENT", sequence)
             if open_result.stream is None:
                 raise UpstreamAmbiguous("BROKER_PROXY_SEND_EVIDENCE_CONFLICT")
-            upstream_stream = open_result.stream
-
             if (
                 type(upstream_stream.status) is not int
                 or not 100 <= upstream_stream.status <= 599
@@ -2839,12 +3154,7 @@ class AttemptBoundResponsesProxy:
                     limit=min(self.contract.sse_idle_seconds, remaining)
                 )
                 contract_started = self.monotonic()
-                chunk = _bounded_io_call(
-                    lambda: upstream_stream.receive(read_deadline.remaining()),
-                    read_deadline,
-                    timeout_code="BROKER_PROXY_SSE_IDLE_TIMEOUT",
-                    on_timeout=lambda: self._close_stream(upstream_stream),
-                )
+                chunk = upstream_stream.receive(read_deadline.remaining())
                 if self.monotonic() - contract_started > min(
                     self.contract.sse_idle_seconds, remaining
                 ):
@@ -2992,13 +3302,13 @@ class AttemptBoundResponsesProxy:
         finally:
             if upstream_stream is not None:
                 try:
-                    _bounded_io_call(
-                        upstream_stream.close,
-                        self._io_deadline(),
-                        timeout_code="BROKER_PROXY_UPSTREAM_CLOSE_TIMEOUT",
-                    )
+                    if isinstance(upstream_stream, _IsolatedUpstreamStream):
+                        upstream_stream.close_with_deadline(self._io_deadline())
+                    else:
+                        raise ProxyError("BROKER_PROXY_UPSTREAM_STREAM_UNISOLATED")
                 except Exception:
-                    pass
+                    if isinstance(upstream_stream, _IsolatedUpstreamStream):
+                        upstream_stream.session._kill_and_verify()
 
 
 def _send_chunked_frames(

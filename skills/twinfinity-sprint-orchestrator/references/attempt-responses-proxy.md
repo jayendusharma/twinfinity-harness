@@ -95,9 +95,12 @@ capabilities, and passing no relay descriptor to Codex.
 
 Every connection consumes the exact attempt's finite request budget. The proxy
 allows only HTTP/1.1 `POST /v1/responses` with one unambiguous content length and
-an `application/json` body. JSON objects reject duplicate keys and non-finite
-numbers. The top-level request schema is closed to `model`, `stream`, `input`,
-optional string `instructions`, `background=false`, `store=false`,
+an `application/json` body. JSON objects reject duplicate keys, named
+non-finite constants, and finite-syntax exponent overflow such as `1e400` at
+every nesting depth. Canonical JSON serialization also rejects NaN and infinity,
+so request, tool-schema, policy, and evidence digests cannot normalize a
+non-finite value. The top-level request schema is closed to `model`, `stream`,
+`input`, optional string `instructions`, `background=false`, `store=false`,
 `max_output_tokens`, and the exact contract-hashed `tools` value. Input is
 closed recursively to text-only user, system, or developer messages and, only
 when the host has already established same-process response lineage,
@@ -167,13 +170,28 @@ becomes `SAFE_NOT_SENT`. `UPSTREAM_STARTED` or `STREAMING` becomes `AMBIGUOUS`.
 In both cases the old proxy enters `HOLD`; recovery attaches the receipt digest,
 is idempotent for that exact receipt, and never restarts or replays the attempt.
 
-All upstream open/read/close, inherited-channel read/write, loopback read/write,
-and accept helpers use absolute real deadlines. Timeout closes or cancels the
-relevant transport, terminalizes any active request as `FAILED`, `AMBIGUOUS`, or
-an already durable `COMPLETE`, and never leaves a request active for replay.
-Response forwarding is frame-by-frame with backpressure; only one bounded SSE
-event, the bounded terminal pair, or the explicitly bounded test helper response
-may be buffered.
+Every credentialed upstream open/read/close operation runs in a per-request
+spawned host worker process. The worker receives the credential reference but
+the sandbox relay does not. It is armed with a parent-death kill guard and owns
+the upstream stream for its entire lifetime. An open/read/close deadline kills
+the worker, joins it, and verifies a terminal exit code before the proxy returns
+`AMBIGUOUS` or `HOLD`; a cancellation callback or acknowledgement is never
+accepted as terminal proof. If a killed worker cannot be proven terminal, the
+proxy process fails stop instead of returning while credentialed work remains
+live. This prevents a broken cancel implementation from sending later when an
+old open call is released after the proxy decision.
+
+A future audited transport must be serializable into that spawned worker.
+Failure to construct the boundary occurs before credentialed open and fails
+closed; the generic relay-only bounded-call helper is never used for credentialed
+upstream work.
+
+Inherited-channel read/write, loopback read/write, and accept helpers likewise
+use absolute real deadlines. Timeout terminalizes any active request as
+`FAILED`, `AMBIGUOUS`, or an already durable `COMPLETE`, and never leaves a
+request active for replay. Response forwarding is frame-by-frame with
+backpressure; only one bounded SSE event, the bounded terminal pair, or the
+explicitly bounded test helper response may be buffered.
 
 The future broker may accept a child receipt only after all proxy requests are
 terminal and none is `AMBIGUOUS`. `complete_proxy` is the closed seam for that

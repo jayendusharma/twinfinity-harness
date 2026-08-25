@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import multiprocessing
 import os
 from pathlib import Path
+import signal
 import socket
 import sys
 import tempfile
@@ -146,7 +148,11 @@ class FakeStream:
         }
         self.chunks = list(chunks or [])
         self.before_receive = before_receive
-        self.closed = False
+        self._closed = multiprocessing.get_context("spawn").Value("b", False)
+
+    @property
+    def closed(self) -> bool:
+        return bool(self._closed.value)
 
     def receive(self, timeout_seconds: float) -> bytes | None:
         if self.before_receive is not None:
@@ -156,17 +162,29 @@ class FakeStream:
         return self.chunks.pop(0)
 
     def close(self) -> None:
-        self.closed = True
+        self._closed.value = True
 
 
 class FakeTransport:
     def __init__(self, outcomes) -> None:
         self.outcomes = list(outcomes)
-        self.calls = []
+        context = multiprocessing.get_context("spawn")
+        self._next_outcome = context.Value("i", 0)
+        self._call_receiver, self._call_sender = context.Pipe(duplex=False)
+        self._calls = []
+
+    @property
+    def calls(self):
+        while self._call_receiver.poll():
+            self._calls.append(self._call_receiver.recv())
+        return self._calls
 
     def open(self, request, *, credential_reference, timeout_seconds):
-        self.calls.append((request, credential_reference, timeout_seconds))
-        outcome = self.outcomes.pop(0)
+        self._call_sender.send((request, credential_reference, timeout_seconds))
+        with self._next_outcome.get_lock():
+            index = self._next_outcome.value
+            self._next_outcome.value += 1
+        outcome = self.outcomes[index]
         if isinstance(outcome, Exception):
             raise outcome
         if outcome == "ZERO_NOT_SENT":
@@ -202,30 +220,97 @@ class FakeTransport:
 
 class BlockingOpenTransport:
     def __init__(self) -> None:
-        self.release = threading.Event()
-        self.cancelled_operation_id = None
+        context = multiprocessing.get_context("spawn")
+        self.release = context.Event()
+        self.cancelled = context.Value("i", 0)
 
     def open(self, request, *, credential_reference, timeout_seconds):
         self.release.wait(5)
         raise RuntimeError("cancelled open")
 
     def cancel_open(self, operation_id) -> None:
-        self.cancelled_operation_id = operation_id
-        self.release.set()
+        with self.cancelled.get_lock():
+            self.cancelled.value += 1
+
+
+class LateSendAfterCancelTransport:
+    """A broken transport whose cancel acknowledgement terminalizes nothing."""
+
+    def __init__(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        self.started = context.RawValue("b", 0)
+        self.release = context.RawValue("b", 0)
+        self.cancel_calls = context.RawValue("i", 0)
+        self.send_count = context.RawValue("i", 0)
+        self.resource_count = context.RawValue("i", 0)
+
+    def open(self, request, *, credential_reference, timeout_seconds):
+        self.started.value = 1
+        expires_at = time.monotonic() + 5
+        while not self.release.value and time.monotonic() < expires_at:
+            time.sleep(0.005)
+        self.send_count.value += 1
+        self.resource_count.value += 1
+        return UpstreamOpenResult(
+            FakeStream(response_stream()),
+            UpstreamSendEvidence(
+                request.attempt_id,
+                request.permit_binding_sha256,
+                request.request_sha256,
+                request.operation_id,
+                len(request.body),
+                False,
+            ),
+        )
+
+    def cancel_open(self, operation_id) -> None:
+        self.cancel_calls.value += 1
+
+
+def acknowledge_cancel_without_terminalizing(
+    transport: LateSendAfterCancelTransport,
+) -> None:
+    expires_at = time.monotonic() + 1
+    while not transport.started.value and time.monotonic() < expires_at:
+        time.sleep(0.005)
+    if transport.started.value:
+        transport.cancel_open("no-op-cancel")
 
 
 class BlockingStream(FakeStream):
     def __init__(self) -> None:
         super().__init__([])
-        self.release = threading.Event()
+        self.release = multiprocessing.get_context("spawn").Event()
 
     def receive(self, timeout_seconds: float) -> bytes | None:
         self.release.wait(5)
         return None
 
     def close(self) -> None:
-        self.closed = True
+        self._closed.value = True
         self.release.set()
+
+
+class SlowReturningStream(FakeStream):
+    def receive(self, timeout_seconds: float) -> bytes | None:
+        time.sleep(timeout_seconds + 1)
+        return super().receive(timeout_seconds)
+
+
+class ForgedSendEvidenceTransport:
+    def open(self, request, *, credential_reference, timeout_seconds):
+        return UpstreamOpenResult(
+            None,
+            UpstreamSendEvidence(
+                request.attempt_id,
+                "f" * 64,
+                request.request_sha256,
+                request.operation_id,
+                0,
+                True,
+                "BROKER_PROXY_UPSTREAM_NOT_SENT",
+            ),
+        )
 
 
 class ScriptedSlowClient:
@@ -631,6 +716,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         self.assertIn(b"response.completed", response)
         self.assertNotIn(b"set-cookie", response.lower())
         self.assertTrue(stream.closed)
+        self.assertEqual((0,), proxy.upstream_worker_exitcodes)
         self.assertEqual(1, len(transport.calls))
         upstream_request, credential, _timeout = transport.calls[0]
         self.assertEqual(self.credential(), credential)
@@ -1116,6 +1202,79 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         self.assertEqual("COMPLETE", accepted.request_state)
         self.assertEqual(safe_input, json.loads(transport.calls[0][0].body)["input"])
 
+    def test_json_numbers_are_finite_before_digest_or_transport(self) -> None:
+        for value in (
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+            {"nested": [float("inf")]},
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    canonical_json({"value": value})
+
+        invalid_bodies = (
+            b'{"model":"gpt-test-exact","stream":true,"input":"x","value":1e400}',
+            b'{"model":"gpt-test-exact","stream":true,"input":"x","value":-1e400}',
+            b'{"model":"gpt-test-exact","stream":true,"input":{"nested":[1e400]}}',
+            b'{"model":"gpt-test-exact","stream":true,"input":"x","value":NaN}',
+            b'{"model":"gpt-test-exact","stream":true,"input":"x","value":Infinity}',
+        )
+        for index, body in enumerate(invalid_bodies):
+            with self.subTest(index=index):
+                root = Path(self.temp.name) / f"finite-json-{index}"
+                root.mkdir(mode=0o700)
+                with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
+                    contract = self.contract(
+                        attempt_id=f"14141414-1414-4414-8414-14141414141{index}"
+                    )
+                    transport = FakeTransport([FakeStream(response_stream())])
+                    proxy = AttemptBoundResponsesProxy(
+                        self.permit(contract), ledger, transport, monotonic=FakeClock()
+                    )
+                    proxy.start()
+                    emitted: list[bytes] = []
+                    result = proxy.handle_raw_request(
+                        raw_request_body(body), emitted.append
+                    )
+                    self.assertEqual("FAILED", result.request_state)
+                    self.assertEqual([], transport.calls)
+                    self.assertIn(b"BROKER_PROXY_JSON_INVALID", b"".join(emitted))
+
+        tools = [
+            {
+                "type": "function",
+                "name": "synthetic_lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "number", "maximum": 1e308}
+                    },
+                },
+            }
+        ]
+        finite_contract = self.contract(
+            allowed_tools_sha256=sha256_text(canonical_json(tools))
+        )
+        proxy, transport = self.proxy(
+            [FakeStream(response_stream())], contract=finite_contract
+        )
+        result = proxy.handle_raw_request(
+            raw_request(
+                {
+                    "model": MODEL,
+                    "stream": True,
+                    "input": "synthetic",
+                    "tools": tools,
+                    "max_output_tokens": 100,
+                }
+            ),
+            lambda _value: None,
+        )
+        self.assertEqual("COMPLETE", result.request_state)
+        forwarded_tools = json.loads(transport.calls[0][0].body)["tools"]
+        self.assertEqual(tools, forwarded_tools)
+
     def test_safe_not_sent_and_ambiguous_are_distinct_and_never_replayed(self) -> None:
         proxy, transport = self.proxy(["ZERO_NOT_SENT"])
         safe = proxy.handle_raw_request(raw_request(), lambda _value: None)
@@ -1239,14 +1398,16 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                 separate_root = Path(self.temp.name) / f"sse-{index}"
                 separate_root.mkdir(mode=0o700)
                 with AttemptProxyLedger(separate_root / "proxy.sqlite3") as ledger:
-                    contract = self.contract(
-                        attempt_id=f"33333333-3333-4333-8333-33333333333{index}"
-                    )
+                    changes = {
+                        "attempt_id": f"33333333-3333-4333-8333-33333333333{index}"
+                    }
                     if stream is None:
-                        stream = FakeStream(
-                            response_stream(),
-                            before_receive=lambda timeout: clock.advance(timeout + 1),
+                        changes.update(
+                            io_timeout_seconds=0.2,
+                            sse_idle_seconds=0.2,
                         )
+                        stream = SlowReturningStream(response_stream())
+                    contract = self.contract(**changes)
                     transport = FakeTransport([stream])
                     proxy = AttemptBoundResponsesProxy(
                         self.permit(contract), ledger, transport, monotonic=clock
@@ -1347,7 +1508,7 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                     self.assertEqual(code, ledger.request_rows(contract.attempt_id)[0]["error_code"])
 
     def test_real_open_read_uds_and_loopback_deadlines_terminalize(self) -> None:
-        contract = self.contract(io_timeout_seconds=0.05, sse_idle_seconds=0.1)
+        contract = self.contract(io_timeout_seconds=0.2, sse_idle_seconds=0.2)
         transport = BlockingOpenTransport()
         proxy = AttemptBoundResponsesProxy(
             self.permit(contract),
@@ -1358,19 +1519,20 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         proxy.start()
         started = time.monotonic()
         result = proxy.handle_raw_request(raw_request(), lambda _value: None)
-        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertLess(time.monotonic() - started, 1.0)
         self.assertEqual("AMBIGUOUS", result.request_state)
         self.assertEqual("HOLD", self.ledger.proxy_row(ATTEMPT_ID)["state"])
-        self.assertTrue(transport.release.wait(0.5))
-        self.assertIsNotNone(transport.cancelled_operation_id)
+        self.assertEqual((-signal.SIGKILL,), proxy.upstream_worker_exitcodes)
+        self.assertFalse(transport.release.is_set())
+        self.assertEqual(0, transport.cancelled.value)
 
         root = Path(self.temp.name) / "blocking-read"
         root.mkdir(mode=0o700)
         with AttemptProxyLedger(root / "proxy.sqlite3") as ledger:
             read_contract = self.contract(
                 attempt_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-                io_timeout_seconds=0.05,
-                sse_idle_seconds=0.1,
+                io_timeout_seconds=0.2,
+                sse_idle_seconds=0.2,
             )
             stream = BlockingStream()
             read_proxy = AttemptBoundResponsesProxy(
@@ -1382,10 +1544,13 @@ class AttemptResponsesProxyTests(unittest.TestCase):
             read_proxy.start()
             started = time.monotonic()
             result = read_proxy.handle_raw_request(raw_request(), lambda _value: None)
-            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertLess(time.monotonic() - started, 1.0)
             self.assertEqual("AMBIGUOUS", result.request_state)
             self.assertEqual("HOLD", ledger.proxy_row(read_contract.attempt_id)["state"])
-            self.assertTrue(stream.release.wait(0.5))
+            self.assertEqual(
+                (-signal.SIGKILL,), read_proxy.upstream_worker_exitcodes
+            )
+            self.assertFalse(stream.release.is_set())
 
         host, relay = memory_pair()
         started = time.monotonic()
@@ -1407,6 +1572,41 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.5)
         loopback_host.close()
         loopback_peer.close()
+
+    def test_open_timeout_kills_noop_cancel_worker_before_return(self) -> None:
+        contract = self.contract(
+            io_timeout_seconds=0.2,
+            sse_idle_seconds=0.2,
+        )
+        transport = LateSendAfterCancelTransport()
+        proxy = AttemptBoundResponsesProxy(
+            self.permit(contract),
+            self.ledger,
+            transport,
+            monotonic=FakeClock(),
+        )
+        proxy.start()
+        context = multiprocessing.get_context("spawn")
+        cancel_process = context.Process(
+            target=acknowledge_cancel_without_terminalizing,
+            args=(transport,),
+        )
+        cancel_process.start()
+        started = time.monotonic()
+        result = proxy.handle_raw_request(raw_request(), lambda _value: None)
+        elapsed = time.monotonic() - started
+        cancel_process.join(1.0)
+        self.assertFalse(cancel_process.is_alive())
+        self.assertEqual(0, cancel_process.exitcode)
+        cancel_process.close()
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual("AMBIGUOUS", result.request_state)
+        self.assertEqual(1, transport.cancel_calls.value)
+        self.assertEqual((-signal.SIGKILL,), proxy.upstream_worker_exitcodes)
+        transport.release.value = 1
+        time.sleep(0.1)
+        self.assertEqual(0, transport.send_count.value)
+        self.assertEqual(0, transport.resource_count.value)
 
     def test_slow_loopback_reader_is_backpressured_and_bounded(self) -> None:
         contract = self.contract(io_timeout_seconds=0.05, sse_idle_seconds=0.1)
@@ -1474,26 +1674,11 @@ class AttemptResponsesProxyTests(unittest.TestCase):
                 relay.close()
 
     def test_forged_send_evidence_is_ambiguous_not_safe_not_sent(self) -> None:
-        class ForgedTransport:
-            def open(inner_self, request, *, credential_reference, timeout_seconds):
-                return UpstreamOpenResult(
-                    None,
-                    UpstreamSendEvidence(
-                        request.attempt_id,
-                        "f" * 64,
-                        request.request_sha256,
-                        request.operation_id,
-                        0,
-                        True,
-                        "BROKER_PROXY_UPSTREAM_NOT_SENT",
-                    ),
-                )
-
-            def cancel_open(inner_self, operation_id):
-                pass
-
         proxy = AttemptBoundResponsesProxy(
-            self.permit(), self.ledger, ForgedTransport(), monotonic=FakeClock()
+            self.permit(),
+            self.ledger,
+            ForgedSendEvidenceTransport(),
+            monotonic=FakeClock(),
         )
         proxy.start()
         result = proxy.handle_raw_request(raw_request(), lambda _value: None)
