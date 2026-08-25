@@ -1767,9 +1767,6 @@ class ExecutorRegistryTests(unittest.TestCase):
             attempt_id=running["attempt_id"],
             executor_token=token,
         )
-        self.store.complete_message(
-            message_id, DEVELOPMENT_ENDPOINT, "2026-08-24T10:00:07Z"
-        )
         transition_attempt(
             self.store.connection,
             attempt_id=running["attempt_id"],
@@ -1778,6 +1775,13 @@ class ExecutorRegistryTests(unittest.TestCase):
             new_state="COMPLETE",
             exit_code=0,
             now="2026-08-24T10:00:08Z",
+        )
+        self.assertEqual(
+            "CLAIMED",
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()[0],
         )
         launched = execute_role(
             self.store.connection,

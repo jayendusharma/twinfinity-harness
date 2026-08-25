@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+import io
 import json
 import hashlib
 import fcntl
@@ -12,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +29,7 @@ from coordination_store import (  # noqa: E402
     terminal_published_body,
     terminal_publication_body,
 )
+import coordination_store as coordination_store_module  # noqa: E402
 from prepush_control import PrePushControl  # noqa: E402
 from portfolio_graph import replace_graph  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
@@ -152,6 +156,48 @@ class CoordinationStoreTests(unittest.TestCase):
             published_body=terminal_published_body(body, row["idempotency_key"]),
             publisher_login="twinfinity-bot",
             now=now,
+        )
+
+    def reserve_terminal_outbox(self, outbox_id: int, now: str) -> dict:
+        self.store.bind_terminal_outbox_publisher(
+            outbox_id=outbox_id,
+            publisher_login="twinfinity-bot",
+            now=now,
+        )
+        return self.store.reserve_outbox(outbox_id, now)
+
+    def terminal_live_evidence(
+        self,
+        closeout_key: str,
+        observed_at: str,
+        *,
+        issue_payload: dict | None = None,
+        current_main_sha: str | None = None,
+    ) -> dict:
+        packet = self.store.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_packets "
+            "WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        snapshot = self.store.current_snapshot(
+            packet["repository"], "issue", int(packet["issue_number"])
+        )
+        payload = copy.deepcopy(
+            snapshot.payload if issue_payload is None else issue_payload
+        )
+        main_sha = (
+            str(packet["graph_main_sha"])
+            if current_main_sha is None
+            else current_main_sha
+        )
+        return self.store.acquire_terminal_live_evidence(
+            closeout_key=closeout_key,
+            observed_at=observed_at,
+            issue_fetcher=lambda _repository, _kind, _number: payload,
+            main_ref_fetcher=lambda _repository: {
+                "ref": "refs/heads/main",
+                "object": {"sha": main_sha},
+            },
         )
 
     def install_all_current_endpoints(self) -> None:
@@ -1759,6 +1805,19 @@ class CoordinationStoreTests(unittest.TestCase):
             executor_token=token,
         )
         self.assertEqual("sre.admission", claimed["topic"])
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_FINALIZATION_REQUIRED"
+        ):
+            self.store.complete_message(
+                message_id, SRE_SESSION, "2026-08-22T10:00:06Z"
+            )
+        self.assertEqual(
+            "CLAIMED",
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()[0],
+        )
         watch_key = f"terminal:{REPOSITORY}:issue:314:generation:1"
         receipt = {
             "schema": "twinfinity-terminal-receipt/v1",
@@ -1831,6 +1890,9 @@ class CoordinationStoreTests(unittest.TestCase):
             closeout_key=closeout_key,
             attempt_id=running["attempt_id"],
             executor_token=token,
+            live_evidence=self.terminal_live_evidence(
+                closeout_key, "2026-08-22T10:00:10Z"
+            ),
             now="2026-08-22T10:00:10Z",
         )
         done = self.store.connection.execute(
@@ -1840,6 +1902,13 @@ class CoordinationStoreTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("COMPLETE", committed["state"])
         self.assertEqual(("DONE", "NONE", 0), tuple(done))
+        self.assertEqual(
+            "COMPLETE",
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()[0],
+        )
 
     def test_legacy_terminal_closeout_topic_is_retired_for_new_work(self) -> None:
         self.install_all_current_endpoints()
@@ -2072,10 +2141,98 @@ class CoordinationStoreTests(unittest.TestCase):
                 now="2026-08-22T10:00:08Z",
             )
         outbox_id = prepared["outbox_id"]
-        self.store.reserve_outbox(outbox_id, "2026-08-22T10:00:09Z")
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_OUTBOX_PUBLISHER_UNBOUND"
+        ):
+            self.store.reserve_outbox(outbox_id, "2026-08-22T10:00:09Z")
+        self.assertEqual(
+            "PREPARED",
+            self.store.connection.execute(
+                "SELECT state FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()[0],
+        )
+        self.reserve_terminal_outbox(outbox_id, "2026-08-22T10:00:09Z")
         self.complete_terminal_outbox(
             outbox_id, "comment:123", "2026-08-22T10:00:10Z"
         )
+        remote_issue = Mock(
+            return_value={
+                "number": 92,
+                "title": "Remote source moved after publication readback",
+                "updated_at": "2026-08-22T10:00:20Z",
+            }
+        )
+        remote_main = Mock(
+            return_value={
+                "ref": "refs/heads/main",
+                "object": {"sha": "a" * 40},
+            }
+        )
+        drift_evidence = self.store.acquire_terminal_live_evidence(
+            closeout_key=closeout_key,
+            observed_at="2026-08-22T10:00:10Z",
+            issue_fetcher=remote_issue,
+            main_ref_fetcher=remote_main,
+        )
+        remote_issue.assert_called_once_with(REPOSITORY, "issue", 92)
+        remote_main.assert_called_once_with(REPOSITORY)
+        before_remote_drift = (
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status,allocation_class,version "
+                    "FROM coordination_items WHERE repository=? AND issue_number=92",
+                    (REPOSITORY,),
+                ).fetchone()
+            ),
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (admission_id,),
+            ).fetchone()[0],
+            self.store.connection.execute(
+                "SELECT state FROM coordination_terminal_watches WHERE watch_key=?",
+                (watch_key,),
+            ).fetchone()[0],
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
+            ).fetchone()[0],
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_dirty_events"
+            ).fetchone()[0],
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_CLOSEOUT_SOURCE_DRIFT"
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=running["attempt_id"],
+                executor_token=token,
+                live_evidence=drift_evidence,
+                now="2026-08-22T10:00:10Z",
+            )
+        after_remote_drift = (
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status,allocation_class,version "
+                    "FROM coordination_items WHERE repository=? AND issue_number=92",
+                    (REPOSITORY,),
+                ).fetchone()
+            ),
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (admission_id,),
+            ).fetchone()[0],
+            self.store.connection.execute(
+                "SELECT state FROM coordination_terminal_watches WHERE watch_key=?",
+                (watch_key,),
+            ).fetchone()[0],
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
+            ).fetchone()[0],
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_dirty_events"
+            ).fetchone()[0],
+        )
+        self.assertEqual(before_remote_drift, after_remote_drift)
         completed_preparer = transition_attempt(
             self.store.connection,
             attempt_id=running["attempt_id"],
@@ -2331,6 +2488,11 @@ class CoordinationStoreTests(unittest.TestCase):
                 closeout_key=closeout_key,
                 attempt_id=watcher["attempt_id"],
                 executor_token=watcher_token,
+                live_evidence=self.terminal_live_evidence(
+                    closeout_key,
+                    "2026-08-22T10:00:11Z",
+                    current_main_sha="b" * 40,
+                ),
                 now="2026-08-22T10:00:11Z",
             )
         self.assertEqual(
@@ -2360,6 +2522,9 @@ class CoordinationStoreTests(unittest.TestCase):
                 closeout_key=closeout_key,
                 attempt_id=watcher["attempt_id"],
                 executor_token=watcher_token,
+                live_evidence=self.terminal_live_evidence(
+                    closeout_key, "2026-08-22T10:00:21Z"
+                ),
                 now="2026-08-22T10:00:21Z",
             )
         self.store.connection.execute(
@@ -2380,6 +2545,30 @@ class CoordinationStoreTests(unittest.TestCase):
             "WHERE repository=?",
             (REPOSITORY,),
         )
+        good_live_evidence = self.terminal_live_evidence(
+            closeout_key, "2026-08-22T10:00:11Z"
+        )
+        stale_live_evidence = copy.deepcopy(good_live_evidence)
+        stale_live_evidence["observed_at"] = "2026-08-22T09:58:00Z"
+        stale_live_evidence["evidence_sha256"] = digest_json(
+            {
+                key: value
+                for key, value in stale_live_evidence.items()
+                if key != "evidence_sha256"
+            }
+        )
+        before_stale_evidence = terminal_fingerprint()
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_LIVE_EVIDENCE_STALE"
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=watcher["attempt_id"],
+                executor_token=watcher_token,
+                live_evidence=stale_live_evidence,
+                now="2026-08-22T10:00:11Z",
+            )
+        self.assertEqual(before_stale_evidence, terminal_fingerprint())
         for failpoint in (
             "commit.after_message",
             "commit.after_message_event",
@@ -2396,6 +2585,7 @@ class CoordinationStoreTests(unittest.TestCase):
                     closeout_key=closeout_key,
                     attempt_id=watcher["attempt_id"],
                     executor_token=watcher_token,
+                    live_evidence=good_live_evidence,
                     now="2026-08-22T10:00:11Z",
                     _test_failpoint=fail_at(failpoint),
                 )
@@ -2437,6 +2627,7 @@ class CoordinationStoreTests(unittest.TestCase):
                     closeout_key=closeout_key,
                     attempt_id=watcher["attempt_id"],
                     executor_token=watcher_token,
+                    live_evidence=good_live_evidence,
                     now="2026-08-22T10:00:11Z",
                 )
             finally:
@@ -2515,6 +2706,26 @@ class CoordinationStoreTests(unittest.TestCase):
                     (admission_id,),
                 ).fetchone()[0],
             ),
+        )
+        terminal_commit = self.store.connection.execute(
+            "SELECT live_evidence_sha256,live_evidence_json "
+            "FROM coordination_terminal_closeout_commits WHERE closeout_key=?",
+            (closeout_key,),
+        ).fetchone()
+        self.assertEqual(
+            (
+                good_live_evidence["evidence_sha256"],
+                canonical_json(good_live_evidence),
+            ),
+            tuple(terminal_commit),
+        )
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()[0],
         )
 
     def test_message_queue_is_idempotent_and_recipient_fenced(self) -> None:
@@ -3526,6 +3737,7 @@ class CoordinationStoreTests(unittest.TestCase):
             )
 
     def test_claimed_recovery_activates_same_generation_atomically_and_idempotently(self) -> None:
+        self.install_all_current_endpoints()
         source = self.snapshot()
         held = self.store.set_issue_status(
             repository=REPOSITORY,
@@ -3593,7 +3805,14 @@ class CoordinationStoreTests(unittest.TestCase):
                 session_id=SESSION,
                 now="2026-08-22T10:00:04Z",
             )
-        self.store.claim_message(commit, SESSION, "2026-08-22T10:00:05Z")
+        running, token = self.running_message_attempt(commit, process_id=9404)
+        self.store.claim_message(
+            commit,
+            SESSION,
+            "2026-08-22T10:00:05Z",
+            attempt_id=running["attempt_id"],
+            executor_token=token,
+        )
         with self.assertRaisesRegex(CoordinationError, "WRONG_MESSAGE_RECIPIENT"):
             self.store.activate_recovery(
                 message_id=commit,
@@ -3605,6 +3824,8 @@ class CoordinationStoreTests(unittest.TestCase):
             message_id=commit,
             session_id=SESSION,
             now="2026-08-22T10:00:07Z",
+            attempt_id=running["attempt_id"],
+            executor_token=token,
         )
         self.assertEqual(
             ("ACTIVE_FENCED", "ACTIVE", 4, 2),
@@ -3618,12 +3839,21 @@ class CoordinationStoreTests(unittest.TestCase):
         observed = self.store.connection.execute(
             "SELECT state FROM coordination_messages WHERE id=?", (commit,)
         ).fetchone()
-        self.assertEqual("COMPLETE", observed["state"])
+        self.assertEqual("CLAIMED", observed["state"])
         watch = self.store.connection.execute(
-            "SELECT state, generation, accountable_session_id FROM coordination_terminal_watches WHERE watch_key=?",
+            "SELECT state, generation, accountable_session_id, claim_attempt_id "
+            "FROM coordination_terminal_watches WHERE watch_key=?",
             (watch_key,),
         ).fetchone()
-        self.assertEqual(("ACTIVE", 4, SESSION), tuple(watch))
+        self.assertEqual(
+            ("ACTIVE", 4, SESSION, running["attempt_id"]), tuple(watch)
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_FINALIZATION_REQUIRED"
+        ):
+            self.store.complete_message(
+                commit, SESSION, "2026-08-22T10:00:07Z"
+            )
         self.assertEqual(
             2,
             self.store.connection.execute(
@@ -3635,6 +3865,8 @@ class CoordinationStoreTests(unittest.TestCase):
             message_id=commit,
             session_id=SESSION,
             now="2026-08-22T10:00:08Z",
+            attempt_id=running["attempt_id"],
+            executor_token=token,
         )
         self.assertEqual(activated, repeated)
         self.assertEqual(watch_key, repeated_watch)
@@ -3653,6 +3885,104 @@ class CoordinationStoreTests(unittest.TestCase):
             self.assertEqual(4, lineage.generation)
         finally:
             prepush.close()
+
+        self.seed_current_graph(92, source.payload_sha256)
+        receipt = {
+            "schema": "twinfinity-terminal-receipt/v1",
+            "repository": REPOSITORY,
+            "issue_number": 92,
+            "generation": 4,
+            "source_payload_sha256": source.payload_sha256,
+            "lease_manifest_sha256": LEASE,
+            "outcome": "ACCEPTED",
+            "accepted_head_sha": "c" * 40,
+            "operational_state_sha256": None,
+            "acceptance_evidence_sha256": "d" * 64,
+            "residual_risks": [],
+        }
+        cleanup = {
+            "schema": "twinfinity-terminal-cleanup/v1",
+            "repository": REPOSITORY,
+            "issue_number": 92,
+            "generation": 4,
+            "lease_manifest_sha256": LEASE,
+            "owned_resources_absent": True,
+            "temporary_resources_absent": True,
+            "worktree_disposition": "ABSENT",
+            "local_branch_disposition": "ABSENT",
+            "remote_branch_disposition": "ABSENT",
+            "residuals": [],
+        }
+        closeout_key = f"terminal-closeout:{REPOSITORY}:issue:92:generation:4"
+        prepared = self.store.prepare_terminal_closeout(
+            packet={
+                "schema": "twinfinity-terminal-closeout-packet/v1",
+                "repository": REPOSITORY,
+                "issue_number": 92,
+                "generation": 4,
+                "expected_item_version": activated["version"],
+                "source_payload_sha256": source.payload_sha256,
+                "lease_manifest_sha256": LEASE,
+                "terminal_watch_key": watch_key,
+                "activation_message_id": commit,
+                "terminal_receipt": receipt,
+                "cleanup_evidence": cleanup,
+                "outbox": {
+                    "idempotency_key": closeout_key,
+                    "body": terminal_publication_body(
+                        closeout_key=closeout_key,
+                        terminal_receipt=receipt,
+                        cleanup_evidence=cleanup,
+                    ),
+                },
+            },
+            attempt_id=running["attempt_id"],
+            executor_token=token,
+            now="2026-08-22T10:00:09Z",
+        )
+        self.assertEqual("PUBLICATION_PENDING", prepared["state"])
+        self.assertEqual(
+            "CLAIMED",
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (commit,),
+            ).fetchone()[0],
+        )
+        self.reserve_terminal_outbox(
+            prepared["outbox_id"], "2026-08-22T10:00:10Z"
+        )
+        self.complete_terminal_outbox(
+            prepared["outbox_id"], "comment:904", "2026-08-22T10:00:11Z"
+        )
+        completed = self.store.commit_terminal_closeout(
+            closeout_key=closeout_key,
+            attempt_id=running["attempt_id"],
+            executor_token=token,
+            live_evidence=self.terminal_live_evidence(
+                closeout_key, "2026-08-22T10:00:12Z"
+            ),
+            now="2026-08-22T10:00:12Z",
+        )
+        self.assertEqual("COMPLETE", completed["state"])
+        self.assertEqual(
+            ("DONE", "NONE", "COMPLETE", "COMPLETE"),
+            tuple(
+                self.store.connection.execute(
+                    """
+                    SELECT item.status,item.allocation_class,
+                           message.state,watch.state
+                    FROM coordination_items item
+                    JOIN coordination_messages message ON message.id=?
+                    JOIN coordination_terminal_watches watch
+                      ON watch.repository=item.repository
+                     AND watch.issue_number=item.issue_number
+                     AND watch.generation=item.generation
+                    WHERE item.repository=? AND item.issue_number=92
+                    """,
+                    (commit, REPOSITORY),
+                ).fetchone()
+            ),
+        )
 
     def test_recovery_activation_rolls_back_on_source_drift(self) -> None:
         source = self.snapshot()
@@ -3847,7 +4177,7 @@ class CoordinationStoreTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            "COMPLETE",
+            "CLAIMED",
             self.store.connection.execute(
                 "SELECT state FROM coordination_messages WHERE id=?", (commit,)
             ).fetchone()[0],
@@ -4045,12 +4375,14 @@ class CoordinationStoreTests(unittest.TestCase):
             expected_version=1,
             now="2026-08-22T10:00:03Z",
         )
-        with self.assertRaisesRegex(CoordinationError, "MESSAGE_ITEM_STATE_MISMATCH"):
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_FINALIZATION_REQUIRED"
+        ):
             self.store.complete_message(message, SESSION, "2026-08-22T10:00:04Z")
         state = self.store.connection.execute(
             "SELECT state, last_error FROM coordination_messages WHERE id=?", (message,)
         ).fetchone()
-        self.assertEqual(("HOLD", "MESSAGE_ITEM_STATE_MISMATCH"), tuple(state))
+        self.assertEqual(("CLAIMED", None), tuple(state))
 
     def test_outbox_is_idempotent_and_never_blindly_rereserved(self) -> None:
         source = self.snapshot()

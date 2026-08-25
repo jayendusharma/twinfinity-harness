@@ -101,6 +101,7 @@ MESSAGE_STATES = {"PREPARED", "CLAIMED", "COMPLETE", "HOLD"}
 OUTBOX_STATES = {"PREPARED", "INFLIGHT", "COMPLETE", "HOLD"}
 TERMINAL_OUTBOX_READBACK_ATTEMPTS_PER_RETRY = 3
 TERMINAL_OUTBOX_MAX_RETRY_ROUNDS = 3
+TERMINAL_LIVE_EVIDENCE_MAX_AGE_SECONDS = 60
 ALLOCATION_CLASSES = {"ACTIVE", "RETAINED", "NONE"}
 ARTIFACT_RETENTION_CLASSES = {"EPHEMERAL", "CLOSEOUT_EVIDENCE", "RETAINED"}
 ARTIFACT_STATES = {
@@ -631,6 +632,16 @@ def utc_now() -> str:
 def timestamp_after(timestamp: str, seconds: int) -> str:
     observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     return (observed + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+def _utc_timestamp(value: str, *, error: str) -> datetime:
+    try:
+        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise CoordinationError(error) from exc
+    if observed.tzinfo is None or observed.utcoffset() != timedelta(0):
+        raise CoordinationError(error)
+    return observed
 
 
 def terminal_watch_key(repository: str, issue_number: int, generation: int) -> str:
@@ -1581,6 +1592,8 @@ class CoordinationStore:
                 finalizer_attempt_id TEXT NOT NULL,
                 finalizer_attempt_version INTEGER NOT NULL
                     CHECK(finalizer_attempt_version > 0),
+                live_evidence_sha256 TEXT,
+                live_evidence_json TEXT,
                 remote_receipt TEXT NOT NULL,
                 remote_receipt_sha256 TEXT NOT NULL,
                 prior_item_version INTEGER NOT NULL CHECK(prior_item_version > 0),
@@ -1629,6 +1642,22 @@ class CoordinationStore:
                 last_error TEXT,
                 FOREIGN KEY(outbox_id) REFERENCES github_outbox(id)
             );
+            CREATE TABLE IF NOT EXISTS coordination_terminal_outbox_publishers (
+                outbox_id INTEGER PRIMARY KEY,
+                closeout_key TEXT NOT NULL UNIQUE,
+                publisher_login TEXT NOT NULL,
+                binding_sha256 TEXT NOT NULL UNIQUE,
+                bound_at TEXT NOT NULL,
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id),
+                FOREIGN KEY(closeout_key)
+                    REFERENCES coordination_terminal_closeout_packets(closeout_key)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_publisher_immutable_update
+            BEFORE UPDATE ON coordination_terminal_outbox_publishers
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_PUBLISHER_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_publisher_immutable_delete
+            BEFORE DELETE ON coordination_terminal_outbox_publishers
+            BEGIN SELECT RAISE(ABORT, 'TERMINAL_OUTBOX_PUBLISHER_IMMUTABLE'); END;
             CREATE TRIGGER IF NOT EXISTS coordination_terminal_outbox_envelope_immutable
             BEFORE UPDATE OF idempotency_key, repository, object_kind,
                              object_number, operation, expected_source_sha256,
@@ -1892,6 +1921,21 @@ class CoordinationStore:
                 self.connection.execute(
                     f"ALTER TABLE coordination_terminal_closeout_packets "
                     f"ADD COLUMN {column} {declaration}"
+                )
+        commit_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(coordination_terminal_closeout_commits)"
+            )
+        }
+        # Historical commits remain replayable audit evidence.  New commits
+        # require both fields; nullable migration columns avoid fabricating a
+        # live observation for an already-completed historical lineage.
+        for column in ("live_evidence_sha256", "live_evidence_json"):
+            if column not in commit_columns:
+                self.connection.execute(
+                    "ALTER TABLE coordination_terminal_closeout_commits "
+                    f"ADD COLUMN {column} TEXT"
                 )
         columns = {
             row[1]
@@ -4177,6 +4221,16 @@ class CoordinationStore:
             if topic in {"development.admission", "sre.admission"}
             else {"HOLD"}
         )
+        if topic in {"development.admission", "sre.admission"}:
+            allowed_statuses = {"ACTIVE", "ACTIVE_FENCED", "PUBLICATION_PENDING"}
+        elif topic == "development.recovery_commit":
+            allowed_statuses = {"HOLD"}
+            if recovery_activated or terminal_pending:
+                allowed_statuses.update(
+                    {"ACTIVE", "ACTIVE_FENCED", "PUBLICATION_PENDING"}
+                )
+        else:
+            allowed_statuses = {"HOLD"}
         if (
             item is None
             or item["status"] not in allowed_statuses
@@ -4193,7 +4247,11 @@ class CoordinationStore:
             )
             or item["lease_manifest_sha256"] != payload["lease_manifest_sha256"]
             or item["source_payload_sha256"] != payload["source"]["payload_sha256"]
-            or (int(item["version"]) != item_version and not terminal_pending)
+            or (
+                int(item["version"]) != item_version
+                and not terminal_pending
+                and not recovery_activated
+            )
             or int(item["development_units"]) != development_units
             or int(item["shared_units"]) != shared_units
             or int(item["sre_units"]) != sre_units
@@ -4866,40 +4924,42 @@ class CoordinationStore:
                 if Path("/tmp") not in self.path.resolve().parents:
                     raise
 
-            if message["state"] == "COMPLETE":
-                item = self.connection.execute(
-                    "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
-                    (repository, issue_number),
-                ).fetchone()
-                watch = self.connection.execute(
-                    "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
-                    (watch_key,),
-                ).fetchone()
-                capacity = payload.get("capacity", {})
-                if (
-                    item is None
-                    or item["status"] not in {"ACTIVE", "ACTIVE_FENCED"}
-                    or item["allocation_class"] != "ACTIVE"
-                    or int(item["generation"]) != generation
-                    or int(item["version"]) != payload.get("item_version", 0) + 1
-                    or item["accountable_session_id"] != session_id
-                    or item["lease_manifest_sha256"]
-                    != payload.get("lease_manifest_sha256")
-                    or item["source_payload_sha256"] != source.get("payload_sha256")
-                    or int(item["development_units"])
-                    != capacity.get("development_units")
-                    or int(item["shared_units"]) != capacity.get("shared_units")
-                    or int(item["sre_units"]) != capacity.get("sre_units")
-                    or watch is None
-                    or watch["state"] != "ACTIVE"
-                    or watch["accountable_session_id"] != session_id
-                    or watch["lease_manifest_sha256"]
-                    != payload.get("lease_manifest_sha256")
-                    or int(watch["admission_message_id"] or 0) != message_id
-                    or watch["admission_payload_sha256"]
-                    != message["payload_sha256"]
-                ):
-                    raise CoordinationError("RECOVERY_ACTIVATION_STATE_CONFLICT")
+            item = self.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            watch = self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (watch_key,),
+            ).fetchone()
+            capacity = payload.get("capacity", {})
+            already_active = bool(
+                item is not None
+                and item["status"] in {"ACTIVE", "ACTIVE_FENCED"}
+                and item["allocation_class"] == "ACTIVE"
+                and int(item["generation"]) == generation
+                and int(item["version"]) == payload.get("item_version", 0) + 1
+                and item["accountable_session_id"] == session_id
+                and item["lease_manifest_sha256"]
+                == payload.get("lease_manifest_sha256")
+                and item["source_payload_sha256"] == source.get("payload_sha256")
+                and int(item["development_units"])
+                == capacity.get("development_units")
+                and int(item["shared_units"]) == capacity.get("shared_units")
+                and int(item["sre_units"]) == capacity.get("sre_units")
+                and watch is not None
+                and watch["state"] == "ACTIVE"
+                and watch["accountable_session_id"] == session_id
+                and watch["lease_manifest_sha256"]
+                == payload.get("lease_manifest_sha256")
+                and int(watch["admission_message_id"] or 0) == message_id
+                and watch["admission_payload_sha256"] == message["payload_sha256"]
+                and (
+                    claim_attempt is None
+                    or watch["claim_attempt_id"] == claim_attempt["attempt_id"]
+                )
+            )
+            if already_active:
                 self._validate_message_source(payload)
                 return (
                     {
@@ -4913,6 +4973,11 @@ class CoordinationStore:
                     },
                     watch_key,
                 )
+            if message["state"] == "COMPLETE":
+                # Historical recovery rows completed by the pre-terminal
+                # protocol are readable only when their exact activation is
+                # already durable; they cannot create a new active lineage.
+                raise CoordinationError("RECOVERY_ACTIVATION_STATE_CONFLICT")
 
             if message["state"] != "CLAIMED":
                 raise CoordinationError("RECOVERY_COMMIT_NOT_CLAIMED")
@@ -4922,10 +4987,6 @@ class CoordinationStore:
                 recipient_session_id=message["recipient_session_id"],
                 payload=payload,
             )
-            item = self.connection.execute(
-                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
-                (repository, issue_number),
-            ).fetchone()
             if item is None:
                 raise CoordinationError("MESSAGE_ITEM_STATE_MISMATCH")
             new_version = int(item["version"]) + 1
@@ -5016,15 +5077,17 @@ class CoordinationStore:
                     ),
                 )
 
-            completed = self.connection.execute(
-                """
-                UPDATE coordination_messages
-                SET state='COMPLETE', updated_at=?, last_error=NULL
-                WHERE id=? AND state='CLAIMED' AND claimed_by=?
-                """,
-                (now, message_id, session_id),
-            )
-            if completed.rowcount != 1:
+            preserved = self.connection.execute(
+                "SELECT state, claimed_by, payload_sha256 "
+                "FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()
+            if (
+                preserved is None
+                or preserved["state"] != "CLAIMED"
+                or preserved["claimed_by"] != session_id
+                or preserved["payload_sha256"] != message["payload_sha256"]
+            ):
                 raise CoordinationError("RECOVERY_COMMIT_STATE_CONFLICT")
             result = {
                 "repository": repository,
@@ -6250,15 +6313,164 @@ class CoordinationStore:
             """
             SELECT packet.closeout_key, packet.packet_sha256, packet.created_at,
                    recovery.readback_attempts, recovery.retry_rounds,
-                   recovery.next_retry_at, recovery.state AS recovery_state
+                   recovery.next_retry_at, recovery.state AS recovery_state,
+                   publisher.publisher_login,
+                   publisher.binding_sha256 AS publisher_binding_sha256
             FROM coordination_terminal_closeout_packets packet
             LEFT JOIN coordination_terminal_outbox_recovery recovery
               ON recovery.outbox_id=packet.outbox_id
+            LEFT JOIN coordination_terminal_outbox_publishers publisher
+              ON publisher.outbox_id=packet.outbox_id
             WHERE packet.outbox_id=?
             """,
             (outbox_id,),
         ).fetchone()
         return None if row is None else dict(row)
+
+    def bind_terminal_outbox_publisher(
+        self, *, outbox_id: int, publisher_login: str, now: str
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(publisher_login, str)
+            or not publisher_login
+            or len(publisher_login) > 100
+            or any(character.isspace() for character in publisher_login)
+        ):
+            raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT * FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            recovery = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_recovery "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if outbox is None or packet is None or recovery is None:
+                raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
+            descriptor = {
+                "schema": "twinfinity-terminal-outbox-publisher/v1",
+                "outbox_id": outbox_id,
+                "closeout_key": str(packet["closeout_key"]),
+                "publisher_login": publisher_login,
+            }
+            binding_sha256 = digest_json(descriptor)
+            if existing is not None:
+                if (
+                    existing["closeout_key"] != packet["closeout_key"]
+                    or existing["publisher_login"] != publisher_login
+                    or existing["binding_sha256"] != binding_sha256
+                ):
+                    raise CoordinationError(
+                        "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                    )
+                return dict(existing)
+            if (
+                outbox["state"] != "PREPARED"
+                or outbox["remote_receipt"] is not None
+                or recovery["state"] not in {"PENDING", "RETRY_READY"}
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_UNBOUND")
+            self.connection.execute(
+                """
+                INSERT INTO coordination_terminal_outbox_publishers(
+                    outbox_id, closeout_key, publisher_login,
+                    binding_sha256, bound_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    packet["closeout_key"],
+                    publisher_login,
+                    binding_sha256,
+                    now,
+                ),
+            )
+            self._event(
+                "TERMINAL_OUTBOX_PUBLISHER_BOUND",
+                f"outbox:{outbox_id}",
+                {"binding_sha256": binding_sha256},
+                now,
+            )
+            bound = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+        return dict(bound)
+
+    def hold_terminal_outbox_publisher_identity(
+        self,
+        *,
+        outbox_id: int,
+        observed_publisher_login: str,
+        error: str,
+        now: str,
+    ) -> None:
+        if error not in {
+            "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH",
+            "TERMINAL_OUTBOX_PUBLISHER_UNBOUND",
+        }:
+            raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_ERROR_INVALID")
+        with self.transaction():
+            outbox = self.connection.execute(
+                "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            packet = self.connection.execute(
+                "SELECT 1 FROM coordination_terminal_closeout_packets "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            publisher = self.connection.execute(
+                "SELECT publisher_login FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
+            if (
+                outbox is None
+                or packet is None
+                or outbox["state"] not in {"PREPARED", "INFLIGHT", "HOLD"}
+                or outbox["remote_receipt"] is not None
+                or (
+                    error == "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                    and (
+                        publisher is None
+                        or publisher["publisher_login"]
+                        == observed_publisher_login
+                    )
+                )
+                or (
+                    error == "TERMINAL_OUTBOX_PUBLISHER_UNBOUND"
+                    and publisher is not None
+                )
+            ):
+                raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_STATE_CONFLICT")
+            self.connection.execute(
+                "UPDATE github_outbox SET state='HOLD', updated_at=?, "
+                "last_error=? WHERE id=?",
+                (now, error, outbox_id),
+            )
+            self.connection.execute(
+                "UPDATE coordination_terminal_outbox_recovery "
+                "SET state='HOLD', updated_at=?, last_error=? WHERE outbox_id=?",
+                (now, error, outbox_id),
+            )
+            self._event(
+                "TERMINAL_OUTBOX_PUBLISHER_HELD",
+                f"outbox:{outbox_id}",
+                {"error": error},
+                now,
+            )
 
     def complete_terminal_outbox_from_readback(
         self,
@@ -6286,8 +6498,21 @@ class CoordinationStore:
                 "WHERE outbox_id=?",
                 (outbox_id,),
             ).fetchone()
+            publisher = self.connection.execute(
+                "SELECT * FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
             if outbox is None or packet is None:
                 raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
+            if (
+                publisher is None
+                or publisher["closeout_key"] != packet["closeout_key"]
+                or publisher["publisher_login"] != publisher_login
+            ):
+                raise CoordinationError(
+                    "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                )
             receipt_sha256 = hashlib.sha256(
                 remote_receipt.encode("utf-8")
             ).hexdigest()
@@ -6314,7 +6539,7 @@ class CoordinationStore:
                     raise CoordinationError("TERMINAL_OUTBOX_READBACK_CONFLICT")
                 return
             if (
-                outbox["state"] not in {"INFLIGHT", "HOLD"}
+                outbox["state"] not in {"PREPARED", "INFLIGHT", "HOLD"}
                 or outbox["remote_receipt"] is not None
                 or outbox["idempotency_key"] != packet["closeout_key"]
                 or published_body != expected_body
@@ -6343,7 +6568,7 @@ class CoordinationStore:
                 UPDATE github_outbox
                 SET state='COMPLETE', remote_receipt=?, updated_at=?,
                     last_error=NULL
-                WHERE id=? AND state IN ('INFLIGHT','HOLD')
+                WHERE id=? AND state IN ('PREPARED','INFLIGHT','HOLD')
                   AND remote_receipt IS NULL
                 """,
                 (remote_receipt, now, outbox_id),
@@ -6366,7 +6591,12 @@ class CoordinationStore:
             )
 
     def record_terminal_outbox_readback_miss(
-        self, *, outbox_id: int, error: str, now: str
+        self,
+        *,
+        outbox_id: int,
+        error: str,
+        publisher_login: str,
+        now: str,
     ) -> dict[str, Any]:
         if error not in {"GITHUB_READBACK_MISSING", "GITHUB_READBACK_DUPLICATE"}:
             raise CoordinationError("TERMINAL_OUTBOX_RECOVERY_ERROR_INVALID")
@@ -6384,9 +6614,20 @@ class CoordinationStore:
                 "WHERE outbox_id=?",
                 (outbox_id,),
             ).fetchone()
+            publisher = self.connection.execute(
+                "SELECT publisher_login FROM coordination_terminal_outbox_publishers "
+                "WHERE outbox_id=?",
+                (outbox_id,),
+            ).fetchone()
             if outbox is None or packet is None or recovery is None:
                 raise CoordinationError("TERMINAL_OUTBOX_NOT_FOUND")
-            if outbox["state"] not in {"INFLIGHT", "HOLD"}:
+            if publisher is None:
+                raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_UNBOUND")
+            if publisher["publisher_login"] != publisher_login:
+                raise CoordinationError(
+                    "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+                )
+            if outbox["state"] not in {"PREPARED", "INFLIGHT", "HOLD"}:
                 raise CoordinationError("OUTBOX_STATE_CONFLICT")
             if recovery["state"] == "COMPLETE":
                 raise CoordinationError("OUTBOX_STATE_CONFLICT")
@@ -6433,7 +6674,7 @@ class CoordinationStore:
                 """
                 UPDATE github_outbox
                 SET state=?, updated_at=?, last_error=?
-                WHERE id=? AND state IN ('INFLIGHT','HOLD')
+                WHERE id=? AND state IN ('PREPARED','INFLIGHT','HOLD')
                   AND remote_receipt IS NULL
                 """,
                 (outbox_state, now, error, outbox_id),
@@ -6494,6 +6735,16 @@ class CoordinationStore:
                 (outbox_id,),
             ).fetchone()
             if terminal_packet is not None:
+                publisher = self.connection.execute(
+                    "SELECT closeout_key FROM coordination_terminal_outbox_publishers "
+                    "WHERE outbox_id=?",
+                    (outbox_id,),
+                ).fetchone()
+                if (
+                    publisher is None
+                    or publisher["closeout_key"] != terminal_packet["closeout_key"]
+                ):
+                    raise CoordinationError("TERMINAL_OUTBOX_PUBLISHER_UNBOUND")
                 binding = self._current_terminal_graph_binding(
                     repository=str(terminal_packet["repository"]),
                     issue_number=int(terminal_packet["issue_number"]),
@@ -7054,10 +7305,23 @@ def main() -> int:
             )
             print(canonical_json({"phase": status["state"], "closeout": status}))
         elif args.command == "commit-terminal-closeout":
+            existing_commit = store.connection.execute(
+                "SELECT 1 FROM coordination_terminal_closeout_commits "
+                "WHERE closeout_key=?",
+                (args.closeout_key,),
+            ).fetchone()
+            live_evidence = (
+                None
+                if existing_commit is not None
+                else store.acquire_terminal_live_evidence(
+                    closeout_key=args.closeout_key
+                )
+            )
             status = store.commit_terminal_closeout(
                 closeout_key=args.closeout_key,
                 attempt_id=os.environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID", ""),
                 executor_token=os.environ.get("TWINFINITY_EXECUTOR_TOKEN", ""),
+                live_evidence=live_evidence,
                 now=utc_now(),
             )
             print(canonical_json({"phase": status["state"], "closeout": status}))

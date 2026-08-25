@@ -58,7 +58,7 @@ class PublisherTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
-    def bind_terminal_packet(self) -> None:
+    def bind_terminal_packet(self, publisher_login: str | None = "twinfinity-bot") -> None:
         row = self.store.connection.execute(
             "SELECT * FROM github_outbox WHERE id=?", (self.outbox,)
         ).fetchone()
@@ -150,6 +150,12 @@ class PublisherTests(unittest.TestCase):
             """,
             (self.outbox,),
         )
+        if publisher_login is not None:
+            self.store.bind_terminal_outbox_publisher(
+                outbox_id=self.outbox,
+                publisher_login=publisher_login,
+                now="2026-08-22T10:00:02Z",
+            )
 
     @patch.object(publisher, "fetch_object")
     @patch.object(publisher, "_gh_json")
@@ -305,6 +311,94 @@ class PublisherTests(unittest.TestCase):
                 (self.outbox,),
             )
 
+    @patch.object(publisher, "fetch_object")
+    @patch.object(publisher, "_gh_json")
+    def test_rotated_actor_reconciles_original_publisher_after_post_ack_loss(
+        self, gh, fetch
+    ) -> None:
+        self.bind_terminal_packet(publisher_login=None)
+        fetch.return_value = self.payload
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        gh.side_effect = [
+            {"login": "actor-a"},
+            CoordinationError("GITHUB_WRITE_AMBIGUOUS"),
+            [[]],
+        ]
+        with self.assertRaisesRegex(
+            CoordinationError, "GITHUB_READBACK_MISSING"
+        ):
+            publisher.publish(self.store, self.outbox)
+        binding = self.store.connection.execute(
+            "SELECT publisher_login FROM coordination_terminal_outbox_publishers "
+            "WHERE outbox_id=?",
+            (self.outbox,),
+        ).fetchone()
+        self.assertEqual("actor-a", binding["publisher_login"])
+
+        gh.side_effect = [
+            {"login": "actor-b"},
+            [[
+                {
+                    "id": 992,
+                    "body": published,
+                    "created_at": "2026-08-22T10:00:03Z",
+                    "user": {"login": "actor-a"},
+                }
+            ]],
+        ]
+        result = publisher.publish(self.store, self.outbox)
+
+        self.assertEqual("comment:992", result["receipt"])
+        self.assertEqual(
+            ("actor-a", "actor-a"),
+            tuple(
+                self.store.connection.execute(
+                    """
+                    SELECT publisher.publisher_login, readback.publisher_login
+                    FROM coordination_terminal_outbox_publishers publisher
+                    JOIN coordination_terminal_outbox_readbacks readback
+                      USING(outbox_id)
+                    WHERE publisher.outbox_id=?
+                    """,
+                    (self.outbox,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum("POST" in call.args[0] for call in gh.call_args_list),
+        )
+
+    @patch.object(publisher, "_gh_json")
+    def test_rotated_actor_without_original_marker_holds_without_rearm(
+        self, gh
+    ) -> None:
+        self.bind_terminal_packet(publisher_login="actor-a")
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        gh.side_effect = [{"login": "actor-b"}, [[]]]
+
+        with self.assertRaisesRegex(
+            CoordinationError,
+            "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH",
+        ):
+            publisher.publish(self.store, self.outbox)
+
+        outbox = self.store.connection.execute(
+            "SELECT state,last_error FROM github_outbox WHERE id=?",
+            (self.outbox,),
+        ).fetchone()
+        recovery = self.store.connection.execute(
+            "SELECT state,retry_rounds,readback_attempts "
+            "FROM coordination_terminal_outbox_recovery WHERE outbox_id=?",
+            (self.outbox,),
+        ).fetchone()
+        self.assertEqual(
+            ("HOLD", "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"),
+            tuple(outbox),
+        )
+        self.assertEqual(("HOLD", 0, 0), tuple(recovery))
+        self.assertTrue(all("POST" not in call.args[0] for call in gh.call_args_list))
+
     @patch.object(publisher, "utc_now")
     @patch.object(publisher, "_gh_json")
     def test_terminal_missing_readback_has_bounded_rebind_to_same_outbox(
@@ -324,6 +418,7 @@ class PublisherTests(unittest.TestCase):
             "2026-08-22T10:00:03Z",
             "2026-08-22T10:01:04Z",
             "2026-08-22T10:03:05Z",
+            "2026-08-22T10:03:06Z",
         ]
 
         for _ in range(3):
@@ -353,6 +448,29 @@ class PublisherTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM github_outbox"
             ).fetchone()[0],
+        )
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        prior_post_count = sum(
+            "POST" in call.args[0] for call in gh.call_args_list
+        )
+        gh.side_effect = [
+            {"login": "twinfinity-bot"},
+            [[
+                {
+                    "id": 993,
+                    "body": published,
+                    "created_at": "2026-08-22T10:00:03Z",
+                    "user": {"login": "twinfinity-bot"},
+                }
+            ]],
+        ]
+
+        result = publisher.publish(self.store, self.outbox)
+
+        self.assertEqual("comment:993", result["receipt"])
+        self.assertEqual(
+            prior_post_count,
+            sum("POST" in call.args[0] for call in gh.call_args_list),
         )
 
 

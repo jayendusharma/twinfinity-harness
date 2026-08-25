@@ -94,6 +94,7 @@ def _complete_from_readback(
     body: str,
     *,
     publisher_login: str,
+    observed_publisher_login: str | None = None,
 ) -> dict[str, Any]:
     terminal_context = store.terminal_outbox_context(int(row["id"]))
     matches = _matching_receipts(
@@ -122,9 +123,25 @@ def _complete_from_readback(
     error = "GITHUB_READBACK_MISSING" if not matches else "GITHUB_READBACK_DUPLICATE"
     if terminal_context is None:
         store.hold_outbox(row["id"], error, utc_now())
+    elif (
+        observed_publisher_login is not None
+        and observed_publisher_login != publisher_login
+        and error == "GITHUB_READBACK_MISSING"
+    ):
+        identity_error = "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH"
+        store.hold_terminal_outbox_publisher_identity(
+            outbox_id=int(row["id"]),
+            observed_publisher_login=observed_publisher_login,
+            error=identity_error,
+            now=utc_now(),
+        )
+        raise CoordinationError(identity_error)
     else:
         store.record_terminal_outbox_readback_miss(
-            outbox_id=int(row["id"]), error=error, now=utc_now()
+            outbox_id=int(row["id"]),
+            error=error,
+            publisher_login=publisher_login,
+            now=utc_now(),
         )
     raise CoordinationError(error)
 
@@ -153,8 +170,87 @@ def publish(store: CoordinationStore, outbox_id: int) -> dict[str, Any]:
     if not isinstance(publisher_login, str) or not publisher_login:
         raise CoordinationError("GITHUB_IDENTITY_INVALID")
 
+    terminal_context = store.terminal_outbox_context(outbox_id)
+    if terminal_context is not None:
+        original_publisher = terminal_context.get("publisher_login")
+        if original_publisher is None:
+            if row["state"] != "PREPARED":
+                error = "TERMINAL_OUTBOX_PUBLISHER_UNBOUND"
+                store.hold_terminal_outbox_publisher_identity(
+                    outbox_id=outbox_id,
+                    observed_publisher_login=publisher_login,
+                    error=error,
+                    now=utc_now(),
+                )
+                raise CoordinationError(error)
+            try:
+                bound = store.bind_terminal_outbox_publisher(
+                    outbox_id=outbox_id,
+                    publisher_login=publisher_login,
+                    now=utc_now(),
+                )
+            except CoordinationError as exc:
+                if str(exc) != "TERMINAL_OUTBOX_PUBLISHER_IDENTITY_MISMATCH":
+                    raise
+                rebound_context = store.terminal_outbox_context(outbox_id)
+                original_publisher = (
+                    None
+                    if rebound_context is None
+                    else rebound_context.get("publisher_login")
+                )
+                if not isinstance(original_publisher, str):
+                    raise
+            else:
+                original_publisher = bound["publisher_login"]
+        if original_publisher != publisher_login:
+            # A rotated credential may prove the exact original actor's marker,
+            # but it can neither assume that identity nor re-arm the envelope.
+            return _complete_from_readback(
+                store,
+                row,
+                published_body,
+                publisher_login=str(original_publisher),
+                observed_publisher_login=publisher_login,
+            )
+        publisher_login = str(original_publisher)
+        if (
+            row["state"] == "PREPARED"
+            and terminal_context.get("recovery_state") == "RETRY_READY"
+        ):
+            # The bounded absence proof authorized a retry, but perform one
+            # last original-actor marker scan immediately before POST so a
+            # delayed GitHub read model cannot turn recovery into a duplicate.
+            retry_matches = _matching_receipts(
+                row["repository"],
+                row["object_number"],
+                published_body,
+                publisher_login=publisher_login,
+                not_before=str(terminal_context["created_at"]),
+            )
+            if len(retry_matches) == 1:
+                store.complete_terminal_outbox_from_readback(
+                    outbox_id=outbox_id,
+                    remote_receipt=retry_matches[0],
+                    published_body=published_body,
+                    publisher_login=publisher_login,
+                    now=utc_now(),
+                )
+                return {
+                    "phase": "COMPLETE",
+                    "outbox_id": outbox_id,
+                    "receipt": retry_matches[0],
+                }
+            if len(retry_matches) > 1:
+                store.record_terminal_outbox_readback_miss(
+                    outbox_id=outbox_id,
+                    error="GITHUB_READBACK_DUPLICATE",
+                    publisher_login=publisher_login,
+                    now=utc_now(),
+                )
+                raise CoordinationError("GITHUB_READBACK_DUPLICATE")
+
     if row["state"] in {"INFLIGHT", "HOLD"}:
-        if row["state"] == "HOLD" and store.terminal_outbox_context(outbox_id) is None:
+        if row["state"] == "HOLD" and terminal_context is None:
             raise CoordinationError("OUTBOX_STATE_CONFLICT")
         return _complete_from_readback(
             store,

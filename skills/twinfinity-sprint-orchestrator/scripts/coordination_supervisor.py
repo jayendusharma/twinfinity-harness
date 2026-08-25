@@ -295,25 +295,29 @@ class CoordinationSupervisor:
                         attempts = []
                     else:
                         attempts = None
-                    required_attempt_state = (
-                        "RUNNING" if bound_message["state"] == "CLAIMED" else "COMPLETE"
-                    )
                     if attempts is None:
+                        required_attempt_states = (
+                            ("RUNNING", "COMPLETE")
+                            if bound_message["state"] == "CLAIMED"
+                            else ("COMPLETE",)
+                        )
                         attempts = self.store.connection.execute(
                             """
                             SELECT * FROM executor_attempts
                             WHERE role=? AND endpoint_id=?
                               AND target_kind='message' AND target_key=?
-                              AND state=?
+                              AND state IN ({})
                               AND lineage_repository=? AND lineage_issue_number=?
                               AND lineage_generation=? AND lineage_lease_sha256=?
                             ORDER BY created_at DESC
-                            """,
+                            """.format(
+                                ",".join("?" for _ in required_attempt_states)
+                            ),
                             (
                                 role,
                                 str(endpoint["endpoint_id"]),
                                 str(bound_message["id"]),
-                                required_attempt_state,
+                                *required_attempt_states,
                                 item["repository"],
                                 item["issue_number"],
                                 item["generation"],
@@ -910,6 +914,36 @@ class CoordinationSupervisor:
             # crashed original writer must not be relaunched against the
             # admission row and race a fresh terminal watcher.
             return False
+        if row["topic"] == "development.recovery_commit":
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                return False
+            source = payload.get("source") if isinstance(payload, dict) else None
+            watch = (
+                None
+                if not isinstance(source, dict)
+                else self.store.connection.execute(
+                    "SELECT * FROM coordination_terminal_watches "
+                    "WHERE repository=? AND issue_number=? AND generation=?",
+                    (
+                        source.get("repository"),
+                        payload.get("issue_number"),
+                        payload.get("generation"),
+                    ),
+                ).fetchone()
+            )
+            if (
+                watch is not None
+                and watch["state"] == "ACTIVE"
+                and int(watch["admission_message_id"] or 0) == int(row["id"])
+                and watch["admission_payload_sha256"] == row["payload_sha256"]
+                and watch["claim_attempt_id"] is not None
+            ):
+                # Recovery activation has transferred continuation to its
+                # exact terminal watch.  The recovery message remains CLAIMED
+                # until the atomic terminal commit and must not be relaunched.
+                return False
         return self._message_contract_error(row) is None
 
     def _order_message_rows(

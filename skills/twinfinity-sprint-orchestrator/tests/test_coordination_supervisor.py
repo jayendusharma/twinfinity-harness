@@ -230,8 +230,13 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 attempt_id=running["attempt_id"],
                 executor_token=token,
             )
-            self.store.complete_message(
-                message_id, DEVELOPMENT_SESSION, "2026-08-22T10:00:08Z"
+            # Historical pre-atomic-closeout rows can still be observed by the
+            # supervisor.  Construct that legacy state directly; the public
+            # completion API is intentionally fenced for current admissions.
+            self.store.connection.execute(
+                "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+                "WHERE id=? AND state='CLAIMED'",
+                ("2026-08-22T10:00:08Z", message_id),
             )
             running = transition_attempt(
                 self.store.connection,
@@ -253,7 +258,11 @@ class CoordinationSupervisorTests(unittest.TestCase):
             repository=REPOSITORY,
             object_kind="issue",
             object_number=92,
-            payload={"number": 92, "title": "Issue 92"},
+            payload={
+                "number": 92,
+                "title": "Issue 92",
+                "updated_at": "2026-08-22T10:00:00Z",
+            },
             source_updated_at="2026-08-22T10:00:00Z",
             fetched_at="2026-08-22T10:00:01Z",
         )
@@ -1037,6 +1046,11 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 (message_id,),
             ).fetchone()[0],
         )
+        self.store.bind_terminal_outbox_publisher(
+            outbox_id=prepared["outbox_id"],
+            publisher_login="twinfinity-bot",
+            now="2026-08-22T10:20:01Z",
+        )
         self.store.reserve_outbox(prepared["outbox_id"], "2026-08-22T10:20:01Z")
         outbox = self.store.connection.execute(
             "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
@@ -1084,10 +1098,20 @@ class CoordinationSupervisorTests(unittest.TestCase):
             process_id=2999,
             now="2026-08-22T10:20:04Z",
         )
+        live_evidence = self.store.acquire_terminal_live_evidence(
+            closeout_key=closeout_key,
+            observed_at="2026-08-22T10:20:05Z",
+            issue_fetcher=lambda _repository, _kind, _number: source.payload,
+            main_ref_fetcher=lambda _repository: {
+                "ref": "refs/heads/main",
+                "object": {"sha": "a" * 40},
+            },
+        )
         self.store.commit_terminal_closeout(
             closeout_key=closeout_key,
             attempt_id=fresh_running["attempt_id"],
             executor_token=fresh_token,
+            live_evidence=live_evidence,
             now="2026-08-22T10:20:05Z",
         )
 
