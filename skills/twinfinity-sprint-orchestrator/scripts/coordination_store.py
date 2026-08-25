@@ -689,7 +689,7 @@ def _fetch_terminal_live_observation(
         if not isinstance(page, list) or not page:
             raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
         for event in page:
-            if not isinstance(event, dict):
+            if not isinstance(event, dict) or not event:
                 raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
             timeline.append(event)
     return issue_payload, main_ref, comment, timeline

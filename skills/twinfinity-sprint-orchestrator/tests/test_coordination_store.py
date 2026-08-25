@@ -327,6 +327,7 @@ class CoordinationStoreTests(unittest.TestCase):
             [comment],
             [[hidden_concurrent_event], comment],
             [[comment, "invalid"]],
+            [[{}]],
         )
         before_changes = self.store.connection.total_changes
         for raw_timeline in malformed_timelines:
@@ -2562,6 +2563,7 @@ class CoordinationStoreTests(unittest.TestCase):
         malformed_pages = (
             [[hidden_concurrent_event], timeline_comment],
             [[timeline_comment, "invalid"]],
+            [[{}]],
         )
         before_malformed_pages = precommit_fingerprint()
         for raw_timeline in malformed_pages:
