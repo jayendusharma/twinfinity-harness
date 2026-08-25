@@ -49,6 +49,7 @@ MAX_LAUNCH_ATTEMPTS_PER_RUN = 4
 MAX_MESSAGE_LAUNCH_ATTEMPTS_PER_RUN = 3
 MAX_TERMINAL_WATCH_LAUNCH_ATTEMPTS_PER_RUN = 1
 MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS = 3
+MAX_DUE_MESSAGE_RETRY_LAUNCH_ATTEMPTS_PER_RUN = 1
 LOCK = DEFAULT_DATABASE.parent / "coordination-supervisor.lock"
 
 
@@ -479,13 +480,102 @@ class CoordinationSupervisor:
     def _record_terminal_watch_launch_failure(self, watch_key: str, now: str) -> None:
         with self.store.transaction():
             watch = self.store.connection.execute(
-                "SELECT attempts FROM coordination_terminal_watches WHERE watch_key=?",
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
                 (watch_key,),
             ).fetchone()
+            if watch is None or watch["state"] != "ACTIVE":
+                return
+            role = coordination_identity_role(
+                self.store.connection, str(watch["accountable_session_id"])
+            )
+            endpoint = (
+                current_endpoint(self.store.connection, role)
+                if role in {"development", "sre"}
+                else None
+            )
+            if (
+                endpoint is None
+                or str(endpoint["endpoint_id"])
+                != str(watch["accountable_session_id"])
+            ):
+                error = "TERMINAL_WATCH_ENDPOINT_NOT_CURRENT"
+                self.store.connection.execute(
+                    """UPDATE coordination_terminal_watches
+                    SET state='HOLD',process_id=NULL,updated_at=?,last_error=?
+                    WHERE watch_key=? AND state='ACTIVE'""",
+                    (now, error, watch_key),
+                )
+                self.store._event(
+                    "TERMINAL_WATCH_HELD", watch_key, {"error": error}, now
+                )
+                return
+            item = self.store.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (watch["repository"], watch["issue_number"]),
+            ).fetchone()
+            if (
+                item is None
+                or item["allocation_class"] != "ACTIVE"
+                or item["status"] not in ACTIVE_EXECUTION_STATUSES
+            ):
+                self.store.connection.execute(
+                    """UPDATE coordination_terminal_watches
+                    SET state='COMPLETE',process_id=NULL,updated_at=?,last_error=NULL
+                    WHERE watch_key=? AND state='ACTIVE'""",
+                    (now, watch_key),
+                )
+                self.store._event("TERMINAL_WATCH_COMPLETED", watch_key, {}, now)
+                return
+            if (
+                int(item["generation"]) != int(watch["generation"])
+                or item["accountable_session_id"] != watch["accountable_session_id"]
+                or item["lease_manifest_sha256"] != watch["lease_manifest_sha256"]
+            ):
+                error = "TERMINAL_WATCH_LINEAGE_DRIFT"
+                self.store.connection.execute(
+                    """UPDATE coordination_terminal_watches
+                    SET state='HOLD',process_id=NULL,updated_at=?,last_error=?
+                    WHERE watch_key=? AND state='ACTIVE'""",
+                    (now, error, watch_key),
+                )
+                self.store._event(
+                    "TERMINAL_WATCH_HELD", watch_key, {"error": error}, now
+                )
+                return
+            try:
+                progress_sha256 = target_progress_digest(
+                    self.store.connection, "terminal_watch", watch_key
+                )
+            except (RegistryError, TypeError, ValueError):
+                error = "TERMINAL_WATCH_PROGRESS_READBACK_FAILED"
+                self.store.connection.execute(
+                    """UPDATE coordination_terminal_watches
+                    SET state='HOLD',process_id=NULL,updated_at=?,last_error=?
+                    WHERE watch_key=? AND state='ACTIVE'""",
+                    (now, error, watch_key),
+                )
+                self.store._event(
+                    "TERMINAL_WATCH_HELD", watch_key, {"error": error}, now
+                )
+                return
+            if progress_sha256 != watch["target_progress_sha256"]:
+                error = "TERMINAL_WATCH_WAKE_FAILED_AFTER_PROGRESS"
+                self.store.connection.execute(
+                    """UPDATE coordination_terminal_watches
+                    SET attempts=0,process_id=NULL,target_progress_sha256=?,
+                        updated_at=?,last_error=?
+                    WHERE watch_key=? AND state='ACTIVE'""",
+                    (progress_sha256, now, error, watch_key),
+                )
+                self.store._event(
+                    "TERMINAL_WATCH_RETRY_BUDGET_RESET",
+                    watch_key,
+                    {"reason": "TARGET_PROGRESS_CHANGED"},
+                    now,
+                )
+                return
             exhausted = (
-                watch is not None
-                and int(watch["attempts"])
-                >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
+                int(watch["attempts"]) >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
             )
             error = (
                 "TERMINAL_WATCH_RETRY_EXHAUSTED"
@@ -569,6 +659,58 @@ class CoordinationSupervisor:
         if row["state"] != "CLAIMED" or row["topic"] not in MUTATING_MESSAGE_TOPICS:
             return False
         return self._message_contract_error(row) is None
+
+    def _order_message_rows(
+        self, rows: list[object], now: str
+    ) -> tuple[list[object], set[int], set[int]]:
+        """Prioritize one oldest due retry without starving fresh targets."""
+
+        wakes = {
+            str(wake["wake_key"]): wake
+            for wake in self.store.connection.execute(
+                "SELECT * FROM coordination_wakes WHERE state='INFLIGHT'"
+            ).fetchall()
+        }
+        due: list[tuple[int, object]] = []
+        fresh: list[object] = []
+        cooling: list[object] = []
+        retry_ids: set[int] = set()
+        due_retry_ids: set[int] = set()
+        for row in rows:
+            message_id = int(row["id"])
+            phase = "prepared" if row["state"] == "PREPARED" else "claimed"
+            wake = wakes.get(f"message:{message_id}:{phase}")
+            if wake is None:
+                fresh.append(row)
+                continue
+            retry_ids.add(message_id)
+            progress_changed = False
+            try:
+                progress_changed = (
+                    wake["target_progress_sha256"]
+                    != target_progress_digest(
+                        self.store.connection, "message", str(message_id)
+                    )
+                )
+                retry_due = progress_changed or (
+                    _epoch(now) - _epoch(str(wake["last_attempt_at"]))
+                    >= _retry_seconds(int(wake["attempts"]))
+                )
+            except (RegistryError, TypeError, ValueError):
+                retry_due = True
+            if retry_due:
+                due_retry_ids.add(message_id)
+                due.append((message_id, row))
+            else:
+                cooling.append(row)
+        due.sort(key=lambda item: item[0])
+        fresh.sort(key=lambda row: int(row["id"]))
+        cooling.sort(key=lambda row: int(row["id"]))
+        return (
+            [item[1] for item in due] + fresh + cooling,
+            retry_ids,
+            due_retry_ids,
+        )
 
     def _hold_rebound_existing_wake(self, row: object, now: str) -> bool:
         """Fence immutable wake payload drift even when this pass does not select it."""
@@ -748,13 +890,105 @@ class CoordinationSupervisor:
     def _record_launch_failure(self, wake_key: str, now: str) -> None:
         with self.store.transaction():
             wake = self.store.connection.execute(
-                "SELECT message_id,attempts FROM coordination_wakes WHERE wake_key=?",
+                "SELECT * FROM coordination_wakes WHERE wake_key=?",
                 (wake_key,),
             ).fetchone()
+            if wake is None or wake["state"] != "INFLIGHT":
+                return
+            message = self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?",
+                (wake["message_id"],),
+            ).fetchone()
+            if message is None:
+                self.store.connection.execute(
+                    """UPDATE coordination_wakes
+                    SET state='COMPLETE',process_id=NULL,updated_at=?,last_error=NULL
+                    WHERE wake_key=? AND state='INFLIGHT'""",
+                    (now, wake_key),
+                )
+                self.store._event("WAKE_COMPLETED", wake_key, {}, now)
+                return
+            if wake["message_payload_sha256"] != message["payload_sha256"]:
+                self._hold_stale_message_locked(
+                    message, "MESSAGE_PAYLOAD_MISMATCH", now
+                )
+                self.store.connection.execute(
+                    """UPDATE coordination_wakes
+                    SET state='COMPLETE',process_id=NULL,updated_at=?,
+                        last_error='MESSAGE_PAYLOAD_MISMATCH'
+                    WHERE wake_key=? AND state='INFLIGHT'""",
+                    (now, wake_key),
+                )
+                self.store._event(
+                    "WAKE_COMPLETED",
+                    wake_key,
+                    {"error": "MESSAGE_PAYLOAD_MISMATCH"},
+                    now,
+                )
+                return
+            contract_error = self._message_contract_error(message)
+            if contract_error is not None:
+                self._hold_stale_message_locked(message, contract_error, now)
+                self.store.connection.execute(
+                    """UPDATE coordination_wakes
+                    SET state='COMPLETE',process_id=NULL,updated_at=?,last_error=?
+                    WHERE wake_key=? AND state='INFLIGHT'""",
+                    (now, contract_error, wake_key),
+                )
+                self.store._event(
+                    "WAKE_COMPLETED", wake_key, {"error": contract_error}, now
+                )
+                return
+            expected_phase = wake_key.rsplit(":", 1)[-1]
+            current_phase = (
+                "prepared" if message["state"] == "PREPARED" else "claimed"
+            )
+            if (
+                message["state"] not in {"PREPARED", "CLAIMED"}
+                or current_phase != expected_phase
+                or not self._message_needs_worker(message)
+            ):
+                self.store.connection.execute(
+                    """UPDATE coordination_wakes
+                    SET state='COMPLETE',process_id=NULL,updated_at=?,last_error=NULL
+                    WHERE wake_key=? AND state='INFLIGHT'""",
+                    (now, wake_key),
+                )
+                self.store._event("WAKE_COMPLETED", wake_key, {}, now)
+                return
+            try:
+                progress_sha256 = target_progress_digest(
+                    self.store.connection, "message", str(wake["message_id"])
+                )
+            except (RegistryError, TypeError, ValueError):
+                error = "WAKE_PROGRESS_READBACK_FAILED"
+                self._hold_stale_message_locked(message, error, now)
+                self.store.connection.execute(
+                    """UPDATE coordination_wakes
+                    SET state='HOLD',process_id=NULL,updated_at=?,last_error=?
+                    WHERE wake_key=? AND state='INFLIGHT'""",
+                    (now, error, wake_key),
+                )
+                self.store._event("WAKE_HELD", wake_key, {"error": error}, now)
+                return
+            if progress_sha256 != wake["target_progress_sha256"]:
+                error = "WAKE_LAUNCH_FAILED_AFTER_PROGRESS"
+                self.store.connection.execute(
+                    """UPDATE coordination_wakes
+                    SET attempts=1,process_id=NULL,target_progress_sha256=?,
+                        last_attempt_at=?,updated_at=?,last_error=?
+                    WHERE wake_key=? AND state='INFLIGHT'""",
+                    (progress_sha256, now, now, error, wake_key),
+                )
+                self.store._event(
+                    "WAKE_RETRY_BUDGET_RESET",
+                    wake_key,
+                    {"reason": "TARGET_PROGRESS_CHANGED"},
+                    now,
+                )
+                return
             exhausted = (
-                wake is not None
-                and int(wake["attempts"])
-                >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
+                int(wake["attempts"]) >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
             )
             error = "WAKE_RETRY_EXHAUSTED" if exhausted else "WAKE_LAUNCH_FAILED"
             self.store.connection.execute(
@@ -763,15 +997,10 @@ class CoordinationSupervisor:
                 "WHERE wake_key=? AND state='INFLIGHT'",
                 ("HOLD" if exhausted else "INFLIGHT", now, error, wake_key),
             )
-            if exhausted and wake is not None:
-                message = self.store.connection.execute(
-                    "SELECT * FROM coordination_messages WHERE id=?",
-                    (wake["message_id"],),
-                ).fetchone()
-                if message is not None:
-                    self._hold_stale_message_locked(
-                        message, "WAKE_RETRY_EXHAUSTED", now
-                    )
+            if exhausted:
+                self._hold_stale_message_locked(
+                    message, "WAKE_RETRY_EXHAUSTED", now
+                )
             self.store._event(
                 "WAKE_HELD" if exhausted else "WAKE_LAUNCH_FAILED",
                 wake_key,
@@ -831,27 +1060,35 @@ class CoordinationSupervisor:
                 self.launch_policy.messages + self.launch_policy.terminal_watches,
             )
         launched: list[dict[str, object]] = []
-        rows = self.store.connection.execute(
+        scanned_rows = self.store.connection.execute(
             """
             SELECT * FROM coordination_messages AS message
             WHERE state IN ('PREPARED', 'CLAIMED')
-            ORDER BY CASE WHEN EXISTS (
-                SELECT 1 FROM coordination_wakes AS wake
-                WHERE wake.message_id=message.id AND wake.state='INFLIGHT'
-            ) THEN 1 ELSE 0 END, id
+            ORDER BY id
             """
         ).fetchall()
+        rows, retry_message_ids, due_retry_message_ids = self._order_message_rows(
+            list(scanned_rows), observed_at
+        )
         scheduled_targets: set[tuple[str, str, str]] = set()
         scheduled_lineages: set[str] = set()
         scheduled_planner_repositories: set[str] = set()
         launch_attempts = 0
         message_launch_attempts = 0
+        due_message_retry_launch_attempts = 0
         for row in rows:
             if (
                 launch_attempts >= self.launch_policy.total
                 or message_launch_attempts >= message_launch_limit
             ):
                 break
+            message_id = int(row["id"])
+            if (
+                message_id in retry_message_ids
+                and due_message_retry_launch_attempts
+                >= MAX_DUE_MESSAGE_RETRY_LAUNCH_ATTEMPTS_PER_RUN
+            ):
+                continue
             recipient = row["recipient_session_id"]
             if not recipient_matches_topic(
                 self.store.connection, topic=row["topic"], recipient=recipient
@@ -918,6 +1155,8 @@ class CoordinationSupervisor:
                 continue
             launch_attempts += 1
             message_launch_attempts += 1
+            if message_id in retry_message_ids:
+                due_message_retry_launch_attempts += 1
             if lineage is not None:
                 scheduled_lineages.add(lineage.sha256)
             if planner_repository is not None:
@@ -1015,6 +1254,10 @@ class CoordinationSupervisor:
             "launch_policy_decision": {
                 "terminal_watch_slot_reserved": terminal_watch_slot_reserved,
                 "message_limit": message_launch_limit,
+                "due_message_retry_slot_reserved": bool(due_retry_message_ids),
+                "due_message_retry_limit": (
+                    MAX_DUE_MESSAGE_RETRY_LAUNCH_ATTEMPTS_PER_RUN
+                ),
             },
             "launch_attempts": {
                 "total": launch_attempts,

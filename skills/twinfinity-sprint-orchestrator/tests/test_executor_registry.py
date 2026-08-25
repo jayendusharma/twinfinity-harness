@@ -1200,6 +1200,89 @@ class ExecutorRegistryTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_nonmutating_notice_ignores_referenced_item_version_drift(self) -> None:
+        source = self.snapshot()
+        self.migrate("notice-item-drift")
+        item = self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="READY",
+            allocation_class="NONE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_ENDPOINT,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-24T10:00:01Z",
+        )
+        message_id = self.store.enqueue_message(
+            idempotency_key="notice-external-item-drift",
+            recipient_session_id=DEVELOPMENT_ENDPOINT,
+            topic="coordination.notice",
+            payload={
+                "source": {
+                    "repository": REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": 92,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "notice_kind": "status",
+                "mutation_authority": False,
+                "subject": "External item drift",
+                "summary": "Only the exact notice lifecycle counts as notice progress.",
+                "evidence": {},
+            },
+            now="2026-08-24T10:00:02Z",
+        )
+
+        def drift_referenced_item(*_args, **_kwargs):
+            self.store.set_issue_status(
+                repository=REPOSITORY,
+                issue_number=92,
+                status="READY",
+                allocation_class="NONE",
+                generation=1,
+                accountable_session_id=DEVELOPMENT_ENDPOINT,
+                lease_manifest_sha256=LEASE,
+                development_units=1,
+                shared_units=0,
+                sre_units=0,
+                expected_source_sha256=source.payload_sha256,
+                expected_version=int(item["version"]),
+                now="2026-08-24T10:00:03Z",
+            )
+            return _ImmediateProcess()
+
+        result = execute_role(
+            self.store.connection,
+            config_path=CONFIG,
+            role="development",
+            endpoint_id=DEVELOPMENT_ENDPOINT,
+            target_kind="message",
+            target_key=str(message_id),
+            prompt="Do not confuse referenced-item drift with notice progress.",
+            systemd_invocation_id=INVOCATION_ID,
+            systemd_evidence=systemd_evidence(target_key=str(message_id)),
+            popen=drift_referenced_item,
+        )
+
+        self.assertEqual("HOLD", result["state"])
+        self.assertEqual("EXECUTOR_TARGET_NO_PROGRESS", result["error"])
+        self.assertEqual(
+            result["target_progress_sha256"], result["terminal_progress_sha256"]
+        )
+        self.assertEqual(
+            int(item["version"]) + 1,
+            self.store.connection.execute(
+                "SELECT version FROM coordination_items "
+                "WHERE repository=? AND issue_number=92",
+                (REPOSITORY,),
+            ).fetchone()[0],
+        )
+
     def test_v3_launch_v4_cutover_launch_rollback_and_v3_launch(self) -> None:
         source = self.snapshot()
         now = "2026-08-24T09:00:00Z"

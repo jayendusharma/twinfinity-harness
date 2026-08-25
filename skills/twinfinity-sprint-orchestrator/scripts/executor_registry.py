@@ -1603,24 +1603,38 @@ def target_progress_digest(
         )
         if type(issue_number) is not int and isinstance(source, dict):
             issue_number = source.get("object_number")
-        item = None
-        if isinstance(repository, str) and type(issue_number) is int:
+        progress: dict[str, Any] = {
+            "claimed_by": row["claimed_by"],
+            "payload_sha256": row["payload_sha256"],
+            "state": row["state"],
+            "topic": row["topic"],
+        }
+        if (
+            row["topic"] != NONMUTATING_MESSAGE_TOPIC
+            and isinstance(repository, str)
+            and type(issue_number) is int
+        ):
             item_row = connection.execute(
                 """SELECT status,allocation_class,generation,accountable_session_id,
                           lease_manifest_sha256,source_payload_sha256,version
                    FROM coordination_items WHERE repository=? AND issue_number=?""",
                 (repository, issue_number),
             ).fetchone()
-            item = None if item_row is None else dict(item_row)
-        return digest_json(
-            {
-                "claimed_by": row["claimed_by"],
-                "item": item,
-                "payload_sha256": row["payload_sha256"],
-                "state": row["state"],
-                "topic": row["topic"],
-            }
-        )
+            progress["item"] = None if item_row is None else dict(item_row)
+            generation = payload.get("generation")
+            watch_row = None
+            if type(generation) is int:
+                watch_row = connection.execute(
+                    """SELECT state,last_heartbeat_at,generation,
+                              accountable_session_id,lease_manifest_sha256
+                       FROM coordination_terminal_watches
+                       WHERE repository=? AND issue_number=? AND generation=?""",
+                    (repository, issue_number, generation),
+                ).fetchone()
+            progress["terminal_watch"] = (
+                None if watch_row is None else dict(watch_row)
+            )
+        return digest_json(progress)
     if target_kind == "terminal_watch":
         watch = connection.execute(
             """SELECT repository,issue_number,generation,accountable_session_id,

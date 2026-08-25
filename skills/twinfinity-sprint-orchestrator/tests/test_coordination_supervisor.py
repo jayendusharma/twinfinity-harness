@@ -445,6 +445,59 @@ class CoordinationSupervisorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(("HOLD", "WAKE_RETRY_EXHAUSTED"), tuple(message))
 
+    def test_due_retry_is_starvation_free_under_sustained_fresh_arrivals(self) -> None:
+        retry_message_id = self.notice(
+            idempotency_key="starvation-free-retry",
+            issue_number=400,
+        )
+        first = self.supervisor.run_once("2026-08-22T10:00:03Z")
+        self.assertEqual(
+            [retry_message_id], [row["message_id"] for row in first["launched"]]
+        )
+
+        results = []
+        for batch, timestamp in (
+            (410, "2026-08-22T10:01:04Z"),
+            (420, "2026-08-22T10:03:05Z"),
+            (430, "2026-08-22T10:07:06Z"),
+        ):
+            for issue_number in range(batch, batch + 4):
+                self.notice(
+                    idempotency_key=f"sustained-fresh-{issue_number}",
+                    issue_number=issue_number,
+                )
+            results.append(self.supervisor.run_once(timestamp))
+
+        self.assertEqual(
+            [retry_message_id],
+            [row["message_id"] for row in results[0]["launched"][:1]],
+        )
+        self.assertEqual(
+            [retry_message_id],
+            [row["message_id"] for row in results[1]["launched"][:1]],
+        )
+        self.assertTrue(
+            all(
+                result["launch_policy_decision"][
+                    "due_message_retry_slot_reserved"
+                ]
+                for result in results
+            )
+        )
+        self.assertEqual(
+            3,
+            sum(
+                candidate_message_id == retry_message_id
+                for _session_id, candidate_message_id in self.launches
+            ),
+        )
+        wake = self.store.connection.execute(
+            "SELECT state,attempts,last_error FROM coordination_wakes "
+            "WHERE message_id=?",
+            (retry_message_id,),
+        ).fetchone()
+        self.assertEqual(("HOLD", 3, "WAKE_RETRY_EXHAUSTED"), tuple(wake))
+
     def test_launch_failures_exhaust_identical_progress_into_typed_hold(self) -> None:
         source = self.snapshot()
         message_id = self.store.enqueue_message(
@@ -502,46 +555,31 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
         self.assertEqual("HOLD", message["state"])
 
-    def test_changed_target_progress_resets_retry_budget(self) -> None:
-        source = self.snapshot()
-        item = self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="READY",
-            allocation_class="NONE",
+    def test_third_message_launch_failure_rereads_progress_before_exhaustion(self) -> None:
+        _source, message_id = self.claimed_admission()
+        watch = self.store.connection.execute(
+            "SELECT watch_key FROM coordination_terminal_watches"
+        ).fetchone()
+        watch_key = str(watch["watch_key"])
+        self.store.heartbeat_terminal_watch(
+            watch_key=watch_key,
+            session_id=DEVELOPMENT_SESSION,
             generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
-        )
-        message_id = self.store.enqueue_message(
-            idempotency_key="progress-reset",
-            recipient_session_id=DEVELOPMENT_SESSION,
-            topic="coordination.notice",
-            payload={
-                "source": {
-                    "repository": REPOSITORY,
-                    "object_kind": "issue",
-                    "object_number": 92,
-                    "payload_sha256": source.payload_sha256,
-                },
-                "notice_kind": "status",
-                "mutation_authority": False,
-                "subject": "Progress reset",
-                "summary": "Changed item progress resets the target retry budget.",
-                "evidence": {},
-            },
-            now="2026-08-22T10:00:02Z",
+            delay_seconds=1800,
+            now="2026-08-22T10:00:04Z",
         )
         failures: list[int] = []
 
         def failing_launcher(_session_id: str, candidate_message_id: int) -> int:
             failures.append(candidate_message_id)
+            if len(failures) == 3:
+                self.store.heartbeat_terminal_watch(
+                    watch_key=watch_key,
+                    session_id=DEVELOPMENT_SESSION,
+                    generation=1,
+                    delay_seconds=1800,
+                    now="2026-08-22T10:03:07Z",
+                )
             raise OSError("launch failed")
 
         supervisor = CoordinationSupervisor(
@@ -550,31 +588,9 @@ class CoordinationSupervisorTests(unittest.TestCase):
             terminal_watch_launcher=lambda _session, _key: 1,
             process_checker=lambda *_: False,
         )
-        supervisor.run_once("2026-08-22T10:00:03Z")
-        supervisor.run_once("2026-08-22T10:01:04Z")
-        before = self.store.connection.execute(
-            "SELECT attempts,target_progress_sha256 FROM coordination_wakes "
-            "WHERE message_id=?",
-            (message_id,),
-        ).fetchone()
-        self.assertEqual(2, before["attempts"])
-
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="READY",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=int(item["version"]),
-            now="2026-08-22T10:01:05Z",
-        )
+        supervisor.run_once("2026-08-22T10:00:05Z")
         supervisor.run_once("2026-08-22T10:01:06Z")
+        supervisor.run_once("2026-08-22T10:03:07Z")
 
         after = self.store.connection.execute(
             "SELECT state,attempts,target_progress_sha256,last_error "
@@ -583,9 +599,20 @@ class CoordinationSupervisorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("INFLIGHT", after["state"])
         self.assertEqual(1, after["attempts"])
-        self.assertNotEqual(before["target_progress_sha256"], after["target_progress_sha256"])
-        self.assertEqual("WAKE_LAUNCH_FAILED", after["last_error"])
+        self.assertEqual("WAKE_LAUNCH_FAILED_AFTER_PROGRESS", after["last_error"])
         self.assertEqual(3, len(failures))
+
+        retry = supervisor.run_once("2026-08-22T10:04:08Z")
+        self.assertEqual(1, retry["launch_attempts"]["messages"])
+        self.assertEqual(4, len(failures))
+        self.assertEqual(
+            ("INFLIGHT", 2, "WAKE_LAUNCH_FAILED"),
+            tuple(self.store.connection.execute(
+                "SELECT state,attempts,last_error FROM coordination_wakes "
+                "WHERE message_id=?",
+                (message_id,),
+            ).fetchone()),
+        )
 
     def test_terminal_watch_launch_failures_exhaust_into_typed_hold(self) -> None:
         source = self.snapshot()
@@ -635,6 +662,70 @@ class CoordinationSupervisorTests(unittest.TestCase):
         self.assertEqual(
             ("HOLD", 3, "TERMINAL_WATCH_RETRY_EXHAUSTED"), tuple(watch)
         )
+
+    def test_third_terminal_watch_failure_rereads_progress_before_exhaustion(self) -> None:
+        source = self.snapshot()
+        self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="ACTIVE",
+            allocation_class="ACTIVE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_SESSION,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-22T10:00:02Z",
+        )
+        watch_key = str(self.store.connection.execute(
+            "SELECT watch_key FROM coordination_terminal_watches"
+        ).fetchone()["watch_key"])
+        failures: list[str] = []
+
+        def fail_after_progress(_session_id: str, candidate_watch_key: str) -> int:
+            failures.append(candidate_watch_key)
+            if len(failures) == 3:
+                self.store.heartbeat_terminal_watch(
+                    watch_key=watch_key,
+                    session_id=DEVELOPMENT_SESSION,
+                    generation=1,
+                    delay_seconds=600,
+                    now="2026-08-22T10:03:05Z",
+                )
+            raise OSError("watch launch failed")
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: 1,
+            terminal_watch_launcher=fail_after_progress,
+            process_checker=lambda *_: False,
+        )
+        for timestamp in (
+            "2026-08-22T10:01:03Z",
+            "2026-08-22T10:02:04Z",
+            "2026-08-22T10:03:05Z",
+        ):
+            supervisor.run_once(timestamp)
+
+        watch = self.store.connection.execute(
+            "SELECT state,attempts,next_wake_at,last_error "
+            "FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        self.assertEqual("ACTIVE", watch["state"])
+        self.assertEqual(0, watch["attempts"])
+        self.assertEqual("2026-08-22T10:13:05Z", watch["next_wake_at"])
+        self.assertEqual(
+            "TERMINAL_WATCH_WAKE_FAILED_AFTER_PROGRESS", watch["last_error"]
+        )
+        self.assertEqual(3, len(failures))
+
+        retry = supervisor.run_once("2026-08-22T10:13:06Z")
+        self.assertEqual(1, retry["launch_attempts"]["terminal_watches"])
+        self.assertEqual(4, len(failures))
 
     def test_capacity_release_consumes_dirty_event_without_planner_notice(self) -> None:
         source = self.snapshot()
@@ -1112,7 +1203,12 @@ class CoordinationSupervisorTests(unittest.TestCase):
             first["launch_policy"],
         )
         self.assertEqual(
-            {"terminal_watch_slot_reserved": True, "message_limit": 3},
+            {
+                "terminal_watch_slot_reserved": True,
+                "message_limit": 3,
+                "due_message_retry_slot_reserved": False,
+                "due_message_retry_limit": 1,
+            },
             first["launch_policy_decision"],
         )
         self.assertEqual(first["launch_policy"], first["launch_attempts"])
@@ -1148,7 +1244,12 @@ class CoordinationSupervisorTests(unittest.TestCase):
         result = self.supervisor.run_once("2026-08-22T10:00:03Z")
 
         self.assertEqual(
-            {"terminal_watch_slot_reserved": False, "message_limit": 4},
+            {
+                "terminal_watch_slot_reserved": False,
+                "message_limit": 4,
+                "due_message_retry_slot_reserved": False,
+                "due_message_retry_limit": 1,
+            },
             result["launch_policy_decision"],
         )
         self.assertEqual(
