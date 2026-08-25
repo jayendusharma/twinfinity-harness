@@ -923,7 +923,9 @@ def main() -> int:
     args = parser.parse_args()
     connection: sqlite3.Connection | None = None
     try:
-        config = load_registry_config(args.config)
+        config = load_registry_config(
+            args.config, profile_validation_scope="catalog"
+        )
         aliases, alias_sha = load_legacy_alias_fixture(args.legacy_alias_file)
         connection = open_registry_database(
             DEFAULT_DATABASE,

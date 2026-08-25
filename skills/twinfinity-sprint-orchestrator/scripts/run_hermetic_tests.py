@@ -185,6 +185,7 @@ def validate_test_registry(codex_home: Path) -> None:
             REGISTRY_PATH,
             codex_home=codex_home,
             profile_template_root=REFERENCE_ROOT,
+            profile_validation_scope="catalog",
         )
     except RegistryError as exc:
         raise HermeticTestError(str(exc)) from exc

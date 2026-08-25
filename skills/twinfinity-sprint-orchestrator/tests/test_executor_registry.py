@@ -63,11 +63,13 @@ from reviewed_endpoint_catalog_fixture import (  # noqa: E402
 
 
 CONFIG = ROOT / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
+PRODUCTION_CONFIG = ROOT / "references" / "twinfinity-executor-registry.toml"
 ALIASES = ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
 REPOSITORY = "twinfinityai/twinfinityapp"
 DEVELOPMENT_UUID = "22222222-2222-4222-8222-222222222222"
 SRE_UUID = "33333333-3333-4333-8333-333333333333"
 DEVELOPMENT_ENDPOINT = "role.development.v4"
+DEVELOPMENT_V3_ENDPOINT = "role.development.v3"
 SRE_ENDPOINT = "role.sre.v4"
 PLANNER_ENDPOINT = "role.planner.v2"
 LEASE = "5" * 64
@@ -369,6 +371,135 @@ class ExecutorRegistryTests(unittest.TestCase):
         development.write_bytes(development.read_bytes() + b"\n")
         with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_DIGEST_MISMATCH"):
             load_registry_config(CONFIG, codex_home=mismatched_home)
+
+    def test_actual_v3_launch_preflight_requires_only_selected_current_profile(self) -> None:
+        selected_home = Path(self.temp.name) / "selected-v3-codex-home"
+        selected_home.mkdir(mode=0o700)
+        selected_profile = selected_home / "twinfinity-development-v3.config.toml"
+        selected_profile.write_bytes(
+            (ROOT / "references" / selected_profile.name).read_bytes()
+        )
+        production_root = Path(self.temp.name) / "production-v3"
+        production_root.mkdir(mode=0o700)
+        production = CoordinationStore(production_root / "state.sqlite3")
+        try:
+            with patch.dict(os.environ, {"CODEX_HOME": str(selected_home)}):
+                config = load_registry_config(
+                    PRODUCTION_CONFIG,
+                    selected_current_endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                )
+                aliases, alias_sha = load_legacy_alias_fixture(ALIASES)
+                plan = build_plan(
+                    production.connection,
+                    config,
+                    aliases,
+                    alias_fixture_sha256=alias_sha,
+                )
+                apply_plan(
+                    production.connection,
+                    plan=plan,
+                    operation_key="selected-v3-launch-preflight",
+                    expected_plan_sha256=plan["plan_sha256"],
+                    now="2026-08-25T22:00:00Z",
+                )
+                source = production.ingest_snapshot(
+                    repository=REPOSITORY,
+                    object_kind="issue",
+                    object_number=92,
+                    payload={"number": 92, "title": "selected v3 launch"},
+                    source_updated_at="2026-08-25T22:00:00Z",
+                    fetched_at="2026-08-25T22:00:01Z",
+                )
+
+                def enqueue(key: str) -> int:
+                    return production.enqueue_message(
+                        idempotency_key=key,
+                        recipient_session_id=DEVELOPMENT_V3_ENDPOINT,
+                        topic="coordination.notice",
+                        payload={
+                            "source": {
+                                "repository": REPOSITORY,
+                                "object_kind": "issue",
+                                "object_number": 92,
+                                "payload_sha256": source.payload_sha256,
+                            },
+                            "notice_kind": "status",
+                            "mutation_authority": False,
+                            "subject": "Selected v3 profile preflight",
+                            "summary": "Launch from a selected-profile-only CODEX_HOME.",
+                            "evidence": {},
+                        },
+                        now="2026-08-25T22:00:02Z",
+                    )
+
+                message_id = enqueue("selected-v3-positive")
+
+                def complete_target(_command, **_kwargs):
+                    production.claim_message(
+                        message_id,
+                        DEVELOPMENT_V3_ENDPOINT,
+                        "2026-08-25T22:00:03Z",
+                    )
+                    production.complete_message(
+                        message_id,
+                        DEVELOPMENT_V3_ENDPOINT,
+                        "2026-08-25T22:00:04Z",
+                    )
+                    return _ImmediateProcess()
+
+                with patch(
+                    "run_role_executor.load_registry_config",
+                    wraps=load_registry_config,
+                ):
+                    result = execute_role(
+                        production.connection,
+                        config_path=PRODUCTION_CONFIG,
+                        role="development",
+                        endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                        target_kind="message",
+                        target_key=str(message_id),
+                        prompt="Inspect the selected current v3 target.",
+                        systemd_invocation_id=INVOCATION_ID,
+                        systemd_evidence=systemd_evidence(
+                            target_key=str(message_id)
+                        ),
+                        popen=complete_target,
+                    )
+                self.assertEqual("COMPLETE", result["state"])
+
+                rejected_message_id = enqueue("selected-v3-negative")
+                selected_profile.write_bytes(selected_profile.read_bytes() + b"\n")
+                attempt_count = production.connection.execute(
+                    "SELECT COUNT(*) FROM executor_attempts"
+                ).fetchone()[0]
+                with patch(
+                    "run_role_executor.load_registry_config",
+                    wraps=load_registry_config,
+                ), self.assertRaisesRegex(
+                    RegistryError, "REGISTRY_PROFILE_DIGEST_MISMATCH"
+                ):
+                    execute_role(
+                        production.connection,
+                        config_path=PRODUCTION_CONFIG,
+                        role="development",
+                        endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                        target_kind="message",
+                        target_key=str(rejected_message_id),
+                        prompt="Reject a changed selected current v3 profile.",
+                        systemd_invocation_id=INVOCATION_ID,
+                        systemd_evidence=systemd_evidence(
+                            target_key=str(rejected_message_id)
+                        ),
+                        popen=lambda *_args, **_kwargs: _ImmediateProcess(),
+                    )
+                self.assertEqual(
+                    attempt_count,
+                    production.connection.execute(
+                        "SELECT COUNT(*) FROM executor_attempts"
+                    ).fetchone()[0],
+                )
+        finally:
+            production.close()
 
     def test_registry_rejects_command_profile_inconsistency_and_bypass_vectors(self) -> None:
         raw = CONFIG.read_text(encoding="utf-8")
@@ -1366,6 +1497,9 @@ class ExecutorRegistryTests(unittest.TestCase):
         )
 
     def test_v3_launch_v4_cutover_launch_rollback_and_v3_launch(self) -> None:
+        # This activation/rollback boundary must load each selected catalog,
+        # rather than the generic fixture config injected for unrelated tests.
+        self.runner_registry_loader.stop()
         source = self.snapshot()
         now = "2026-08-24T09:00:00Z"
         for endpoint in self.config.endpoints.values():
@@ -1418,9 +1552,21 @@ class ExecutorRegistryTests(unittest.TestCase):
                 )
                 return _ImmediateProcess()
 
+            selected_config = (
+                PRODUCTION_CONFIG
+                if endpoint_id == "role.development.v3"
+                else CONFIG
+            )
+            self.assertEqual(
+                endpoint_id,
+                load_registry_config(
+                    selected_config,
+                    selected_current_endpoint_id=endpoint_id,
+                ).roles["development"].endpoint_id,
+            )
             result = execute_role(
                 self.store.connection,
-                config_path=CONFIG,
+                config_path=selected_config,
                 role="development",
                 endpoint_id=endpoint_id,
                 target_kind="message",

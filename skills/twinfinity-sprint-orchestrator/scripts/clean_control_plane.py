@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 from typing import Any
 
@@ -186,6 +187,92 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _descriptor_sha256(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _archive_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _git_repository_from_remote(value: str) -> str | None:
+    normalized = value.strip()
+    for prefix in (
+        "https://github.com/",
+        "ssh://git@github.com/",
+        "git@github.com:",
+    ):
+        if normalized.startswith(prefix):
+            repository = normalized[len(prefix) :].removesuffix(".git")
+            return repository if REPOSITORY.fullmatch(repository) else None
+    return None
+
+
+def _validate_source_git(
+    source_root: Path,
+    *,
+    repository: str,
+    commit: str,
+    bound_paths: list[str],
+) -> None:
+    """Bind the source root and every reviewed input to one exact Git commit."""
+
+    environment = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+
+    def git(*arguments: str) -> bytes:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(source_root), *arguments],
+                check=True,
+                capture_output=True,
+                env=environment,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise CleanControlPlaneError("BOOTSTRAP_SOURCE_GIT_INVALID") from exc
+
+    try:
+        declared_root = source_root.resolve(strict=True)
+        top = Path(
+            git("rev-parse", "--show-toplevel").decode().strip()
+        ).resolve(strict=True)
+        head = git("rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+        remote = git("config", "--get", "remote.origin.url").decode().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CleanControlPlaneError("BOOTSTRAP_SOURCE_GIT_INVALID") from exc
+    if (
+        top != declared_root
+        or head != commit
+        or _git_repository_from_remote(remote) != repository
+    ):
+        raise CleanControlPlaneError("BOOTSTRAP_SOURCE_GIT_MISMATCH")
+    for relative in bound_paths:
+        path = _source_file(source_root, relative)
+        try:
+            committed = git("show", f"{commit}:{relative}")
+        except CleanControlPlaneError as exc:
+            raise CleanControlPlaneError("BOOTSTRAP_SOURCE_GIT_MISMATCH") from exc
+        if path.read_bytes() != committed:
+            raise CleanControlPlaneError("BOOTSTRAP_SOURCE_GIT_MISMATCH")
+
+
 def _validate_archive_lineages(
     connection: sqlite3.Connection,
     lineages: list[dict[str, Any]],
@@ -293,7 +380,12 @@ def _validate_archive(
     if not isinstance(value["archive_path"], str) or not value["archive_path"]:
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_PATH_INVALID")
     archive = Path(value["archive_path"])
-    if not archive.is_absolute() or Path(os.path.abspath(archive)) == database:
+    archive = Path(os.path.abspath(archive))
+    if (
+        not Path(value["archive_path"]).is_absolute()
+        or archive == database
+        or archive == DEFAULT_CANONICAL_DATABASE
+    ):
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_PATH_INVALID")
     try:
         validate_owner_database(archive)
@@ -301,12 +393,41 @@ def _validate_archive(
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_UNSAFE") from exc
     if any(Path(f"{archive}{suffix}").exists() for suffix in ("-wal", "-shm")):
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_SIDECAR_PRESENT")
-    if _file_sha256(archive) != value["archive_sha256"]:
-        raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_DIGEST_MISMATCH")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        connection = open_owner_database_readonly(archive)
+        descriptor = os.open(archive, flags)
+    except OSError as exc:
+        raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_UNSAFE") from exc
+    connection: sqlite3.Connection | None = None
+    try:
+        initial_descriptor = os.fstat(descriptor)
+        initial_path = archive.stat(follow_symlinks=False)
+        if (
+            _archive_identity(initial_descriptor) != _archive_identity(initial_path)
+            or not stat.S_ISREG(initial_descriptor.st_mode)
+            or initial_descriptor.st_uid != os.getuid()
+            or initial_descriptor.st_nlink != 1
+            or stat.S_IMODE(initial_descriptor.st_mode) != 0o600
+        ):
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_UNSAFE")
+        if _descriptor_sha256(descriptor) != value["archive_sha256"]:
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_DIGEST_MISMATCH")
+        try:
+            preopen_path = archive.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_DRIFT") from exc
+        if _archive_identity(initial_descriptor) != _archive_identity(preopen_path):
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_DRIFT")
+        connection = sqlite3.connect(
+            f"file:/proc/self/fd/{descriptor}?mode=ro&immutable=1",
+            uri=True,
+            isolation_level=None,
+            timeout=5,
+        )
         try:
             connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA foreign_keys=ON")
             integrity = [str(row[0]) for row in connection.execute("PRAGMA integrity_check")]
             if integrity == ["ok"]:
                 _validate_archive_lineages(
@@ -314,8 +435,26 @@ def _validate_archive(
                 )
         finally:
             connection.close()
-    except (UnsafeSQLitePathError, sqlite3.Error) as exc:
+            connection = None
+        try:
+            final_path = archive.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_DRIFT") from exc
+        final_descriptor = os.fstat(descriptor)
+        if (
+            _archive_identity(initial_descriptor)
+            != _archive_identity(final_descriptor)
+            or _archive_identity(final_descriptor) != _archive_identity(final_path)
+            or _descriptor_sha256(descriptor) != value["archive_sha256"]
+            or any(Path(f"{archive}{suffix}").exists() for suffix in ("-wal", "-shm"))
+        ):
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_DRIFT")
+    except sqlite3.Error as exc:
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_UNREADABLE") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(descriptor)
     if integrity != ["ok"]:
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_INTEGRITY_INVALID")
 
@@ -360,6 +499,7 @@ def _validate_manifest_closed(
         raise CleanControlPlaneError("BOOTSTRAP_SOURCE_SCHEMA_INVALID")
     if _require_git_sha(source["main_sha"], "BOOTSTRAP_SOURCE_MAIN_INVALID") != harness_main_sha:
         raise CleanControlPlaneError("BOOTSTRAP_SOURCE_MAIN_MISMATCH")
+    bound_source_paths = [source["registry_path"]]
     registry_path = _source_file(source_root, source["registry_path"])
     if _file_sha256(registry_path) != _require_sha(source["registry_sha256"], "BOOTSTRAP_REGISTRY_DIGEST_INVALID"):
         raise CleanControlPlaneError("BOOTSTRAP_REGISTRY_DIGEST_MISMATCH")
@@ -376,6 +516,7 @@ def _validate_manifest_closed(
             raise CleanControlPlaneError("BOOTSTRAP_PROFILE_SCHEMA_INVALID")
         seen_roles.add(role)
         path = _source_file(source_root, profile["path"])
+        bound_source_paths.append(profile["path"])
         if _file_sha256(path) != _require_sha(profile["sha256"], "BOOTSTRAP_PROFILE_DIGEST_INVALID"):
             raise CleanControlPlaneError("BOOTSTRAP_PROFILE_DIGEST_MISMATCH")
         if profile_root is None:
@@ -401,8 +542,15 @@ def _validate_manifest_closed(
 
     goal = _require_keys(manifest["approved_goal"], {"path", "sha256"}, "BOOTSTRAP_GOAL_SCHEMA_INVALID")
     goal_path = _source_file(source_root, goal["path"])
+    bound_source_paths.append(goal["path"])
     if _file_sha256(goal_path) != _require_sha(goal["sha256"], "BOOTSTRAP_GOAL_DIGEST_INVALID"):
         raise CleanControlPlaneError("BOOTSTRAP_GOAL_DIGEST_MISMATCH")
+    _validate_source_git(
+        source_root,
+        repository=source["repository"],
+        commit=source["main_sha"],
+        bound_paths=bound_source_paths,
+    )
 
     application = _require_keys(manifest["application"], {"repository", "main_sha", "snapshots"}, "BOOTSTRAP_APPLICATION_SCHEMA_INVALID")
     if REPOSITORY.fullmatch(str(application["repository"])) is None:

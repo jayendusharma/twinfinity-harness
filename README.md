@@ -41,9 +41,11 @@ depends on or mutates installed profiles.
 
 Audit the catalog directly from source bytes with:
 
+<!-- source-profile-audit:start -->
 ```bash
 python3 skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py \
   --config skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml \
-  --profile-root skills/twinfinity-sprint-orchestrator/references \
+  --profile-root "$(pwd -P)/skills/twinfinity-sprint-orchestrator/references" \
   audit-config
 ```
+<!-- source-profile-audit:end -->

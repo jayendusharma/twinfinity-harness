@@ -5,10 +5,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL_ROOT / "scripts"))
@@ -17,7 +20,12 @@ import clean_control_plane as clean
 
 
 SOURCE_ROOT = SKILL_ROOT.parents[1]
-HARNESS_MAIN = "b" * 40
+HARNESS_MAIN = subprocess.run(
+    ["git", "-C", str(SOURCE_ROOT), "rev-parse", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
 APPLICATION_MAIN = "a" * 40
 NOW = "2026-08-25T20:00:00Z"
 
@@ -324,6 +332,60 @@ class CleanControlPlaneTests(unittest.TestCase):
                 artifact["sha256"] = lease_sha
         manifest["manifest_sha256"] = clean.manifest_digest(manifest)
 
+    def source_fixture(self, manifest: dict[str, object]) -> tuple[Path, str]:
+        source_root = self.root / "source-fixture"
+        source_root.mkdir(mode=0o700)
+        source = manifest["source_harness"]
+        assert isinstance(source, dict)
+        goal = manifest["approved_goal"]
+        assert isinstance(goal, dict)
+        relative_paths = [
+            str(source["registry_path"]),
+            *(str(profile["path"]) for profile in source["profiles"]),
+            str(goal["path"]),
+        ]
+        for relative in relative_paths:
+            destination = source_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(SOURCE_ROOT / relative, destination)
+        subprocess.run(["git", "init", "-q", str(source_root)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jayendusharma/twinfinity-harness.git",
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(source_root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "-c",
+                "user.name=Twinfinity Test",
+                "-c",
+                "user.email=test@twinfinity.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "source fixture",
+            ],
+            check=True,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return source_root, commit
+
     def test_creates_and_validates_clean_database_without_retained_work(self) -> None:
         database = self.root / "clean.sqlite3"
         manifest = self.manifest()
@@ -439,6 +501,49 @@ class CleanControlPlaneTests(unittest.TestCase):
                 harness_main_sha=HARNESS_MAIN,
             )
 
+    def test_archive_rejects_canonical_path_and_descriptor_replacement_race(self) -> None:
+        manifest = self.manifest()
+        manifest["old_control_plane"]["archive_path"] = str(  # type: ignore[index]
+            clean.DEFAULT_CANONICAL_DATABASE
+        )
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_ARCHIVE_PATH_INVALID"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "candidate.sqlite3",
+                harness_main_sha=HARNESS_MAIN,
+            )
+
+        manifest = self.manifest()
+        real_digest = clean._descriptor_sha256
+        calls = 0
+
+        def replace_after_digest(descriptor: int) -> str:
+            nonlocal calls
+            result = real_digest(descriptor)
+            calls += 1
+            if calls == 1:
+                replacement = self.root / "archive-replacement.sqlite3"
+                shutil.copy2(self.archive, replacement)
+                replacement.chmod(0o600)
+                os.replace(replacement, self.archive)
+            return result
+
+        with patch.object(
+            clean, "_descriptor_sha256", side_effect=replace_after_digest
+        ), self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_ARCHIVE_DRIFT"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "candidate.sqlite3",
+                harness_main_sha=HARNESS_MAIN,
+            )
+
         unrelated = self.root / "unrelated.sqlite3"
         connection = sqlite3.connect(unrelated)
         connection.execute("CREATE TABLE unrelated(value TEXT)")
@@ -488,6 +593,58 @@ class CleanControlPlaneTests(unittest.TestCase):
                         database=self.root / "candidate.sqlite3",
                         harness_main_sha=HARNESS_MAIN,
                     )
+
+    def test_source_git_attestation_rejects_sha_repository_root_and_dirty_binding(self) -> None:
+        manifest = self.manifest()
+        manifest["source_harness"]["main_sha"] = "f" * 40  # type: ignore[index]
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_SOURCE_GIT_MISMATCH"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "candidate.sqlite3",
+                harness_main_sha="f" * 40,
+            )
+
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_SOURCE_GIT_MISMATCH"
+        ):
+            clean._validate_source_git(
+                SOURCE_ROOT / "skills",
+                repository=clean.SOURCE_HARNESS_REPOSITORY,
+                commit=HARNESS_MAIN,
+                bound_paths=[],
+            )
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_SOURCE_GIT_MISMATCH"
+        ):
+            clean._validate_source_git(
+                SOURCE_ROOT,
+                repository="unrelated/repository",
+                commit=HARNESS_MAIN,
+                bound_paths=[],
+            )
+
+        manifest = self.manifest()
+        source_root, commit = self.source_fixture(manifest)
+        source = manifest["source_harness"]
+        assert isinstance(source, dict)
+        source["main_sha"] = commit
+        registry = source_root / str(source["registry_path"])
+        registry.write_bytes(registry.read_bytes() + b"\n")
+        source["registry_sha256"] = sha(registry)
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_SOURCE_GIT_MISMATCH"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=source_root,
+                database=self.root / "candidate.sqlite3",
+                harness_main_sha=commit,
+            )
 
 
 if __name__ == "__main__":

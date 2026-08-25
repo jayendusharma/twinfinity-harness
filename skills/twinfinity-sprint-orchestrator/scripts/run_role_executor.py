@@ -341,9 +341,11 @@ def execute_role(
         invocation_id=systemd_invocation_id,
         evidence=systemd_evidence,
     )
-    config = load_registry_config(config_path)
-    configured = config.endpoints.get(endpoint_id)
-    if configured is None or configured.role != role:
+    config = load_registry_config(
+        config_path, selected_current_endpoint_id=endpoint_id
+    )
+    configured = config.roles.get(role)
+    if configured is None or configured.endpoint_id != endpoint_id:
         raise RegistryError("EXECUTOR_CONFIG_ENDPOINT_MISMATCH")
     endpoint = current_endpoint(connection, role)
     if (

@@ -16,6 +16,7 @@ from executor_registry import RegistryError, load_registry_config  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT.parents[1]
 CODEX_HOME = Path(os.environ["CODEX_HOME"])
 EXPECTED_ENDPOINTS = {
     "planner": ("role.planner.v2", 2),
@@ -128,6 +129,56 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 codex_home=object(),  # type: ignore[arg-type]
                 profile_template_root=ROOT / "references",
             )
+
+    def test_current_only_install_is_runtime_valid_but_not_catalog_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "current-only"
+            codex_home.mkdir(mode=0o700)
+            for profile in (
+                "twinfinity-planner-v2.config.toml",
+                "twinfinity-development-v3.config.toml",
+                "twinfinity-sre-v3.config.toml",
+            ):
+                shutil.copy2(ROOT / "references" / profile, codex_home / profile)
+            config = load_registry_config(
+                ROOT / "references" / "twinfinity-executor-registry.toml",
+                codex_home=codex_home,
+            )
+            self.assertEqual(
+                {
+                    "role.planner.v2",
+                    "role.development.v3",
+                    "role.sre.v3",
+                },
+                {
+                    endpoint.endpoint_id for endpoint in config.roles.values()
+                },
+            )
+            with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_MISSING"):
+                load_registry_config(
+                    ROOT / "references" / "twinfinity-executor-registry.toml",
+                    codex_home=codex_home,
+                    profile_validation_scope="catalog",
+                )
+
+    def test_readme_source_audit_command_executes_verbatim(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        marked = readme.split("<!-- source-profile-audit:start -->", 1)[1].split(
+            "<!-- source-profile-audit:end -->", 1
+        )[0]
+        command = marked.split("```bash", 1)[1].split("```", 1)[0].strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            absent_codex_home = Path(temporary) / "must-remain-absent"
+            completed = subprocess.run(
+                ["/bin/bash", "-eu", "-o", "pipefail", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "CODEX_HOME": str(absent_codex_home)},
+            )
+            self.assertEqual("PASS", json.loads(completed.stdout)["phase"])
+            self.assertFalse(absent_codex_home.exists())
 
     def test_current_direct_profiles_and_staged_profiles_are_digest_bound(self) -> None:
         registry = tomllib.loads(

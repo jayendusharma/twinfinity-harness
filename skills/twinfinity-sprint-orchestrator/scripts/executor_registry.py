@@ -214,6 +214,8 @@ class RegistryConfig:
     source_sha256: str
     source_evidence: OwnerFileEvidence
     profile_evidence: tuple[OwnerFileEvidence, ...]
+    profile_validation_scope: str
+    selected_profile_endpoint_id: str | None
     codex_home: str
     profile_template_root: str
 
@@ -576,6 +578,8 @@ def revalidate_registry_inputs(config: RegistryConfig) -> RegistryConfig:
         Path(config.source_evidence.path),
         codex_home=Path(config.codex_home),
         profile_template_root=Path(config.profile_template_root),
+        profile_validation_scope=config.profile_validation_scope,
+        selected_current_endpoint_id=config.selected_profile_endpoint_id,
     )
     if current.source_evidence != config.source_evidence:
         raise RegistryError("REGISTRY_CONFIG_DRIFT")
@@ -587,6 +591,9 @@ def revalidate_registry_inputs(config: RegistryConfig) -> RegistryConfig:
         or current.endpoints != config.endpoints
         or current.staged_endpoint_ids != config.staged_endpoint_ids
         or current.source_sha256 != config.source_sha256
+        or current.profile_validation_scope != config.profile_validation_scope
+        or current.selected_profile_endpoint_id
+        != config.selected_profile_endpoint_id
         or current.codex_home != config.codex_home
         or current.profile_template_root != config.profile_template_root
     ):
@@ -730,6 +737,8 @@ def load_registry_config(
     *,
     codex_home: Path | None = None,
     profile_template_root: Path | None = DEFAULT_PROFILE_TEMPLATE_ROOT,
+    profile_validation_scope: str = "current",
+    selected_current_endpoint_id: str | None = None,
 ) -> RegistryConfig:
     """Load the closed current-and-rollback endpoint catalog."""
 
@@ -799,6 +808,23 @@ def load_registry_config(
     }
     if current_mutating["development"] & current_mutating["sre"]:
         raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
+    if profile_validation_scope not in {"current", "catalog"}:
+        raise RegistryError("REGISTRY_PROFILE_VALIDATION_SCOPE_INVALID")
+    if selected_current_endpoint_id is not None:
+        selected = endpoints.get(selected_current_endpoint_id)
+        if (
+            profile_validation_scope != "current"
+            or selected is None
+            or roles[selected.role].endpoint_id != selected_current_endpoint_id
+        ):
+            raise RegistryError("REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT")
+        profiled_endpoints = {selected_current_endpoint_id: selected}
+    elif profile_validation_scope == "catalog":
+        profiled_endpoints = endpoints
+    else:
+        profiled_endpoints = {
+            endpoint.endpoint_id: endpoint for endpoint in roles.values()
+        }
     effective_codex_home = _validate_profile_directory(
         _default_codex_home() if codex_home is None else codex_home,
         "REGISTRY_CODEX_HOME",
@@ -810,7 +836,7 @@ def load_registry_config(
         "REGISTRY_PROFILE_ROOT",
     )
     profile_evidence = _validate_role_profiles(
-        endpoints,
+        profiled_endpoints,
         codex_home=effective_codex_home,
         profile_template_root=effective_template_root,
     )
@@ -822,6 +848,8 @@ def load_registry_config(
         source_sha256=hashlib.sha256(raw).hexdigest(),
         source_evidence=source_evidence,
         profile_evidence=profile_evidence,
+        profile_validation_scope=profile_validation_scope,
+        selected_profile_endpoint_id=selected_current_endpoint_id,
         codex_home=os.path.abspath(os.fspath(effective_codex_home)),
         profile_template_root=os.path.abspath(os.fspath(effective_template_root)),
     )
@@ -2556,6 +2584,7 @@ def main() -> int:
                     args.config,
                     codex_home=args.profile_root,
                     profile_template_root=args.profile_root,
+                    profile_validation_scope="catalog",
                 )
             print(canonical_json({
                 "phase": "PASS",
