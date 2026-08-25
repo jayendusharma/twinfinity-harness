@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,8 +62,15 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             );
             """
         )
-        self.config = load_registry_config(CONFIG)
-        self.aliases, self.alias_sha = load_legacy_alias_fixture(ALIASES)
+        (
+            self.config,
+            self.aliases,
+            self.alias_sha,
+            _config_path,
+            _alias_path,
+            _template_root,
+            _codex_home,
+        ) = self._copied_review_inputs()
         self.alias_by_role = {
             entry["role"]: entry["alias"] for entry in self.aliases
         }
@@ -148,8 +156,10 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             "twinfinity-planner-v2",
             "twinfinity-development-v3",
             "twinfinity-development-v4",
+            "twinfinity-development-v5",
             "twinfinity-sre-v3",
             "twinfinity-sre-v4",
+            "twinfinity-sre-v5",
         ):
             source = ROOT / "references" / f"{profile}.config.toml"
             shutil.copy2(source, template_root / source.name)
@@ -292,7 +302,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 before = self._routing_state_bytes()
                 root = template_root if source_kind == "template" else codex_home
                 self._replace_with_same_bytes(
-                    root / "twinfinity-development-v4.config.toml"
+                    root / "twinfinity-development-v5.config.toml"
                 )
 
                 with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_DRIFT"):
@@ -445,7 +455,9 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 (entry["alias"],),
             ).fetchone()
             self.assertEqual(current_by_role[entry["role"]], stored["endpoint_id"])
-            with self.assertRaisesRegex(
+            with patch(
+                "executor_registry.load_registry_config", return_value=self.config
+            ), self.assertRaisesRegex(
                 RegistryError, "CURRENT_ROLE_ENDPOINT_REQUIRED"
             ):
                 require_current_endpoint_identity(

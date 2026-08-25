@@ -24,7 +24,7 @@ The installed role contracts are:
 | Development | `development` | `development.*` only | `twinfinity-development-executor` |
 | SRE | `sre` | `sre.*` only | `twinfinity-devops-sre` |
 
-Planner, Development, and SRE use distinct strict Codex profiles. Development and SRE may share only the focused `delivery_guard.py` hook; Planner has no delivery hook and receives only non-authorizing `coordination.notice` work. Every reviewed endpoint, including an executable rollback target, has a versioned portable template named `$CODEX_HOME/<logical-profile>-v<version>.config.toml`. The registry catalog and immutable SQLite endpoint row bind its exact SHA-256 and command manifest. The runner selects that versioned profile from the exact current pointer; it never reloads only the newest singleton role definition. A profile or endpoint cannot grant mutation authority outside the role contract, current user authority, and exact control-plane row.
+Planner, Development, and SRE use distinct strict Codex profiles. Planner has no delivery hook and receives only non-authorizing `coordination.notice` work. Direct Development/SRE v3 and v4 profiles retain the focused `delivery_guard.py` hook. Brokered v5 readiness profiles have no hook, raw executor token, coordination-root write, GitHub tool, or mutation surface because the trusted outer broker owns every control-plane transition. Every reviewed endpoint, including an executable rollback target, has a versioned portable template named `$CODEX_HOME/<logical-profile>-v<version>.config.toml`. The registry catalog and immutable SQLite endpoint row bind its exact SHA-256, execution protocol, and command manifest. The runner selects that versioned profile from the exact current pointer; it never reloads only the newest singleton role definition. A profile or endpoint cannot grant mutation authority outside the role contract, current user authority, and exact control-plane row.
 
 Changing a role creates a new immutable endpoint version. Advance only that role's current pointer by compare-and-swap. Never edit a persisted endpoint or alias in place.
 
@@ -35,12 +35,20 @@ The checked-in registry and portable templates are staged cutover inputs, not ev
 | Role | Staged endpoint | Portable profile SHA-256 | Pointer intent |
 | --- | --- | --- | --- |
 | Planner | `role.planner.v2` | `38d39166c7573d676206a0f70efd4ebbc68c2d74cd743bab85f48de56b5128cf` | unchanged |
-| Development | `role.development.v4` | `96542613dab00abca2a3bcc7e6975025f7b8ed01f610b54ecf23ea6b470c3f18` | additive `role.development.v3` to `role.development.v4` CAS |
-| SRE | `role.sre.v4` | `2257302ec8dafb3ad7f45018b28b98e6a120344f0fab1cc9ae81037639edd5e7` | additive `role.sre.v3` to `role.sre.v4` CAS |
+| Development | `role.development.v5` | `c00d7af40a71326473f85ecd830b4af9f26f2537795b55de2f291907713722fb` | additive v5 readiness-broker CAS after an exact reviewed live rendezvous |
+| SRE | `role.sre.v5` | `5043fdc47cf3c945471d80b90ac92c08963a4871511a1cfd6554843e00ed3488` | additive v5 readiness-broker CAS after an exact reviewed live rendezvous |
 
-The Development and SRE v4 profiles accept exactly two entry classes. The first is an exact current-endpoint, non-authorizing `coordination.notice` for one read-only Kanban-readiness phase with zero writer WIP for that role. The second is the role's exact Planner admission, recovery, terminal-watch wake, or, for SRE, an authorized read-only operational audit. A readiness notice grants no repository, GitHub, provider, admission, tracker, lease, allocation, application, operational-target, or hosted mutation authority. Every mutation still requires its exact role admission and all ordinary authority and safety gates. Legacy aliases, prior endpoints, and resumed Codex threads are not execution routes.
+The Development and SRE v5 profiles accept only the brokered `readiness/v1` behavior implemented in `role_executor_broker.py`: one exact current-endpoint, non-authorizing `coordination.notice` tied to one RUNNING Kanban readiness campaign. They cannot claim messages, read SQLite, access GitHub or a repository, receive a raw executor token, write the coordination root, or finalize a verdict. The outer owner process retains all those mechanics. Writer messages, terminal watches, recovery work, and hosted operations at v5 fail closed as `BROKER_RPC_NOT_IMPLEMENTED` before attempt reservation until a separately reviewed RPC commit exists. Direct v3/v4 bundles remain immutable executable rollback inputs; they are not silently rewritten to acquire the v5 boundary.
 
-Do not install the staged templates or run migration merely because these artifacts validate. A later authorized cutover must install all five reviewed versioned profile files (`planner-v2`, Development v3/v4, and SRE v3/v4), re-read their digests, build a fresh plan against live SQLite, and compare-and-swap only the Development and SRE pointers from their exact observed v3 rendezvous. Planner stays at v2 unless its bytes or contract change. The v3 files are executable rollback inputs, not new-work routes while v4 is current.
+Do not install the staged templates or run migration merely because these artifacts validate. A later authorized cutover must install all seven reviewed versioned profile files (`planner-v2`, Development v3/v4/v5, and SRE v3/v4/v5), re-read their digests, build a fresh plan against live SQLite, and compare-and-swap only from the exact observed complete pointer set. Planner stays at v2 unless its bytes or contract change. Do not advance a role to v5 while its required target mix still depends on an unimplemented writer or hosted RPC. A v5-to-v4 rollback launches the original immutable v4 profile in a fresh attempt; it never resumes a thread or reconstructs bytes from a mutable singleton.
+
+### Brokered readiness/v1 boundary
+
+`run_role_executor.py` delegates only a registry-declared `readiness/v1` endpoint to the owner-side broker. The broker reserves the attempt, builds one canonical input projection from the exact message, GitHub issue snapshot, readiness campaign and gates, graph, candidate, and capacity-policy rows, and persists an immutable `twinfinity-role-broker-contract/v1` binding. The contract includes role, endpoint, attempt and instance IDs, target, message digest, repository and issue, campaign and readiness-plan digest, candidate/source/main/graph/policy/gate-set digests, result schema/path/limit, and isolation/profile digests.
+
+The broker-run lifecycle is `PREPARING -> LAUNCHING -> RUNNING -> COMPLETE`; any nonrecoverable boundary failure goes to terminal `HOLD`. A Bubblewrap child starts behind `--block-fd` and cannot run Codex until one `BEGIN IMMEDIATE` transaction has claimed the exact message, attached the exact readiness campaign, and moved both attempt and broker run to `RUNNING`. Its mount tree has private `/proc`, `/tmp`, `/run`, and `/dev`; no user D-Bus; an empty read-only coordination root; read-only exact contract, projection, v5 profile, role skill, Codex runtime/auth material; all capabilities dropped with no-new-privileges; and exactly one writable file, `/run/twinfinity-attempt/out/receipt.json`, limited to 1,048,576 bytes. The raw executor token and owner database path never enter the child command, environment, contract, or mounts.
+
+Before the claim/attach transaction, failure makes the attempt `LAUNCH_FAILED`, keeps the message `PREPARED`, and terminally holds the broker run. After claim/attach, child, receipt, or binding failure atomically moves the message, readiness campaign, attempt, and broker run to `HOLD`. Success descriptor-reads and strictly validates one `twinfinity-kanban-readiness-receipt/v1`, then one transaction stores its canonical JSON, digest, and file observation in `role_executor_broker_receipt_pickups`, completes the exact message and attempt, and marks the broker run `COMPLETE`. The readiness campaign intentionally remains `RUNNING`: the existing Planner-side readiness finalizer later interprets the staged verdict. Filesystem spool or archive bytes are derived and never authorize replay; after commit, replay reads the immutable SQLite pickup.
 
 ## Dispatch and attempt lifecycle
 
@@ -50,7 +58,8 @@ Module ownership is narrow:
 - `executor_registry.py` owns endpoints, aliases, current pointers, change ledger, and attempt primitives;
 - `coordination_supervisor.py` selects current due targets;
 - `role_executor_transport.py` builds the bounded systemd transient-unit invocation; and
-- `run_role_executor.py` validates, reserves, launches, heartbeats, and closes one attempt.
+- `run_role_executor.py` validates the current endpoint and selects the endpoint-bound direct or broker protocol; and
+- `role_executor_broker.py` exclusively owns v5 readiness reservation, claim/attach, isolation, receipt pickup, message completion, and attempt terminalization.
 
 For every inbox, terminal-watch, or hosted-operation wake:
 
@@ -62,7 +71,7 @@ For every inbox, terminal-watch, or hosted-operation wake:
 6. Record the positive child PID only with `LAUNCHING -> RUNNING`.
 7. Heartbeat through versioned `RUNNING` updates and finish as `COMPLETE` or `HOLD` with token validation and version compare-and-swap.
 
-Persist only the token digest; pass the raw token only in the child environment. The attempt prompt identifies one exact target and carries no authority beyond that target's ordinary guards.
+Persist only the token digest. Direct v3/v4 execution passes the raw token only in the child environment. Brokered v5 readiness keeps the token exclusively in the outer owner process and uses a fixed non-authorizing child prompt.
 
 Active uniqueness is `(role, target_kind, target_key)` plus logical-lineage uniqueness. Planner attempts additionally carry an immutable canonical repository scope with a partial-unique active fence, so one repository has at most one active Planner control attempt while distinct repositories remain independent. The supervisor's per-pass launch policy is four total transport attempts: three base message slots and one terminal-watch reserve. A due eligible watch owns the reserve; otherwise a fourth message may borrow it. One stable FIFO message slot is reserved for the oldest eligible due `INFLIGHT` retry, with the remaining message slots available to fresh work. Unselected rows retain their prior state and retry counters. This transport budget does not consume Development, Shared, or SRE capacity. Endpoint availability is never a capacity semaphore.
 
@@ -72,9 +81,9 @@ Each reservation records an authoritative target-progress digest and each termin
 
 ## Native role execution
 
-The Planner endpoint loads `/home/ubuntu/.codex/twinfinity-planner.config.toml`, must read `twinfinity-sprint-orchestrator/SKILL.md`, remains non-coding, and has owner-local write access only to the coordination root. The Development endpoint loads `/home/ubuntu/.codex/twinfinity-development.config.toml` and must read `twinfinity-development-executor/SKILL.md` before acting. The SRE endpoint loads `/home/ubuntu/.codex/twinfinity-sre.config.toml` and must read `twinfinity-devops-sre/SKILL.md` before acting.
+The Planner endpoint loads its exact versioned `twinfinity-planner-v2` profile, must read `twinfinity-sprint-orchestrator/SKILL.md`, remains non-coding, and has owner-local write access only to the coordination root. A direct Development or SRE endpoint likewise loads the exact versioned profile bound to its immutable manifest and reads its role skill before acting. A brokered v5 evaluator receives only the v5 profile, the applicable read-only role skill, and the canonical broker inputs inside its private mount tree.
 
-Development and SRE native attempts perform their authorized Git, network, Docker, GitHub, provider, and cleanup work only through their role skill, exact admission, strict topic set, and controlled escalation.
+Development and SRE direct v3/v4 attempts perform their authorized Git, network, Docker, GitHub, provider, and cleanup work only through their role skill, exact admission, strict topic set, and controlled escalation. V5 is not a native writer profile: it is the isolated readiness evaluator described above, and all unimplemented target kinds fail closed.
 
 ## Crash recovery
 
@@ -136,7 +145,7 @@ python3 scripts/reconcile_routing_artifacts.py \
   rollback --change-id '<change-id>' --expected-version '<version>'
 ```
 
-An exact repeat is idempotent. Pointer, item, watch, profile, endpoint-manifest, or change-version drift is `HOLD`; never force an older value over newer work. After a v4-to-v3 rollback, fresh attempts load the immutable `*-v3.config.toml` profile through a new attempt; no session resumes. File-level SQLite restore is disaster recovery, not endpoint rollback.
+An exact repeat is idempotent. Pointer, item, watch, profile, endpoint-manifest, or change-version drift is `HOLD`; never force an older value over newer work. After a v5-to-v4 or v4-to-v3 rollback, fresh attempts load the exact immutable versioned profile through a new attempt; no session resumes. File-level SQLite restore is disaster recovery, not endpoint rollback.
 
 ## GitHub body remediation
 

@@ -74,6 +74,8 @@ COMMON_ROLE_KEYS = {
     "allowed_topics",
 }
 PROFILED_ROLE_KEYS = COMMON_ROLE_KEYS | {"profile_sha256"}
+BROKERED_ROLE_KEYS = PROFILED_ROLE_KEYS | {"execution_protocol"}
+BROKERED_READINESS_PROTOCOL = "readiness/v1"
 EXPECTED_CODEX_PROFILES = {
     "planner": "twinfinity-planner",
     "development": "twinfinity-development",
@@ -172,12 +174,15 @@ class EndpointConfig:
     profile_sha256: str
     command_prefix: tuple[str, ...]
     allowed_topics: tuple[str, ...]
+    execution_protocol: str | None = None
 
     @property
     def payload(self) -> dict[str, Any]:
         value = asdict(self)
         if not self.profile_sha256:
             value.pop("profile_sha256")
+        if self.execution_protocol is None:
+            value.pop("execution_protocol")
         value["command_prefix"] = list(self.command_prefix)
         value["allowed_topics"] = list(self.allowed_topics)
         return value
@@ -537,13 +542,17 @@ def _validate_role_profiles(
 def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
     """Parse one exact reviewed endpoint manifest without syntax-only authority."""
 
-    if not isinstance(value, dict) or set(value) != PROFILED_ROLE_KEYS:
+    if not isinstance(value, dict) or set(value) not in (
+        PROFILED_ROLE_KEYS,
+        BROKERED_ROLE_KEYS,
+    ):
         raise RegistryError("REGISTRY_CONFIG_ROLE_SCHEMA_INVALID")
     endpoint_id = value.get("endpoint_id")
     version = value.get("version")
     executor_profile = value.get("executor_profile")
     codex_profile = value.get("codex_profile")
     profile_sha256 = value.get("profile_sha256", "")
+    execution_protocol = value.get("execution_protocol")
     if (
         role not in ROLES
         or type(endpoint_id) is not str
@@ -556,6 +565,20 @@ def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
         or type(codex_profile) is not str
         or type(profile_sha256) is not str
         or SHA256.fullmatch(profile_sha256) is None
+        or (
+            execution_protocol is not None
+            and (
+                execution_protocol != BROKERED_READINESS_PROTOCOL
+                or role not in {"development", "sre"}
+                or version != 5
+            )
+        )
+        or (
+            role in {"development", "sre"}
+            and version >= 5
+            and execution_protocol != BROKERED_READINESS_PROTOCOL
+        )
+        or (role == "planner" and execution_protocol is not None)
     ):
         raise RegistryError("REGISTRY_CONFIG_ROLE_INVALID")
     command_prefix = _validate_string_list(
@@ -564,6 +587,11 @@ def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
     allowed_topics = _validate_string_list(
         value.get("allowed_topics"), "REGISTRY_CONFIG_TOPICS_INVALID"
     )
+    if (
+        execution_protocol == BROKERED_READINESS_PROTOCOL
+        and allowed_topics != (NONMUTATING_MESSAGE_TOPIC,)
+    ):
+        raise RegistryError("REGISTRY_CONFIG_TOPICS_INVALID")
     expected_name = EXPECTED_CODEX_PROFILES[role]
     expected_command = (
         "/home/ubuntu/.local/bin/codex",
@@ -604,6 +632,7 @@ def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
         profile_sha256=profile_sha256,
         command_prefix=command_prefix,
         allowed_topics=allowed_topics,
+        execution_protocol=execution_protocol,
     )
 
 

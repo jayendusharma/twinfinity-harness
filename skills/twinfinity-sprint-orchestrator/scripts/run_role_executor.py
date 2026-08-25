@@ -40,6 +40,12 @@ from executor_registry import (
     utc_now,
     validate_launch_systemd_evidence,
 )
+from role_executor_broker import (
+    BROKER_PROTOCOL,
+    BrokerError,
+    BrokerRuntimePaths,
+    execute_brokered_readiness,
+)
 
 
 HEARTBEAT_SECONDS = 30
@@ -322,6 +328,7 @@ def execute_role(
     popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
     transitioner: Callable[..., dict[str, Any]] = transition_attempt,
     heartbeat_seconds: int = HEARTBEAT_SECONDS,
+    broker_runtime: BrokerRuntimePaths | None = None,
 ) -> dict[str, Any]:
     """Reserve, launch, heartbeat, and terminally record a fresh executor."""
 
@@ -355,6 +362,24 @@ def execute_role(
         target_key=target_key,
         allowed_topics=set(configured.allowed_topics),
     )
+    if configured.execution_protocol is not None:
+        if configured.execution_protocol != BROKER_PROTOCOL:
+            raise RegistryError("BROKER_PROTOCOL_INVALID")
+        return execute_brokered_readiness(
+            connection,
+            configured=configured,
+            profile_path=(
+                Path(config.codex_home)
+                / f"{configured.runtime_codex_profile}.config.toml"
+            ),
+            target_kind=target_kind,
+            target_key=target_key,
+            systemd_evidence=systemd_evidence,
+            target_precondition=target_validator,
+            runtime=broker_runtime,
+            popen=popen,
+            heartbeat_seconds=heartbeat_seconds,
+        )
     reserved, token = reserve_attempt(
         connection,
         role=role,
@@ -548,6 +573,9 @@ def main() -> int:
         )
         print(canonical_json(result))
         return 0 if result["phase"] == "PASS" else 1
+    except BrokerError as exc:
+        print(canonical_json({"phase": "HOLD", "error": str(exc)}))
+        return 1
     except (OSError, RegistryError, sqlite3.Error):
         print(canonical_json({"phase": "HOLD", "error": "ROLE_EXECUTOR_FAILED"}))
         return 1

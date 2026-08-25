@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -58,7 +59,7 @@ from reviewed_endpoint_catalog_fixture import (  # noqa: E402
 )
 
 
-CONFIG = ROOT / "references" / "twinfinity-executor-registry.toml"
+CONFIG = ROOT / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
 ALIASES = ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
 REPOSITORY = "twinfinityai/twinfinityapp"
 DEVELOPMENT_UUID = "22222222-2222-4222-8222-222222222222"
@@ -150,10 +151,30 @@ class ExecutorRegistryTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
+        self.codex_home = Path(self.temp.name) / "codex-home"
+        self._install_role_profiles(self.codex_home)
+        self.environment = patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home)})
+        self.environment.start()
         self.config = load_registry_config(CONFIG)
+        self.registry_loader = patch(
+            "executor_registry.load_registry_config", return_value=self.config
+        )
+        self.runner_registry_loader = patch(
+            "run_role_executor.load_registry_config", return_value=self.config
+        )
+        self.readiness_registry_loader = patch(
+            "archive_readiness_audit.load_registry_config", return_value=self.config
+        )
+        self.registry_loader.start()
+        self.runner_registry_loader.start()
+        self.readiness_registry_loader.start()
         self.aliases, self.alias_sha = load_legacy_alias_fixture(ALIASES)
 
     def tearDown(self) -> None:
+        self.readiness_registry_loader.stop()
+        self.runner_registry_loader.stop()
+        self.registry_loader.stop()
+        self.environment.stop()
         self.store.close()
         self.temp.cleanup()
 
@@ -278,7 +299,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             load_registry_config(aliased)
 
     def _install_role_profiles(self, codex_home: Path) -> None:
-        codex_home.mkdir()
+        codex_home.mkdir(exist_ok=True)
         for profile in (
             "twinfinity-planner-v2",
             "twinfinity-development-v3",
@@ -441,8 +462,10 @@ class ExecutorRegistryTests(unittest.TestCase):
                     "role.planner.v3",
                     "role.development.v3",
                     "role.development.v4",
+                    "role.development.v5",
                     "role.sre.v3",
                     "role.sre.v4",
+                    "role.sre.v5",
                 },
                 set(rotated_config.endpoints),
             )
@@ -478,8 +501,8 @@ class ExecutorRegistryTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "planner": "role.planner.v2",
-                    "development": "role.development.v4",
-                    "sre": "role.sre.v4",
+                    "development": "role.development.v5",
+                    "sre": "role.sre.v5",
                 },
                 {
                     role: endpoint.endpoint_id
@@ -491,11 +514,17 @@ class ExecutorRegistryTests(unittest.TestCase):
                     "role.planner.v2",
                     "role.development.v3",
                     "role.development.v4",
+                    "role.development.v5",
                     "role.sre.v3",
                     "role.sre.v4",
+                    "role.sre.v5",
                 },
                 set(current_config.endpoints),
             )
+            for role in ("development", "sre"):
+                endpoint = current_config.roles[role]
+                self.assertEqual("readiness/v1", endpoint.execution_protocol)
+                self.assertEqual(("coordination.notice",), endpoint.allowed_topics)
 
     def test_read_only_registry_open_cannot_write(self) -> None:
         connection = open_registry_database(self.store.path, read_only=True)

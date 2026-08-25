@@ -47,6 +47,7 @@ The coordination root must be an owner-owned nonsymlink directory with mode `070
 
 - `coordination_store.py`: GitHub snapshots, delivery items, allocations, leases, typed inbox, outbox, terminal watches, events, atomic admissions/recovery/closeout, and registered-artifact lifecycle.
 - `executor_registry.py`: immutable role endpoint versions, current pointers, aliases used only for historical compatibility, migration ledger, and target-bound attempts.
+- `role_executor_broker.py`: owner-only v5 readiness attempt reservation, atomic message claim/campaign attach, kernel isolation, canonical receipt pickup, and terminal attempt/message transaction.
 - `portfolio_graph.py`: immutable graph revisions, hard dependencies, ranking order, collisions, source coverage, and dependency-aware scheduling decisions.
 - `portfolio_graph_supervisor.py`: bounded graph refresh, accepted-main cursor reconciliation, and scheduler recovery.
 - `kanban_pull_buffer.py`: zero-WIP prepared and ready candidate packets bound to current source, graph, policy, artifacts, and admission checks.
@@ -94,6 +95,8 @@ Derive the queue by releasing only nodes whose hard predecessors are accepted, p
 The prepared buffer may hold reviewed zero-WIP candidates. A distinct READY packet must bind the exact candidate artifact, source digest, issue generation/version, observed main, graph revision, capacity policy, lane, allocation demand, collision matrix, activation contract, lease manifest, and complete atomic-admission transaction. Any source, main, graph, policy, item, artifact, lease, or admission drift retires the current packet without changing historical evidence.
 
 Kanban owns the missing middle between a prepared candidate and a READY packet. Discover structurally ready, current-main, zero-WIP candidates; register one immutable readiness campaign per candidate; and dispatch at most one fresh read-only Development or SRE attempt for the campaign. That attempt evaluates the complete source, dependency, lease, collision, scope/boundary, scenario/evidence, and operational checklist and returns one all-gates receipt. Gates are checklist entries, never independently queued micro-handoffs. Parallelism is across disjoint candidates. Readiness attempts consume no Development, Shared, or SRE writer allocation.
+
+For registry-declared v5 endpoints, the trusted readiness broker owns every mechanical control-plane transition and launches the evaluator behind a kernel start gate with only a read-only canonical contract/projection and one writable receipt file. The staged SQLite pickup is evidence, not a verdict transition: the existing readiness finalizer performs the one later interpretation step. Writer, terminal-watch, recovery, and hosted v5 RPCs remain fail-closed until separately implemented; endpoint availability never substitutes for a supported protocol or capacity.
 
 The readiness states are `PENDING -> RUNNING`, followed by exactly one of:
 

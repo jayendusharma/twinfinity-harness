@@ -163,8 +163,10 @@ def reviewed_current_endpoint_catalog(
         "role.planner.v2",
         "role.development.v3",
         "role.development.v4",
+        "role.development.v5",
         "role.sre.v3",
         "role.sre.v4",
+        "role.sre.v5",
     }
     if set(config.endpoints) != expected:
         raise AssertionError("temporary reviewed endpoint catalog is incomplete")
@@ -172,8 +174,8 @@ def reviewed_current_endpoint_catalog(
         role: endpoint.endpoint_id for role, endpoint in config.roles.items()
     } != {
         "planner": "role.planner.v2",
-        "development": "role.development.v4",
-        "sre": "role.sre.v4",
+        "development": "role.development.v5",
+        "sre": "role.sre.v5",
     }:
         raise AssertionError("temporary reviewed endpoint current set drifted")
     with patch.object(executor_registry, "load_registry_config", return_value=config):
@@ -230,8 +232,10 @@ def reviewed_planner_rotation_catalog(
         "role.planner.v3",
         "role.development.v3",
         "role.development.v4",
+        "role.development.v5",
         "role.sre.v3",
         "role.sre.v4",
+        "role.sre.v5",
     }
     if set(config.endpoints) != expected:
         raise AssertionError("temporary reviewed endpoint catalog is incomplete")
