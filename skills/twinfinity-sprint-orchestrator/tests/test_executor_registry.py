@@ -150,6 +150,7 @@ class ExecutorRegistryTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
+        self.config = load_registry_config(CONFIG)
         self.aliases, self.alias_sha = load_legacy_alias_fixture(ALIASES)
 
     def tearDown(self) -> None:
@@ -511,7 +512,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             "coordination_store.require_current_endpoint_identity",
             return_value=DEVELOPMENT_UUID,
         ):
-            active = self.store.set_issue_status(
+            active = self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=92,
                 status="ACTIVE",
@@ -594,7 +595,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             "coordination_store.require_current_endpoint_identity",
             return_value=DEVELOPMENT_UUID,
         ):
-            self.store.set_issue_status(
+            self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=92,
                 status="ACTIVE",
@@ -726,10 +727,10 @@ class ExecutorRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(
             CoordinationError, "CURRENT_ROLE_ENDPOINT_REQUIRED"
         ):
-            self.store._set_issue_status_for_test_fixture(
+            self.store.set_issue_status(
                 repository=REPOSITORY,
                 issue_number=92,
-                status="READY",
+                status="PREPARED",
                 allocation_class="NONE",
                 generation=1,
                 accountable_session_id=DEVELOPMENT_UUID,
@@ -1244,7 +1245,7 @@ class ExecutorRegistryTests(unittest.TestCase):
         )
 
         def drift_referenced_item(*_args, **_kwargs):
-            self.store.set_issue_status(
+            self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=92,
                 status="PREPARED",
@@ -1783,6 +1784,15 @@ class ExecutorRegistryTests(unittest.TestCase):
                 (message_id,),
             ).fetchone()[0],
         )
+
+        def advance_terminal_watch(*_args, **_kwargs):
+            self.store.connection.execute(
+                "UPDATE coordination_terminal_watches SET last_heartbeat_at=? "
+                "WHERE watch_key=?",
+                ("2026-08-24T10:00:09Z", watch_key),
+            )
+            return _ImmediateProcess()
+
         launched = execute_role(
             self.store.connection,
             config_path=CONFIG,
@@ -1797,7 +1807,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                 target_kind="terminal_watch",
                 target_key=watch_key,
             ),
-            popen=lambda *_args, **_kwargs: _ImmediateProcess(),
+            popen=advance_terminal_watch,
         )
         self.assertEqual("COMPLETE", launched["state"])
         before_drift_attempts = self.store.connection.execute(
@@ -1839,30 +1849,11 @@ class ExecutorRegistryTests(unittest.TestCase):
             "WHERE repository=? AND issue_number=92",
             (LEASE, REPOSITORY),
         )
-        old_endpoint = self.store.connection.execute(
-            "SELECT * FROM executor_role_endpoints WHERE endpoint_id=?",
-            (DEVELOPMENT_ENDPOINT,),
-        ).fetchone()
-        rotated_endpoint = "role.development.v4"
-        rotated_config = json.loads(old_endpoint["config_json"])
-        rotated_config["endpoint_id"] = rotated_endpoint
-        rotated_config["version"] = 4
-        self.store.connection.execute(
-            """
-            INSERT INTO executor_role_endpoints(
-                endpoint_id,role,version,executor_profile,codex_profile,
-                config_sha256,config_json,command_json,created_at
-            ) VALUES (?,'development',4,?,?,?,?,?,?)
-            """,
-            (
-                rotated_endpoint,
-                old_endpoint["executor_profile"],
-                old_endpoint["codex_profile"],
-                digest_json(rotated_config),
-                json.dumps(rotated_config, sort_keys=True, separators=(",", ":")),
-                old_endpoint["command_json"],
-                "2026-08-24T10:00:20Z",
-            ),
+        rotated_endpoint = "role.development.v3"
+        _verify_or_insert_endpoint(
+            self.store.connection,
+            self.config.endpoints[rotated_endpoint].payload,
+            "2026-08-24T10:00:20Z",
         )
         self.store.connection.execute(
             "UPDATE executor_role_endpoint_current SET endpoint_id=?,"
@@ -2448,7 +2439,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             "coordination_store.require_current_endpoint_identity",
             return_value=DEVELOPMENT_UUID,
         ):
-            self.store.set_issue_status(
+            self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=92,
                 status="ACTIVE",

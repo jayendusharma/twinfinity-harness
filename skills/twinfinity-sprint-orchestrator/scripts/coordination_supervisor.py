@@ -35,6 +35,8 @@ from executor_registry import (
     attempt_lineage_for_target,
     current_endpoint,
     planner_repository_for_target,
+    recover_reserved_attempts,
+    recover_stale_active_attempts,
     target_progress_digest,
 )
 from role_executor_transport import launch_role_executor, role_executor_command
@@ -59,6 +61,7 @@ MAX_MESSAGE_LAUNCH_ATTEMPTS_PER_RUN = 3
 MAX_TERMINAL_WATCH_LAUNCH_ATTEMPTS_PER_RUN = 1
 MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS = 3
 MAX_DUE_MESSAGE_RETRY_LAUNCH_ATTEMPTS_PER_RUN = 1
+ATTEMPT_STALE_SECONDS = 15 * 60
 LOCK = DEFAULT_DATABASE.parent / "coordination-supervisor.lock"
 
 
@@ -203,6 +206,8 @@ class CoordinationSupervisor:
         convergence: PortfolioConvergence | None = None,
         convergence_limit: int = DEFAULT_CONVERGENCE_LIMIT,
         launch_policy: SchedulerLaunchPolicy = DEFAULT_LAUNCH_POLICY,
+        stale_attempt_evidence_reader: Callable[[str], SystemdUnitEvidence]
+        | None = None,
     ) -> None:
         if convergence_limit <= 0 or convergence_limit > MAX_CONVERGENCE_LIMIT:
             raise CoordinationError("CONVERGENCE_LIMIT_INVALID")
@@ -215,6 +220,7 @@ class CoordinationSupervisor:
         if not isinstance(launch_policy, SchedulerLaunchPolicy):
             raise CoordinationError("SCHEDULER_LAUNCH_POLICY_INVALID")
         self.launch_policy = launch_policy
+        self.stale_attempt_evidence_reader = stale_attempt_evidence_reader
 
     def _ensure_terminal_watches(self, now: str) -> tuple[list[str], list[dict[str, object]]]:
         opened: list[str] = []
@@ -1381,6 +1387,23 @@ class CoordinationSupervisor:
         convergence_results = self.convergence.consume_due(
             limit=self.convergence_limit, now=observed_at
         )
+        stale_before = timestamp_after(observed_at, -ATTEMPT_STALE_SECONDS)
+        try:
+            recovered_reserved = recover_reserved_attempts(
+                self.store.connection, before=stale_before, now=observed_at
+            )
+            recovery_kwargs = {}
+            if self.stale_attempt_evidence_reader is not None:
+                recovery_kwargs["evidence_reader"] = self.stale_attempt_evidence_reader
+            recovered_active = recover_stale_active_attempts(
+                self.store.connection,
+                before=stale_before,
+                now=observed_at,
+                **recovery_kwargs,
+            )
+        except RegistryError as exc:
+            recovered_reserved = []
+            recovered_active = [{"phase": "HOLD", "error": str(exc)}]
         try:
             artifact_gc: dict[str, object] = self.store.collect_artifacts(
                 now=observed_at, execute=True
@@ -1622,6 +1645,8 @@ class CoordinationSupervisor:
             "readiness_revisits": readiness_revisits,
             "readiness_revocations": readiness_revocations,
             "portfolio_convergence": convergence_results,
+            "recovered_reserved_attempts": recovered_reserved,
+            "recovered_active_attempts": recovered_active,
             "opened_terminal_watches": opened_watches,
             "held_terminal_watch_backfills": held_watch_backfills,
             "launched": launched,

@@ -77,7 +77,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             now="2026-08-24T09:59:59Z",
         )
         self.sources = {number: self._snapshot(number) for number in (1, 2)}
-        self.release_item = self.store.set_issue_status(
+        self.release_item = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=1,
             status="ACTIVE",
@@ -162,7 +162,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
         }
 
     def _release(self, now: str = "2026-08-24T10:00:03Z") -> dict:
-        return self.store.set_issue_status(
+        return self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=1,
             status="DONE",
@@ -394,7 +394,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-24T10:00:03Z",
         )
-        released = self.store.set_issue_status(
+        released = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=3,
             status="DONE",
@@ -425,7 +425,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
 
     def test_monotonic_done_none_version_keeps_release_wake_admissible(self) -> None:
         released = self._release()
-        advanced = self.store.set_issue_status(
+        advanced = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=1,
             status="DONE",

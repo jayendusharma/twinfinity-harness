@@ -194,7 +194,7 @@ class ArchiveReadinessAtomicTests(unittest.TestCase):
             source_updated_at="2026-08-24T09:00:00Z",
             fetched_at="2026-08-24T09:00:01Z",
         )
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="ACTIVE",

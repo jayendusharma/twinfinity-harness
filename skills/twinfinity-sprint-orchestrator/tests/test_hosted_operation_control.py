@@ -682,7 +682,7 @@ class HostedOperationControlTests(unittest.TestCase):
             source_updated_at="2026-08-23T10:00:00Z",
             fetched_at="2026-08-23T10:00:01Z",
         )
-        self.control.store.set_issue_status(
+        self.control.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=314,
             status="ACTIVE_FENCED",
@@ -719,7 +719,7 @@ class HostedOperationControlTests(unittest.TestCase):
                 required=True,
             )
             self.assertEqual("WAITING", row["state"])
-            self.control.store.set_issue_status(
+            self.control.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=314,
                 status="DONE",

@@ -193,7 +193,7 @@ class PortfolioGraphTests(unittest.TestCase):
         if requested_status == "READY" and current is not None:
             seeded = dict(current)
         else:
-            seeded = self.store.set_issue_status(
+            seeded = self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=number,
                 status=(

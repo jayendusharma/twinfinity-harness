@@ -58,7 +58,7 @@ class PrePushControlTests(unittest.TestCase):
             fetched_at="2026-08-23T00:00:01Z",
         )
         self.source_sha = source.payload_sha256
-        self.control.store.set_issue_status(
+        self.control.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=ISSUE,
             status="ACTIVE",
@@ -103,11 +103,27 @@ class PrePushControlTests(unittest.TestCase):
             },
             now="2026-08-23T00:00:03Z",
         )
+        message = self.control.connection.execute(
+            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
+            (self.message,),
+        ).fetchone()
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches "
+            "SET admission_message_id=?,admission_payload_sha256=? "
+            "WHERE watch_key=?",
+            (
+                self.message,
+                message["payload_sha256"],
+                f"terminal:{REPOSITORY}:issue:{ISSUE}:generation:2",
+            ),
+        )
         self.control.store.claim_message(
             self.message, SESSION, "2026-08-23T00:00:04Z"
         )
-        self.control.store.complete_message(
-            self.message, SESSION, "2026-08-23T00:00:05Z"
+        self.control.connection.execute(
+            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+            ("2026-08-23T00:00:05Z", self.message, SESSION),
         )
 
     def tearDown(self) -> None:
@@ -361,11 +377,18 @@ class PrePushControlTests(unittest.TestCase):
                 self.control.store, transaction, "2026-08-23T00:01:02Z"
             )
         child_message = result["message_id"]
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches SET state='ACTIVE' "
+            "WHERE repository=? AND issue_number=? AND generation=1",
+            (REPOSITORY, child_issue),
+        )
         self.control.store.claim_message(
             child_message, SESSION, "2026-08-23T00:01:03Z"
         )
-        self.control.store.complete_message(
-            child_message, SESSION, "2026-08-23T00:01:04Z"
+        self.control.connection.execute(
+            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+            ("2026-08-23T00:01:04Z", child_message, SESSION),
         )
         with patch(
             "coordination_transfer_ledger.fetch_comment", side_effect=fetch_comment
@@ -1807,8 +1830,10 @@ class PrePushControlTests(unittest.TestCase):
                 ("2026-08-23T00:01:00Z", REPOSITORY, ISSUE),
             )
         with self.assertRaisesRegex(sqlite3.IntegrityError, "PREPUSH_PUBLICATION_RESERVED"):
-            self.control.store.claim_message(
-                pending_admission, SESSION, "2026-08-23T00:01:00Z"
+            self.control.connection.execute(
+                "UPDATE coordination_messages SET state='CLAIMED',claimed_by=?,updated_at=? "
+                "WHERE id=? AND state='PREPARED'",
+                (SESSION, "2026-08-23T00:01:00Z", pending_admission),
             )
         with self.assertRaisesRegex(sqlite3.IntegrityError, "PREPUSH_PUBLICATION_RESERVED"):
             self.control.store.enqueue_message(

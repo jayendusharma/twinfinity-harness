@@ -68,7 +68,7 @@ class CoordinationTransferTests(unittest.TestCase):
                 source_updated_at="2026-08-23T17:00:00Z",
                 fetched_at="2026-08-23T17:00:01Z",
             )
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=314,
             status="ACTIVE_FENCED",
@@ -109,11 +109,27 @@ class CoordinationTransferTests(unittest.TestCase):
             },
             now="2026-08-23T17:00:03Z",
         )
+        parent = self.store.connection.execute(
+            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
+            (self.parent_message,),
+        ).fetchone()
+        self.store.connection.execute(
+            "UPDATE coordination_terminal_watches "
+            "SET admission_message_id=?,admission_payload_sha256=? "
+            "WHERE watch_key=?",
+            (
+                self.parent_message,
+                parent["payload_sha256"],
+                f"terminal:{REPOSITORY}:issue:314:generation:8",
+            ),
+        )
         self.store.claim_message(
             self.parent_message, SRE_SESSION, "2026-08-23T17:00:04Z"
         )
-        self.store.complete_message(
-            self.parent_message, SRE_SESSION, "2026-08-23T17:00:05Z"
+        self.store.connection.execute(
+            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+            ("2026-08-23T17:00:05Z", self.parent_message, SRE_SESSION),
         )
         self.store.set_issue_status(
             repository=REPOSITORY,
@@ -314,11 +330,18 @@ class CoordinationTransferTests(unittest.TestCase):
         self.assertFalse(first["replayed"])
         second = activate_transfer(self.store, transaction, "2026-08-23T17:00:04Z")
         self.assertTrue(second["replayed"])
+        self.store.connection.execute(
+            "UPDATE coordination_terminal_watches SET state='ACTIVE' "
+            "WHERE repository=? AND issue_number=320 AND generation=1",
+            (REPOSITORY,),
+        )
         self.store.claim_message(
             first["message_id"], SRE_SESSION, "2026-08-23T17:00:05Z"
         )
-        self.store.complete_message(
-            first["message_id"], SRE_SESSION, "2026-08-23T17:00:06Z"
+        self.store.connection.execute(
+            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+            ("2026-08-23T17:00:06Z", first["message_id"], SRE_SESSION),
         )
         transfer_record, transfer_digest = load_record(
             self.store, transaction["transfer_key"]

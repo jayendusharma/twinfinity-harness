@@ -185,7 +185,7 @@ class ArchiveReadinessAttemptAuditTests(unittest.TestCase):
         self.assertEqual("ACTIVE_ATTEMPT_EVENT_CHAIN_INVALID", self.active_error())
 
     def test_watch_requires_current_source_generation_and_lease(self) -> None:
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=501,
             status="ACTIVE",
