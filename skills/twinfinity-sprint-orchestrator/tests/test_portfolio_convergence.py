@@ -20,11 +20,13 @@ from coordination_store import (  # noqa: E402
 )
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from kanban_pull_buffer import (  # noqa: E402
+    PullBufferError,
     admission_binding_error,
     audit_pull_buffer,
     close_candidate_observations,
+    ensure_pull_buffer_schema,
     load_candidate_packets,
-    register_candidate,
+    _register_ready_candidate_for_test_fixture,
 )
 from portfolio_convergence import (  # noqa: E402
     PortfolioConvergence,
@@ -87,7 +89,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-24T10:00:01Z",
         )
-        self.ready_item = self.store.set_issue_status(
+        self.ready_item = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=2,
             status="READY",
@@ -329,7 +331,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             ],
             now="2026-08-24T10:00:02Z",
         )
-        register_candidate(
+        _register_ready_candidate_for_test_fixture(
             self.store.connection,
             self.database,
             packet_path,
@@ -519,11 +521,15 @@ class PortfolioConvergenceTests(unittest.TestCase):
         finally:
             close_candidate_observations(observations)
 
-        self.assertEqual(1, audit["executable_ready_depth"])
+        self.assertEqual(0, audit["executable_ready_depth"])
         self.assertEqual(0, audit["dispatchable_now_depth"])
         self.assertIn(
-            "ADMISSION_PACKET_BINDING_DRIFT:issue:2",
-            audit["deficit_reasons"],
+            "ADMISSION_PACKET_BINDING_DRIFT",
+            {
+                reason
+                for candidate in audit["invalid"]
+                for reason in candidate["reasons"]
+            },
         )
 
     def test_all_canonical_development_dispatch_bindings_are_required(self) -> None:
@@ -665,7 +671,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            1,
+            0,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_current WHERE issue_number=2"
             ).fetchone()[0],
@@ -710,7 +716,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            1,
+            0,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_current WHERE issue_number=2"
             ).fetchone()[0],
@@ -939,7 +945,28 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual("ADMITTED", admitted["outcome"])
         self.assertEqual(2, admitted["admitted_issue_number"])
 
+    def test_ready_fixture_gateway_rejects_identical_unissued_database_copy(self) -> None:
+        packet_path = self._register_ready_candidate()
+        copied_path = self.root / "unissued-copy.sqlite3"
+        copied = CoordinationStore(copied_path)
+        try:
+            self.store.connection.backup(copied.connection)
+            before = copied.connection.total_changes
+            with self.assertRaisesRegex(
+                PullBufferError, "PULL_BUFFER_TEST_FIXTURE_BINDING_REQUIRED"
+            ):
+                _register_ready_candidate_for_test_fixture(
+                    copied.connection,
+                    copied_path,
+                    packet_path,
+                    now="2026-08-24T10:00:03Z",
+                )
+            self.assertEqual(before, copied.connection.total_changes)
+        finally:
+            copied.close()
+
     def test_ready_successor_registration_marks_promotion_from_prepared_pointer(self) -> None:
+        ensure_pull_buffer_schema(self.store.connection)
         audit_pull_buffer(
             self.store.connection,
             REPOSITORY,

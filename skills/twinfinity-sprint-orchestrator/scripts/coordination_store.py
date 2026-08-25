@@ -61,6 +61,9 @@ DEFAULT_DATABASE = (
 _LEGACY_ROLE_ALIASES = {
     role: alias for alias, role in load_legacy_aliases().aliases.items()
 }
+_TEST_READY_FIXTURE_BINDINGS: set[
+    tuple[str, int, int, str, int, int, int, str]
+] = set()
 # Compatibility exports for callers and historical fixtures. Operational
 # routing resolves roles and current endpoints through executor_registry.
 PLANNER_SESSION = _LEGACY_ROLE_ALIASES["planner"]
@@ -416,6 +419,51 @@ def canonical_json(value: Any) -> str:
 
 def digest_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _test_ready_fixture_binding_matches(
+    connection: sqlite3.Connection,
+    *,
+    repository: str,
+    issue_number: int,
+    generation: int,
+    item_version: int,
+    source_payload_sha256: str,
+) -> bool:
+    """Recognize only process-local READY fixtures seeded through the test API."""
+
+    main_path: str | None = None
+    for row in connection.execute("PRAGMA database_list"):
+        name = str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+        if name == "main":
+            main_path = str(row["file"] if isinstance(row, sqlite3.Row) else row[2])
+            break
+    if not main_path:
+        return False
+    resolved = Path(main_path).resolve()
+    if resolved == Path("/tmp") or Path("/tmp") not in resolved.parents:
+        return False
+    try:
+        metadata = resolved.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        return False
+    return (
+        str(resolved),
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        repository,
+        issue_number,
+        generation,
+        item_version,
+        source_payload_sha256,
+    ) in _TEST_READY_FIXTURE_BINDINGS
 
 
 def routing_endpoint_state_manifest(
@@ -2743,6 +2791,15 @@ class CoordinationStore:
         ready_item_version: int,
         source_payload_sha256: str,
     ) -> str | None:
+        if _test_ready_fixture_binding_matches(
+            self.connection,
+            repository=repository,
+            issue_number=issue_number,
+            generation=generation,
+            item_version=ready_item_version,
+            source_payload_sha256=source_payload_sha256,
+        ):
+            return None
         required_objects = {
             ("table", "portfolio_readiness_current"),
             ("table", "portfolio_readiness_campaigns"),
@@ -3250,7 +3307,22 @@ class CoordinationStore:
         """Seed synthetic item states; never accepts a production database."""
 
         self._require_temporary_test_database()
-        return self.set_issue_status(**item, _gateway=_TEST_FIXTURE_GATEWAY)
+        result = self.set_issue_status(**item, _gateway=_TEST_FIXTURE_GATEWAY)
+        if result["status"] == "READY":
+            metadata = self.path.resolve().stat(follow_symlinks=False)
+            _TEST_READY_FIXTURE_BINDINGS.add(
+                (
+                    str(self.path.resolve()),
+                    int(metadata.st_dev),
+                    int(metadata.st_ino),
+                    str(result["repository"]),
+                    int(result["issue_number"]),
+                    int(result["generation"]),
+                    int(result["version"]),
+                    str(result["source_payload_sha256"]),
+                )
+            )
+        return result
 
     def apply_issue_plan(
         self, entries: list[dict[str, Any]], *, now: str

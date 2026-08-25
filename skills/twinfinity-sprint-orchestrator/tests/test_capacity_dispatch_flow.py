@@ -29,7 +29,9 @@ from hosted_operation_control import (  # noqa: E402
     HostedOperationControl,
     run_supervisor as run_hosted_supervisor,
 )
-from kanban_pull_buffer import register_candidate  # noqa: E402
+from kanban_pull_buffer import (  # noqa: E402
+    _register_ready_candidate_for_test_fixture,
+)
 from portfolio_convergence import PortfolioConvergence  # noqa: E402
 from portfolio_graph import replace_graph, schedule  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
@@ -154,7 +156,7 @@ class _FlowHarness:
                 if allocation == "ACTIVE"
                 else None
             )
-            self.items[issue] = self.store.set_issue_status(
+            self.items[issue] = self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=issue,
                 status=status,
@@ -235,7 +237,7 @@ class _FlowHarness:
                 (REPOSITORY, issue_number),
             ).fetchone()
         )
-        updated = self.store.set_issue_status(
+        updated = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=issue_number,
             status="READY",
@@ -400,7 +402,7 @@ class _FlowHarness:
             ],
             now=now,
         )
-        return register_candidate(
+        return _register_ready_candidate_for_test_fixture(
             self.store.connection, self.database, packet_path, now=now
         )
 

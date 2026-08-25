@@ -439,6 +439,7 @@ class PortfolioConvergence:
                     now=observed_at,
                     database=self.store.path,
                     artifact_observations=observations,
+                    store=self.store,
                     _transaction=False,
                     _ensure_schema=False,
                 )

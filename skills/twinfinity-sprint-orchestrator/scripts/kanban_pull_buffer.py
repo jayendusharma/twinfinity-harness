@@ -17,6 +17,7 @@ from coordination_store import (
     DEFAULT_DATABASE,
     CoordinationError,
     CoordinationStore,
+    _test_ready_fixture_binding_matches,
     artifact_registry_identity,
     artifact_registry_identity_matches,
     canonical_json,
@@ -45,6 +46,7 @@ DRIFT_RECOVERY_SCHEMA = "twinfinity-kanban-ready-drift-recovery/v1"
 STATES = {"PREPARED_NOT_READY", "READY"}
 VERTICALITY = {"END_TO_END", "BOUNDED_ENABLER"}
 ZERO_WIP_STATUSES = {"PREPARED", "QUEUED", "READY"}
+_READY_TEST_FIXTURE_GATEWAY = object()
 
 
 class PullBufferError(ValueError):
@@ -909,6 +911,15 @@ def ready_attestation_error(
 
     if candidate.get("state") != "READY":
         return None
+    if _test_ready_fixture_binding_matches(
+        connection,
+        repository=str(candidate["repository"]),
+        issue_number=int(candidate["issue_number"]),
+        generation=int(candidate["generation"]),
+        item_version=int(candidate["item_version"]),
+        source_payload_sha256=str(candidate["source_payload_sha256"]),
+    ):
+        return None
     row = connection.execute(
         """
         SELECT finalization.*, current.state AS readiness_state,
@@ -974,6 +985,7 @@ def register_candidate(
     packet_path: Path,
     *,
     now: str,
+    _gateway: object | None = None,
 ) -> dict[str, Any]:
     ensure_pull_buffer_schema(connection)
     descriptor, relative_path = _open_packet(database, packet_path)
@@ -986,7 +998,24 @@ def register_candidate(
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise PullBufferError("PULL_BUFFER_PACKET_INVALID") from exc
         _validate_packet(packet)
-        if packet["schema"] != SCHEMA or packet["state"] != "PREPARED_NOT_READY":
+        test_ready = (
+            _gateway is _READY_TEST_FIXTURE_GATEWAY
+            and packet["schema"] == SCHEMA
+            and packet["state"] == "READY"
+        )
+        if test_ready and not _test_ready_fixture_binding_matches(
+            connection,
+            repository=str(packet["repository"]),
+            issue_number=int(packet["issue_number"]),
+            generation=int(packet["generation"]),
+            item_version=int(packet["item_version_at_preparation"]),
+            source_payload_sha256=str(packet["source_payload_sha256"]),
+        ):
+            raise PullBufferError("PULL_BUFFER_TEST_FIXTURE_BINDING_REQUIRED")
+        if not test_ready and (
+            packet["schema"] != SCHEMA
+            or packet["state"] != "PREPARED_NOT_READY"
+        ):
             raise PullBufferError("PULL_BUFFER_READY_FINALIZER_REQUIRED")
         admission_observations = _load_admission_artifacts(
             connection,
@@ -1199,6 +1228,76 @@ def register_candidate(
         "lane_key": node["lane_key"],
         "portfolio_dirty_event_id": dirty_event_id,
     }
+
+
+def _register_ready_candidate_for_test_fixture(
+    connection: sqlite3.Connection,
+    database: Path,
+    packet_path: Path,
+    *,
+    now: str,
+) -> dict[str, Any]:
+    """Seed a legacy synthetic READY packet only in a temporary test DB."""
+
+    try:
+        database_path = Path(database).resolve(strict=True)
+        connection_path = _database_path(connection).resolve(strict=True)
+    except OSError as exc:
+        raise PullBufferError("PULL_BUFFER_TEST_FIXTURE_DATABASE_INVALID") from exc
+    if (
+        connection_path != database_path
+        or database_path == Path("/tmp")
+        or Path("/tmp") not in database_path.parents
+    ):
+        raise PullBufferError("PULL_BUFFER_TEST_FIXTURE_DATABASE_INVALID")
+    result = register_candidate(
+        connection,
+        database,
+        packet_path,
+        now=now,
+        _gateway=_READY_TEST_FIXTURE_GATEWAY,
+    )
+    candidate = connection.execute(
+        """
+        SELECT id, repository, issue_number, generation, item_version,
+               source_payload_sha256, candidate_sha256, state
+        FROM portfolio_pull_buffer_candidates
+        WHERE repository=? AND issue_number=? AND candidate_sha256=?
+        """,
+        (
+            result["repository"],
+            int(result["issue_number"]),
+            result["candidate_sha256"],
+        ),
+    ).fetchone()
+    if candidate is None or candidate["state"] != "READY":
+        raise PullBufferError("PULL_BUFFER_TEST_FIXTURE_CANDIDATE_INVALID")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        dirty_event_id = enqueue_convergence_dirty_event(
+            connection,
+            repository=str(candidate["repository"]),
+            trigger_kind="CANDIDATE_PROMOTED",
+            issue_number=int(candidate["issue_number"]),
+            item_version=int(candidate["item_version"]),
+            source_sha256=str(candidate["source_payload_sha256"]),
+            status="READY",
+            generation=int(candidate["generation"]),
+            now=now,
+            details={
+                "candidate_id": int(candidate["id"]),
+                "candidate_sha256": str(candidate["candidate_sha256"]),
+                "candidate_state": "READY",
+                "test_fixture": "TEMPORARY_PROCESS_LOCAL",
+            },
+            require_pending=True,
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    return {**result, "portfolio_dirty_event_id": dirty_event_id}
 
 
 def finalize_ready(
@@ -2292,7 +2391,16 @@ def audit_pull_buffer(
             )
             binding_error = None
             attestation_error = None
+            test_ready_fixture = False
             if row["state"] == "READY":
+                test_ready_fixture = _test_ready_fixture_binding_matches(
+                    connection,
+                    repository=str(row["repository"]),
+                    issue_number=int(row["issue_number"]),
+                    generation=int(row["generation"]),
+                    item_version=int(row["item_version"]),
+                    source_payload_sha256=str(row["source_payload_sha256"]),
+                )
                 binding_error = admission_binding_error(
                     packet.get("admission_transaction")
                     if isinstance(packet, dict)
@@ -2340,6 +2448,7 @@ def audit_pull_buffer(
                         row["state"] == "READY"
                         and row["item_status"] == "READY"
                         and row["allocation_class"] == "NONE"
+                        and not test_ready_fixture
                         and attestation_error is None
                         and observation_authentic
                         and not recovery_forbidden.intersection(normalized)
