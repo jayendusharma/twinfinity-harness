@@ -12,7 +12,7 @@ Act as an optional, bounded, read-only advisor to the Product Planner. Judge whe
 Separate evaluation from updating:
 
 1. A low-context governor evaluates current evidence and proposes `KEEP`, `UPDATE`, `DELETE`, `MERGE`, `SPLIT`, `RETIRE`, `MECHANIZE`, or `NO UPDATE`.
-2. The Product Planner independently verifies the finding and is the sole durable editor and control-role owner.
+2. The Product Planner independently verifies the finding and remains the sole durable control-role owner. For harness source maintenance, the Planner admits a fresh bounded Development writer and cannot author the candidate itself.
 
 The governor must not edit skills, goals, endpoint profiles, broker/action registries, admission templates, GitHub, repositories, SQLite, workflows, providers, or hosted systems. It must not claim work, control leases, change capacity, invoke privileged broker operations, or accept a product or release.
 
@@ -35,6 +35,8 @@ Use only the evidence required by the material trigger:
 Audit no Development/SRE goal definitions or archived conversations. GitHub is the external fact, authority-publication, collaboration, and audit surface. SQLite is the same-host queue, claim, capacity, lease, attempt, watch, and acknowledgement surface. Current installed files and the current Planner goal override historical summaries.
 
 Read [references/evaluation-rubric.md](references/evaluation-rubric.md) for evidence thresholds, the scorecard, dispositions, and the compact output contract.
+
+For a harness-repository source change, also read [the shared source self-maintenance contract](../twinfinity-sprint-orchestrator/references/harness-self-maintenance.md). Run one fresh low-context, read-only, independent exact-head attempt and return its digest-bound receipt with exactly one terminal verb: `APPROVE_SOURCE_HEAD`, `REJECT_SOURCE_HEAD`, or `HOLD`. Bind the starting-main contract and exact repository, base, head, diff, validation, Governor contract, Governor report, and independent-attempt evidence required by that reference. The receipt grants no patch, publication, merge, installation, cutover, or other mutation authority.
 
 ## Trigger only on material change
 
@@ -94,7 +96,7 @@ For each affected artifact, judge:
 
 For an evidence-supported change:
 
-1. Name the exact affected files and one Product Planner editor.
+1. Name the exact affected files and accountable Product Planner. For harness source maintenance, also name the fresh bounded Development writer; the Planner is not the source author.
 2. State verified evidence, diagnosis, expected effect, non-goals, and instruction-size direction.
 3. Prefer deletion, consolidation, or a focused profile/template/validator correction before adding a new rule.
 4. Preserve user-authored product and authority boundaries; propose rather than apply any material goal or role change.

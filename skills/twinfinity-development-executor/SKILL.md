@@ -34,6 +34,8 @@ Read and apply, without duplicating them:
 
 Use broker-projected live GitHub facts for external issue/PR state, authority publication, collaboration, CI/review evidence, and audit. The owner-only SQLite store remains authoritative for same-host queue, claim, capacity, lease, attempt, watch, acknowledgement, guarded-publication, and terminal state, but the Development child never opens it. Never use GitHub comments as a local queue or acknowledgement channel.
 
+For a harness-repository maintenance admission, read and apply [the shared source self-maintenance contract](../twinfinity-sprint-orchestrator/references/harness-self-maintenance.md) as a harness-specific overlay. One fresh bounded writer owns the admitted `change/*` branch through exact-head validation and at most one same-scope repair under one terminal watch. The writer cannot self-approve, merge, install, cut over, or claim that reviewed source is live.
+
 ## Revalidate the exact admission
 
 Before editing:

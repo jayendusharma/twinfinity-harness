@@ -18,6 +18,8 @@ Generated caches, bytecode, databases, credentials, live receipts, spools, and o
 
 Changes that share SQLite transitions or supervisor behavior may be developed separately, but they are installed only from a validated integration head. Live endpoint cutover, service activation, and migration remain explicit Planner-controlled operations; a pushed branch is not an installation or deployment.
 
+Reviewed and merged source is not installed or live state. Source maintenance reaches `SOURCE_COMPLETE` only under [the shared harness contract](skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md); installation, registration, cutover, and runtime attestation remain separate explicitly authorized operations.
+
 ## Safety rules
 
 - Never commit the coordination database, approval contents, live receipts, launch tokens, provider credentials, or worktree-local evidence.

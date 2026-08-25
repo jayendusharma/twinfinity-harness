@@ -17,6 +17,10 @@ The fresh Planner, Development, and SRE model attempts are unprivileged decision
 
 If the installed goal, endpoint profile, registry, shared reference, or wrapper still permits direct child authority, free-form readiness actions, combined READY/admission, early release, or resumed attempts, the contracts are not integrated. Record the exact mismatch and stop at `HOLD`; do not choose whichever instruction is more permissive.
 
+## Route harness source maintenance
+
+Before any mutation to the versioned Twinfinity harness repository, read and apply [the harness source self-maintenance contract](references/harness-self-maintenance.md). Admit only its single Shared-writer source lane, preserve independent exact-head Governor approval, and keep reviewed source distinct from installed or live state.
+
 ## Preserve the product and role model
 
 - Twinfinity is an AI-twin platform.
