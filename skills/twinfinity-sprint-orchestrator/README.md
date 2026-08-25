@@ -212,6 +212,21 @@ journalctl --user -u 'twinfinity-role-executor-*' -n 200 --no-pager
 
 Leave ambiguous external effects in readback-only recovery. Never restart the same failed attempt or create a replacement lineage to clear bookkeeping.
 
+## Readiness approval lifecycle
+
+For `APPROVAL_REQUIRED`, the one candidate-phase receipt carries a closed `READINESS` proposal input bound to the authenticated Development or SRE worker endpoint/attempt and the current Planner. The worker stages that immutable input but never submits it or asks the human. After the exact message and attempt are `COMPLETE`, supervisor pickup atomically records the receipt, submits and binds the proposal in the central approval ledger, enters `APPROVAL_PENDING`, and relies only on the proposal-review notice.
+
+After the Planner records the user's decision and the owning-issue outbox publication/readback is `COMPLETE`, the supervisor creates one idempotent exact current-Planner decision notice. Consume it with fresh owning-issue JSON:
+
+```bash
+python3 scripts/kanban_pull_buffer.py readiness-apply-decision \
+  --message-id '<exact-decision-notice-id>' \
+  --planner-session-id '<current-planner-endpoint>' \
+  --source '<fresh-owning-issue.json>'
+```
+
+The consumer is atomic across message claim/completion, historical role-equivalent approval delivery claim/acknowledgement, source/scope/revocation checks, immutable consumption, and disposition. `APPROVE` derives one deterministic successor from stored state. `REJECT` and `COURSE_CORRECT` enter durable `HOLD`; course correction requires a new materially different proposal. Readiness `DEFER` enters `HOLD` with a strict UTC `AT` revisit trigger and produces one due Planner re-review rather than approving automatically. Generic message claim and caller-authored approval resumes fail closed. Revocations are processed before portfolio convergence, and approval-resumed READY activation rechecks effectivity inside the admission transaction.
+
 ## Validation
 
 Run tests only against temporary databases and the source-bound hermetic Codex

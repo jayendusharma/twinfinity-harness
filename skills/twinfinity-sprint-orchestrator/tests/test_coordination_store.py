@@ -154,7 +154,7 @@ class CoordinationStoreTests(unittest.TestCase):
         self, slug: str
     ) -> tuple[dict, dict, list[dict], dict]:
         source = self.snapshot()
-        ready = self.store.set_issue_status(
+        ready = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="READY",
@@ -421,7 +421,7 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_activation_and_admission_commit_atomically(self) -> None:
         source = self.snapshot()
-        ready = self.store.set_issue_status(
+        ready = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="READY",
@@ -936,7 +936,7 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_ready_first_admission_requires_a_complete_lease_artifact(self) -> None:
         source = self.snapshot()
-        ready = self.store.set_issue_status(
+        ready = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="READY",
@@ -1053,7 +1053,7 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_sre_activation_and_admission_are_atomic_and_capacity_typed(self) -> None:
         source = self.issue_snapshot(314)
-        ready = self.store.set_issue_status(
+        ready = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=314,
             status="READY",
@@ -1207,7 +1207,7 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_terminal_closeout_binds_done_item_watch_lineage_and_outbox(self) -> None:
         source = self.snapshot()
-        ready = self.store.set_issue_status(
+        ready = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="READY",

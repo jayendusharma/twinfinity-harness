@@ -11,11 +11,12 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import Any
+from typing import Any, Callable
 
 from coordination_store import (
     DEFAULT_DATABASE,
     CoordinationError,
+    CoordinationStore,
     artifact_registry_identity,
     artifact_registry_identity_matches,
     canonical_json,
@@ -28,15 +29,19 @@ from executor_registry import (
     current_endpoint,
     identity_role,
 )
-from owner_safe_sqlite import prepare_owner_database
+from owner_safe_sqlite import open_owner_database_readonly, prepare_owner_database
 from portfolio_graph import (
     PortfolioGraphError,
     _schedule_decision,
     enqueue_convergence_dirty_event,
+    evaluate_graph,
 )
 
 
 SCHEMA = "twinfinity-kanban-pull-buffer/v2"
+READY_SCHEMA = "twinfinity-kanban-pull-buffer/v3"
+FINALIZATION_SCHEMA = "twinfinity-kanban-ready-finalization/v1"
+DRIFT_RECOVERY_SCHEMA = "twinfinity-kanban-ready-drift-recovery/v1"
 STATES = {"PREPARED_NOT_READY", "READY"}
 VERTICALITY = {"END_TO_END", "BOUNDED_ENABLER"}
 ZERO_WIP_STATUSES = {"PREPARED", "QUEUED", "READY"}
@@ -127,6 +132,53 @@ def _descriptor_is_current(observation: dict[str, Any]) -> bool:
     )
 
 
+def _observation_snapshot_is_authentic(
+    connection: sqlite3.Connection, observation: dict[str, Any] | None
+) -> bool:
+    """Reject caller-mutated prereads before they can authorize recovery."""
+
+    if not isinstance(observation, dict) or not _descriptor_is_current(observation):
+        return False
+    raw = observation.get("raw")
+    packet = observation.get("packet")
+    if not isinstance(raw, bytes) or not isinstance(packet, dict):
+        return False
+    try:
+        if (
+            _read_descriptor(observation["descriptor"]) != raw
+            or json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
+            != packet
+        ):
+            return False
+    except (OSError, UnicodeError, json.JSONDecodeError, PullBufferError):
+        return False
+    artifacts = observation.get("admission_artifacts")
+    if not isinstance(artifacts, list):
+        return False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or not _descriptor_is_current(artifact):
+            return False
+        try:
+            if _read_descriptor(artifact["descriptor"]) != artifact.get("raw"):
+                return False
+        except OSError:
+            return False
+        if not artifact.get("existing_only"):
+            continue
+        registered = artifact.get("entry", {}).get("registered_artifact")
+        if not isinstance(registered, dict):
+            return False
+        current = connection.execute(
+            "SELECT * FROM coordination_artifacts WHERE artifact_key=?",
+            (registered.get("artifact_key"),),
+        ).fetchone()
+        if current is None or not artifact_registry_identity_matches(
+            registered, current
+        ):
+            return False
+    return True
+
+
 def close_candidate_observations(observations: dict[int, dict[str, Any]]) -> None:
     """Close descriptors retained for in-transaction identity revalidation."""
 
@@ -141,6 +193,28 @@ def close_candidate_observations(observations: dict[int, dict[str, Any]]) -> Non
                 except OSError:
                     pass
                 item["descriptor"] = -1
+
+
+def _require_finalizer_descriptors_current(
+    packet_observation: dict[str, Any],
+    admission_observations: list[dict[str, Any]],
+    prepared_observation: dict[str, Any] | None,
+) -> None:
+    """Close the finalizer TOCTOU window for both first-run and replay paths."""
+
+    if (
+        not _descriptor_is_current(packet_observation)
+        or _read_descriptor(packet_observation["descriptor"])
+        != packet_observation["raw"]
+        or prepared_observation is None
+        or prepared_observation.get("error") is not None
+        or not _descriptor_is_current(prepared_observation)
+        or any(
+            not _descriptor_is_current(observation)
+            for observation in admission_observations
+        )
+    ):
+        raise PullBufferError("PULL_BUFFER_ARTIFACT_DRIFT")
 
 
 def _database_path(connection: sqlite3.Connection) -> Path:
@@ -222,6 +296,11 @@ def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
             artifact_relative_path TEXT NOT NULL,
             artifact_content_sha256 TEXT NOT NULL,
             candidate_sha256 TEXT NOT NULL,
+            readiness_campaign_id INTEGER,
+            readiness_current_version INTEGER,
+            readiness_plan_sha256 TEXT,
+            readiness_receipt_id INTEGER,
+            readiness_receipt_sha256 TEXT,
             registered_at TEXT NOT NULL,
             UNIQUE(repository, issue_number, candidate_sha256)
         );
@@ -257,6 +336,25 @@ def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
             retired_at TEXT NOT NULL,
             FOREIGN KEY(candidate_id) REFERENCES portfolio_pull_buffer_candidates(id)
         );
+        CREATE TABLE IF NOT EXISTS portfolio_ready_finalizations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repository TEXT NOT NULL,
+            issue_number INTEGER NOT NULL CHECK(issue_number > 0),
+            generation INTEGER NOT NULL CHECK(generation >= 0),
+            prepared_candidate_id INTEGER NOT NULL UNIQUE,
+            ready_candidate_id INTEGER NOT NULL UNIQUE,
+            campaign_id INTEGER NOT NULL UNIQUE,
+            receipt_id INTEGER NOT NULL UNIQUE,
+            dirty_event_id INTEGER NOT NULL UNIQUE,
+            finalization_sha256 TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(prepared_candidate_id) REFERENCES portfolio_pull_buffer_candidates(id),
+            FOREIGN KEY(ready_candidate_id) REFERENCES portfolio_pull_buffer_candidates(id),
+            FOREIGN KEY(campaign_id) REFERENCES portfolio_readiness_campaigns(id),
+            FOREIGN KEY(receipt_id) REFERENCES portfolio_readiness_receipts(id),
+            FOREIGN KEY(dirty_event_id) REFERENCES portfolio_dirty_events(id)
+        );
         CREATE TRIGGER IF NOT EXISTS portfolio_pull_buffer_candidates_immutable_update
         BEFORE UPDATE ON portfolio_pull_buffer_candidates
         BEGIN SELECT RAISE(ABORT, 'PULL_BUFFER_CANDIDATE_IMMUTABLE'); END;
@@ -275,13 +373,55 @@ def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS portfolio_pull_buffer_retirements_immutable_delete
         BEFORE DELETE ON portfolio_pull_buffer_retirements
         BEGIN SELECT RAISE(ABORT, 'PULL_BUFFER_RETIREMENT_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS portfolio_ready_finalizations_immutable_update
+        BEFORE UPDATE ON portfolio_ready_finalizations
+        BEGIN SELECT RAISE(ABORT, 'READY_FINALIZATION_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS portfolio_ready_finalizations_immutable_delete
+        BEFORE DELETE ON portfolio_ready_finalizations
+        BEGIN SELECT RAISE(ABORT, 'READY_FINALIZATION_IMMUTABLE'); END;
         COMMIT;
             """
         )
+        candidate_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(portfolio_pull_buffer_candidates)"
+            )
+        }
+        for column, declaration in {
+            "readiness_campaign_id": "INTEGER",
+            "readiness_current_version": "INTEGER",
+            "readiness_plan_sha256": "TEXT",
+            "readiness_receipt_id": "INTEGER",
+            "readiness_receipt_sha256": "TEXT",
+        }.items():
+            if column not in candidate_columns:
+                connection.execute(
+                    f"ALTER TABLE portfolio_pull_buffer_candidates "
+                    f"ADD COLUMN {column} {declaration}"
+                )
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
+
+
+def require_pull_buffer_schema(connection: sqlite3.Connection) -> None:
+    required = {
+        "portfolio_pull_buffer_candidates", "portfolio_pull_buffer_current",
+        "portfolio_pull_buffer_audits", "portfolio_pull_buffer_retirements",
+        "portfolio_ready_finalizations",
+    }
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND (name LIKE 'portfolio_pull_buffer_%' "
+            "OR name='portfolio_ready_finalizations')"
+        )
+    }
+    if not required.issubset(present):
+        raise PullBufferError("PULL_BUFFER_SCHEMA_MISSING")
 
 
 def _require_nonempty_strings(value: Any, code: str) -> None:
@@ -292,8 +432,9 @@ def _require_nonempty_strings(value: Any, code: str) -> None:
 
 
 def _validate_packet(packet: Any) -> None:
-    if not isinstance(packet, dict) or packet.get("schema") != SCHEMA:
+    if not isinstance(packet, dict) or packet.get("schema") not in {SCHEMA, READY_SCHEMA}:
         raise PullBufferError("PULL_BUFFER_PACKET_INVALID")
+    ready_v3 = packet.get("schema") == READY_SCHEMA
     required_scalars = {
         "repository": str,
         "issue_number": int,
@@ -320,6 +461,8 @@ def _validate_packet(packet: Any) -> None:
         expected_keys.add("immediate_product_consumer")
     if "admission_transaction" in packet:
         expected_keys.add("admission_transaction")
+    if ready_v3:
+        expected_keys.update({"prepared_candidate", "readiness_binding"})
     if set(packet) != expected_keys:
         raise PullBufferError("PULL_BUFFER_PACKET_INVALID")
     for key, kind in required_scalars.items():
@@ -330,6 +473,10 @@ def _validate_packet(packet: Any) -> None:
         raise PullBufferError("PULL_BUFFER_PACKET_INVALID")
     if packet["state"] not in STATES or packet["verticality"] not in VERTICALITY:
         raise PullBufferError("PULL_BUFFER_PACKET_INVALID")
+    if ready_v3 and (
+        packet["state"] != "READY" or "admission_transaction" not in packet
+    ):
+        raise PullBufferError("PULL_BUFFER_READY_FINALIZATION_INVALID")
     if packet["verticality"] == "BOUNDED_ENABLER" and not str(
         packet.get("immediate_product_consumer") or ""
     ).strip():
@@ -349,6 +496,32 @@ def _validate_packet(packet: Any) -> None:
             )
         ):
             raise PullBufferError("PULL_BUFFER_ADMISSION_INVALID")
+    if ready_v3:
+        prepared = packet.get("prepared_candidate")
+        readiness = packet.get("readiness_binding")
+        if (
+            not isinstance(prepared, dict)
+            or set(prepared) != {"candidate_id", "candidate_sha256"}
+            or type(prepared.get("candidate_id")) is not int
+            or prepared["candidate_id"] <= 0
+            or not isinstance(prepared.get("candidate_sha256"), str)
+            or len(prepared["candidate_sha256"]) != 64
+            or not isinstance(readiness, dict)
+            or set(readiness) != {
+                "campaign_id", "current_version", "plan_sha256",
+                "receipt_id", "receipt_sha256",
+            }
+            or any(
+                type(readiness.get(field)) is not int or readiness[field] <= 0
+                for field in ("campaign_id", "current_version", "receipt_id")
+            )
+            or any(
+                not isinstance(readiness.get(field), str)
+                or len(readiness[field]) != 64
+                for field in ("plan_sha256", "receipt_sha256")
+            )
+        ):
+            raise PullBufferError("PULL_BUFFER_READINESS_BINDING_INVALID")
     policy = packet.get("capacity_policy")
     capacity = packet.get("capacity_on_activation")
     if (
@@ -359,7 +532,8 @@ def _validate_packet(packet: Any) -> None:
     ):
         raise PullBufferError("PULL_BUFFER_PACKET_INVALID")
     for key in ("version", "development_limit", "shared_limit", "sre_limit"):
-        if type(policy.get(key)) is not int or int(policy[key]) <= 0:
+        minimum = 1 if key == "version" else 0
+        if type(policy.get(key)) is not int or int(policy[key]) < minimum:
             raise PullBufferError("PULL_BUFFER_PACKET_INVALID")
     for key in ("development_units", "shared_units", "sre_units"):
         if type(capacity.get(key)) is not int or int(capacity[key]) < 0:
@@ -694,6 +868,106 @@ def admission_binding_error(
     return None
 
 
+def _ready_dirty_event_error(
+    row: sqlite3.Row, candidate: dict[str, Any], finalization_payload: dict[str, Any]
+) -> str | None:
+    try:
+        dirty_payload = json.loads(
+            row["dirty_payload_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, PullBufferError):
+        return "READINESS_ATTESTATION_DRIFT"
+    try:
+        expected_dirty_payload = {
+            "trigger_kind": "CANDIDATE_PROMOTED",
+            "repository": candidate["repository"],
+            "issue_number": int(candidate["issue_number"]),
+            "release_item_version": int(finalization_payload["ready_item_version"]),
+            "release_source_sha256": finalization_payload["source_payload_sha256"],
+            "status": "READY",
+            "generation": int(candidate["generation"]),
+            "candidate_id": int(candidate["id"]),
+            "candidate_sha256": candidate["candidate_sha256"],
+            "candidate_state": "READY",
+            "finalization_sha256": row["finalization_sha256"],
+        }
+    except (KeyError, TypeError, ValueError):
+        return "READINESS_ATTESTATION_DRIFT"
+    if (
+        row["dirty_state"] not in {"PENDING", "RETRY", "COMPLETE", "HOLD"}
+        or dirty_payload != expected_dirty_payload
+        or digest_json(dirty_payload) != row["dirty_event_sha256"]
+    ):
+        return "READINESS_ATTESTATION_DRIFT"
+    return None
+
+
+def ready_attestation_error(
+    connection: sqlite3.Connection, candidate: dict[str, Any]
+) -> str | None:
+    """Require the immutable PASS-to-READY finalization for one READY candidate."""
+
+    if candidate.get("state") != "READY":
+        return None
+    row = connection.execute(
+        """
+        SELECT finalization.*, current.state AS readiness_state,
+               current.campaign_id AS current_campaign_id,
+               current.receipt_id AS current_receipt_id,
+               current.finalized_candidate_id, current.finalized_event_id,
+               campaign.plan_sha256, receipt.verdict,
+               receipt.receipt_sha256, receipt.receipt_json,
+               dirty.id AS observed_dirty_event_id,
+               dirty.state AS dirty_state,
+               dirty.event_sha256 AS dirty_event_sha256,
+               dirty.payload_json AS dirty_payload_json
+        FROM portfolio_ready_finalizations finalization
+        JOIN portfolio_readiness_current current
+          ON current.repository=finalization.repository
+         AND current.issue_number=finalization.issue_number
+        JOIN portfolio_readiness_campaigns campaign
+          ON campaign.id=finalization.campaign_id
+        JOIN portfolio_readiness_receipts receipt
+          ON receipt.id=finalization.receipt_id
+        LEFT JOIN portfolio_dirty_events dirty
+          ON dirty.id=finalization.dirty_event_id
+        WHERE finalization.ready_candidate_id=?
+        """,
+        (int(candidate["id"]),),
+    ).fetchone()
+    if row is None:
+        return "READINESS_ATTESTATION_MISSING"
+    try:
+        receipt_payload = json.loads(
+            row["receipt_json"], object_pairs_hook=_strict_object
+        )
+        finalization_payload = json.loads(
+            row["payload_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, PullBufferError):
+        return "READINESS_ATTESTATION_INVALID"
+    expected = (
+        row["readiness_state"] == "FINALIZED"
+        and int(row["current_campaign_id"]) == int(row["campaign_id"])
+        and int(row["current_receipt_id"]) == int(row["receipt_id"])
+        and int(row["finalized_candidate_id"] or -1) == int(candidate["id"])
+        and int(row["finalized_event_id"] or -1) == int(row["dirty_event_id"])
+        and int(row["observed_dirty_event_id"] or -1) == int(row["dirty_event_id"])
+        and row["verdict"] == "PASS"
+        and digest_json(receipt_payload) == row["receipt_sha256"]
+        and candidate.get("readiness_campaign_id") == int(row["campaign_id"])
+        and candidate.get("readiness_receipt_id") == int(row["receipt_id"])
+        and candidate.get("readiness_plan_sha256") == row["plan_sha256"]
+        and candidate.get("readiness_receipt_sha256") == row["receipt_sha256"]
+        and finalization_payload.get("ready_candidate_sha256")
+        == candidate.get("candidate_sha256")
+        and finalization_payload.get("schema") == FINALIZATION_SCHEMA
+        and digest_json(finalization_payload) == row["finalization_sha256"]
+        and _ready_dirty_event_error(row, candidate, finalization_payload) is None
+    )
+    return None if expected else "READINESS_ATTESTATION_DRIFT"
+
+
 def register_candidate(
     connection: sqlite3.Connection,
     database: Path,
@@ -712,6 +986,8 @@ def register_candidate(
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise PullBufferError("PULL_BUFFER_PACKET_INVALID") from exc
         _validate_packet(packet)
+        if packet["schema"] != SCHEMA or packet["state"] != "PREPARED_NOT_READY":
+            raise PullBufferError("PULL_BUFFER_READY_FINALIZER_REQUIRED")
         admission_observations = _load_admission_artifacts(
             connection,
             database,
@@ -894,29 +1170,7 @@ def register_candidate(
             raise PullBufferError("PULL_BUFFER_ARTIFACT_DRIFT")
         if any(not _descriptor_is_current(item) for item in admission_observations):
             raise PullBufferError("ADMISSION_LEASE_ARTIFACT_DRIFT")
-        trigger_kind = (
-            "CANDIDATE_PROMOTED"
-            if prior is not None
-            and prior["state"] == "PREPARED_NOT_READY"
-            and packet["state"] == "READY"
-            else "CANDIDATE_REGISTERED"
-        )
-        dirty_event_id = enqueue_convergence_dirty_event(
-            connection,
-            repository=repository,
-            trigger_kind=trigger_kind,
-            issue_number=issue_number,
-            item_version=int(item["version"]),
-            source_sha256=item["source_payload_sha256"],
-            status=str(item["status"]),
-            generation=int(item["generation"]),
-            now=now,
-            details={
-                "candidate_id": int(row["id"]),
-                "candidate_sha256": candidate_sha,
-                "candidate_state": packet["state"],
-            },
-        )
+        dirty_event_id = None
         commit_metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(commit_metadata.st_mode)
@@ -947,19 +1201,565 @@ def register_candidate(
     }
 
 
+def finalize_ready(
+    store: CoordinationStore,
+    packet_path: Path,
+    *,
+    now: str,
+    failpoint: Any | None = None,
+) -> dict[str, Any]:
+    """Atomically bind PASS readiness, READY state, packet, pointer, and wake."""
+
+    from kanban_readiness import (
+        _binding_reasons as readiness_binding_reasons,
+        _campaign as readiness_campaign,
+        _graph_stale_only_for_equivalent_source as readiness_graph_equivalent,
+        _event as readiness_event,
+        approval_source_equivalent as readiness_source_equivalent,
+        ensure_schema as ensure_readiness_schema,
+    )
+
+    connection = store.connection
+    ensure_readiness_schema(connection)
+    ensure_pull_buffer_schema(connection)
+    descriptor, relative_path = _open_packet(store.path, packet_path)
+    admission_observations: list[dict[str, Any]] = []
+    prepared_observations: dict[int, dict[str, Any]] = {}
+    packet_observation: dict[str, Any] | None = None
+    try:
+        try:
+            initial_metadata = os.fstat(descriptor)
+            raw = _read_descriptor(descriptor)
+            packet_observation = _descriptor_observation(descriptor, raw)
+            packet = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise PullBufferError("PULL_BUFFER_PACKET_INVALID") from exc
+        _validate_packet(packet)
+        if packet["schema"] != READY_SCHEMA or packet["state"] != "READY":
+            raise PullBufferError("PULL_BUFFER_READY_FINALIZATION_INVALID")
+        repository = str(packet["repository"])
+        issue_number = int(packet["issue_number"])
+        candidate_sha = digest_json(packet)
+        admission = packet["admission_transaction"]
+        prepared_binding = packet["prepared_candidate"]
+        admission_observations = _load_admission_artifacts(
+            connection, store.path, admission
+        )
+        prepared_observations = load_candidate_packets(
+            connection,
+            repository,
+            database=store.path,
+            keep_descriptors=True,
+            candidate_ids={int(prepared_binding["candidate_id"])},
+        )
+
+        with store.transaction():
+            artifact_sha = _registered_artifact(
+                connection,
+                descriptor,
+                relative_path,
+                repository=repository,
+                issue_number=issue_number,
+                generation=int(packet["generation"]),
+            )
+            readiness = packet["readiness_binding"]
+            phase = connection.execute(
+                """
+                SELECT current.state, current.version AS current_version,
+                       current.campaign_id, current.receipt_id,
+                       current.finalized_candidate_id, current.finalized_event_id,
+                       campaign.plan_sha256, campaign.candidate_sha256,
+                       campaign.repository, campaign.issue_number,
+                       campaign.generation, campaign.item_version,
+                       campaign.source_payload_sha256, campaign.accepted_main_sha,
+                       campaign.graph_version, campaign.capacity_policy_version,
+                       receipt.verdict, receipt.receipt_sha256,
+                       receipt.receipt_json, receipt.campaign_id AS receipt_campaign_id
+                FROM portfolio_readiness_current current
+                JOIN portfolio_readiness_campaigns campaign
+                  ON campaign.id=current.campaign_id
+                LEFT JOIN portfolio_readiness_receipts receipt
+                  ON receipt.id=current.receipt_id
+                WHERE current.repository=? AND current.issue_number=?
+                """,
+                (repository, issue_number),
+            ).fetchone()
+            if phase is None:
+                raise PullBufferError("READINESS_CAMPAIGN_NOT_FOUND")
+            current_phase = readiness_campaign(
+                connection, repository, issue_number
+            )
+            readiness_reasons = readiness_binding_reasons(
+                connection, current_phase
+            )
+            if readiness_reasons:
+                raise PullBufferError(
+                    "PULL_BUFFER_READINESS_BINDING_DRIFT:"
+                    + ",".join(readiness_reasons)
+                )
+            receipt_payload: dict[str, Any] | None = None
+            try:
+                receipt_payload = json.loads(
+                    phase["receipt_json"], object_pairs_hook=_strict_object
+                )
+            except (TypeError, json.JSONDecodeError):
+                pass
+            if (
+                int(readiness["campaign_id"]) != int(phase["campaign_id"])
+                or int(readiness["current_version"])
+                != int(phase["current_version"])
+                - (1 if phase["state"] == "FINALIZED" else 0)
+                or readiness["plan_sha256"] != phase["plan_sha256"]
+                or int(readiness["receipt_id"]) != int(phase["receipt_id"] or -1)
+                or readiness["receipt_sha256"] != phase["receipt_sha256"]
+                or phase["verdict"] != "PASS"
+                or int(phase["receipt_campaign_id"] or -1) != int(phase["campaign_id"])
+                or not isinstance(receipt_payload, dict)
+                or digest_json(receipt_payload) != phase["receipt_sha256"]
+            ):
+                raise PullBufferError("PULL_BUFFER_READINESS_ATTESTATION_DRIFT")
+
+            finalization = connection.execute(
+                """
+                SELECT finalization.*, candidate.candidate_sha256,
+                       candidate.artifact_content_sha256,
+                       prepared.candidate_sha256 AS prepared_candidate_sha256,
+                       dirty.state AS dirty_state,
+                       dirty.event_sha256 AS dirty_event_sha256,
+                       dirty.payload_json AS dirty_payload_json
+                FROM portfolio_ready_finalizations finalization
+                JOIN portfolio_pull_buffer_candidates candidate
+                  ON candidate.id=finalization.ready_candidate_id
+                JOIN portfolio_pull_buffer_candidates prepared
+                  ON prepared.id=finalization.prepared_candidate_id
+                LEFT JOIN portfolio_dirty_events dirty
+                  ON dirty.id=finalization.dirty_event_id
+                WHERE finalization.campaign_id=?
+                """,
+                (int(phase["campaign_id"]),),
+            ).fetchone()
+            if phase["state"] == "FINALIZED":
+                if finalization is None:
+                    raise PullBufferError("PULL_BUFFER_FINALIZATION_DRIFT")
+                try:
+                    final_payload = json.loads(
+                        finalization["payload_json"], object_pairs_hook=_strict_object
+                    )
+                except (TypeError, json.JSONDecodeError, PullBufferError) as exc:
+                    raise PullBufferError("PULL_BUFFER_FINALIZATION_DRIFT") from exc
+                if (
+                    int(phase["finalized_candidate_id"] or -1)
+                    != int(finalization["ready_candidate_id"])
+                    or int(phase["finalized_event_id"] or -1)
+                    != int(finalization["dirty_event_id"])
+                    or final_payload.get("ready_candidate_sha256") != candidate_sha
+                    or finalization["candidate_sha256"] != candidate_sha
+                    or finalization["artifact_content_sha256"] != artifact_sha
+                    or int(finalization["prepared_candidate_id"])
+                    != int(prepared_binding["candidate_id"])
+                    or finalization["prepared_candidate_sha256"]
+                    != prepared_binding["candidate_sha256"]
+                    or final_payload.get("schema") != FINALIZATION_SCHEMA
+                    or digest_json(final_payload)
+                    != finalization["finalization_sha256"]
+                    or _ready_dirty_event_error(
+                        finalization,
+                        {
+                            "repository": repository,
+                            "issue_number": issue_number,
+                            "generation": int(packet["generation"]),
+                            "id": int(finalization["ready_candidate_id"]),
+                            "candidate_sha256": candidate_sha,
+                        },
+                        final_payload,
+                    )
+                    is not None
+                ):
+                    raise PullBufferError("PULL_BUFFER_FINALIZATION_DRIFT")
+                if failpoint is not None:
+                    failpoint("before_replay_commit")
+                if packet_observation is None:
+                    raise PullBufferError("PULL_BUFFER_ARTIFACT_DRIFT")
+                _require_finalizer_descriptors_current(
+                    packet_observation,
+                    admission_observations,
+                    prepared_observations.get(int(prepared_binding["candidate_id"])),
+                )
+                return {
+                    "repository": repository,
+                    "issue_number": issue_number,
+                    "state": "FINALIZED",
+                    "candidate_id": int(finalization["ready_candidate_id"]),
+                    "candidate_sha256": candidate_sha,
+                    "portfolio_dirty_event_id": int(finalization["dirty_event_id"]),
+                    "portfolio_dirty_event_state": finalization["dirty_state"],
+                    "finalization_sha256": finalization["finalization_sha256"],
+                    "replay": True,
+                }
+            if phase["state"] != "READY_ELIGIBLE" or finalization is not None:
+                raise PullBufferError("PULL_BUFFER_READINESS_STATE_CONFLICT")
+
+            graph = connection.execute(
+                "SELECT * FROM portfolio_graph_current WHERE repository=?",
+                (repository,),
+            ).fetchone()
+            policy = connection.execute(
+                """
+                SELECT policy.* FROM coordination_capacity_current current
+                JOIN coordination_capacity_policies policy
+                  ON policy.repository=current.repository AND policy.version=current.version
+                WHERE current.repository=?
+                """,
+                (repository,),
+            ).fetchone()
+            item = connection.execute(
+                """
+                SELECT item.*,
+                       source.payload_sha256 AS observed_source_sha256,
+                       CASE WHEN source.payload_sha256=item.source_payload_sha256
+                            THEN 1 ELSE 0 END AS source_current
+                FROM coordination_items item
+                LEFT JOIN github_current source
+                  ON source.repository=item.repository
+                 AND source.object_kind='issue'
+                 AND source.object_number=item.issue_number
+                WHERE item.repository=? AND item.issue_number=?
+                """,
+                (repository, issue_number),
+            ).fetchone()
+            prepared = connection.execute(
+                """
+                SELECT candidate.* FROM portfolio_pull_buffer_current pointer
+                JOIN portfolio_pull_buffer_candidates candidate
+                  ON candidate.id=pointer.candidate_id
+                WHERE pointer.repository=? AND pointer.issue_number=?
+                """,
+                (repository, issue_number),
+            ).fetchone()
+            if graph is None or policy is None or item is None or prepared is None:
+                raise PullBufferError("PULL_BUFFER_BINDING_MISSING")
+            source_equivalent = bool(
+                item["observed_source_sha256"] is not None
+                and readiness_source_equivalent(
+                    connection,
+                    current_phase,
+                    str(item["source_payload_sha256"]),
+                    str(item["observed_source_sha256"]),
+                )
+            )
+            graph_equivalent = readiness_graph_equivalent(
+                connection, current_phase, graph
+            )
+            if (
+                (graph["health"] != "CURRENT" and not graph_equivalent)
+                or int(graph["version"]) != int(phase["graph_version"])
+                or graph["observed_main_sha"] != phase["accepted_main_sha"]
+                or int(policy["version"]) != int(phase["capacity_policy_version"])
+                or int(prepared["id"]) != int(prepared_binding["candidate_id"])
+                or prepared["candidate_sha256"] != prepared_binding["candidate_sha256"]
+                or prepared["candidate_sha256"] != phase["candidate_sha256"]
+                or prepared["state"] != "PREPARED_NOT_READY"
+                or int(item["generation"]) != int(phase["generation"])
+                or int(item["version"]) != int(phase["item_version"])
+                or item["status"] != "PREPARED"
+                or item["allocation_class"] != "NONE"
+                or item["source_payload_sha256"] != phase["source_payload_sha256"]
+                or (item["source_current"] != 1 and not source_equivalent)
+                or packet["source_payload_sha256"] != item["source_payload_sha256"]
+                or int(packet["generation"]) != int(item["generation"])
+                or int(packet["item_version_at_preparation"]) != int(item["version"])
+                or packet["accepted_main_at_preparation"] != graph["observed_main_sha"]
+                or int(packet["portfolio_graph_version"]) != int(graph["version"])
+                or int(packet["capacity_policy"]["version"]) != int(policy["version"])
+                or any(
+                    int(packet["capacity_policy"][field]) != int(policy[field])
+                    for field in (
+                        "development_limit", "shared_limit", "sre_limit"
+                    )
+                )
+                or any(
+                    int(packet["capacity_on_activation"][field]) != int(item[field])
+                    for field in (
+                        "development_units", "shared_units", "sre_units"
+                    )
+                )
+            ):
+                raise PullBufferError("PULL_BUFFER_BINDING_DRIFT")
+            prepared_observation = prepared_observations.get(int(prepared["id"]))
+            if (
+                not isinstance(prepared_observation, dict)
+                or prepared_observation.get("error") is not None
+                or not _descriptor_is_current(prepared_observation)
+                or prepared_observation.get("content_sha256")
+                != prepared["artifact_content_sha256"]
+            ):
+                raise PullBufferError("PULL_BUFFER_PREPARED_ARTIFACT_DRIFT")
+
+            projected_ready_version = int(item["version"]) + 1
+            binding_error = admission_binding_error(
+                admission,
+                candidate={
+                    "repository": repository,
+                    "issue_number": issue_number,
+                    "generation": int(item["generation"]),
+                    "item_version": projected_ready_version,
+                    "source_payload_sha256": item["source_payload_sha256"],
+                    "accepted_main_sha": graph["observed_main_sha"],
+                },
+                observed_main_sha=str(graph["observed_main_sha"]),
+                observation={"admission_artifacts": admission_observations},
+                connection=connection,
+            )
+            if binding_error is not None:
+                raise PullBufferError(binding_error)
+            message = admission["message"]
+            payload = message["payload"]
+            projected_active = {
+                "repository": repository,
+                "issue_number": issue_number,
+                "status": admission["item"]["status"],
+                "allocation_class": "ACTIVE",
+                "generation": int(item["generation"]),
+                "accountable_session_id": message["recipient_session_id"],
+                "lease_manifest_sha256": payload["lease_manifest_sha256"],
+                "development_units": int(item["development_units"]),
+                "shared_units": int(item["shared_units"]),
+                "sre_units": int(item["sre_units"]),
+                "source_payload_sha256": item["source_payload_sha256"],
+                "version": int(payload["item_version"]),
+            }
+            store._validate_message_contract(
+                topic=message["topic"],
+                recipient_session_id=message["recipient_session_id"],
+                payload=payload,
+                current_write=True,
+                projected_item=projected_active,
+            )
+
+            connection.execute(
+                """
+                INSERT INTO portfolio_pull_buffer_candidates(
+                    repository, issue_number, generation, item_version,
+                    source_payload_sha256, accepted_main_sha, graph_version,
+                    capacity_policy_version, lane_key, state, verticality,
+                    development_units, shared_units, sre_units, promotion_trigger,
+                    artifact_relative_path, artifact_content_sha256,
+                    candidate_sha256, readiness_campaign_id,
+                    readiness_current_version, readiness_plan_sha256,
+                    readiness_receipt_id, readiness_receipt_sha256, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repository, issue_number, int(item["generation"]),
+                    projected_ready_version, item["source_payload_sha256"],
+                    graph["observed_main_sha"], int(graph["version"]),
+                    int(policy["version"]), prepared["lane_key"],
+                    packet["verticality"], int(item["development_units"]),
+                    int(item["shared_units"]), int(item["sre_units"]),
+                    packet["promotion_trigger"], relative_path, artifact_sha,
+                    candidate_sha, int(phase["campaign_id"]),
+                    int(phase["current_version"]), phase["plan_sha256"],
+                    int(phase["receipt_id"]), phase["receipt_sha256"], now,
+                ),
+            )
+            ready_candidate = connection.execute(
+                "SELECT * FROM portfolio_pull_buffer_candidates "
+                "WHERE repository=? AND issue_number=? AND candidate_sha256=?",
+                (repository, issue_number, candidate_sha),
+            ).fetchone()
+            if failpoint is not None:
+                failpoint("after_ready_candidate")
+            _retire_pointer(
+                connection,
+                repository=repository,
+                issue_number=issue_number,
+                candidate_id=int(prepared["id"]),
+                reasons=["SUPERSEDED"],
+                now=now,
+            )
+            if failpoint is not None:
+                failpoint("after_prepared_retirement")
+            connection.execute(
+                """
+                INSERT INTO portfolio_pull_buffer_current(
+                    repository, issue_number, candidate_id, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(repository, issue_number) DO UPDATE SET
+                    candidate_id=excluded.candidate_id, updated_at=excluded.updated_at
+                """,
+                (repository, issue_number, int(ready_candidate["id"]), now),
+            )
+            if failpoint is not None:
+                failpoint("after_ready_pointer")
+            finalization_payload = {
+                "schema": FINALIZATION_SCHEMA,
+                "repository": repository,
+                "issue_number": issue_number,
+                "generation": int(item["generation"]),
+                "prepared_item_version": int(item["version"]),
+                "ready_item_version": projected_ready_version,
+                "source_payload_sha256": item["source_payload_sha256"],
+                "accepted_main_sha": graph["observed_main_sha"],
+                "graph_version": int(graph["version"]),
+                "capacity_policy_version": int(policy["version"]),
+                "prepared_candidate_id": int(prepared["id"]),
+                "prepared_candidate_sha256": prepared["candidate_sha256"],
+                "readiness_campaign_id": int(phase["campaign_id"]),
+                "readiness_current_version": int(phase["current_version"]),
+                "readiness_plan_sha256": phase["plan_sha256"],
+                "readiness_receipt_id": int(phase["receipt_id"]),
+                "readiness_receipt_sha256": phase["receipt_sha256"],
+                "ready_packet_content_sha256": artifact_sha,
+                "ready_candidate_sha256": candidate_sha,
+                "admission_transaction_sha256": digest_json(admission),
+                "lease_manifest_sha256": payload["lease_manifest_sha256"],
+            }
+            finalization_sha = digest_json(finalization_payload)
+            dirty_event_id = enqueue_convergence_dirty_event(
+                connection,
+                repository=repository,
+                trigger_kind="CANDIDATE_PROMOTED",
+                issue_number=issue_number,
+                item_version=projected_ready_version,
+                source_sha256=item["source_payload_sha256"],
+                status="READY",
+                generation=int(item["generation"]),
+                now=now,
+                details={
+                    "candidate_id": int(ready_candidate["id"]),
+                    "candidate_sha256": candidate_sha,
+                    "candidate_state": "READY",
+                    "finalization_sha256": finalization_sha,
+                },
+                require_pending=True,
+            )
+            if failpoint is not None:
+                failpoint("after_dirty_event")
+            connection.execute(
+                """
+                INSERT INTO portfolio_ready_finalizations(
+                    repository, issue_number, generation, prepared_candidate_id,
+                    ready_candidate_id, campaign_id, receipt_id, dirty_event_id,
+                    finalization_sha256, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repository, issue_number, int(item["generation"]),
+                    int(prepared["id"]), int(ready_candidate["id"]),
+                    int(phase["campaign_id"]), int(phase["receipt_id"]),
+                    dirty_event_id, finalization_sha,
+                    canonical_json(finalization_payload), now,
+                ),
+            )
+            if failpoint is not None:
+                failpoint("after_finalization")
+            changed = connection.execute(
+                """
+                UPDATE portfolio_readiness_current
+                SET state='FINALIZED', finalized_candidate_id=?,
+                    finalized_event_id=?, finalized_at=?, version=version+1,
+                    updated_at=?, last_error=NULL
+                WHERE repository=? AND issue_number=? AND campaign_id=?
+                  AND state='READY_ELIGIBLE' AND version=? AND receipt_id=?
+                """,
+                (
+                    int(ready_candidate["id"]), dirty_event_id, now, now,
+                    repository, issue_number, int(phase["campaign_id"]),
+                    int(phase["current_version"]), int(phase["receipt_id"]),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise PullBufferError("PULL_BUFFER_READINESS_FENCE_LOST")
+            ready_item = store._set_issue_status_from_ready_finalizer(
+                repository=repository,
+                issue_number=issue_number,
+                status="READY",
+                allocation_class="NONE",
+                generation=int(item["generation"]),
+                accountable_session_id=None,
+                lease_manifest_sha256=None,
+                development_units=int(item["development_units"]),
+                shared_units=int(item["shared_units"]),
+                sre_units=int(item["sre_units"]),
+                expected_source_sha256=item["source_payload_sha256"],
+                expected_version=int(item["version"]),
+                now=now,
+            )
+            if int(ready_item["version"]) != projected_ready_version:
+                raise PullBufferError("PULL_BUFFER_READY_VERSION_DRIFT")
+            node = connection.execute(
+                """
+                SELECT node_key FROM portfolio_graph_nodes
+                WHERE repository=? AND graph_version=? AND issue_number=?
+                  AND dispatchable=1
+                """,
+                (repository, int(graph["version"]), issue_number),
+            ).fetchone()
+            selected = set(
+                _schedule_decision(
+                    connection,
+                    repository,
+                    current_main=str(graph["observed_main_sha"]),
+                    record=False,
+                    now=now,
+                )["selected"]
+            )
+            if node is None or node["node_key"] not in selected:
+                raise PullBufferError("PULL_BUFFER_READY_NOT_DISPATCHABLE")
+            if failpoint is not None:
+                failpoint("after_item_ready")
+            readiness_event(
+                connection,
+                int(phase["campaign_id"]),
+                "READINESS_READY_FINALIZED",
+                {
+                    "ready_candidate_id": int(ready_candidate["id"]),
+                    "dirty_event_id": dirty_event_id,
+                    "finalization_sha256": finalization_sha,
+                },
+                now,
+            )
+            if packet_observation is None:
+                raise PullBufferError("PULL_BUFFER_ARTIFACT_DRIFT")
+            _require_finalizer_descriptors_current(
+                packet_observation,
+                admission_observations,
+                prepared_observation,
+            )
+            if failpoint is not None:
+                failpoint("before_commit")
+        return {
+            "repository": repository,
+            "issue_number": issue_number,
+            "state": "FINALIZED",
+            "candidate_id": int(ready_candidate["id"]),
+            "candidate_sha256": candidate_sha,
+            "portfolio_dirty_event_id": dirty_event_id,
+            "portfolio_dirty_event_state": "PENDING",
+            "finalization_sha256": finalization_sha,
+            "replay": False,
+        }
+    finally:
+        close_candidate_observations(prepared_observations)
+        close_candidate_observations(
+            {0: {"admission_artifacts": admission_observations}}
+        )
+        os.close(descriptor)
+
+
 def load_candidate_packets(
     connection: sqlite3.Connection,
     repository: str,
     *,
     database: Path | None = None,
     keep_descriptors: bool = True,
+    candidate_ids: set[int] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Read current candidate artifacts before a reconciliation write lock."""
 
-    ensure_pull_buffer_schema(connection)
+    require_pull_buffer_schema(connection)
     database = database or _database_path(connection)
-    rows = connection.execute(
-        """
+    select = """
         SELECT c.id, c.artifact_relative_path, c.artifact_content_sha256,
                a.state AS artifact_state,
                a.artifact_key AS registry_artifact_key,
@@ -973,15 +1773,33 @@ def load_candidate_packets(
                a.inode AS registry_inode,
                a.retention_class AS registry_retention_class,
                a.registered_at AS registry_registered_at
-        FROM portfolio_pull_buffer_current pointer
-        JOIN portfolio_pull_buffer_candidates c ON c.id=pointer.candidate_id
+        FROM portfolio_pull_buffer_candidates c
         LEFT JOIN coordination_artifacts a
           ON a.relative_path=c.artifact_relative_path
-        WHERE pointer.repository=?
-        ORDER BY c.id
-        """,
-        (repository,),
-    ).fetchall()
+    """
+    if candidate_ids is None:
+        rows = connection.execute(
+            select
+            + " JOIN portfolio_pull_buffer_current pointer ON pointer.candidate_id=c.id"
+            + " WHERE pointer.repository=? ORDER BY c.id",
+            (repository,),
+        ).fetchall()
+    else:
+        normalized_ids = sorted(
+            candidate_id
+            for candidate_id in candidate_ids
+            if type(candidate_id) is int and candidate_id > 0
+        )
+        if len(normalized_ids) != len(candidate_ids):
+            raise PullBufferError("PULL_BUFFER_CANDIDATE_ID_INVALID")
+        if not normalized_ids:
+            return {}
+        placeholders = ",".join("?" for _ in normalized_ids)
+        rows = connection.execute(
+            select
+            + f" WHERE c.repository=? AND c.id IN ({placeholders}) ORDER BY c.id",
+            (repository, *normalized_ids),
+        ).fetchall()
     observations: dict[int, dict[str, Any]] = {}
     for row in rows:
         candidate_id = int(row["id"])
@@ -1048,6 +1866,255 @@ def load_candidate_packets(
     return observations
 
 
+def _recover_finalized_ready_candidate(
+    store: CoordinationStore | None,
+    candidate: sqlite3.Row,
+    reasons: list[str],
+    *,
+    now: str,
+    failpoint: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    """Atomically retire one invalid attested READY packet into fresh discovery."""
+
+    if store is None:
+        raise PullBufferError("PULL_BUFFER_RECOVERY_STORE_REQUIRED")
+    connection = store.connection
+    if not connection.in_transaction:
+        raise PullBufferError("PULL_BUFFER_RECOVERY_TRANSACTION_REQUIRED")
+    repository = str(candidate["repository"])
+    issue_number = int(candidate["issue_number"])
+    candidate_id = int(candidate["id"])
+    current = connection.execute(
+        """
+        SELECT item.*, source.payload_sha256 AS observed_source_sha256,
+               pointer.candidate_id AS pointer_candidate_id,
+               readiness.campaign_id AS current_campaign_id,
+               readiness.state AS readiness_state,
+               readiness.version AS readiness_version,
+               readiness.finalized_candidate_id,
+               readiness.finalized_event_id,
+               finalization.id AS finalization_id,
+               finalization.finalization_sha256
+        FROM coordination_items item
+        LEFT JOIN github_current source
+          ON source.repository=item.repository
+         AND source.object_kind='issue'
+         AND source.object_number=item.issue_number
+        LEFT JOIN portfolio_pull_buffer_current pointer
+          ON pointer.repository=item.repository
+         AND pointer.issue_number=item.issue_number
+        LEFT JOIN portfolio_readiness_current readiness
+          ON readiness.repository=item.repository
+         AND readiness.issue_number=item.issue_number
+        LEFT JOIN portfolio_ready_finalizations finalization
+          ON finalization.ready_candidate_id=pointer.candidate_id
+        WHERE item.repository=? AND item.issue_number=?
+        """,
+        (repository, issue_number),
+    ).fetchone()
+    if (
+        current is None
+        or int(current["pointer_candidate_id"] or -1) != candidate_id
+        or current["status"] != "READY"
+        or current["allocation_class"] != "NONE"
+        or current["accountable_session_id"] is not None
+        or current["lease_manifest_sha256"] is not None
+        or int(current["generation"]) != int(candidate["generation"])
+        or int(current["version"]) != int(candidate["item_version"])
+        or current["readiness_state"] != "FINALIZED"
+        or int(current["current_campaign_id"] or -1)
+        != int(candidate["readiness_campaign_id"] or -1)
+        or int(current["finalized_candidate_id"] or -1) != candidate_id
+        or int(current["finalized_event_id"] or -1) <= 0
+        or current["finalization_id"] is None
+        or not isinstance(current["observed_source_sha256"], str)
+        or len(current["observed_source_sha256"]) != 64
+        or ready_attestation_error(connection, dict(candidate)) is not None
+    ):
+        raise PullBufferError("PULL_BUFFER_RECOVERY_FENCE_LOST")
+
+    message_guard = connection.execute(
+        """
+        SELECT id FROM coordination_messages
+        WHERE topic IN (
+            'development.admission','development.recovery_prepare',
+            'development.recovery_commit','sre.admission'
+        )
+          AND json_extract(payload_json, '$.source.repository')=?
+          AND json_extract(payload_json, '$.issue_number')=?
+          AND json_extract(payload_json, '$.generation')=?
+        LIMIT 1
+        """,
+        (repository, issue_number, int(candidate["generation"])),
+    ).fetchone()
+    watch_guard = connection.execute(
+        """
+        SELECT watch_key FROM coordination_terminal_watches
+        WHERE repository=? AND issue_number=? AND generation=? LIMIT 1
+        """,
+        (repository, issue_number, int(candidate["generation"])),
+    ).fetchone()
+    if message_guard is not None or watch_guard is not None:
+        raise PullBufferError("PULL_BUFFER_RECOVERY_RUNTIME_GUARD")
+
+    planner = current_endpoint(connection, "planner")
+    if planner is None:
+        raise PullBufferError("CURRENT_PLANNER_ENDPOINT_REQUIRED")
+    normalized_reasons = sorted(set(reasons))
+    next_generation = int(current["generation"]) + 1
+    next_item_version = int(current["version"]) + 1
+    recovery_payload = {
+        "schema": DRIFT_RECOVERY_SCHEMA,
+        "repository": repository,
+        "issue_number": issue_number,
+        "retired_candidate_id": candidate_id,
+        "retired_candidate_sha256": candidate["candidate_sha256"],
+        "finalization_id": int(current["finalization_id"]),
+        "finalization_sha256": current["finalization_sha256"],
+        "prior_generation": int(current["generation"]),
+        "next_generation": next_generation,
+        "prior_item_version": int(current["version"]),
+        "next_item_version": next_item_version,
+        "prior_source_payload_sha256": current["source_payload_sha256"],
+        "next_source_payload_sha256": current["observed_source_sha256"],
+        "reasons": normalized_reasons,
+    }
+    recovery_sha256 = digest_json(recovery_payload)
+
+    _retire_pointer(
+        connection,
+        repository=repository,
+        issue_number=issue_number,
+        candidate_id=candidate_id,
+        reasons=normalized_reasons,
+        now=now,
+    )
+    if failpoint is not None:
+        failpoint("after_recovery_pointer")
+    changed = connection.execute(
+        """
+        UPDATE coordination_items
+        SET status='PREPARED', allocation_class='NONE', generation=?,
+            accountable_session_id=NULL, lease_manifest_sha256=NULL,
+            source_payload_sha256=?, version=?, updated_at=?
+        WHERE repository=? AND issue_number=? AND status='READY'
+          AND allocation_class='NONE' AND accountable_session_id IS NULL
+          AND lease_manifest_sha256 IS NULL AND generation=? AND version=?
+        """,
+        (
+            next_generation,
+            current["observed_source_sha256"],
+            next_item_version,
+            now,
+            repository,
+            issue_number,
+            int(current["generation"]),
+            int(current["version"]),
+        ),
+    ).rowcount
+    if changed != 1:
+        raise PullBufferError("PULL_BUFFER_RECOVERY_ITEM_FENCE_LOST")
+    if failpoint is not None:
+        failpoint("after_recovery_item")
+    changed = connection.execute(
+        """
+        UPDATE portfolio_readiness_current
+        SET state='STALE', version=version+1, updated_at=?, last_error=?
+        WHERE repository=? AND issue_number=? AND campaign_id=?
+          AND state='FINALIZED' AND version=?
+          AND finalized_candidate_id=? AND finalized_event_id=?
+        """,
+        (
+            now,
+            "FINALIZED_READY_DRIFT:" + ",".join(normalized_reasons),
+            repository,
+            issue_number,
+            int(current["current_campaign_id"]),
+            int(current["readiness_version"]),
+            candidate_id,
+            int(current["finalized_event_id"]),
+        ),
+    ).rowcount
+    if changed != 1:
+        raise PullBufferError("PULL_BUFFER_RECOVERY_READINESS_FENCE_LOST")
+    if failpoint is not None:
+        failpoint("after_recovery_readiness")
+
+    notice = {
+        "source": {
+            "repository": repository,
+            "object_kind": "issue",
+            "object_number": issue_number,
+            "payload_sha256": current["observed_source_sha256"],
+        },
+        "notice_kind": "planning_request",
+        "mutation_authority": False,
+        "subject": f"Issue {issue_number} finalized READY drift recovery",
+        "summary": (
+            "An attested zero-WIP READY candidate drifted before admission and "
+            "was returned atomically to fresh discovery."
+        ),
+        "evidence": {
+            "drift_recovery_sha256": recovery_sha256,
+            "retired_candidate_id": candidate_id,
+            "prior_generation": int(current["generation"]),
+            "next_generation": next_generation,
+            "reason_count": len(normalized_reasons),
+            "reasons": normalized_reasons,
+        },
+        "requested_evidence": [
+            "One refreshed immutable PREPARED packet and one candidate-level "
+            "readiness campaign bound to the new generation."
+        ],
+        "next_observation": (
+            "Fresh pull-buffer preparation and the complete all-gates readiness "
+            "phase remain pending."
+        ),
+    }
+    planner_message_id = store.enqueue_message(
+        idempotency_key=f"kanban-ready-drift-recovery:{recovery_sha256}",
+        recipient_session_id=str(planner["endpoint_id"]),
+        topic="coordination.notice",
+        payload=notice,
+        now=now,
+        _transaction=False,
+    )
+    if failpoint is not None:
+        failpoint("after_recovery_planner_notice")
+
+    from kanban_readiness import _event as readiness_event
+
+    readiness_event(
+        connection,
+        int(current["current_campaign_id"]),
+        "READINESS_FINALIZED_READY_REQUEUED",
+        {
+            **recovery_payload,
+            "drift_recovery_sha256": recovery_sha256,
+            "planner_message_id": planner_message_id,
+        },
+        now,
+    )
+    store._event(
+        "READY_CANDIDATE_DRIFT_RECOVERED",
+        f"{repository}:issue:{issue_number}:generation:{next_generation}",
+        {
+            "drift_recovery_sha256": recovery_sha256,
+            "planner_message_id": planner_message_id,
+        },
+        now,
+    )
+    if failpoint is not None:
+        failpoint("before_recovery_commit")
+    return {
+        "state": "REQUEUED",
+        "drift_recovery_sha256": recovery_sha256,
+        "next_generation": next_generation,
+        "next_item_version": next_item_version,
+        "planner_message_id": planner_message_id,
+    }
+
+
 def audit_pull_buffer(
     connection: sqlite3.Connection,
     repository: str,
@@ -1056,18 +2123,26 @@ def audit_pull_buffer(
     now: str,
     database: Path | None = None,
     artifact_observations: dict[int, dict[str, Any]] | None = None,
+    store: CoordinationStore | None = None,
+    recovery_failpoint: Callable[[str], None] | None = None,
     _transaction: bool = True,
     _ensure_schema: bool = True,
 ) -> dict[str, Any]:
+    if store is not None and store.connection is not connection:
+        raise PullBufferError("PULL_BUFFER_RECOVERY_STORE_MISMATCH")
     if _ensure_schema:
-        ensure_pull_buffer_schema(connection)
+        if record:
+            ensure_pull_buffer_schema(connection)
+        else:
+            require_pull_buffer_schema(connection)
     database = database or _database_path(connection)
     owns_observations = artifact_observations is None
     if owns_observations:
         artifact_observations = load_candidate_packets(
             connection, repository, database=database, keep_descriptors=True
         )
-    if _transaction:
+    write_transaction = _transaction and record
+    if write_transaction:
         connection.execute("BEGIN IMMEDIATE")
     try:
         current = connection.execute(
@@ -1086,6 +2161,20 @@ def audit_pull_buffer(
         if current is None or policy is None:
             raise PullBufferError("PULL_BUFFER_BINDING_MISSING")
         graph_version = int(current["version"])
+        structurally_ready: dict[str, bool] = {}
+        if current["health"] == "CURRENT":
+            try:
+                structurally_ready = {
+                    str(node["node_key"]): bool(node["structurally_ready"])
+                    for node in evaluate_graph(
+                        connection,
+                        repository,
+                        current_main=str(current["observed_main_sha"]),
+                        _ensure_schema=False,
+                    )["nodes"]
+                }
+            except PortfolioGraphError:
+                structurally_ready = {}
         potential_lanes = connection.execute(
             """
             SELECT COUNT(DISTINCT n.lane_key)
@@ -1149,6 +2238,12 @@ def audit_pull_buffer(
                 reasons.append("MAIN_DRIFT")
             if int(row["graph_version"]) != graph_version or row["priority_rank"] is None:
                 reasons.append("GRAPH_DRIFT")
+            if (
+                current["health"] == "CURRENT"
+                and row["node_key"] is not None
+                and not structurally_ready.get(str(row["node_key"]), False)
+            ):
+                reasons.append("DEPENDENCY_DRIFT")
             if int(row["capacity_policy_version"]) != int(policy["version"]):
                 reasons.append("CAPACITY_POLICY_DRIFT")
             if row["current_generation"] is None or int(row["generation"]) != int(row["current_generation"]):
@@ -1196,6 +2291,7 @@ def audit_pull_buffer(
                 else None
             )
             binding_error = None
+            attestation_error = None
             if row["state"] == "READY":
                 binding_error = admission_binding_error(
                     packet.get("admission_transaction")
@@ -1206,6 +2302,16 @@ def audit_pull_buffer(
                     observation=observation,
                     connection=connection,
                 )
+                attestation_error = ready_attestation_error(
+                    connection, dict(row)
+                )
+                if attestation_error is not None:
+                    reasons.append(attestation_error)
+                if binding_error is not None:
+                    reasons.append(binding_error)
+            observation_authentic = _observation_snapshot_is_authentic(
+                connection, observation
+            )
             candidate = {
                 "candidate_id": int(row["id"]),
                 "node_key": row["node_key"],
@@ -1220,14 +2326,46 @@ def audit_pull_buffer(
             }
             if reasons:
                 normalized = sorted(set(reasons))
-                invalid.append({**candidate, "reasons": normalized})
-                _retire_pointer(
-                    connection,
-                    repository=repository,
-                    issue_number=int(row["issue_number"]),
-                    candidate_id=int(row["id"]),
-                    reasons=normalized,
-                    now=now,
+                recovery = None
+                if record:
+                    recovery_forbidden = {
+                        "GENERATION_DRIFT",
+                        "ITEM_VERSION_DRIFT",
+                        "NOT_ZERO_WIP_PREP",
+                        "READINESS_ATTESTATION_MISSING",
+                        "READINESS_ATTESTATION_INVALID",
+                        "READINESS_ATTESTATION_DRIFT",
+                    }
+                    if (
+                        row["state"] == "READY"
+                        and row["item_status"] == "READY"
+                        and row["allocation_class"] == "NONE"
+                        and attestation_error is None
+                        and observation_authentic
+                        and not recovery_forbidden.intersection(normalized)
+                    ):
+                        recovery = _recover_finalized_ready_candidate(
+                            store,
+                            row,
+                            normalized,
+                            now=now,
+                            failpoint=recovery_failpoint,
+                        )
+                    else:
+                        _retire_pointer(
+                            connection,
+                            repository=repository,
+                            issue_number=int(row["issue_number"]),
+                            candidate_id=int(row["id"]),
+                            reasons=normalized,
+                            now=now,
+                        )
+                invalid.append(
+                    {
+                        **candidate,
+                        "reasons": normalized,
+                        **({} if recovery is None else {"recovery": recovery}),
+                    }
                 )
             else:
                 valid.append(candidate)
@@ -1312,10 +2450,10 @@ def audit_pull_buffer(
                     audit_sha, canonical_json(payload), now,
                 ),
             )
-        if _transaction:
+        if write_transaction:
             connection.execute("COMMIT")
     except Exception:
-        if _transaction and connection.in_transaction:
+        if write_transaction and connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
     finally:
@@ -1325,7 +2463,7 @@ def audit_pull_buffer(
 
 
 def show_pull_buffer(connection: sqlite3.Connection, repository: str) -> dict[str, Any]:
-    ensure_pull_buffer_schema(connection)
+    require_pull_buffer_schema(connection)
     candidates = [dict(row) for row in connection.execute(
         """
         SELECT c.* FROM portfolio_pull_buffer_current pointer
@@ -1354,6 +2492,9 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     register = subparsers.add_parser("register")
     register.add_argument("--packet", type=Path, required=True)
+    finalize = subparsers.add_parser("finalize-ready")
+    finalize.add_argument("--packet", type=Path, required=True)
+    subparsers.add_parser("initialize")
     audit = subparsers.add_parser("audit")
     audit.add_argument("--repository", required=True)
     audit.add_argument("--record", action="store_true")
@@ -1372,8 +2513,14 @@ def main() -> int:
     readiness_attach.add_argument("--issue", type=int, required=True)
     readiness_attach.add_argument("--message-id", type=int, required=True)
     readiness_attach.add_argument("--attempt-id", required=True)
-    readiness_record = subparsers.add_parser("readiness-record")
-    readiness_record.add_argument("--receipt", type=Path, required=True)
+    readiness_stage = subparsers.add_parser("readiness-stage-receipt")
+    readiness_stage.add_argument("--receipt", type=Path, required=True)
+    readiness_stage.add_argument("--message-id", type=int, required=True)
+    readiness_stage.add_argument("--attempt-id", required=True)
+    readiness_decision = subparsers.add_parser("readiness-apply-decision")
+    readiness_decision.add_argument("--message-id", type=int, required=True)
+    readiness_decision.add_argument("--planner-session-id", required=True)
+    readiness_decision.add_argument("--source", type=Path, required=True)
     readiness_evaluate = subparsers.add_parser("readiness-evaluate")
     readiness_evaluate.add_argument("--repository", required=True)
     readiness_evaluate.add_argument("--issue", type=int, required=True)
@@ -1381,20 +2528,35 @@ def main() -> int:
     readiness_show = subparsers.add_parser("readiness-show")
     readiness_show.add_argument("--repository", required=True)
     args = parser.parse_args()
-    prepare_owner_database(DEFAULT_DATABASE)
-    connection = sqlite3.connect(DEFAULT_DATABASE)
-    connection.row_factory = sqlite3.Row
+    read_only = (
+        args.command in {
+            "show", "readiness-discover", "readiness-show",
+        }
+        or (args.command == "audit" and not args.record)
+        or (args.command == "readiness-evaluate" and not args.record)
+    )
+    audit_store: CoordinationStore | None = None
+    if args.command == "audit" and args.record:
+        audit_store = CoordinationStore(DEFAULT_DATABASE)
+        connection = audit_store.connection
+    elif read_only:
+        connection = open_owner_database_readonly(DEFAULT_DATABASE)
+    else:
+        prepare_owner_database(DEFAULT_DATABASE)
+        connection = sqlite3.connect(DEFAULT_DATABASE)
+        connection.row_factory = sqlite3.Row
     try:
         if args.command.startswith("readiness-"):
             from kanban_readiness import (
                 attach as attach_readiness,
+                apply_readiness_decision,
                 discover as discover_readiness,
                 dispatch as dispatch_readiness,
                 evaluate as evaluate_readiness,
                 read_json as read_readiness_json,
-                record as record_readiness,
                 register as register_readiness,
                 show as show_readiness,
+                stage_receipt as stage_readiness_receipt,
             )
 
             if args.command == "readiness-discover":
@@ -1421,16 +2583,29 @@ def main() -> int:
                     connection, args.repository, args.issue, args.message_id,
                     args.attempt_id, now=utc_now(),
                 )
-            elif args.command == "readiness-record":
-                from coordination_store import CoordinationStore
-
-                record_store = CoordinationStore(DEFAULT_DATABASE)
+            elif args.command == "readiness-stage-receipt":
+                result = stage_readiness_receipt(
+                    connection,
+                    DEFAULT_DATABASE,
+                    args.receipt,
+                    message_id=args.message_id,
+                    attempt_id=args.attempt_id,
+                    now=utc_now(),
+                )
+            elif args.command == "readiness-apply-decision":
+                decision_store = CoordinationStore(DEFAULT_DATABASE)
                 try:
-                    result = record_readiness(
-                        record_store, read_readiness_json(args.receipt), now=utc_now()
+                    refreshed_source = read_readiness_json(args.source)
+                    result = apply_readiness_decision(
+                        decision_store,
+                        message_id=args.message_id,
+                        planner_session_id=args.planner_session_id,
+                        refreshed_payload=refreshed_source,
+                        refreshed_payload_sha256=digest_json(refreshed_source),
+                        now=utc_now(),
                     )
                 finally:
-                    record_store.close()
+                    decision_store.close()
             elif args.command == "readiness-evaluate":
                 result = evaluate_readiness(
                     connection, args.repository, args.issue,
@@ -1440,10 +2615,25 @@ def main() -> int:
                 result = show_readiness(connection, args.repository)
         elif args.command == "register":
             result = register_candidate(connection, DEFAULT_DATABASE, args.packet, now=utc_now())
+        elif args.command == "finalize-ready":
+            finalize_store = CoordinationStore(DEFAULT_DATABASE)
+            try:
+                result = finalize_ready(
+                    finalize_store, args.packet, now=utc_now()
+                )
+            finally:
+                finalize_store.close()
+        elif args.command == "initialize":
+            from kanban_readiness import ensure_schema as ensure_readiness_schema
+
+            ensure_pull_buffer_schema(connection)
+            ensure_readiness_schema(connection)
+            result = {"state": "INITIALIZED"}
         elif args.command == "audit":
             result = audit_pull_buffer(
                 connection, args.repository, record=args.record, now=utc_now(),
                 database=DEFAULT_DATABASE,
+                store=audit_store,
             )
         else:
             result = show_pull_buffer(connection, args.repository)
@@ -1453,7 +2643,10 @@ def main() -> int:
         print(canonical_json({"phase": "HOLD", "error": str(exc)}))
         return 1
     finally:
-        connection.close()
+        if audit_store is not None:
+            audit_store.close()
+        else:
+            connection.close()
 
 
 if __name__ == "__main__":

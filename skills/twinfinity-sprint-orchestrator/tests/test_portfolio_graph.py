@@ -179,7 +179,12 @@ class PortfolioGraphTests(unittest.TestCase):
         development: int = 1,
         shared: int = 0,
     ) -> dict:
-        return self.store.set_issue_status(
+        setter = (
+            self.store._set_issue_status_for_test_fixture
+            if status == "READY"
+            else self.store.set_issue_status
+        )
+        return setter(
             repository=REPOSITORY,
             issue_number=number,
             status=status,
@@ -385,7 +390,7 @@ class PortfolioGraphTests(unittest.TestCase):
             "INSERT INTO hosted_operations(repository, state, sre_units) VALUES (?, 'CLAIMED', 5)",
             (REPOSITORY,),
         )
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=320,
             status="READY",

@@ -11,6 +11,7 @@ has been published and read back successfully.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 import os
@@ -51,7 +52,9 @@ USER_EVENT_SOURCES = {
 }
 PRIORITIES = {"P0", "P1", "P2"}
 URGENCIES = {"ACTIVE_BLOCKER", "READY_BLOCKER", "FUTURE", "INFORMATIONAL"}
-WORKSTREAMS = {"DEVELOPMENT", "SRE", "PLANNER", "PORTFOLIO", "CLIENT"}
+WORKSTREAMS = {
+    "DEVELOPMENT", "SRE", "PLANNER", "PORTFOLIO", "CLIENT", "READINESS"
+}
 WORKSTREAM_ROLES = {
     "DEVELOPMENT": "development",
     "SRE": "sre",
@@ -206,12 +209,22 @@ def validate_packet(packet: Any) -> dict[str, Any]:
         or packet["urgency"] not in URGENCIES
     ):
         raise CoordinationError("APPROVAL_PACKET_FIELD_INVALID")
-    expected_role = WORKSTREAM_ROLES[packet["workstream"]]
-    if (
-        configured_identity_role(packet["requester_session_id"]) != expected_role
-        or configured_identity_role(packet["recipient_session_id"]) != expected_role
-    ):
-        raise CoordinationError("APPROVAL_CANONICAL_PARENT_REQUIRED")
+    if packet["workstream"] == "READINESS":
+        if (
+            configured_identity_role(packet["requester_session_id"])
+            not in {"development", "sre"}
+            or configured_identity_role(packet["recipient_session_id"]) != "planner"
+        ):
+            raise CoordinationError("APPROVAL_READINESS_ROUTE_REQUIRED")
+    else:
+        expected_role = WORKSTREAM_ROLES[packet["workstream"]]
+        if (
+            configured_identity_role(packet["requester_session_id"])
+            != expected_role
+            or configured_identity_role(packet["recipient_session_id"])
+            != expected_role
+        ):
+            raise CoordinationError("APPROVAL_CANONICAL_PARENT_REQUIRED")
 
     normalized = dict(packet)
     for field in (
@@ -419,6 +432,27 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(proposal_sha256) REFERENCES approval_proposals(proposal_sha256),
             FOREIGN KEY(message_id) REFERENCES coordination_messages(id)
         );
+        CREATE TABLE IF NOT EXISTS approval_delivery_notices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_sha256 TEXT NOT NULL,
+            submission_sha256 TEXT NOT NULL,
+            decision_sha256 TEXT NOT NULL,
+            recipient_session_id TEXT NOT NULL,
+            readiness_campaign_id INTEGER NOT NULL CHECK(readiness_campaign_id > 0),
+            readiness_receipt_id INTEGER NOT NULL CHECK(readiness_receipt_id > 0),
+            expected_readiness_version INTEGER NOT NULL
+                CHECK(expected_readiness_version > 0),
+            source_payload_sha256 TEXT NOT NULL,
+            routed_endpoint_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            UNIQUE(readiness_campaign_id, decision_sha256,
+                   source_payload_sha256, routed_endpoint_id),
+            FOREIGN KEY(submission_sha256)
+                REFERENCES approval_submissions(submission_sha256),
+            FOREIGN KEY(decision_sha256) REFERENCES approval_decisions(decision_sha256),
+            FOREIGN KEY(message_id) REFERENCES coordination_messages(id)
+        );
         CREATE TABLE IF NOT EXISTS approval_effectivity (
             proposal_sha256 TEXT PRIMARY KEY,
             decision_sha256 TEXT NOT NULL UNIQUE,
@@ -486,6 +520,12 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS approval_effectivity_immutable_delete
         BEFORE DELETE ON approval_effectivity
         BEGIN SELECT RAISE(ABORT, 'APPROVAL_EFFECTIVITY_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_delivery_notices_immutable_update
+        BEFORE UPDATE ON approval_delivery_notices
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_DELIVERY_NOTICE_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_delivery_notices_immutable_delete
+        BEFORE DELETE ON approval_delivery_notices
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_DELIVERY_NOTICE_IMMUTABLE'); END;
         COMMIT;
             """
         )
@@ -667,21 +707,50 @@ def _record_interest(
 
 
 def submit_proposal(
-    store: CoordinationStore, packet: dict[str, Any], now: str
+    store: CoordinationStore,
+    packet: dict[str, Any],
+    now: str,
+    *,
+    _transaction: bool = True,
+    _readiness_binding: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    ensure_schema(store.connection)
+    if _transaction:
+        ensure_schema(store.connection)
+    elif not store.connection.in_transaction:
+        raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
     packet = validate_packet(packet)
     packet = dict(packet)
-    packet["requester_session_id"] = canonicalize_coordination_identity(
-        store.connection, packet["requester_session_id"]
-    )
-    packet["recipient_session_id"] = canonicalize_coordination_identity(
-        store.connection, packet["recipient_session_id"]
-    )
+    if packet["workstream"] == "READINESS":
+        if not isinstance(_readiness_binding, dict) or set(_readiness_binding) != {
+            "requester_session_id",
+            "recipient_session_id",
+            "execution_scope_sha256",
+        }:
+            raise CoordinationError("APPROVAL_READINESS_SUPERVISOR_REQUIRED")
+        planner_endpoint = _current_role_route(store, "planner")
+        if (
+            packet["requester_session_id"]
+            != _readiness_binding["requester_session_id"]
+            or packet["recipient_session_id"]
+            != _readiness_binding["recipient_session_id"]
+            or packet["execution_scope_sha256"]
+            != _readiness_binding["execution_scope_sha256"]
+            or planner_endpoint != packet["recipient_session_id"]
+        ):
+            raise CoordinationError("APPROVAL_READINESS_BINDING_MISMATCH")
+    else:
+        if _readiness_binding is not None:
+            raise CoordinationError("APPROVAL_READINESS_BINDING_UNEXPECTED")
+        packet["requester_session_id"] = canonicalize_coordination_identity(
+            store.connection, packet["requester_session_id"]
+        )
+        packet["recipient_session_id"] = canonicalize_coordination_identity(
+            store.connection, packet["recipient_session_id"]
+        )
     submission_sha256 = digest_json(packet)
     semantic_sha256 = digest_json(_semantic_packet(packet))
     proposal_sha256 = semantic_sha256
-    with store.transaction():
+    with store.transaction() if _transaction else nullcontext():
         if not _source_is_current(store, packet):
             raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_DRIFT")
         submission = store.connection.execute(
@@ -689,10 +758,18 @@ def submit_proposal(
             (submission_sha256,),
         ).fetchone()
         if submission is not None:
+            notice = store.connection.execute(
+                "SELECT message_id FROM approval_proposal_notices "
+                "WHERE proposal_sha256=?",
+                (submission["proposal_sha256"],),
+            ).fetchone()
             return {
                 "proposal_sha256": submission["proposal_sha256"],
                 "submission_sha256": submission_sha256,
                 "state": "PENDING",
+                "planner_message_id": (
+                    None if notice is None else int(notice["message_id"])
+                ),
                 "idempotent": True,
             }
         current = store.connection.execute(
@@ -725,10 +802,18 @@ def submit_proposal(
                 packet=packet,
                 now=now,
             )
+            notice = store.connection.execute(
+                "SELECT message_id FROM approval_proposal_notices "
+                "WHERE proposal_sha256=?",
+                (proposal_sha256,),
+            ).fetchone()
             return {
                 "proposal_sha256": proposal_sha256,
                 "submission_sha256": submission_sha256,
                 "state": "DECIDED" if current["decision"] else "PENDING",
+                "planner_message_id": (
+                    None if notice is None else int(notice["message_id"])
+                ),
                 "idempotent": False,
                 "clustered": True,
             }
@@ -828,9 +913,40 @@ def submit_proposal(
         "proposal_sha256": proposal_sha256,
         "submission_sha256": submission_sha256,
         "state": "PENDING",
+        "planner_message_id": message_id,
         "idempotent": False,
         "clustered": False,
     }
+
+
+def submit_readiness_proposal_in_transaction(
+    store: CoordinationStore,
+    packet: dict[str, Any],
+    *,
+    expected_requester_session_id: str,
+    expected_recipient_session_id: str,
+    expected_execution_scope_sha256: str,
+    now: str,
+) -> dict[str, Any]:
+    """Submit one terminal-worker packet without granting worker authority.
+
+    The caller must already hold the receipt-pickup transaction after proving
+    the exact worker message and attempt terminal.  Historical worker endpoint
+    identity is preserved, while the recipient must still be the current
+    Planner endpoint.
+    """
+
+    return submit_proposal(
+        store,
+        packet,
+        now,
+        _transaction=False,
+        _readiness_binding={
+            "requester_session_id": expected_requester_session_id,
+            "recipient_session_id": expected_recipient_session_id,
+            "execution_scope_sha256": expected_execution_scope_sha256,
+        },
+    )
 
 
 def _pending_rows(
@@ -1025,6 +1141,25 @@ def _decision_comment(
     )
 
 
+def _readiness_revisit_at(value: str | None) -> str:
+    """Validate the one machine-evaluable readiness DEFER trigger: UTC AT."""
+
+    text = _validate_text(value, "revisit_trigger")
+    if not text.endswith("Z"):
+        raise CoordinationError("APPROVAL_READINESS_REVISIT_TRIGGER_INVALID")
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError as exc:
+        raise CoordinationError(
+            "APPROVAL_READINESS_REVISIT_TRIGGER_INVALID"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise CoordinationError("APPROVAL_READINESS_REVISIT_TRIGGER_INVALID")
+    if parsed.microsecond:
+        raise CoordinationError("APPROVAL_READINESS_REVISIT_TRIGGER_INVALID")
+    return parsed.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def record_decision(
     store: CoordinationStore,
     *,
@@ -1082,6 +1217,16 @@ def record_decision(
             raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_DRIFT")
         if _expired(packet, now):
             raise CoordinationError("APPROVAL_PROPOSAL_EXPIRED")
+        readiness_submission_recipients = [
+            str(submission["recipient_session_id"])
+            for submission in store.connection.execute(
+                "SELECT recipient_session_id FROM approval_submissions "
+                "WHERE proposal_sha256=? AND workstream='READINESS'",
+                (proposal_sha256,),
+            )
+        ]
+        if decision == "DEFER" and readiness_submission_recipients:
+            revisit_trigger = _readiness_revisit_at(revisit_trigger)
         if selected_option_id not in {option["id"] for option in packet["options"]}:
             raise CoordinationError("APPROVAL_SELECTED_OPTION_INVALID")
         recipients = sorted({
@@ -1200,14 +1345,29 @@ def record_decision(
                 now,
             ),
         )
-        delivery_state = "HOLD" if decision == "DEFER" else "WAITING_PUBLICATION"
-        delivery_error = "APPROVAL_DEFERRED" if decision == "DEFER" else None
+        # Only the exact readiness recipient must consume DEFER after the
+        # published/read-back boundary.  Historical non-readiness DEFER
+        # deliveries preserve their canonical immediate durable HOLD.
+        delivery_rows: list[tuple[str, str, str | None]] = []
+        for recipient in recipients:
+            readiness_delivery = any(
+                identities_role_equivalent(
+                    store.connection, historical_recipient, recipient
+                )
+                for historical_recipient in readiness_submission_recipients
+            )
+            if decision == "DEFER" and not readiness_delivery:
+                delivery_rows.append(
+                    (recipient, "HOLD", "APPROVAL_DEFERRED")
+                )
+            else:
+                delivery_rows.append((recipient, "WAITING_PUBLICATION", None))
         store.connection.executemany(
             "INSERT INTO approval_deliveries(proposal_sha256,decision_sha256,"
             "recipient_session_id,state,updated_at,last_error) VALUES (?,?,?,?,?,?)",
             [
-                (proposal_sha256, decision_sha256, recipient, delivery_state, now, delivery_error)
-                for recipient in recipients
+                (proposal_sha256, decision_sha256, recipient, state, now, error)
+                for recipient, state, error in delivery_rows
             ],
         )
         _retire_planner_notice(store, proposal_sha256, now)
@@ -1222,7 +1382,9 @@ def record_decision(
         "proposal_sha256": proposal_sha256,
         "decision_sha256": decision_sha256,
         "owner_outbox_id": outbox_id,
-        "delivery_states": {recipient: delivery_state for recipient in recipients},
+        "delivery_states": {
+            recipient: state for recipient, state, _error in delivery_rows
+        },
         "idempotent": False,
     }
 
@@ -1359,6 +1521,268 @@ def revoke_decision(
     }
 
 
+def enqueue_published_readiness_decision_notices(
+    store: CoordinationStore,
+    *,
+    now: str,
+    limit: int = 8,
+) -> dict[str, Any]:
+    """Enqueue one idempotent Planner delivery wake after exact publication.
+
+    This is a mechanical supervisor operation.  The notice is deliberately
+    non-authorizing: the Planner handler must atomically claim the immutable
+    ledger delivery before changing readiness state.
+    """
+
+    if type(limit) is not int or limit <= 0 or limit > 64:
+        raise CoordinationError("APPROVAL_NOTICE_LIMIT_INVALID")
+    ensure_schema(store.connection)
+    if not all(
+        store.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        for name in (
+            "portfolio_readiness_campaigns",
+            "portfolio_readiness_receipts",
+            "portfolio_readiness_current",
+            "portfolio_readiness_approval_requests",
+            "portfolio_readiness_approval_consumptions",
+        )
+    ):
+        return {"limit": limit, "enqueued": []}
+    enqueued: list[dict[str, Any]] = []
+    with store.transaction():
+        planner_endpoint = _current_role_route(store, "planner")
+        rows = store.connection.execute(
+            """
+            SELECT DISTINCT request.proposal_sha256, request.submission_sha256,
+                   x.decision_sha256,
+                   x.recipient_session_id, d.decision, d.selected_option_id,
+                   d.revisit_trigger, d.execution_scope_sha256,
+                   d.owner_outbox_id, o.remote_receipt,
+                   request.repository, request.issue_number AS owning_issue,
+                   request.boundary,
+                   request.campaign_id AS readiness_campaign_id,
+                   request.receipt_id AS readiness_receipt_id,
+                   request.expected_approval_pending_version
+                       AS expected_readiness_version,
+                   current.payload_sha256 AS current_source_sha256,
+                   revocation.decision_sha256 AS revoked_decision_sha256
+            FROM portfolio_readiness_approval_requests request
+            JOIN approval_submissions submission
+              ON submission.submission_sha256=request.submission_sha256
+             AND submission.proposal_sha256=request.proposal_sha256
+             AND submission.requester_session_id=request.requester_session_id
+             AND submission.recipient_session_id=request.packet_recipient_session_id
+             AND submission.workstream='READINESS'
+            JOIN approval_proposals p
+              ON p.proposal_sha256=request.proposal_sha256
+            JOIN approval_deliveries x
+              ON x.proposal_sha256=request.proposal_sha256
+            JOIN approval_decisions d
+              USING(proposal_sha256, decision_sha256)
+            JOIN portfolio_readiness_receipts receipt
+              ON receipt.id=request.receipt_id
+             AND receipt.campaign_id=request.campaign_id
+             AND receipt.verdict='APPROVAL_REQUIRED'
+             AND receipt.approval_proposal_sha256=request.proposal_sha256
+            JOIN portfolio_readiness_current readiness
+              ON readiness.receipt_id=request.receipt_id
+             AND readiness.campaign_id=request.campaign_id
+             AND readiness.state='APPROVAL_PENDING'
+             AND readiness.version=request.expected_approval_pending_version
+            JOIN portfolio_readiness_campaigns campaign
+              ON campaign.id=request.campaign_id
+             AND campaign.repository=request.repository
+             AND campaign.issue_number=request.issue_number
+             AND campaign.source_payload_sha256=request.source_payload_sha256
+            JOIN github_outbox o ON o.id=d.owner_outbox_id
+            JOIN github_current current
+              ON current.repository=request.repository
+             AND current.object_kind='issue'
+             AND current.object_number=request.issue_number
+            LEFT JOIN approval_revocations revocation
+              USING(proposal_sha256, decision_sha256)
+            LEFT JOIN portfolio_readiness_approval_consumptions consumption
+              ON consumption.request_campaign_id=request.campaign_id
+            WHERE consumption.request_campaign_id IS NULL
+              AND (
+                  x.state='WAITING_PUBLICATION'
+                  OR (x.state='HOLD' AND revocation.decision_sha256 IS NOT NULL)
+              )
+              AND p.repository=request.repository
+              AND p.owning_issue=request.issue_number
+              AND p.source_snapshot_sha256=request.source_payload_sha256
+              AND p.boundary=request.boundary
+              AND d.execution_scope_sha256=request.execution_scope_sha256
+              AND json_extract(submission.packet_json,
+                               '$.execution_scope_sha256')
+                    =request.execution_scope_sha256
+              AND json_extract(submission.packet_json, '$.boundary')
+                    =request.boundary
+              AND json_extract(submission.packet_json,
+                               '$.source_snapshot_sha256')
+                    =request.source_payload_sha256
+              AND o.state='COMPLETE' AND o.remote_receipt IS NOT NULL
+            ORDER BY d.created_at, request.campaign_id, x.recipient_session_id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            if not identities_role_equivalent(
+                store.connection,
+                str(row["recipient_session_id"]),
+                planner_endpoint,
+            ):
+                # A semantically clustered proposal may also have an ordinary
+                # Development/SRE delivery.  Its endpoint owns that delivery;
+                # this supervisor path wakes only the readiness Planner.
+                continue
+            prior = store.connection.execute(
+                """
+                SELECT notice.*, message.state AS message_state
+                FROM approval_delivery_notices notice
+                JOIN coordination_messages message ON message.id=notice.message_id
+                WHERE notice.readiness_campaign_id=?
+                  AND notice.decision_sha256=?
+                ORDER BY notice.id DESC
+                """,
+                (
+                    int(row["readiness_campaign_id"]),
+                    row["decision_sha256"],
+                ),
+            ).fetchall()
+            exact_prior = next(
+                (
+                    notice
+                    for notice in prior
+                    if notice["source_payload_sha256"]
+                    == row["current_source_sha256"]
+                    and notice["routed_endpoint_id"] == planner_endpoint
+                ),
+                None,
+            )
+            if exact_prior is not None:
+                continue
+            for notice in prior:
+                if notice["message_state"] in {"PREPARED", "CLAIMED"}:
+                    store.connection.execute(
+                        "UPDATE coordination_messages SET state='HOLD', "
+                        "updated_at=?, last_error='READINESS_DECISION_NOTICE_SUPERSEDED' "
+                        "WHERE id=? AND state IN ('PREPARED','CLAIMED')",
+                        (now, int(notice["message_id"])),
+                    )
+            message_id = store.enqueue_message(
+                idempotency_key=(
+                    "readiness-decision-disposition:"
+                    f"{int(row['readiness_campaign_id'])}:"
+                    f"{row['decision_sha256']}:{row['current_source_sha256']}:"
+                    f"{planner_endpoint}"
+                ),
+                recipient_session_id=planner_endpoint,
+                topic="coordination.notice",
+                payload={
+                    "source": {
+                        "repository": row["repository"],
+                        "object_kind": "issue",
+                        "object_number": int(row["owning_issue"]),
+                        "payload_sha256": row["current_source_sha256"],
+                    },
+                    "notice_kind": "planning_request",
+                    "mutation_authority": False,
+                    "subject": (
+                        "published-readiness-decision:"
+                        f"{row['proposal_sha256']}"
+                    ),
+                    "summary": (
+                        "A material readiness decision is published and "
+                        "awaits one atomic Planner disposition."
+                    ),
+                    "evidence": {
+                        "proposal_sha256": row["proposal_sha256"],
+                        "submission_sha256": row["submission_sha256"],
+                        "decision_sha256": row["decision_sha256"],
+                        "decision": row["decision"],
+                        "selected_option_id": row["selected_option_id"],
+                        "revisit_trigger": row["revisit_trigger"],
+                        "execution_scope_sha256": row[
+                            "execution_scope_sha256"
+                        ],
+                        "boundary": row["boundary"],
+                        "readiness_campaign_id": int(
+                            row["readiness_campaign_id"]
+                        ),
+                        "readiness_receipt_id": int(
+                            row["readiness_receipt_id"]
+                        ),
+                        "expected_readiness_version": int(
+                            row["expected_readiness_version"]
+                        ),
+                        "owner_outbox_id": int(row["owner_outbox_id"]),
+                        "remote_receipt": row["remote_receipt"],
+                        "revoked": row["revoked_decision_sha256"] is not None,
+                    },
+                    "requested_evidence": [
+                        "Atomic ledger claim and readiness disposition receipt."
+                    ],
+                    "next_observation": (
+                        "The exact delivery and notice become terminal together."
+                    ),
+                },
+                now=now,
+                _transaction=False,
+            )
+            store.connection.execute(
+                """
+                INSERT INTO approval_delivery_notices(
+                    proposal_sha256, submission_sha256, decision_sha256,
+                    recipient_session_id,
+                    readiness_campaign_id, readiness_receipt_id,
+                    expected_readiness_version, source_payload_sha256,
+                    routed_endpoint_id, message_id, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    row["proposal_sha256"],
+                    row["submission_sha256"],
+                    row["decision_sha256"],
+                    row["recipient_session_id"],
+                    int(row["readiness_campaign_id"]),
+                    int(row["readiness_receipt_id"]),
+                    int(row["expected_readiness_version"]),
+                    row["current_source_sha256"],
+                    planner_endpoint,
+                    message_id,
+                    now,
+                ),
+            )
+            _event(
+                store.connection,
+                "READINESS_DECISION_NOTICE_ENQUEUED",
+                f"approval:{row['proposal_sha256']}",
+                {
+                    "decision_sha256": row["decision_sha256"],
+                    "message_id": message_id,
+                    "readiness_campaign_id": int(
+                        row["readiness_campaign_id"]
+                    ),
+                    "routed_endpoint_id": planner_endpoint,
+                },
+                now,
+            )
+            enqueued.append(
+                {
+                    "proposal_sha256": row["proposal_sha256"],
+                    "decision_sha256": row["decision_sha256"],
+                    "message_id": message_id,
+                    "routed_endpoint_id": planner_endpoint,
+                }
+            )
+    return {"limit": limit, "enqueued": enqueued}
+
+
 def delivery_recipient_for_role(
     store: CoordinationStore, proposal_sha256: str, requested_identity: str
 ) -> str:
@@ -1400,6 +1824,8 @@ def claim_decision_in_transaction(
     refreshed_payload_sha256: str,
     now: str,
     allow_acknowledged_replay: bool = False,
+    ingest_refreshed_source: bool = True,
+    expected_current_source_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Claim a delivery and bind effectivity inside an existing transaction."""
 
@@ -1414,6 +1840,11 @@ def claim_decision_in_transaction(
         raise CoordinationError("APPROVAL_SOURCE_REFRESH_INVALID")
     if digest_json(refreshed_payload) != refreshed_payload_sha256:
         raise CoordinationError("APPROVAL_SOURCE_REFRESH_DIGEST_DRIFT")
+    if (
+        expected_current_source_sha256 is not None
+        and not SHA256.fullmatch(expected_current_source_sha256)
+    ):
+        raise CoordinationError("APPROVAL_EXPECTED_CURRENT_SOURCE_INVALID")
     row = store.connection.execute(
         """
         SELECT x.*, d.decision, d.selected_option_id, d.revisit_trigger,
@@ -1454,17 +1885,6 @@ def claim_decision_in_transaction(
         raise CoordinationError("APPROVAL_ALREADY_ACKNOWLEDGED")
 
     packet = json.loads(row["packet_json"])
-    refreshed = store.ingest_snapshot_in_transaction(
-        repository=packet["repository"],
-        object_kind="issue",
-        object_number=packet["owning_issue"],
-        payload=refreshed_payload,
-        source_updated_at=refreshed_payload.get(
-            "_projection_updated_at", refreshed_payload.get("updated_at", "")
-        ),
-        fetched_at=now,
-        expected_payload_sha256=refreshed_payload_sha256,
-    )
     original_row = store.connection.execute(
         """
         SELECT payload_json FROM github_snapshots
@@ -1480,12 +1900,43 @@ def claim_decision_in_transaction(
     if original_row is None:
         raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_MISSING")
     original_payload = json.loads(original_row["payload_json"])
-    if _stable_source_payload(original_payload) != _stable_source_payload(
-        refreshed.payload
+    current = store.current_snapshot(
+        packet["repository"], "issue", packet["owning_issue"]
+    )
+    if current is None:
+        raise CoordinationError("APPROVAL_CURRENT_SOURCE_MISSING")
+    if (
+        expected_current_source_sha256 is not None
+        and current.payload_sha256 != expected_current_source_sha256
+    ):
+        raise CoordinationError("APPROVAL_CURRENT_SOURCE_DIGEST_DRIFT")
+    if _stable_source_payload(current.payload) != _stable_source_payload(
+        refreshed_payload
     ):
         raise CoordinationError("APPROVAL_SOURCE_DRIFT_AFTER_PUBLICATION")
+    if _stable_source_payload(original_payload) != _stable_source_payload(
+        refreshed_payload
+    ):
+        raise CoordinationError("APPROVAL_SOURCE_DRIFT_AFTER_PUBLICATION")
+    if ingest_refreshed_source:
+        refreshed = store.ingest_snapshot_in_transaction(
+            repository=packet["repository"],
+            object_kind="issue",
+            object_number=packet["owning_issue"],
+            payload=refreshed_payload,
+            source_updated_at=refreshed_payload.get(
+                "_projection_updated_at", refreshed_payload.get("updated_at", "")
+            ),
+            fetched_at=now,
+            expected_payload_sha256=refreshed_payload_sha256,
+        )
+        effective_payload = refreshed.payload
+    else:
+        # Readiness consumes authority against a canonical stable comparison
+        # without advancing the planning source cursor for comment-only churn.
+        effective_payload = refreshed_payload
 
-    effective_source_sha256 = digest_json(_stable_source_payload(refreshed.payload))
+    effective_source_sha256 = digest_json(_stable_source_payload(effective_payload))
     effectivity = store.connection.execute(
         "SELECT * FROM approval_effectivity WHERE proposal_sha256=?",
         (proposal_sha256,),

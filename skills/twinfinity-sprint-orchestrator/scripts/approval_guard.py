@@ -7,6 +7,8 @@ import json
 import sqlite3
 from typing import Any
 
+from executor_registry import identities_role_equivalent, identity_role
+
 
 SHA256_LENGTH = 64
 
@@ -51,6 +53,81 @@ def admission_execution_scope_sha256(payload: dict[str, Any]) -> str:
     )
 
 
+def capacity_policy_execution_scope_sha256(
+    *,
+    repository: str,
+    expected_prior_version: int,
+    development_limit: int,
+    shared_limit: int,
+    sre_limit: int,
+) -> str:
+    """Digest the complete authority-bearing capacity-policy mutation."""
+
+    return execution_scope_sha256(
+        {
+            "kind": "CAPACITY_POLICY",
+            "repository": repository,
+            "expected_prior_version": expected_prior_version,
+            "development_limit": development_limit,
+            "shared_limit": shared_limit,
+            "sre_limit": sre_limit,
+        }
+    )
+
+
+def readiness_execution_scope_sha256(
+    *,
+    repository: str,
+    issue_number: int,
+    source_payload_sha256: str,
+    campaign_id: int,
+    generation: int,
+    item_version: int,
+    accepted_main_sha: str,
+    graph_version: int,
+    capacity_policy_version: int,
+    candidate_sha256: str,
+    worker_role: str,
+    worker_endpoint_id: str,
+    worker_attempt_id: str,
+    parent_plan_sha256: str,
+    material_boundary: str,
+) -> str:
+    """Digest the complete authority-bearing readiness approval wait.
+
+    The decision mapping is deliberately fixed in the digest contract rather
+    than supplied by a worker: APPROVE resumes one deterministic successor;
+    every other user outcome preserves the lineage on HOLD.
+    """
+
+    return execution_scope_sha256(
+        {
+            "kind": "READINESS_APPROVAL",
+            "repository": repository,
+            "issue_number": issue_number,
+            "source_payload_sha256": source_payload_sha256,
+            "campaign_id": campaign_id,
+            "generation": generation,
+            "item_version": item_version,
+            "accepted_main_sha": accepted_main_sha,
+            "graph_version": graph_version,
+            "capacity_policy_version": capacity_policy_version,
+            "candidate_sha256": candidate_sha256,
+            "worker_role": worker_role,
+            "worker_endpoint_id": worker_endpoint_id,
+            "worker_attempt_id": worker_attempt_id,
+            "parent_plan_sha256": parent_plan_sha256,
+            "material_boundary": material_boundary,
+            "decision_mapping": {
+                "APPROVE": "APPROVAL_RESUME",
+                "REJECT": "HOLD",
+                "DEFER": "HOLD",
+                "COURSE_CORRECT": "HOLD",
+            },
+        }
+    )
+
+
 def hosted_execution_scope_sha256(
     *,
     provider: str,
@@ -86,6 +163,11 @@ def require_effective_approval(
     execution_scope_sha256: str | None = None,
     authority_sha256: str | None = None,
     authority_comment_id: int | None = None,
+    required_proposal_sha256: str | None = None,
+    required_workstream: str | None = None,
+    required_boundary: str | None = None,
+    required_current_recipient_role: str | None = None,
+    actor_session_id: str | None = None,
     required: bool,
 ) -> dict[str, Any] | None:
     """Require one current APPROVE decision and its exact execution binding.
@@ -100,6 +182,7 @@ def require_effective_approval(
     tables = {
         "approval_current",
         "approval_proposals",
+        "approval_submissions",
         "approval_interests",
         "approval_decisions",
         "approval_deliveries",
@@ -111,16 +194,71 @@ def require_effective_approval(
             raise ApprovalGuardError("APPROVAL_LEDGER_REQUIRED")
         return None
 
+    actor = actor_session_id or recipient_session_id
+    if required_current_recipient_role is not None:
+        current_recipient = connection.execute(
+            """
+            SELECT endpoint.endpoint_id
+            FROM executor_role_endpoint_current current
+            JOIN executor_role_endpoints endpoint
+              ON endpoint.endpoint_id=current.endpoint_id
+             AND endpoint.role=current.role
+            WHERE current.role=?
+            """,
+            (required_current_recipient_role,),
+        ).fetchone()
+        if (
+            current_recipient is None
+            or current_recipient["endpoint_id"] != actor
+        ):
+            raise ApprovalGuardError("APPROVAL_CURRENT_RECIPIENT_REQUIRED")
+
+    if required_proposal_sha256 is not None and (
+        len(required_proposal_sha256) != SHA256_LENGTH
+        or any(
+            character not in "0123456789abcdef"
+            for character in required_proposal_sha256
+        )
+    ):
+        raise ApprovalGuardError("APPROVAL_PROPOSAL_BINDING_INVALID")
+    if required_workstream is not None and (
+        not isinstance(required_workstream, str) or not required_workstream.strip()
+    ):
+        raise ApprovalGuardError("APPROVAL_WORKSTREAM_BINDING_INVALID")
+
     proposals = connection.execute(
         """
-        SELECT p.proposal_sha256
+        SELECT DISTINCT p.proposal_sha256, i.recipient_session_id
         FROM approval_current c
         JOIN approval_proposals p USING(proposal_sha256)
         JOIN approval_interests i USING(proposal_sha256)
-        WHERE p.repository=? AND p.owning_issue=? AND i.recipient_session_id=?
+        WHERE p.repository=? AND p.owning_issue=?
+          AND (? IS NULL OR p.proposal_sha256=?)
+          AND (? IS NULL OR EXISTS (
+              SELECT 1 FROM approval_submissions submission
+              WHERE submission.proposal_sha256=p.proposal_sha256
+                AND submission.workstream=?
+          ))
+          AND (? IS NULL OR p.boundary=?)
         """,
-        (repository, issue_number, recipient_session_id),
+        (
+            repository,
+            issue_number,
+            required_proposal_sha256,
+            required_proposal_sha256,
+            required_workstream,
+            required_workstream,
+            required_boundary,
+            required_boundary,
+        ),
     ).fetchall()
+    proposals = [
+        row
+        for row in proposals
+        if identities_role_equivalent(
+            connection, str(row["recipient_session_id"]), actor
+        )
+    ]
     if not proposals:
         if required:
             raise ApprovalGuardError("APPROVAL_DECISION_REQUIRED")
@@ -133,7 +271,16 @@ def require_effective_approval(
         raise ApprovalGuardError("APPROVAL_EXECUTION_SCOPE_MISSING")
 
     clauses: list[str] = []
-    parameters: list[Any] = [repository, issue_number, recipient_session_id]
+    parameters: list[Any] = [
+        repository,
+        issue_number,
+        required_proposal_sha256,
+        required_proposal_sha256,
+        required_workstream,
+        required_workstream,
+        required_boundary,
+        required_boundary,
+    ]
     if authority_sha256 is not None:
         clauses.append("d.decision_sha256=?")
         parameters.append(authority_sha256)
@@ -142,15 +289,17 @@ def require_effective_approval(
         parameters.append(f"comment:{authority_comment_id}")
     if not clauses:
         raise ApprovalGuardError("APPROVAL_AUTHORITY_BINDING_MISSING")
-    match = connection.execute(
+    matches = connection.execute(
         f"""
-        SELECT p.proposal_sha256, d.decision_sha256, d.decision,
+        SELECT p.proposal_sha256, p.boundary, x.recipient_session_id,
+               d.decision_sha256, d.decision,
                x.state AS delivery_state, e.effective_source_sha256,
                e.remote_receipt, o.state AS outbox_state,
                o.remote_receipt AS outbox_receipt,
                current.payload_sha256 AS current_source_sha256,
                current_snapshot.payload_json AS current_source_json,
-               d.execution_scope_sha256 AS approved_execution_scope_sha256
+               d.execution_scope_sha256 AS approved_execution_scope_sha256,
+               d.planner_session_id
         FROM approval_current c
         JOIN approval_proposals p USING(proposal_sha256)
         JOIN approval_decisions d USING(proposal_sha256)
@@ -167,16 +316,46 @@ def require_effective_approval(
          AND current_snapshot.object_kind=current.object_kind
          AND current_snapshot.object_number=current.object_number
          AND current_snapshot.payload_sha256=current.payload_sha256
-        WHERE p.repository=? AND p.owning_issue=? AND x.recipient_session_id=?
+        WHERE p.repository=? AND p.owning_issue=?
+          AND (? IS NULL OR p.proposal_sha256=?)
+          AND (? IS NULL OR EXISTS (
+              SELECT 1 FROM approval_submissions submission
+              WHERE submission.proposal_sha256=p.proposal_sha256
+                AND submission.workstream=?
+          ))
+          AND (? IS NULL OR p.boundary=?)
           AND r.decision_sha256 IS NULL
           AND ({' OR '.join(clauses)})
         """,
         tuple(parameters),
-    ).fetchone()
+    ).fetchall()
+    role_matches = [
+        row
+        for row in matches
+        if identities_role_equivalent(
+            connection, str(row["recipient_session_id"]), actor
+        )
+    ]
+    if len(role_matches) > 1:
+        raise ApprovalGuardError("APPROVAL_AUTHORITY_AMBIGUOUS")
+    match = None if not role_matches else role_matches[0]
     if match is None:
         raise ApprovalGuardError("APPROVAL_AUTHORITY_MISMATCH")
     if match["approved_execution_scope_sha256"] != execution_scope_sha256:
         raise ApprovalGuardError("APPROVAL_EXECUTION_SCOPE_MISMATCH")
+    if required_boundary is not None and match["boundary"] != required_boundary:
+        raise ApprovalGuardError("APPROVAL_BOUNDARY_MISMATCH")
+    if (
+        required_current_recipient_role is not None
+        and (
+            identity_role(connection, str(match["planner_session_id"]))
+            != required_current_recipient_role
+            or not identities_role_equivalent(
+                connection, str(match["planner_session_id"]), actor
+            )
+        )
+    ):
+        raise ApprovalGuardError("APPROVAL_PLANNER_IDENTITY_MISMATCH")
     if match["decision"] != "APPROVE":
         raise ApprovalGuardError("APPROVAL_DECISION_NOT_APPROVED")
     if match["delivery_state"] not in {"CLAIMED", "ACKNOWLEDGED"}:

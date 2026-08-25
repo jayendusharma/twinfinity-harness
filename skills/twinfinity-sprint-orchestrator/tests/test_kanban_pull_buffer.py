@@ -12,12 +12,14 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from coordination_store import CoordinationStore  # noqa: E402
+from coordination_store import CoordinationError, CoordinationStore  # noqa: E402
 from kanban_pull_buffer import (  # noqa: E402
     PullBufferError,
     audit_pull_buffer,
     register_candidate,
+    show_pull_buffer,
 )
+from kanban_readiness import ensure_schema as ensure_readiness_schema  # noqa: E402
 from portfolio_graph import replace_graph, sync_head  # noqa: E402
 
 
@@ -68,7 +70,7 @@ class KanbanPullBufferTests(unittest.TestCase):
         self.sources[number] = snapshot.payload_sha256
 
     def _item(self, number: int, status: str) -> None:
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=number,
             status=status,
@@ -234,14 +236,14 @@ class KanbanPullBufferTests(unittest.TestCase):
                 "SELECT payload_json FROM portfolio_dirty_events"
             )
         }
-        self.assertEqual({"CANDIDATE_REGISTERED"}, triggers)
+        self.assertEqual(set(), triggers)
 
     def test_ready_registration_fails_closed_on_incomplete_admission(self) -> None:
         current = self.store.connection.execute(
             "SELECT version FROM coordination_items WHERE repository=? AND issue_number=251",
             (REPOSITORY,),
         ).fetchone()
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=251,
             status="READY",
@@ -267,7 +269,9 @@ class KanbanPullBufferTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(PullBufferError, "ADMISSION_PACKET_INVALID"):
+        with self.assertRaisesRegex(
+            PullBufferError, "PULL_BUFFER_READY_FINALIZER_REQUIRED"
+        ):
             register_candidate(
                 self.store.connection,
                 self.database,
@@ -280,6 +284,40 @@ class KanbanPullBufferTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_current WHERE issue_number=251"
             ).fetchone()[0],
         )
+
+    def test_direct_ready_transition_requires_atomic_finalizer(self) -> None:
+        ensure_readiness_schema(self.store.connection)
+        current = self.store.connection.execute(
+            "SELECT version FROM coordination_items WHERE repository=? AND issue_number=251",
+            (REPOSITORY,),
+        ).fetchone()
+
+        with self.assertRaisesRegex(
+            CoordinationError, "READY_FINALIZATION_REQUIRED"
+        ):
+            self.store.set_issue_status(
+                repository=REPOSITORY,
+                issue_number=251,
+                status="READY",
+                allocation_class="NONE",
+                generation=1,
+                accountable_session_id=None,
+                lease_manifest_sha256=None,
+                development_units=1,
+                shared_units=1,
+                sre_units=0,
+                expected_source_sha256=self.sources[251],
+                expected_version=int(current["version"]),
+                now="2026-08-24T02:00:02Z",
+            )
+
+        unchanged = self.store.connection.execute(
+            "SELECT status, version FROM coordination_items "
+            "WHERE repository=? AND issue_number=251",
+            (REPOSITORY,),
+        ).fetchone()
+        self.assertEqual("PREPARED", unchanged["status"])
+        self.assertEqual(int(current["version"]), int(unchanged["version"]))
 
     def test_missing_second_lane_records_typed_deficit(self) -> None:
         register_candidate(
@@ -313,7 +351,7 @@ class KanbanPullBufferTests(unittest.TestCase):
             self._packet(251, "END_TO_END"),
             now="2026-08-24T02:00:04Z",
         )
-        self.store.set_capacity_policy(
+        self.store._set_capacity_policy_for_test_fixture(
             repository=REPOSITORY,
             development_limit=6,
             shared_limit=3,
@@ -339,13 +377,13 @@ class KanbanPullBufferTests(unittest.TestCase):
         self.assertTrue({"MAIN_DRIFT", "CAPACITY_POLICY_DRIFT"} <= reasons)
         self.assertNotIn("GRAPH_STALE", reasons)
         self.assertEqual(
-            0,
+            2,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_current"
             ).fetchone()[0],
         )
         self.assertEqual(
-            2,
+            0,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_retirements"
             ).fetchone()[0],
@@ -451,7 +489,7 @@ class KanbanPullBufferTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            0,
+            1,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_current"
             ).fetchone()[0],
@@ -461,13 +499,13 @@ class KanbanPullBufferTests(unittest.TestCase):
             "version=1 WHERE repository=? AND issue_number=115",
             (REPOSITORY,),
         )
-        with self.assertRaisesRegex(PullBufferError, "PULL_BUFFER_CANDIDATE_RETIRED"):
-            register_candidate(
-                self.store.connection,
-                self.database,
-                packet_path,
-                now="2026-08-24T02:00:05Z",
-            )
+        replay = register_candidate(
+            self.store.connection,
+            self.database,
+            packet_path,
+            now="2026-08-24T02:00:05Z",
+        )
+        self.assertEqual("PREPARED_NOT_READY", replay["state"])
 
     def test_duplicate_packet_key_fails_before_registration(self) -> None:
         plans = self.root / "plans"
@@ -549,6 +587,29 @@ class KanbanPullBufferTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM portfolio_pull_buffer_candidates"
             ).fetchone()[0],
         )
+
+    def test_observational_audit_and_show_are_query_only_safe(self) -> None:
+        register_candidate(
+            self.store.connection,
+            self.database,
+            self._packet(115, "BOUNDED_ENABLER"),
+            now="2026-08-24T02:00:03Z",
+        )
+        before_changes = self.store.connection.total_changes
+        self.store.connection.execute("PRAGMA query_only=ON")
+        try:
+            audit = audit_pull_buffer(
+                self.store.connection,
+                REPOSITORY,
+                record=False,
+                now="2026-08-24T02:00:04Z",
+            )
+            shown = show_pull_buffer(self.store.connection, REPOSITORY)
+        finally:
+            self.store.connection.execute("PRAGMA query_only=OFF")
+        self.assertEqual(before_changes, self.store.connection.total_changes)
+        self.assertEqual("PULL_BUFFER_DEFICIT", audit["state"])
+        self.assertEqual(1, len(shown["candidates"]))
 
 
 if __name__ == "__main__":
