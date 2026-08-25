@@ -2403,6 +2403,108 @@ def _resolution_action_start_matches(
     return _resolution_observation_matches(observation, expected_digest)
 
 
+def _resolution_action_start_receipt(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    actions: list[dict[str, Any]],
+    action_index: int,
+) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+    action = actions[action_index]
+    action_sha256 = digest_json(action)
+    start = connection.execute(
+        "SELECT * FROM portfolio_readiness_resolution_action_starts "
+        "WHERE notice_message_id=? AND action_sha256=?",
+        (int(row["message_id"]), action_sha256),
+    ).fetchone()
+    completion = connection.execute(
+        "SELECT * FROM portfolio_readiness_resolution_action_completions "
+        "WHERE notice_message_id=? AND action_sha256=?",
+        (int(row["message_id"]), action_sha256),
+    ).fetchone()
+    if start is not None and (
+        int(start["action_index"]) != action_index
+        or int(start["campaign_id"]) != int(row["resolution_campaign_id"])
+        or int(start["receipt_id"]) != int(row["resolution_receipt_id"])
+        or start["context_sha256"] != row["context_sha256"]
+        or start["kind"] != action["kind"]
+        or start["target"] != action["target"]
+        or start["expected_digest"] != action["expected_digest"]
+        or start["desired_digest"] != action["desired_digest"]
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_ACTION_RECEIPT_CONFLICT")
+    if completion is not None and (
+        start is None
+        or completion["context_sha256"] != row["context_sha256"]
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_ACTION_RECEIPT_CONFLICT")
+    return start, completion
+
+
+def _require_resolution_action_predecessors(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    actions: list[dict[str, Any]],
+    action_index: int,
+) -> None:
+    """Require each frozen predecessor receipt and its durable owner effect."""
+
+    current = actions[action_index]
+    for predecessor_index, predecessor in enumerate(actions[:action_index]):
+        start, completion = _resolution_action_start_receipt(
+            connection, row, actions, predecessor_index
+        )
+        if start is None:
+            raise ReadinessError("READINESS_RESOLUTION_ACTION_ORDER_REQUIRED")
+        source_to_graph = (
+            predecessor["kind"] == "REFRESH_SOURCE_SNAPSHOT"
+            and current["kind"] == "RECOMPUTE_DEPENDENCY_GRAPH"
+        )
+        if not source_to_graph and completion is None:
+            raise ReadinessError("READINESS_RESOLUTION_ACTION_ORDER_REQUIRED")
+        observation = _resolution_action_observation(
+            connection, row, predecessor
+        )
+        if source_to_graph:
+            if observation["observed_digest"] != predecessor["desired_digest"]:
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_ACTION_PREREQUISITE_EFFECT_MISSING"
+                )
+        elif not _resolution_observation_matches(
+            observation, str(predecessor["desired_digest"])
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_ACTION_PREREQUISITE_DRIFT"
+            )
+
+
+def _source_graph_completion_required(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    actions: list[dict[str, Any]],
+    source_index: int,
+) -> bool:
+    """Return whether a frozen downstream graph effect is still incomplete."""
+
+    for graph_index in range(source_index + 1, len(actions)):
+        graph = actions[graph_index]
+        if graph["kind"] != "RECOMPUTE_DEPENDENCY_GRAPH":
+            continue
+        start, completion = _resolution_action_start_receipt(
+            connection, row, actions, graph_index
+        )
+        if start is None or completion is None:
+            return True
+        observation = _resolution_action_observation(connection, row, graph)
+        if not _resolution_observation_matches(
+            observation, str(graph["desired_digest"])
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_ACTION_PREREQUISITE_DRIFT"
+            )
+        return False
+    return False
+
+
 def _resolution_context_payload(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2674,6 +2776,7 @@ def execute_readiness_resolution_action(
     _require_pull_buffer_schema(store.connection)
     action_input_sha256 = digest_json(action_input)
     execute_owner = True
+    source_effect_already_applied = False
     start_before_binding: dict[str, Any]
     start_binding_sha256: str
     with store.transaction():
@@ -2706,19 +2809,19 @@ def execute_readiness_resolution_action(
         action_index, action = matches[0]
         if action["expected_digest"] != expected_digest:
             raise ReadinessError("READINESS_RESOLUTION_ACTION_EXPECTED_DRIFT")
+        _require_resolution_action_predecessors(
+            store.connection, row, actions, action_index
+        )
         observation = _resolution_action_observation(
             store.connection, row, action
         )
-        start = store.connection.execute(
-            "SELECT * FROM portfolio_readiness_resolution_action_starts "
-            "WHERE notice_message_id=? AND action_sha256=?",
-            (message_id, action_sha256),
-        ).fetchone()
-        completion = store.connection.execute(
-            "SELECT * FROM portfolio_readiness_resolution_action_completions "
-            "WHERE notice_message_id=? AND action_sha256=?",
-            (message_id, action_sha256),
-        ).fetchone()
+        start, completion = _resolution_action_start_receipt(
+            store.connection, row, actions, action_index
+        )
+        source_effect_already_applied = (
+            action["kind"] == "REFRESH_SOURCE_SNAPSHOT"
+            and observation["observed_digest"] == action["desired_digest"]
+        )
         if start is None:
             if not _resolution_action_start_matches(
                 observation, expected_digest
@@ -2807,16 +2910,30 @@ def execute_readiness_resolution_action(
                 raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_INVALID")
             if digest_json(action_input["payload"]) != action["desired_digest"]:
                 raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_DRIFT")
-            with store.transaction():
-                store.ingest_snapshot_in_transaction(
-                    repository=str(row["repository"]),
-                    object_kind="issue",
-                    object_number=int(row["issue_number"]),
-                    payload=action_input["payload"],
-                    source_updated_at=str(action_input["source_updated_at"]),
-                    fetched_at=str(action_input["fetched_at"]),
-                    expected_payload_sha256=str(action["desired_digest"]),
-                )
+            if not source_effect_already_applied:
+                with store.transaction():
+                    store.ingest_snapshot_in_transaction(
+                        repository=str(row["repository"]),
+                        object_kind="issue",
+                        object_number=int(row["issue_number"]),
+                        payload=action_input["payload"],
+                        source_updated_at=str(action_input["source_updated_at"]),
+                        fetched_at=str(action_input["fetched_at"]),
+                        expected_payload_sha256=str(action["desired_digest"]),
+                    )
+            if _source_graph_completion_required(
+                store.connection, row, actions, action_index
+            ):
+                return {
+                    "schema": READINESS_RESOLUTION_ACTION_RECEIPT_SCHEMA,
+                    "message_id": message_id,
+                    "context_sha256": expected_context_sha256,
+                    "action_sha256": action_sha256,
+                    "before_binding_sha256": start_binding_sha256,
+                    "after_binding_sha256": None,
+                    "state": "WAITING_DEPENDENCY",
+                    "replay": source_effect_already_applied,
+                }
             try:
                 store.set_issue_status(
                     repository=str(row["repository"]),
@@ -2895,6 +3012,10 @@ def execute_readiness_resolution_action(
             planner_session_id=planner_session_id,
             require_pending=True,
         )
+        if kind == "REFRESH_SOURCE_SNAPSHOT" and _source_graph_completion_required(
+            store.connection, latest, actions, action_index
+        ):
+            raise ReadinessError("READINESS_RESOLUTION_ACTION_ORDER_REQUIRED")
         after = _resolution_action_observation(store.connection, latest, action)
         if not _resolution_observation_matches(
             after, str(action["desired_digest"])

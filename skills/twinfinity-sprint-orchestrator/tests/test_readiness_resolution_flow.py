@@ -807,6 +807,34 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
             now=CLAIMED_AT,
         )
 
+        def durable_counts() -> tuple[int, ...]:
+            return tuple(
+                self.h.store.connection.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM portfolio_graph_revisions),"
+                    "(SELECT COUNT(*) FROM portfolio_readiness_events),"
+                    "(SELECT COUNT(*) FROM portfolio_readiness_resolution_action_starts),"
+                    "(SELECT COUNT(*) FROM portfolio_readiness_resolution_action_completions),"
+                    "(SELECT COUNT(*) FROM coordination_events)"
+                ).fetchone()
+            )
+
+        before_out_of_order = durable_counts()
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_RESOLUTION_ACTION_ORDER_REQUIRED"
+        ):
+            execute_readiness_resolution_action(
+                self.h.store,
+                message_id=message_id,
+                planner_session_id=PLANNER,
+                expected_context_sha256=context["context_sha256"],
+                action_sha256=digest_json(actions[1]),
+                expected_digest=actions[1]["expected_digest"],
+                action_input={"plan": graph_plan},
+                now=CLAIMED_AT,
+            )
+        self.assertEqual(before_out_of_order, durable_counts())
+
         source_receipt = execute_readiness_resolution_action(
             self.h.store,
             message_id=message_id,
@@ -823,6 +851,67 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         )
         self.assertEqual("WAITING_DEPENDENCY", source_receipt["state"])
         self.assertIsNone(source_receipt["after_binding_sha256"])
+        source_events = self.h.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_events "
+            "WHERE event_type='SOURCE_REFRESHED'"
+        ).fetchone()[0]
+        waiting_replay = execute_readiness_resolution_action(
+            self.h.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            expected_context_sha256=context["context_sha256"],
+            action_sha256=digest_json(actions[0]),
+            expected_digest=actions[0]["expected_digest"],
+            action_input={
+                "payload": next_payload,
+                "source_updated_at": CLAIMED_AT,
+                "fetched_at": CLAIMED_AT,
+            },
+            now=CLAIMED_AT,
+        )
+        self.assertEqual("WAITING_DEPENDENCY", waiting_replay["state"])
+        self.assertTrue(waiting_replay["replay"])
+        self.assertEqual(
+            source_events,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events "
+                "WHERE event_type='SOURCE_REFRESHED'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_resolution_action_completions "
+                "WHERE notice_message_id=? AND action_sha256=?",
+                (message_id, digest_json(actions[0])),
+            ).fetchone()[0],
+        )
+
+        premature_candidate_path = self.h._candidate_path(
+            desired_packet, "premature-full-correction"
+        )
+        candidate_count = self.h.store.connection.execute(
+            "SELECT COUNT(*) FROM portfolio_pull_buffer_candidates"
+        ).fetchone()[0]
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_RESOLUTION_ACTION_ORDER_REQUIRED"
+        ):
+            execute_readiness_resolution_action(
+                self.h.store,
+                message_id=message_id,
+                planner_session_id=PLANNER,
+                expected_context_sha256=context["context_sha256"],
+                action_sha256=digest_json(actions[2]),
+                expected_digest=actions[2]["expected_digest"],
+                action_input={"packet_path": str(premature_candidate_path)},
+                now=CLAIMED_AT,
+            )
+        self.assertEqual(
+            candidate_count,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_pull_buffer_candidates"
+            ).fetchone()[0],
+        )
         graph_receipt = execute_readiness_resolution_action(
             self.h.store,
             message_id=message_id,
@@ -868,6 +957,33 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
             now=CLAIMED_AT,
         )
         self.assertEqual("COMPLETE", candidate_receipt["state"])
+
+        receipts_before_replay = durable_counts()
+        for action, action_input in (
+            (
+                actions[0],
+                {
+                    "payload": next_payload,
+                    "source_updated_at": CLAIMED_AT,
+                    "fetched_at": CLAIMED_AT,
+                },
+            ),
+            (actions[1], {"plan": graph_plan}),
+            (actions[2], {"packet_path": str(candidate_path)}),
+        ):
+            replay = execute_readiness_resolution_action(
+                self.h.store,
+                message_id=message_id,
+                planner_session_id=PLANNER,
+                expected_context_sha256=context["context_sha256"],
+                action_sha256=digest_json(action),
+                expected_digest=action["expected_digest"],
+                action_input=action_input,
+                now=CLAIMED_AT,
+            )
+            self.assertEqual("COMPLETE", replay["state"])
+            self.assertTrue(replay["replay"])
+        self.assertEqual(receipts_before_replay, durable_counts())
 
         result = apply_readiness_resolution(
             self.h.store,

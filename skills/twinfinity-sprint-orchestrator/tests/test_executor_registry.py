@@ -1206,7 +1206,7 @@ class ExecutorRegistryTests(unittest.TestCase):
         item = self.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=92,
-            status="READY",
+            status="PREPARED",
             allocation_class="NONE",
             generation=1,
             accountable_session_id=DEVELOPMENT_ENDPOINT,
@@ -1242,7 +1242,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             self.store.set_issue_status(
                 repository=REPOSITORY,
                 issue_number=92,
-                status="READY",
+                status="PREPARED",
                 allocation_class="NONE",
                 generation=1,
                 accountable_session_id=DEVELOPMENT_ENDPOINT,
