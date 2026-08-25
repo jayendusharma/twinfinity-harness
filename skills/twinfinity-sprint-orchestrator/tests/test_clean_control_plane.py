@@ -33,8 +33,152 @@ class CleanControlPlaneTests(unittest.TestCase):
         self.root.chmod(0o700)
         self.archive = self.root / "old-archive.sqlite3"
         connection = sqlite3.connect(self.archive)
-        connection.execute("CREATE TABLE old_state(value TEXT NOT NULL)")
-        connection.execute("INSERT INTO old_state VALUES ('queryable')")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE portfolio_readiness_campaigns(
+                id INTEGER PRIMARY KEY, repository TEXT, issue_number INTEGER,
+                generation INTEGER, item_version INTEGER,
+                source_payload_sha256 TEXT, accepted_main_sha TEXT,
+                graph_version INTEGER, capacity_policy_version INTEGER,
+                candidate_sha256 TEXT, worker_role TEXT, phase_summary TEXT,
+                plan_sha256 TEXT, plan_json TEXT, parent_campaign_id INTEGER,
+                transition_kind TEXT, resolution_ordinal INTEGER
+            );
+            CREATE TABLE portfolio_readiness_current(
+                repository TEXT, issue_number INTEGER, campaign_id INTEGER,
+                state TEXT, message_id INTEGER, attempt_id TEXT,
+                endpoint_id TEXT, version INTEGER
+            );
+            CREATE TABLE portfolio_pull_buffer_candidates(
+                repository TEXT, issue_number INTEGER, candidate_sha256 TEXT,
+                state TEXT
+            );
+            CREATE TABLE coordination_messages(
+                id INTEGER PRIMARY KEY, state TEXT, payload_sha256 TEXT
+            );
+            CREATE TABLE executor_attempts(
+                attempt_id TEXT PRIMARY KEY, state TEXT, target_kind TEXT,
+                target_key TEXT, endpoint_id TEXT
+            );
+            CREATE TABLE portfolio_readiness_receipts(campaign_id INTEGER);
+            """
+        )
+        self.archive_lineages: list[dict[str, object]] = []
+        for ordinal, (issue_number, identity) in enumerate(
+            clean.STRANDED_IDENTITIES.items(), start=1
+        ):
+            campaign_id, attempt_id = identity
+            message_id = 3_000 + issue_number
+            source_sha = f"{ordinal}" * 64
+            candidate_sha = f"{ordinal + 2}" * 64
+            message_sha = f"{ordinal + 4}" * 64
+            plan = {"campaign_id": campaign_id, "issue_number": issue_number}
+            plan_json = clean.canonical_json(plan)
+            plan_sha = clean.digest_json(plan)
+            endpoint_id = (
+                "role.development.v5" if issue_number == 328 else "role.sre.v5"
+            )
+            projection = {
+                "campaign_id": campaign_id,
+                "repository": "twinfinityai/twinfinityapp",
+                "issue_number": issue_number,
+                "generation": 1,
+                "item_version": 1,
+                "source_payload_sha256": source_sha,
+                "accepted_main_sha": APPLICATION_MAIN,
+                "graph_version": 1,
+                "capacity_policy_version": 1,
+                "candidate_sha256": candidate_sha,
+                "worker_role": "development" if issue_number == 328 else "sre",
+                "phase_summary": "stranded malformed readiness",
+                "plan_sha256": plan_sha,
+                "plan_json": plan_json,
+                "parent_campaign_id": None,
+                "transition_kind": None,
+                "resolution_ordinal": 0,
+                "campaign_state": "RUNNING",
+                "message_id": message_id,
+                "attempt_id": attempt_id,
+                "endpoint_id": endpoint_id,
+                "current_version": 2,
+            }
+            connection.execute(
+                """
+                INSERT INTO portfolio_readiness_campaigns VALUES(
+                    ?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?
+                )
+                """,
+                (
+                    campaign_id,
+                    projection["repository"],
+                    issue_number,
+                    projection["generation"],
+                    projection["item_version"],
+                    source_sha,
+                    APPLICATION_MAIN,
+                    projection["graph_version"],
+                    projection["capacity_policy_version"],
+                    candidate_sha,
+                    projection["worker_role"],
+                    projection["phase_summary"],
+                    plan_sha,
+                    plan_json,
+                    None,
+                    None,
+                    0,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO portfolio_readiness_current VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    projection["repository"],
+                    issue_number,
+                    campaign_id,
+                    projection["campaign_state"],
+                    message_id,
+                    attempt_id,
+                    endpoint_id,
+                    projection["current_version"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO portfolio_pull_buffer_candidates VALUES(?,?,?,?)",
+                (
+                    projection["repository"],
+                    issue_number,
+                    candidate_sha,
+                    "PREPARED_NOT_READY",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO coordination_messages VALUES(?,?,?)",
+                (message_id, "CLAIMED", message_sha),
+            )
+            connection.execute(
+                "INSERT INTO executor_attempts VALUES(?,?,?,?,?)",
+                (attempt_id, "COMPLETE", "message", str(message_id), endpoint_id),
+            )
+            self.archive_lineages.append(
+                {
+                    "repository": projection["repository"],
+                    "issue_number": issue_number,
+                    "campaign_id": campaign_id,
+                    "attempt_id": attempt_id,
+                    "source_payload_sha256": source_sha,
+                    "campaign_sha256": clean.digest_json(projection),
+                    "candidate_sha256": candidate_sha,
+                    "plan_sha256": plan_sha,
+                    "message_payload_sha256": message_sha,
+                    "campaign_state": "RUNNING",
+                    "candidate_state": "PREPARED_NOT_READY",
+                    "message_id": message_id,
+                    "message_state": "CLAIMED",
+                    "attempt_state": "COMPLETE",
+                    "disposition": "SUPERSEDED_WITHOUT_REPLAY",
+                    "receipt_fabricated": False,
+                }
+            )
         connection.commit()
         connection.close()
         self.archive.chmod(0o600)
@@ -60,7 +204,7 @@ class CleanControlPlaneTests(unittest.TestCase):
                 }
             )
             retained_root = self.root / "retained"
-            retained_root.mkdir(mode=0o700)
+            retained_root.mkdir(mode=0o700, exist_ok=True)
             lease = {
                 "repository": "twinfinityai/twinfinityapp",
                 "issue_number": 320,
@@ -91,6 +235,7 @@ class CleanControlPlaneTests(unittest.TestCase):
                 "source_payload_sha256": payload_sha,
                 "lease_manifest_path": "retained/lease.json",
                 "lease_manifest_sha256": sha(lease_path),
+                "lease_bindings": copy.deepcopy(lease["paths"]),
                 "development_units": 0,
                 "shared_units": 0,
                 "sre_units": 1,
@@ -154,11 +299,30 @@ class CleanControlPlaneTests(unittest.TestCase):
                 "archive_sha256": sha(self.archive),
                 "archive_integrity": "ok",
                 "disposition": "IMMUTABLE_ARCHIVE_SUPERSEDED",
-                "excluded_lineages": copy.deepcopy(clean.STRANDED_LINEAGES),
+                "excluded_lineages": copy.deepcopy(self.archive_lineages),
             },
         }
         value["manifest_sha256"] = clean.manifest_digest(value)
         return value
+
+    def rewrite_retained_lease(
+        self, manifest: dict[str, object], **updates: object
+    ) -> None:
+        retained = manifest["retained_item"]
+        assert isinstance(retained, dict)
+        lease_path = self.root / str(retained["lease_manifest_path"])
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        lease.update(updates)
+        lease_path.write_text(clean.canonical_json(lease), encoding="utf-8")
+        lease_path.chmod(0o600)
+        lease_sha = sha(lease_path)
+        retained["lease_manifest_sha256"] = lease_sha
+        artifacts = retained["artifacts"]
+        assert isinstance(artifacts, list)
+        for artifact in artifacts:
+            if artifact["path"] == retained["lease_manifest_path"]:
+                artifact["sha256"] = lease_sha
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
 
     def test_creates_and_validates_clean_database_without_retained_work(self) -> None:
         database = self.root / "clean.sqlite3"
@@ -180,7 +344,10 @@ class CleanControlPlaneTests(unittest.TestCase):
             self.assertEqual(clean.EXPECTED_ENDPOINTS, pointers)
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM portfolio_readiness_campaigns").fetchone()[0])
             stored = json.loads(connection.execute("SELECT manifest_json FROM coordination_bootstrap_provenance").fetchone()[0])
-            self.assertEqual(clean.STRANDED_LINEAGES, stored["old_control_plane"]["excluded_lineages"])
+            self.assertEqual(
+                self.archive_lineages,
+                stored["old_control_plane"]["excluded_lineages"],
+            )
         finally:
             connection.close()
 
@@ -251,6 +418,76 @@ class CleanControlPlaneTests(unittest.TestCase):
                 database=self.root / "candidate.sqlite3",
                 harness_main_sha=HARNESS_MAIN,
             )
+
+    def test_archive_must_contain_exact_authenticated_stranded_lineages(self) -> None:
+        manifest = self.manifest()
+        connection = sqlite3.connect(self.archive)
+        connection.execute(
+            "UPDATE portfolio_readiness_current SET state='HOLD' WHERE issue_number=328"
+        )
+        connection.commit()
+        connection.close()
+        manifest["old_control_plane"]["archive_sha256"] = sha(self.archive)  # type: ignore[index]
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_ARCHIVE_LINEAGE_MISMATCH"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "candidate.sqlite3",
+                harness_main_sha=HARNESS_MAIN,
+            )
+
+        unrelated = self.root / "unrelated.sqlite3"
+        connection = sqlite3.connect(unrelated)
+        connection.execute("CREATE TABLE unrelated(value TEXT)")
+        connection.commit()
+        connection.close()
+        unrelated.chmod(0o600)
+        manifest = self.manifest()
+        manifest["old_control_plane"]["archive_path"] = str(unrelated)  # type: ignore[index]
+        manifest["old_control_plane"]["archive_sha256"] = sha(unrelated)  # type: ignore[index]
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_ARCHIVE_UNREADABLE"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "candidate.sqlite3",
+                harness_main_sha=HARNESS_MAIN,
+            )
+
+    def test_retained_lease_identity_base_and_paths_are_exactly_bound(self) -> None:
+        cases = (
+            {"issue_number": 999},
+            {"base_sha": "f" * 40},
+            {
+                "paths": [
+                    {
+                        "path": "infra/different.txt",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": None,
+                    }
+                ]
+            },
+        )
+        for updates in cases:
+            with self.subTest(updates=updates):
+                manifest = self.manifest(retained=True)
+                self.rewrite_retained_lease(manifest, **updates)
+                with self.assertRaisesRegex(
+                    clean.CleanControlPlaneError,
+                    "BOOTSTRAP_LEASE_BINDING_MISMATCH",
+                ):
+                    clean._validate_manifest(
+                        manifest,
+                        source_root=SOURCE_ROOT,
+                        database=self.root / "candidate.sqlite3",
+                        harness_main_sha=HARNESS_MAIN,
+                    )
 
 
 if __name__ == "__main__":

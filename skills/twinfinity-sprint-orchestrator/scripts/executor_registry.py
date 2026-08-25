@@ -514,6 +514,50 @@ def _read_regular_owner_file(
         os.close(descriptor)
 
 
+def _validate_profile_directory(value: Any, error_prefix: str) -> Path:
+    """Reject profile roots that traverse links or mutable shared directories."""
+
+    try:
+        path = Path(os.fspath(value))
+    except TypeError as exc:
+        raise RegistryError(f"{error_prefix}_INVALID") from exc
+    if not path.is_absolute():
+        raise RegistryError(f"{error_prefix}_INVALID")
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    anchor_metadata = current.lstat()
+    if (
+        not stat.S_ISDIR(anchor_metadata.st_mode)
+        or anchor_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RegistryError(f"{error_prefix}_UNSAFE")
+    parts = absolute.parts[1:]
+    for ordinal, part in enumerate(parts):
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise RegistryError(f"{error_prefix}_MISSING") from exc
+        is_final = ordinal == len(parts) - 1
+        shared_sticky_ancestor = not is_final and bool(
+            metadata.st_mode & stat.S_ISVTX
+        )
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (
+                metadata.st_uid not in {0, os.getuid()}
+                and not shared_sticky_ancestor
+            )
+            or (
+                metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                and not shared_sticky_ancestor
+            )
+        ):
+            raise RegistryError(f"{error_prefix}_UNSAFE")
+    return absolute
+
+
 def revalidate_owner_file_evidence(
     evidence: OwnerFileEvidence, error_prefix: str
 ) -> bytes:
@@ -685,7 +729,7 @@ def load_registry_config(
     path: Path = DEFAULT_CONFIG,
     *,
     codex_home: Path | None = None,
-    profile_template_root: Path = DEFAULT_PROFILE_TEMPLATE_ROOT,
+    profile_template_root: Path | None = DEFAULT_PROFILE_TEMPLATE_ROOT,
 ) -> RegistryConfig:
     """Load the closed current-and-rollback endpoint catalog."""
 
@@ -755,8 +799,16 @@ def load_registry_config(
     }
     if current_mutating["development"] & current_mutating["sre"]:
         raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
-    effective_codex_home = codex_home or _default_codex_home()
-    effective_template_root = profile_template_root
+    effective_codex_home = _validate_profile_directory(
+        _default_codex_home() if codex_home is None else codex_home,
+        "REGISTRY_CODEX_HOME",
+    )
+    effective_template_root = _validate_profile_directory(
+        DEFAULT_PROFILE_TEMPLATE_ROOT
+        if profile_template_root is None
+        else profile_template_root,
+        "REGISTRY_PROFILE_ROOT",
+    )
     profile_evidence = _validate_role_profiles(
         endpoints,
         codex_home=effective_codex_home,
@@ -2497,11 +2549,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "audit-config":
-            config = load_registry_config(
-                args.config,
-                codex_home=args.profile_root,
-                profile_template_root=args.profile_root,
-            )
+            if args.profile_root is None:
+                config = load_registry_config(args.config)
+            else:
+                config = load_registry_config(
+                    args.config,
+                    codex_home=args.profile_root,
+                    profile_template_root=args.profile_root,
+                )
             print(canonical_json({
                 "phase": "PASS",
                 "config_sha256": config.source_sha256,

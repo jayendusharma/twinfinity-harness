@@ -52,20 +52,52 @@ EXPECTED_ENDPOINTS = {
     "sre": "role.sre.v3",
 }
 SOURCE_HARNESS_REPOSITORY = "jayendusharma/twinfinity-harness"
-STRANDED_LINEAGES = [
-    {
-        "attempt_id": "d7f69b5a-dc4c-4d1e-b434-da4ab6cdb2d5",
-        "campaign_id": 1,
-        "disposition": "SUPERSEDED_WITHOUT_REPLAY",
-        "receipt_fabricated": False,
-    },
-    {
-        "attempt_id": "c448fd19-40a6-4511-bdf7-9ca7bbbb2788",
-        "campaign_id": 2,
-        "disposition": "SUPERSEDED_WITHOUT_REPLAY",
-        "receipt_fabricated": False,
-    },
-]
+STRANDED_IDENTITIES = {
+    328: (1, "d7f69b5a-dc4c-4d1e-b434-da4ab6cdb2d5"),
+    329: (2, "c448fd19-40a6-4511-bdf7-9ca7bbbb2788"),
+}
+ARCHIVE_CAMPAIGN_FIELDS = (
+    "campaign_id",
+    "repository",
+    "issue_number",
+    "generation",
+    "item_version",
+    "source_payload_sha256",
+    "accepted_main_sha",
+    "graph_version",
+    "capacity_policy_version",
+    "candidate_sha256",
+    "worker_role",
+    "phase_summary",
+    "plan_sha256",
+    "plan_json",
+    "parent_campaign_id",
+    "transition_kind",
+    "resolution_ordinal",
+    "campaign_state",
+    "message_id",
+    "attempt_id",
+    "endpoint_id",
+    "current_version",
+)
+ARCHIVE_LINEAGE_KEYS = {
+    "repository",
+    "issue_number",
+    "campaign_id",
+    "attempt_id",
+    "source_payload_sha256",
+    "campaign_sha256",
+    "candidate_sha256",
+    "plan_sha256",
+    "message_payload_sha256",
+    "campaign_state",
+    "candidate_state",
+    "message_id",
+    "message_state",
+    "attempt_state",
+    "disposition",
+    "receipt_fabricated",
+}
 
 
 class CleanControlPlaneError(RuntimeError):
@@ -74,6 +106,12 @@ class CleanControlPlaneError(RuntimeError):
 
 def digest_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def archive_campaign_digest(row: sqlite3.Row) -> str:
+    """Digest the exact archived campaign and current-pointer projection."""
+
+    return digest_json({field: row[field] for field in ARCHIVE_CAMPAIGN_FIELDS})
 
 
 def manifest_digest(manifest: dict[str, Any]) -> str:
@@ -148,7 +186,110 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_archive(value: dict[str, Any], database: Path) -> None:
+def _validate_archive_lineages(
+    connection: sqlite3.Connection,
+    lineages: list[dict[str, Any]],
+    application_repository: str,
+) -> None:
+    for lineage in lineages:
+        campaign = connection.execute(
+            """
+            SELECT campaign.repository,campaign.issue_number,campaign.generation,
+                   campaign.id AS campaign_id,
+                   campaign.item_version,campaign.source_payload_sha256,
+                   campaign.accepted_main_sha,campaign.graph_version,
+                   campaign.capacity_policy_version,campaign.candidate_sha256,
+                   campaign.worker_role,campaign.phase_summary,
+                   campaign.plan_sha256,campaign.plan_json,
+                   campaign.parent_campaign_id,campaign.transition_kind,
+                   campaign.resolution_ordinal,current.state AS campaign_state,
+                   current.message_id,current.attempt_id,current.endpoint_id,
+                   current.version AS current_version
+            FROM portfolio_readiness_campaigns AS campaign
+            JOIN portfolio_readiness_current AS current
+              ON current.campaign_id=campaign.id
+            WHERE campaign.id=? AND campaign.repository=?
+              AND campaign.issue_number=?
+            """,
+            (
+                lineage["campaign_id"],
+                application_repository,
+                lineage["issue_number"],
+            ),
+        ).fetchall()
+        if len(campaign) != 1:
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_LINEAGE_MISSING")
+        campaign_row = campaign[0]
+        try:
+            plan = json.loads(campaign_row["plan_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_PLAN_INVALID") from exc
+        if (
+            not isinstance(plan, dict)
+            or canonical_json(plan) != campaign_row["plan_json"]
+            or digest_json(plan) != campaign_row["plan_sha256"]
+            or campaign_row["source_payload_sha256"]
+            != lineage["source_payload_sha256"]
+            or campaign_row["candidate_sha256"] != lineage["candidate_sha256"]
+            or campaign_row["plan_sha256"] != lineage["plan_sha256"]
+            or archive_campaign_digest(campaign_row)
+            != lineage["campaign_sha256"]
+            or campaign_row["campaign_state"] != lineage["campaign_state"]
+            or campaign_row["message_id"] != lineage["message_id"]
+            or campaign_row["attempt_id"] != lineage["attempt_id"]
+        ):
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_LINEAGE_MISMATCH")
+        candidates = connection.execute(
+            """
+            SELECT state FROM portfolio_pull_buffer_candidates
+            WHERE repository=? AND issue_number=? AND candidate_sha256=?
+            """,
+            (
+                application_repository,
+                lineage["issue_number"],
+                lineage["candidate_sha256"],
+            ),
+        ).fetchall()
+        if len(candidates) != 1 or candidates[0]["state"] != lineage["candidate_state"]:
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_CANDIDATE_MISMATCH")
+        messages = connection.execute(
+            "SELECT state,payload_sha256 FROM coordination_messages WHERE id=?",
+            (lineage["message_id"],),
+        ).fetchall()
+        if (
+            len(messages) != 1
+            or messages[0]["state"] != lineage["message_state"]
+            or messages[0]["payload_sha256"]
+            != lineage["message_payload_sha256"]
+        ):
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_MESSAGE_MISMATCH")
+        attempts = connection.execute(
+            """
+            SELECT state,target_kind,target_key,endpoint_id
+            FROM executor_attempts WHERE attempt_id=?
+            """,
+            (lineage["attempt_id"],),
+        ).fetchall()
+        if (
+            len(attempts) != 1
+            or attempts[0]["state"] != lineage["attempt_state"]
+            or attempts[0]["target_kind"] != "message"
+            or attempts[0]["target_key"] != str(lineage["message_id"])
+            or attempts[0]["endpoint_id"] != campaign_row["endpoint_id"]
+        ):
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_ATTEMPT_MISMATCH")
+        if int(
+            connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_receipts WHERE campaign_id=?",
+                (lineage["campaign_id"],),
+            ).fetchone()[0]
+        ) != 0:
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_RECEIPT_PRESENT")
+
+
+def _validate_archive(
+    value: dict[str, Any], database: Path, application_repository: str
+) -> None:
     if not isinstance(value["archive_path"], str) or not value["archive_path"]:
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_PATH_INVALID")
     archive = Path(value["archive_path"])
@@ -165,7 +306,12 @@ def _validate_archive(value: dict[str, Any], database: Path) -> None:
     try:
         connection = open_owner_database_readonly(archive)
         try:
+            connection.row_factory = sqlite3.Row
             integrity = [str(row[0]) for row in connection.execute("PRAGMA integrity_check")]
+            if integrity == ["ok"]:
+                _validate_archive_lineages(
+                    connection, value["excluded_lineages"], application_repository
+                )
         finally:
             connection.close()
     except (UnsafeSQLitePathError, sqlite3.Error) as exc:
@@ -174,7 +320,7 @@ def _validate_archive(value: dict[str, Any], database: Path) -> None:
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_INTEGRITY_INVALID")
 
 
-def _validate_manifest(
+def _validate_manifest_closed(
     manifest: dict[str, Any],
     *,
     source_root: Path,
@@ -313,7 +459,8 @@ def _validate_manifest(
             {
                 "issue_number", "generation", "accountable_endpoint_id",
                 "source_payload_sha256", "lease_manifest_path",
-                "lease_manifest_sha256", "development_units", "shared_units",
+                "lease_manifest_sha256", "lease_bindings",
+                "development_units", "shared_units",
                 "sre_units", "artifacts",
             },
             "BOOTSTRAP_RETAINED_SCHEMA_INVALID",
@@ -352,9 +499,18 @@ def _validate_manifest(
         if _file_sha256(lease_path) != retained["lease_manifest_sha256"]:
             raise CleanControlPlaneError("BOOTSTRAP_LEASE_DIGEST_MISMATCH")
         try:
-            parse_structured_lease_manifest(lease_path.read_bytes())
+            parsed_lease = parse_structured_lease_manifest(lease_path.read_bytes())
         except (CoordinationError, OSError) as exc:
             raise CleanControlPlaneError("BOOTSTRAP_LEASE_MANIFEST_INVALID") from exc
+        if (
+            parsed_lease["repository"] != application["repository"]
+            or parsed_lease["issue_number"] != 320
+            or parsed_lease["generation"] != retained["generation"]
+            or parsed_lease["base_sha"] != application["main_sha"]
+            or not isinstance(retained["lease_bindings"], list)
+            or parsed_lease["paths"] != retained["lease_bindings"]
+        ):
+            raise CleanControlPlaneError("BOOTSTRAP_LEASE_BINDING_MISMATCH")
 
     old = _require_keys(
         manifest["old_control_plane"],
@@ -364,12 +520,88 @@ def _validate_manifest(
     if (
         old["archive_integrity"] != "ok"
         or old["disposition"] != "IMMUTABLE_ARCHIVE_SUPERSEDED"
-        or old["excluded_lineages"] != STRANDED_LINEAGES
+        or not isinstance(old["excluded_lineages"], list)
+        or len(old["excluded_lineages"]) != 2
     ):
         raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_SCHEMA_INVALID")
+    observed_issues: set[int] = set()
+    for lineage in old["excluded_lineages"]:
+        _require_keys(
+            lineage, ARCHIVE_LINEAGE_KEYS, "BOOTSTRAP_ARCHIVE_LINEAGE_SCHEMA_INVALID"
+        )
+        issue_number = lineage["issue_number"]
+        expected_identity = STRANDED_IDENTITIES.get(issue_number)
+        if (
+            expected_identity is None
+            or issue_number in observed_issues
+            or lineage["repository"] != application["repository"]
+            or (lineage["campaign_id"], lineage["attempt_id"])
+            != expected_identity
+            or type(lineage["message_id"]) is not int
+            or lineage["message_id"] <= 0
+            or lineage["campaign_state"]
+            not in {
+                "PENDING",
+                "RUNNING",
+                "RESOLUTION_PENDING",
+                "APPROVAL_PENDING",
+                "READY_ELIGIBLE",
+                "FINALIZED",
+                "HOLD",
+                "STALE",
+            }
+            or lineage["candidate_state"] not in {"PREPARED_NOT_READY", "READY"}
+            or lineage["message_state"]
+            not in {"PREPARED", "CLAIMED", "COMPLETE", "HOLD"}
+            or lineage["attempt_state"]
+            not in {
+                "RESERVED",
+                "LAUNCHING",
+                "RUNNING",
+                "COMPLETE",
+                "HOLD",
+                "LAUNCH_FAILED",
+            }
+            or lineage["disposition"] != "SUPERSEDED_WITHOUT_REPLAY"
+            or lineage["receipt_fabricated"] is not False
+        ):
+            raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_LINEAGE_SCHEMA_INVALID")
+        for key in (
+            "source_payload_sha256",
+            "campaign_sha256",
+            "candidate_sha256",
+            "plan_sha256",
+            "message_payload_sha256",
+        ):
+            _require_sha(
+                lineage[key], "BOOTSTRAP_ARCHIVE_LINEAGE_DIGEST_INVALID"
+            )
+        observed_issues.add(issue_number)
+    if observed_issues != set(STRANDED_IDENTITIES):
+        raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_LINEAGE_SCHEMA_INVALID")
     _require_sha(old["archive_sha256"], "BOOTSTRAP_ARCHIVE_DIGEST_INVALID")
-    _validate_archive(old, database)
+    _validate_archive(old, database, application["repository"])
     return config, artifacts
+
+
+def _validate_manifest(
+    manifest: dict[str, Any],
+    *,
+    source_root: Path,
+    database: Path,
+    harness_main_sha: str,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Validate arbitrary manifest input without exposing type errors."""
+
+    try:
+        return _validate_manifest_closed(
+            manifest,
+            source_root=source_root,
+            database=database,
+            harness_main_sha=harness_main_sha,
+        )
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
+        raise CleanControlPlaneError("BOOTSTRAP_MANIFEST_SCHEMA_INVALID") from exc
 
 
 def _validate_target(path: Path) -> Path:

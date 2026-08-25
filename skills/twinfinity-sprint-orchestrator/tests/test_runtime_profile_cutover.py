@@ -4,11 +4,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from executor_registry import RegistryError, load_registry_config  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +23,16 @@ EXPECTED_ENDPOINTS = {
     "sre": ("role.sre.v3", 3),
 }
 class RuntimeProfileCutoverTests(unittest.TestCase):
+    def audit_command(self, *extra: str) -> list[str]:
+        return [
+            sys.executable,
+            str(ROOT / "scripts" / "executor_registry.py"),
+            "--config",
+            str(ROOT / "references" / "twinfinity-executor-registry.toml"),
+            *extra,
+            "audit-config",
+        ]
+
     def test_source_profile_audit_does_not_read_or_write_live_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             absent_codex_home = Path(temporary) / "must-remain-absent"
@@ -57,6 +71,63 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 result["staged_endpoints"],
             )
             self.assertFalse(absent_codex_home.exists())
+
+    def test_profile_root_rejects_symlink_and_world_writable_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            symlink_root = temporary_root / "profile-link"
+            symlink_root.symlink_to(ROOT / "references", target_is_directory=True)
+            completed = subprocess.run(
+                self.audit_command("--profile-root", str(symlink_root)),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, completed.returncode)
+            self.assertEqual(
+                "REGISTRY_CODEX_HOME_UNSAFE",
+                json.loads(completed.stdout)["error"],
+            )
+            self.assertNotIn("Traceback", completed.stderr)
+
+            writable_root = temporary_root / "world-writable"
+            shutil.copytree(ROOT / "references", writable_root)
+            writable_root.chmod(0o777)
+            completed = subprocess.run(
+                self.audit_command("--profile-root", str(writable_root)),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, completed.returncode)
+            self.assertEqual(
+                "REGISTRY_CODEX_HOME_UNSAFE",
+                json.loads(completed.stdout)["error"],
+            )
+            self.assertNotIn("Traceback", completed.stderr)
+
+    def test_audit_config_omitted_profile_root_uses_safe_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex-home"
+            codex_home.mkdir(mode=0o700)
+            for profile in (ROOT / "references").glob("*.config.toml"):
+                shutil.copy2(profile, codex_home / profile.name)
+            completed = subprocess.run(
+                self.audit_command(),
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "CODEX_HOME": str(codex_home)},
+            )
+            self.assertEqual("PASS", json.loads(completed.stdout)["phase"])
+
+    def test_invalid_profile_root_type_is_a_closed_registry_error(self) -> None:
+        with self.assertRaisesRegex(RegistryError, "REGISTRY_CODEX_HOME_INVALID"):
+            load_registry_config(
+                ROOT / "references" / "twinfinity-executor-registry.toml",
+                codex_home=object(),  # type: ignore[arg-type]
+                profile_template_root=ROOT / "references",
+            )
 
     def test_current_direct_profiles_and_staged_profiles_are_digest_bound(self) -> None:
         registry = tomllib.loads(

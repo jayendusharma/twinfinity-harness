@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage, validate, install, or roll back one reviewed source file atom."""
+"""Stage, validate, install, or recover one reviewed journaled file set."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 from typing import Any, Iterator
 
@@ -59,7 +60,7 @@ def _read_json(path: Path, error: str) -> dict[str, Any]:
 
 
 def _relative(value: Any) -> Path:
-    if not isinstance(value, str) or not value or "\\" in value:
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         raise SourceInstallAtomError("INSTALL_ATOM_PATH_INVALID")
     path = Path(value)
     if path.is_absolute() or value != path.as_posix() or any(part in {"", ".", ".."} for part in path.parts):
@@ -110,6 +111,210 @@ def _safe_file(root: Path, relative: Path, *, required: bool = True) -> Path | N
     return candidate
 
 
+DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+FILE_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _validate_directory_descriptor(descriptor: int) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise SourceInstallAtomError("INSTALL_ATOM_DIRECTORY_UNSAFE")
+
+
+@contextmanager
+def _root_descriptor(root: Path) -> Iterator[int]:
+    root = _safe_root(root)
+    try:
+        descriptor = os.open(root, DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROOT_INVALID") from exc
+    try:
+        _validate_directory_descriptor(descriptor)
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _parent_descriptor(
+    root_descriptor: int, relative: Path, *, create: bool = False
+) -> Iterator[tuple[int, str]]:
+    """Open every parent without following a path component symlink."""
+
+    descriptor = os.dup(root_descriptor)
+    try:
+        for part in relative.parts[:-1]:
+            try:
+                child = os.open(part, DIRECTORY_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise SourceInstallAtomError(
+                        "INSTALL_ATOM_DESTINATION_PARENT_MISSING"
+                    )
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    child = os.open(part, DIRECTORY_FLAGS, dir_fd=descriptor)
+                except OSError as exc:
+                    raise SourceInstallAtomError(
+                        "INSTALL_ATOM_DIRECTORY_CREATE_FAILED"
+                    ) from exc
+            except OSError as exc:
+                raise SourceInstallAtomError("INSTALL_ATOM_DIRECTORY_UNSAFE") from exc
+            try:
+                _validate_directory_descriptor(child)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, relative.name
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_at(
+    root_descriptor: int,
+    relative: Path,
+    *,
+    required: bool = True,
+) -> tuple[bytes, os.stat_result] | None:
+    with _parent_descriptor(root_descriptor, relative) as (parent, leaf):
+        try:
+            descriptor = os.open(leaf, FILE_FLAGS, dir_fd=parent)
+        except FileNotFoundError:
+            if not required:
+                return None
+            raise SourceInstallAtomError("INSTALL_ATOM_FILE_MISSING")
+        except OSError as exc:
+            raise SourceInstallAtomError("INSTALL_ATOM_FILE_UNSAFE") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise SourceInstallAtomError("INSTALL_ATOM_FILE_UNSAFE")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks), metadata
+        finally:
+            os.close(descriptor)
+
+
+def _sha256_bytes(contents: bytes) -> str:
+    return hashlib.sha256(contents).hexdigest()
+
+
+def _write_exclusive_at(
+    root_descriptor: int,
+    relative: Path,
+    contents: bytes,
+    *,
+    mode: int,
+    uid: int,
+    gid: int,
+    create_parents: bool = False,
+) -> None:
+    with _parent_descriptor(
+        root_descriptor, relative, create=create_parents
+    ) as (parent, leaf):
+        _write_leaf_exclusive(
+            parent, leaf, contents, mode=mode, uid=uid, gid=gid
+        )
+        os.fsync(parent)
+
+
+def _write_leaf_exclusive(
+    parent_descriptor: int,
+    leaf: str,
+    contents: bytes,
+    *,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> None:
+    flags = (
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(leaf, flags, mode, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise SourceInstallAtomError("INSTALL_ATOM_FILE_CREATE_FAILED") from exc
+    try:
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            stat.S_IMODE(metadata.st_mode) != mode
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+        ):
+            raise SourceInstallAtomError("INSTALL_ATOM_OWNER_MODE_INVALID")
+    finally:
+        os.close(descriptor)
+
+
+def _verify_source_commit(
+    source_root: Path, manifest: dict[str, Any], entries: list[dict[str, Any]]
+) -> None:
+    """Bind selected source bytes to an independently observed Git commit."""
+
+    environment = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(source_root), *arguments],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise SourceInstallAtomError("INSTALL_ATOM_SOURCE_COMMIT_INVALID") from exc
+
+    top = Path(git("rev-parse", "--show-toplevel").stdout.decode().strip())
+    if top.resolve(strict=True) != source_root.resolve(strict=True):
+        raise SourceInstallAtomError("INSTALL_ATOM_SOURCE_COMMIT_INVALID")
+    observed_commit = git("rev-parse", "--verify", "HEAD").stdout.decode().strip()
+    if observed_commit != manifest["source_commit"]:
+        raise SourceInstallAtomError("INSTALL_ATOM_SOURCE_COMMIT_MISMATCH")
+    with _root_descriptor(source_root) as source_descriptor:
+        for entry in entries:
+            relative = _relative(entry["source_path"])
+            actual = _read_regular_at(source_descriptor, relative)
+            if actual is None:
+                raise SourceInstallAtomError("INSTALL_ATOM_SOURCE_HASH_MISMATCH")
+            committed = git(
+                "show", f"{manifest['source_commit']}:{relative.as_posix()}"
+            ).stdout
+            if actual[0] != committed:
+                raise SourceInstallAtomError("INSTALL_ATOM_SOURCE_COMMIT_MISMATCH")
+
+
 def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     if set(manifest) != {"schema", "manifest_sha256", "atom_id", "source_commit", "entries"}:
         raise SourceInstallAtomError("INSTALL_ATOM_MANIFEST_SCHEMA_INVALID")
@@ -143,16 +348,16 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             or destination.as_posix() in seen_destinations
             or not isinstance(entry["source_sha256"], str)
             or SHA256.fullmatch(entry["source_sha256"]) is None
-            or entry["source_mode"] not in {0o600, 0o644, 0o700, 0o755}
-            or entry["destination_mode"] not in {0o600, 0o644, 0o700, 0o755}
-            or type(entry["destination_uid"]) is not int
-            or type(entry["destination_gid"]) is not int
+            or entry["source_mode"] not in (0o600, 0o644, 0o700, 0o755)
+            or entry["destination_mode"] not in (0o600, 0o644, 0o700, 0o755)
+            or entry["destination_uid"] != os.getuid()
+            or entry["destination_gid"] != os.getgid()
             or not isinstance(prior, dict)
             or set(prior) not in (
                 {"state"},
                 {"state", "sha256", "mode", "uid", "gid"},
             )
-            or prior.get("state") not in {"ABSENT", "PRESENT"}
+            or prior.get("state") not in ("ABSENT", "PRESENT")
             or (prior["state"] == "ABSENT" and set(prior) != {"state"})
             or (
                 prior["state"] == "PRESENT"
@@ -160,9 +365,9 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                     set(prior) != {"state", "sha256", "mode", "uid", "gid"}
                     or not isinstance(prior["sha256"], str)
                     or SHA256.fullmatch(prior["sha256"]) is None
-                    or prior["mode"] not in {0o600, 0o644, 0o700, 0o755}
-                    or type(prior["uid"]) is not int
-                    or type(prior["gid"]) is not int
+                    or prior["mode"] not in (0o600, 0o644, 0o700, 0o755)
+                    or prior["uid"] != os.getuid()
+                    or prior["gid"] != os.getgid()
                 )
             )
         ):
@@ -172,9 +377,9 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
-def _validate_prior(destination_root: Path, entry: dict[str, Any]) -> None:
+def _validate_prior_at(destination_descriptor: int, entry: dict[str, Any]) -> None:
     relative = _relative(entry["destination_path"])
-    actual = _safe_file(destination_root, relative, required=False)
+    actual = _read_regular_at(destination_descriptor, relative, required=False)
     prior = entry["destination_prior"]
     if prior["state"] == "ABSENT":
         if actual is not None:
@@ -182,14 +387,19 @@ def _validate_prior(destination_root: Path, entry: dict[str, Any]) -> None:
         return
     if actual is None:
         raise SourceInstallAtomError("INSTALL_ATOM_PRIOR_HASH_MISMATCH")
-    metadata = actual.lstat()
+    contents, metadata = actual
     if (
-        _file_sha256(actual) != prior["sha256"]
+        _sha256_bytes(contents) != prior["sha256"]
         or stat.S_IMODE(metadata.st_mode) != prior["mode"]
         or metadata.st_uid != prior["uid"]
         or metadata.st_gid != prior["gid"]
     ):
         raise SourceInstallAtomError("INSTALL_ATOM_PRIOR_HASH_MISMATCH")
+
+
+def _validate_prior(destination_root: Path, entry: dict[str, Any]) -> None:
+    with _root_descriptor(destination_root) as descriptor:
+        _validate_prior_at(descriptor, entry)
 
 
 def _write_file_exclusive(path: Path, contents: bytes, mode: int) -> None:
@@ -220,6 +430,7 @@ def stage_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
     entries = _validate_manifest(manifest)
     source_root = _safe_root(source_root)
     destination_root = _safe_root(destination_root)
+    _verify_source_commit(source_root, manifest, entries)
     if not stage_root.is_absolute() or stage_root.exists() or stage_root.is_symlink():
         raise SourceInstallAtomError("INSTALL_ATOM_STAGE_PATH_INVALID")
     _safe_root(stage_root.parent)
@@ -253,6 +464,7 @@ def validate_stage(*, manifest: dict[str, Any], source_root: Path, destination_r
     entries = _validate_manifest(manifest)
     source_root = _safe_root(source_root)
     destination_root = _safe_root(destination_root)
+    _verify_source_commit(source_root, manifest, entries)
     stage_root = _safe_root(stage_root)
     receipt = _read_json(stage_root / STAGE_RECEIPT, "INSTALL_ATOM_STAGE_RECEIPT_INVALID")
     if receipt.get("schema") != SCHEMA or receipt.get("manifest_sha256") != manifest["manifest_sha256"] or receipt.get("state") != "STAGED":
@@ -285,11 +497,13 @@ def validate_stage(*, manifest: dict[str, Any], source_root: Path, destination_r
 
 
 @contextmanager
-def _destination_lock(root: Path) -> Iterator[None]:
-    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+def _destination_lock(root: Path) -> Iterator[int]:
+    root = _safe_root(root)
+    descriptor = os.open(root, DIRECTORY_FLAGS)
     try:
+        _validate_directory_descriptor(descriptor)
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        yield descriptor
     except BlockingIOError as exc:
         raise SourceInstallAtomError("INSTALL_ATOM_LOCK_BUSY") from exc
     finally:
@@ -297,43 +511,201 @@ def _destination_lock(root: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _atomic_replace_from(source: Path, destination: Path, mode: int) -> None:
-    destination.parent.mkdir(parents=False, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.twinfinity-install-{os.getpid()}")
-    if temporary.exists() or temporary.is_symlink():
-        raise SourceInstallAtomError("INSTALL_ATOM_TEMP_CONFLICT")
+def _atomic_replace_at(
+    root_descriptor: int,
+    relative: Path,
+    contents: bytes,
+    *,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> None:
+    """Replace one leaf relative to an already validated directory chain."""
+
+    with _parent_descriptor(root_descriptor, relative) as (parent, leaf):
+        temporary = f".{leaf}.twinfinity-install-{os.getpid()}"
+        try:
+            try:
+                os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise SourceInstallAtomError("INSTALL_ATOM_TEMP_CONFLICT")
+            _write_leaf_exclusive(
+                parent, temporary, contents, mode=mode, uid=uid, gid=gid
+            )
+            os.replace(
+                temporary,
+                leaf,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+            os.fsync(parent)
+        finally:
+            try:
+                metadata = os.stat(
+                    temporary, dir_fd=parent, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid():
+                    os.unlink(temporary, dir_fd=parent)
+
+
+def _unlink_regular_at(root_descriptor: int, relative: Path) -> None:
+    with _parent_descriptor(root_descriptor, relative) as (parent, leaf):
+        current = _read_regular_at(root_descriptor, relative)
+        if current is None:
+            raise SourceInstallAtomError("INSTALL_ATOM_INSTALLED_HASH_MISMATCH")
+        try:
+            os.unlink(leaf, dir_fd=parent)
+            os.fsync(parent)
+        except OSError as exc:
+            raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_FAILED") from exc
+
+
+def _receipt(manifest: dict[str, Any], entries: list[dict[str, Any]], state: str) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "entries": [
+            {
+                "destination_path": entry["destination_path"],
+                "destination_prior": entry["destination_prior"],
+                "installed_sha256": entry["source_sha256"],
+                "installed_mode": entry["destination_mode"],
+                "installed_uid": entry["destination_uid"],
+                "installed_gid": entry["destination_gid"],
+            }
+            for entry in entries
+        ],
+        "state": state,
+    }
+
+
+def _read_receipt_at(rollback_descriptor: int) -> dict[str, Any]:
+    observed = _read_regular_at(rollback_descriptor, Path(ROLLBACK_RECEIPT))
+    if observed is None:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
     try:
-        _write_file_exclusive(temporary, source.read_bytes(), mode)
-        os.replace(temporary, destination)
-    finally:
-        if temporary.exists() and not temporary.is_symlink():
-            temporary.unlink()
+        receipt = json.loads(observed[0].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID") from exc
+    if not isinstance(receipt, dict):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    return receipt
 
 
-def _replace_receipt(path: Path, receipt: dict[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        _write_file_exclusive(
-            temporary, canonical_json(receipt).encode("utf-8"), 0o600
-        )
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists() and not temporary.is_symlink():
-            temporary.unlink()
+def _replace_receipt_at(rollback_descriptor: int, receipt: dict[str, Any]) -> None:
+    _atomic_replace_at(
+        rollback_descriptor,
+        Path(ROLLBACK_RECEIPT),
+        canonical_json(receipt).encode("utf-8"),
+        mode=0o600,
+        uid=os.getuid(),
+        gid=os.getgid(),
+    )
 
 
-def _restore_entries(destination_root: Path, rollback_root: Path, entries: list[dict[str, Any]]) -> None:
-    for entry in reversed(entries):
-        destination = destination_root / _relative(entry["destination_path"])
+def _validate_receipt(
+    manifest: dict[str, Any], entries: list[dict[str, Any]], receipt: dict[str, Any]
+) -> None:
+    if set(receipt) != {"schema", "manifest_sha256", "entries", "state"}:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    if (
+        receipt["schema"] != SCHEMA
+        or receipt["manifest_sha256"] != manifest["manifest_sha256"]
+        or receipt["entries"] != _receipt(manifest, entries, "PREPARED")["entries"]
+        or receipt["state"] not in ("PREPARED", "INSTALLED", "ROLLED_BACK")
+    ):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+
+
+def _entry_state(destination_descriptor: int, entry: dict[str, Any]) -> str:
+    current = _read_regular_at(
+        destination_descriptor,
+        _relative(entry["destination_path"]),
+        required=False,
+    )
+    prior = entry["destination_prior"]
+    if current is not None:
+        contents, metadata = current
+        if (
+            _sha256_bytes(contents) == entry["source_sha256"]
+            and stat.S_IMODE(metadata.st_mode) == entry["destination_mode"]
+            and metadata.st_uid == entry["destination_uid"]
+            and metadata.st_gid == entry["destination_gid"]
+        ):
+            return "INSTALLED"
+        if (
+            prior["state"] == "PRESENT"
+            and _sha256_bytes(contents) == prior["sha256"]
+            and stat.S_IMODE(metadata.st_mode) == prior["mode"]
+            and metadata.st_uid == prior["uid"]
+            and metadata.st_gid == prior["gid"]
+        ):
+            return "PRIOR"
+    elif prior["state"] == "ABSENT":
+        return "PRIOR"
+    raise SourceInstallAtomError("INSTALL_ATOM_FILESYSTEM_STATE_INVALID")
+
+
+def _recover_entries(
+    *,
+    destination_descriptor: int,
+    rollback_descriptor: int,
+    manifest: dict[str, Any],
+    entries: list[dict[str, Any]],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Derive a partial transition from bytes and restore the exact prior set."""
+
+    _validate_receipt(manifest, entries, receipt)
+    states = [_entry_state(destination_descriptor, entry) for entry in entries]
+    backups: dict[str, bytes] = {}
+    for entry in entries:
+        prior = entry["destination_prior"]
+        if prior["state"] != "PRESENT":
+            continue
+        relative = Path("files") / _relative(entry["destination_path"])
+        observed = _read_regular_at(rollback_descriptor, relative)
+        if observed is None:
+            raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+        contents, metadata = observed
+        if (
+            _sha256_bytes(contents) != prior["sha256"]
+            or stat.S_IMODE(metadata.st_mode) != prior["mode"]
+            or metadata.st_uid != prior["uid"]
+            or metadata.st_gid != prior["gid"]
+        ):
+            raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+        backups[entry["destination_path"]] = contents
+    if receipt["state"] == "ROLLED_BACK":
+        if any(state != "PRIOR" for state in states):
+            raise SourceInstallAtomError("INSTALL_ATOM_FILESYSTEM_STATE_INVALID")
+        return receipt
+    for entry, state in reversed(list(zip(entries, states, strict=True))):
+        if state == "PRIOR":
+            continue
+        relative = _relative(entry["destination_path"])
         prior = entry["destination_prior"]
         if prior["state"] == "ABSENT":
-            if destination.exists() and not destination.is_symlink():
-                destination.unlink()
-            continue
-        backup = _safe_file(rollback_root / "files", _relative(entry["destination_path"]))
-        if backup is None or _file_sha256(backup) != prior["sha256"]:
-            raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
-        _atomic_replace_from(backup, destination, prior["mode"])
+            _unlink_regular_at(destination_descriptor, relative)
+        else:
+            _atomic_replace_at(
+                destination_descriptor,
+                relative,
+                backups[entry["destination_path"]],
+                mode=prior["mode"],
+                uid=prior["uid"],
+                gid=prior["gid"],
+            )
+    if any(_entry_state(destination_descriptor, entry) != "PRIOR" for entry in entries):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_POSTCONDITION_FAILED")
+    rolled_back = _receipt(manifest, entries, "ROLLED_BACK")
+    _replace_receipt_at(rollback_descriptor, rolled_back)
+    return rolled_back
 
 
 def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root: Path, stage_root: Path, rollback_root: Path, confirmation: str) -> dict[str, Any]:
@@ -346,63 +718,77 @@ def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
     if not rollback_root.is_absolute() or rollback_root.exists() or rollback_root.is_symlink():
         raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_PATH_INVALID")
     _safe_root(rollback_root.parent)
-    with _destination_lock(destination_root):
+    with _destination_lock(destination_root) as destination_descriptor:
         validate_stage(manifest=manifest, source_root=source_root, destination_root=destination_root, stage_root=stage_root)
         _make_private_directory(rollback_root)
-        (rollback_root / "files").mkdir(mode=0o700)
-        applied: list[dict[str, Any]] = []
-        try:
+        with _root_descriptor(rollback_root) as rollback_descriptor:
             for entry in entries:
+                _validate_prior_at(destination_descriptor, entry)
                 prior = entry["destination_prior"]
                 if prior["state"] == "PRESENT":
-                    current = _safe_file(destination_root, _relative(entry["destination_path"]))
+                    current = _read_regular_at(
+                        destination_descriptor, _relative(entry["destination_path"])
+                    )
                     if current is None:
                         raise SourceInstallAtomError("INSTALL_ATOM_PRIOR_HASH_MISMATCH")
-                    backup = rollback_root / "files" / _relative(entry["destination_path"])
-                    backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    _write_file_exclusive(backup, current.read_bytes(), prior["mode"])
-            receipt = {
-                "schema": SCHEMA,
-                "manifest_sha256": manifest["manifest_sha256"],
-                "entries": [
-                    {
-                        "destination_path": entry["destination_path"],
-                        "destination_prior": entry["destination_prior"],
-                        "installed_sha256": entry["source_sha256"],
-                        "installed_mode": entry["destination_mode"],
-                    }
-                    for entry in entries
-                ],
-                "state": "PREPARED",
-            }
-            _write_file_exclusive(
-                rollback_root / ROLLBACK_RECEIPT,
-                canonical_json(receipt).encode("utf-8"),
-                0o600,
+                    _write_exclusive_at(
+                        rollback_descriptor,
+                        Path("files") / _relative(entry["destination_path"]),
+                        current[0],
+                        mode=prior["mode"],
+                        uid=prior["uid"],
+                        gid=prior["gid"],
+                        create_parents=True,
+                    )
+            prepared = _receipt(manifest, entries, "PREPARED")
+            _write_exclusive_at(
+                rollback_descriptor,
+                Path(ROLLBACK_RECEIPT),
+                canonical_json(prepared).encode("utf-8"),
+                mode=0o600,
+                uid=os.getuid(),
+                gid=os.getgid(),
             )
-            for entry in entries:
-                staged = _safe_file(stage_root, _relative(entry["destination_path"]))
-                if staged is None:
-                    raise SourceInstallAtomError("INSTALL_ATOM_STAGE_VALIDATION_FAILED")
-                destination = destination_root / _relative(entry["destination_path"])
-                if not destination.parent.exists():
-                    raise SourceInstallAtomError("INSTALL_ATOM_DESTINATION_PARENT_MISSING")
-                _atomic_replace_from(staged, destination, entry["destination_mode"])
-                applied.append(entry)
-                metadata = destination.lstat()
-                if (
-                    metadata.st_uid != entry["destination_uid"]
-                    or metadata.st_gid != entry["destination_gid"]
-                    or stat.S_IMODE(metadata.st_mode) != entry["destination_mode"]
-                    or _file_sha256(destination) != entry["source_sha256"]
-                ):
-                    raise SourceInstallAtomError("INSTALL_ATOM_POSTCONDITION_FAILED")
-            receipt["state"] = "INSTALLED"
-            _replace_receipt(rollback_root / ROLLBACK_RECEIPT, receipt)
-            return receipt
-        except Exception:
-            _restore_entries(destination_root, rollback_root, applied)
-            raise
+            try:
+                with _root_descriptor(stage_root) as stage_descriptor:
+                    for entry in entries:
+                        staged = _read_regular_at(
+                            stage_descriptor, _relative(entry["destination_path"])
+                        )
+                        if staged is None:
+                            raise SourceInstallAtomError(
+                                "INSTALL_ATOM_STAGE_VALIDATION_FAILED"
+                            )
+                        _atomic_replace_at(
+                            destination_descriptor,
+                            _relative(entry["destination_path"]),
+                            staged[0],
+                            mode=entry["destination_mode"],
+                            uid=entry["destination_uid"],
+                            gid=entry["destination_gid"],
+                        )
+                        if _entry_state(destination_descriptor, entry) != "INSTALLED":
+                            raise SourceInstallAtomError(
+                                "INSTALL_ATOM_POSTCONDITION_FAILED"
+                            )
+                installed = _receipt(manifest, entries, "INSTALLED")
+                _replace_receipt_at(rollback_descriptor, installed)
+                return installed
+            except BaseException as failure:
+                try:
+                    observed_receipt = _read_receipt_at(rollback_descriptor)
+                    _recover_entries(
+                        destination_descriptor=destination_descriptor,
+                        rollback_descriptor=rollback_descriptor,
+                        manifest=manifest,
+                        entries=entries,
+                        receipt=observed_receipt,
+                    )
+                except BaseException as recovery_failure:
+                    raise SourceInstallAtomError(
+                        "INSTALL_ATOM_RECOVERY_REQUIRED"
+                    ) from recovery_failure
+                raise failure
 
 
 def rollback_atom(*, manifest: dict[str, Any], destination_root: Path, rollback_root: Path, confirmation: str) -> dict[str, Any]:
@@ -411,53 +797,20 @@ def rollback_atom(*, manifest: dict[str, Any], destination_root: Path, rollback_
     entries = _validate_manifest(manifest)
     destination_root = _safe_root(destination_root)
     rollback_root = _safe_root(rollback_root)
-    receipt = _read_json(rollback_root / ROLLBACK_RECEIPT, "INSTALL_ATOM_ROLLBACK_DATA_INVALID")
-    expected_entries = [
-        {
-            "destination_path": entry["destination_path"],
-            "destination_prior": entry["destination_prior"],
-            "installed_sha256": entry["source_sha256"],
-            "installed_mode": entry["destination_mode"],
-        }
-        for entry in entries
-    ]
-    if (
-        receipt.get("schema") != SCHEMA
-        or receipt.get("manifest_sha256") != manifest["manifest_sha256"]
-        or receipt.get("entries") != expected_entries
-        or receipt.get("state") not in {"PREPARED", "INSTALLED"}
-    ):
-        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
-    with _destination_lock(destination_root):
-        for entry in entries:
-            relative = _relative(entry["destination_path"])
-            current = _safe_file(destination_root, relative, required=False)
-            prior = entry["destination_prior"]
-            installed = (
-                current is not None
-                and _file_sha256(current) == entry["source_sha256"]
-                and stat.S_IMODE(current.lstat().st_mode)
-                == entry["destination_mode"]
+    with _destination_lock(destination_root) as destination_descriptor:
+        with _root_descriptor(rollback_root) as rollback_descriptor:
+            receipt = _read_receipt_at(rollback_descriptor)
+            result = _recover_entries(
+                destination_descriptor=destination_descriptor,
+                rollback_descriptor=rollback_descriptor,
+                manifest=manifest,
+                entries=entries,
+                receipt=receipt,
             )
-            still_prior = prior["state"] == "ABSENT" and current is None
-            if prior["state"] == "PRESENT" and current is not None:
-                metadata = current.lstat()
-                still_prior = (
-                    _file_sha256(current) == prior["sha256"]
-                    and stat.S_IMODE(metadata.st_mode) == prior["mode"]
-                    and metadata.st_uid == prior["uid"]
-                    and metadata.st_gid == prior["gid"]
-                )
-            if not installed and not still_prior:
-                raise SourceInstallAtomError("INSTALL_ATOM_INSTALLED_HASH_MISMATCH")
-            if prior["state"] == "PRESENT":
-                backup = _safe_file(
-                    rollback_root / "files", _relative(entry["destination_path"])
-                )
-                if backup is None or _file_sha256(backup) != prior["sha256"]:
-                    raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
-        _restore_entries(destination_root, rollback_root, entries)
-    return {"manifest_sha256": manifest["manifest_sha256"], "state": "ROLLED_BACK"}
+    return {
+        "manifest_sha256": manifest["manifest_sha256"],
+        "state": result["state"],
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
