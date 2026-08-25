@@ -1,4 +1,4 @@
 interface:
   display_name: "Twinfinity Skill Governor"
-  short_description: "Audit and improve Twinfinity skills and session goals"
-  default_prompt: "Audit Twinfinity skills, canonical session goals, and agent roles against live portfolio evidence; propose or apply the smallest justified governance updates."
+  short_description: "Audit Twinfinity skills and session goals"
+  default_prompt: "Use $twinfinity-skill-governor to audit Twinfinity skills, the current Planner goal, endpoint and broker contracts, and role boundaries against live evidence without applying changes."
