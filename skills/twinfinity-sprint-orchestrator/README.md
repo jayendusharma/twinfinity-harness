@@ -214,13 +214,28 @@ Leave ambiguous external effects in readback-only recovery. Never restart the sa
 
 ## Validation
 
-Run tests only against temporary databases:
+Run tests only against temporary databases and the source-bound hermetic Codex
+home. The runner creates a private temporary `CODEX_HOME`, installs only the
+exact versioned profiles declared by the checked-in schema-v2 endpoint catalog,
+validates their source and installed bytes through the production loader, runs
+discovery, and removes the temporary tree. This is the canonical full-suite
+command:
 
 ```bash
 cd /home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+python3 scripts/run_hermetic_tests.py
+```
+
+Pass unittest selectors to the same runner for focused evidence:
+
+```bash
+python3 scripts/run_hermetic_tests.py \
   tests.test_executor_registry tests.test_coordination_supervisor
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+Then run the remaining static gates:
+
+```bash
 compile_cache=/tmp/twinfinity-sprint-orchestrator-pycompile
 PYTHONPYCACHEPREFIX="$compile_cache" python3 -m py_compile scripts/*.py tests/*.py
 python3 /home/ubuntu/.codex/skills/.system/skill-creator/scripts/quick_validate.py \

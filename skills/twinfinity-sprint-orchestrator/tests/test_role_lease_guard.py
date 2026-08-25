@@ -11,14 +11,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-INSTALLED_SCRIPTS = Path(
-    "/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/scripts"
-)
-sys.path.insert(0, str(INSTALLED_SCRIPTS))
 sys.path.insert(0, str(SCRIPTS))
 
 from delivery_guard import pre_tool  # noqa: E402
 from run_role_executor import build_child_environment  # noqa: E402
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
@@ -37,7 +36,16 @@ class RoleLeaseGuardTests(unittest.TestCase):
         self.code_root.mkdir(mode=0o700)
         self.database = self.root / "state.sqlite3"
         self.connection = sqlite3.connect(self.database)
+        self.connection.row_factory = sqlite3.Row
+        config = apply_reviewed_current_endpoint_catalog(
+            self.connection,
+            ROOT,
+            operation_key="role-lease-guard-tests",
+        )
         self._schema()
+        self.endpoints = {
+            role: endpoint.endpoint_id for role, endpoint in config.roles.items()
+        }
         self.seed("development", ("scripts/allowed.py",))
 
     def tearDown(self) -> None:
@@ -47,13 +55,6 @@ class RoleLeaseGuardTests(unittest.TestCase):
     def _schema(self) -> None:
         self.connection.executescript(
             """
-            CREATE TABLE executor_role_endpoints(endpoint_id TEXT PRIMARY KEY, role TEXT);
-            CREATE TABLE executor_role_endpoint_current(role TEXT PRIMARY KEY, endpoint_id TEXT);
-            CREATE TABLE executor_attempts(
-                attempt_id TEXT PRIMARY KEY, instance_id TEXT, role TEXT,
-                endpoint_id TEXT, token_sha256 TEXT, target_kind TEXT,
-                target_key TEXT, state TEXT
-            );
             CREATE TABLE github_current(
                 repository TEXT, object_kind TEXT, object_number INTEGER,
                 payload_sha256 TEXT
@@ -87,12 +88,11 @@ class RoleLeaseGuardTests(unittest.TestCase):
 
     def seed(self, role: str, paths: tuple[str, ...]) -> None:
         for table in (
-            "executor_role_endpoints", "executor_role_endpoint_current",
             "executor_attempts", "github_current", "coordination_messages",
             "coordination_items", "coordination_artifacts",
         ):
             self.connection.execute(f"DELETE FROM {table}")
-        endpoint = f"role.{role}.v2"
+        endpoint = self.endpoints[role]
         worktree = self.code_root / f"twinfinityapp-issue-{92 if role == 'development' else 314}"
         worktree.mkdir(mode=0o700, exist_ok=True)
         for path in paths:
@@ -145,17 +145,19 @@ class RoleLeaseGuardTests(unittest.TestCase):
         }
         topic = f"{role}.admission"
         self.connection.execute(
-            "INSERT INTO executor_role_endpoints VALUES (?, ?)", (endpoint, role)
-        )
-        self.connection.execute(
-            "INSERT INTO executor_role_endpoint_current VALUES (?, ?)",
-            (role, endpoint),
-        )
-        self.connection.execute(
-            "INSERT INTO executor_attempts VALUES (?, ?, ?, ?, ?, 'message', '11', 'RUNNING')",
+            """
+            INSERT INTO executor_attempts(
+                attempt_id, instance_id, role, endpoint_id, token_sha256,
+                target_kind, target_key, state, heartbeat_at, version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'message', '11', 'RUNNING', ?, 1, ?, ?)
+            """,
             (
                 ATTEMPT_ID, INSTANCE_ID, role, endpoint,
                 hashlib.sha256(TOKEN.encode()).hexdigest(),
+                "2026-08-24T10:00:00Z",
+                "2026-08-24T10:00:00Z",
+                "2026-08-24T10:00:00Z",
             ),
         )
         self.connection.execute(
@@ -222,7 +224,7 @@ class RoleLeaseGuardTests(unittest.TestCase):
         environment = build_child_environment(
             {"SAFE_PARENT": "present"}, attempt_id=ATTEMPT_ID,
             instance_id=INSTANCE_ID, role="development",
-            endpoint_id="role.development.v2", token=TOKEN,
+            endpoint_id=self.endpoints["development"], token=TOKEN,
             target_kind="message", target_key="11",
         )
         self.assertEqual("message", environment["TWINFINITY_EXECUTOR_TARGET_KIND"])
@@ -232,10 +234,8 @@ class RoleLeaseGuardTests(unittest.TestCase):
 
     def test_stale_endpoint_fails_closed_even_for_read_only_operation(self) -> None:
         self.connection.execute(
-            "INSERT INTO executor_role_endpoints VALUES ('role.development.v9', 'development')"
-        )
-        self.connection.execute(
-            "UPDATE executor_role_endpoint_current SET endpoint_id='role.development.v9' "
+            "UPDATE executor_role_endpoint_current "
+            "SET endpoint_id='role.development.v3', pointer_version=pointer_version+1 "
             "WHERE role='development'"
         )
         self.connection.commit()

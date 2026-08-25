@@ -41,7 +41,7 @@ from reconcile_routing_artifacts import (  # noqa: E402
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 MAIN = "a" * 40
-DEVELOPMENT_SESSION = "role.development.v3"
+DEVELOPMENT_SESSION = "role.development.v4"
 
 
 class PortfolioConvergenceTests(unittest.TestCase):

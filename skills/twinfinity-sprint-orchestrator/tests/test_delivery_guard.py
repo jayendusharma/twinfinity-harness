@@ -21,7 +21,7 @@ class DeliveryGuardTests(unittest.TestCase):
             "_load_context",
             return_value=DeliveryContext(
                 role="development",
-                endpoint_id="role.development.v2",
+                endpoint_id="role.development.v4",
                 target_kind="message",
                 target_key="1",
                 topic="development.admission",

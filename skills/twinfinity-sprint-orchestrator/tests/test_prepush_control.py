@@ -12,7 +12,8 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import digest_json  # noqa: E402
@@ -25,11 +26,14 @@ from prepush_control import (  # noqa: E402
     PrePushError,
     build_parser,
 )
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 ISSUE = 314
-SESSION = "role.sre.v2"
+SESSION = "role.sre.v4"
 LEASE = "5" * 64
 HEAD = "b" * 40
 
@@ -40,6 +44,11 @@ class PrePushControlTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.control = PrePushControl(root / "state.sqlite3")
+        apply_reviewed_current_endpoint_catalog(
+            self.control.connection,
+            ROOT,
+            operation_key="prepush-control-tests",
+        )
         source = self.control.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
@@ -145,7 +154,7 @@ class PrePushControlTests(unittest.TestCase):
 
         self.control.connection.execute(
             "UPDATE coordination_messages SET claimed_by=? WHERE id=?",
-            ("role.development.v2", self.message),
+            ("role.development.v4", self.message),
         )
         with self.assertRaisesRegex(
             PrePushError, "PREPUSH_COMPLETED_ADMISSION_ABSENT"

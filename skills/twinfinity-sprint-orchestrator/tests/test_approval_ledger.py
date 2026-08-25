@@ -9,7 +9,8 @@ import unittest
 
 import sys
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from approval_ledger import (  # noqa: E402
@@ -33,12 +34,15 @@ from reconcile_routing_artifacts import (  # noqa: E402
     build_plan,
     load_legacy_alias_fixture,
 )
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
-DEVELOPMENT_SESSION = "role.development.v3"
+DEVELOPMENT_SESSION = "role.development.v4"
 PLANNER_SESSION = "role.planner.v2"
-SRE_SESSION = "role.sre.v3"
+SRE_SESSION = "role.sre.v4"
 REQUESTER = DEVELOPMENT_SESSION
 
 
@@ -48,6 +52,11 @@ class ApprovalLedgerTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
+        apply_reviewed_current_endpoint_catalog(
+            self.store.connection,
+            ROOT,
+            operation_key="approval-ledger-tests",
+        )
         self.snapshot = self.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
@@ -282,10 +291,10 @@ class ApprovalLedgerTests(unittest.TestCase):
 
     def test_current_endpoint_consumes_immutable_historical_delivery_by_role(self) -> None:
         endpoint_packet = self.packet(key="issue-58:endpoint-packet")
-        endpoint_packet["requester_session_id"] = "role.development.v2"
-        endpoint_packet["recipient_session_id"] = "role.development.v2"
+        endpoint_packet["requester_session_id"] = "role.development.v3"
+        endpoint_packet["recipient_session_id"] = "role.development.v3"
         self.assertEqual(
-            "role.development.v2",
+            "role.development.v3",
             validate_packet(endpoint_packet)["recipient_session_id"],
         )
 

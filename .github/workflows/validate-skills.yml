@@ -1,0 +1,48 @@
+name: Validate skills
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Validate all skills
+        shell: bash
+        run: |
+          set -euo pipefail
+          validator="skills/.system/skill-creator/scripts/quick_validate.py"
+          skill_roots=(
+            skills/.system/imagegen
+            skills/.system/openai-docs
+            skills/.system/plugin-creator
+            skills/.system/review-agent
+            skills/.system/skill-creator
+            skills/.system/skill-installer
+            skills/twinfinity-development-executor
+            skills/twinfinity-devops-sre
+            skills/twinfinity-product-strategist
+            skills/twinfinity-skill-governor
+            skills/twinfinity-sprint-orchestrator
+          )
+          test "${#skill_roots[@]}" -eq 11
+          for skill_root in "${skill_roots[@]}"; do
+            python "$validator" "$skill_root"
+          done
+
+      - name: Run hermetic full suite
+        run: python skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py

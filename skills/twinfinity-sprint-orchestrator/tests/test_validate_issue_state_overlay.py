@@ -1088,9 +1088,7 @@ class OverlayTest(unittest.TestCase):
         self.assertIn("unrecognized arguments", bypass.stderr)
 
     def test_frozen_issue88_fixture_has_seven_control_replacements(self) -> None:
-        fixture_path = Path("/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/tests/issue88_fixture.py")
-        if not fixture_path.is_file():
-            self.skipTest("portable #88 fixture is not installed")
+        fixture_path = ROOT / "tests" / "issue88_fixture.py"
         spec = importlib.util.spec_from_file_location("issue88_fixture", fixture_path)
         assert spec and spec.loader
         fixture = importlib.util.module_from_spec(spec)

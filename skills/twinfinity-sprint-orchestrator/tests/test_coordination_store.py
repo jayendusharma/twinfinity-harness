@@ -11,7 +11,8 @@ import tempfile
 import unittest
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import (  # noqa: E402
@@ -21,18 +22,20 @@ from coordination_store import (  # noqa: E402
     digest_json,
 )
 from prepush_control import PrePushControl  # noqa: E402
-from executor_registry import load_registry_config  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
     load_legacy_alias_fixture,
 )
-from executor_registry import canonical_json, load_registry_config  # noqa: E402
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+    reviewed_planner_rotation_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
-SESSION = "role.development.v3"
-SRE_SESSION = "role.sre.v3"
+SESSION = "role.development.v4"
+SRE_SESSION = "role.sre.v4"
 PLANNER_SESSION = "role.planner.v2"
 LEASE = "5" * 64
 
@@ -44,6 +47,11 @@ class CoordinationStoreTests(unittest.TestCase):
         directory.mkdir(mode=0o700)
         self.database = directory / "state.sqlite3"
         self.store = CoordinationStore(self.database)
+        apply_reviewed_current_endpoint_catalog(
+            self.store.connection,
+            ROOT,
+            operation_key="coordination-store-tests",
+        )
 
     def tearDown(self) -> None:
         self.store.close()
@@ -1287,49 +1295,7 @@ class CoordinationStoreTests(unittest.TestCase):
             expected_version=active["version"],
             now="2026-08-22T10:00:06Z",
         )
-        endpoint = load_registry_config().roles["development"]
-        self.store.connection.execute(
-            "INSERT INTO executor_role_endpoints("
-            "endpoint_id,role,version,executor_profile,codex_profile,config_sha256,"
-            "config_json,command_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                endpoint.endpoint_id,
-                endpoint.role,
-                endpoint.version,
-                endpoint.executor_profile,
-                endpoint.codex_profile,
-                endpoint.config_sha256,
-                canonical_json(endpoint.payload),
-                canonical_json(list(endpoint.command_prefix)),
-                "2026-08-22T10:00:06Z",
-            ),
-        )
-        self.store.connection.execute(
-            "INSERT INTO executor_role_endpoint_current("
-            "role,endpoint_id,pointer_version,updated_at) VALUES ('development',?,1,?)",
-            (endpoint.endpoint_id, "2026-08-22T10:00:06Z"),
-        )
         watch_key = f"terminal:{REPOSITORY}:issue:92:generation:1"
-        root = Path(__file__).resolve().parents[1]
-        config = load_registry_config(
-            root / "references" / "twinfinity-executor-registry.toml"
-        )
-        aliases, alias_sha = load_legacy_alias_fixture(
-            root / "tests" / "fixtures" / "legacy-role-aliases.json"
-        )
-        plan = build_plan(
-            self.store.connection,
-            config,
-            aliases,
-            alias_fixture_sha256=alias_sha,
-        )
-        apply_plan(
-            self.store.connection,
-            plan=plan,
-            operation_key="terminal-closeout-endpoint-migration",
-            expected_plan_sha256=plan["plan_sha256"],
-            now="2026-08-22T10:00:06Z",
-        )
         outbox_id, closeout_id = self.store.prepare_terminal_closeout(
             outbox={
                 "idempotency_key": "issue-92-terminal-receipt",
@@ -2311,80 +2277,78 @@ class CoordinationStoreTests(unittest.TestCase):
         )
 
     def test_legacy_planner_notice_cutover_is_one_exact_atomic_window(self) -> None:
-        skill_root = Path(__file__).resolve().parents[1]
-        config = load_registry_config(
-            skill_root / "references" / "twinfinity-executor-registry.toml"
-        )
-        aliases, alias_sha = load_legacy_alias_fixture(
-            skill_root / "tests" / "fixtures" / "legacy-role-aliases.json"
-        )
-        plan = build_plan(
-            self.store.connection,
-            config,
-            aliases,
-            alias_fixture_sha256=alias_sha,
-        )
-        apply_plan(
-            self.store.connection,
-            plan=plan,
-            operation_key="legacy-notice-cutover-test",
-            expected_plan_sha256=plan["plan_sha256"],
-            now="2026-08-22T10:00:00Z",
-        )
-        legacy = next(
-            entry["alias"] for entry in aliases if entry["role"] == "planner"
-        )
-        source = self.snapshot()
-        payload = {
-            "source": {
-                "repository": REPOSITORY,
-                "object_kind": "issue",
-                "object_number": 92,
-                "payload_sha256": source.payload_sha256,
-            },
-            "notice_kind": "status",
-            "subject": "Legacy cutover notice",
-            "summary": "Non-authorizing historical notice.",
-            "evidence": {"status": "historical"},
-            "next_observation": "Read current SQLite and GitHub state.",
-            "mutation_authority": False,
-        }
-        message_id = self.store.enqueue_message(
-            idempotency_key="legacy-notice-cutover",
-            recipient_session_id=PLANNER_SESSION,
-            topic="coordination.notice",
-            payload=payload,
-            now="2026-08-22T10:00:01Z",
-        )
-        self.store.connection.execute(
-            "DROP TRIGGER coordination_message_envelope_immutable"
-        )
-        self.store.connection.execute(
-            "UPDATE coordination_messages SET recipient_session_id=? WHERE id=?",
-            (legacy, message_id),
-        )
-        manifest = self.store.prepared_legacy_notice_manifest(legacy)
-        with self.assertRaisesRegex(CoordinationError, "MANIFEST_DRIFT"):
-            self.store.retire_prepared_legacy_notices(
-                legacy_recipient=legacy,
-                current_planner_endpoint=PLANNER_SESSION,
-                expected_manifest_sha256="9" * 64,
-                now="2026-08-22T10:00:02Z",
+        with reviewed_planner_rotation_catalog(
+            ROOT, Path(self.temp.name)
+        ) as config:
+            aliases, alias_sha = load_legacy_alias_fixture(
+                ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
             )
-        result = self.store.retire_prepared_legacy_notices(
-            legacy_recipient=legacy,
-            current_planner_endpoint=PLANNER_SESSION,
-            expected_manifest_sha256=manifest["manifest_sha256"],
-            now="2026-08-22T10:00:03Z",
-        )
-        self.assertEqual((1, "HOLD"), (result["count"], result["state"]))
-        row = self.store.connection.execute(
-            "SELECT state,last_error FROM coordination_messages WHERE id=?",
-            (message_id,),
-        ).fetchone()
-        self.assertEqual(
-            ("HOLD", "SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER"), tuple(row)
-        )
+            plan = build_plan(
+                self.store.connection,
+                config,
+                aliases,
+                alias_fixture_sha256=alias_sha,
+            )
+            apply_plan(
+                self.store.connection,
+                plan=plan,
+                operation_key="legacy-notice-cutover-test",
+                expected_plan_sha256=plan["plan_sha256"],
+                now="2026-08-22T10:00:00Z",
+            )
+            legacy = "role.planner.v2"
+            current = "role.planner.v3"
+            source = self.snapshot()
+            payload = {
+                "source": {
+                    "repository": REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": 92,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "notice_kind": "status",
+                "subject": "Legacy cutover notice",
+                "summary": "Non-authorizing historical notice.",
+                "evidence": {"status": "historical"},
+                "next_observation": "Read current SQLite and GitHub state.",
+                "mutation_authority": False,
+            }
+            message_id = self.store.enqueue_message(
+                idempotency_key="legacy-notice-cutover",
+                recipient_session_id=current,
+                topic="coordination.notice",
+                payload=payload,
+                now="2026-08-22T10:00:01Z",
+            )
+            self.store.connection.execute(
+                "DROP TRIGGER coordination_message_envelope_immutable"
+            )
+            self.store.connection.execute(
+                "UPDATE coordination_messages SET recipient_session_id=? WHERE id=?",
+                (legacy, message_id),
+            )
+            manifest = self.store.prepared_legacy_notice_manifest(legacy)
+            with self.assertRaisesRegex(CoordinationError, "MANIFEST_DRIFT"):
+                self.store.retire_prepared_legacy_notices(
+                    legacy_recipient=legacy,
+                    current_planner_endpoint=current,
+                    expected_manifest_sha256="9" * 64,
+                    now="2026-08-22T10:00:02Z",
+                )
+            result = self.store.retire_prepared_legacy_notices(
+                legacy_recipient=legacy,
+                current_planner_endpoint=current,
+                expected_manifest_sha256=manifest["manifest_sha256"],
+                now="2026-08-22T10:00:03Z",
+            )
+            self.assertEqual((1, "HOLD"), (result["count"], result["state"]))
+            row = self.store.connection.execute(
+                "SELECT state,last_error FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()
+            self.assertEqual(
+                ("HOLD", "SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER"), tuple(row)
+            )
 
     def test_claimed_recovery_activates_same_generation_atomically_and_idempotently(self) -> None:
         source = self.snapshot()

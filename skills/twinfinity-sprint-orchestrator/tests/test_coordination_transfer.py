@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import (  # noqa: E402
@@ -25,10 +26,13 @@ from coordination_transfer_ledger import (  # noqa: E402
     record_existing,
     record_sha256,
 )
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
-SRE_SESSION = "role.sre.v2"
+SRE_SESSION = "role.sre.v4"
 
 
 class CoordinationTransferTests(unittest.TestCase):
@@ -48,6 +52,11 @@ class CoordinationTransferTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
+        apply_reviewed_current_endpoint_catalog(
+            self.store.connection,
+            ROOT,
+            operation_key="coordination-transfer-tests",
+        )
         self.database = root / "state.sqlite3"
         self.sources = {}
         for issue in (314, 320):
@@ -521,7 +530,7 @@ class CoordinationTransferTests(unittest.TestCase):
             ("predecessor_source_payload_sha256", "8" * 64),
             (
                 "predecessor_accountable_session_id",
-                "role.development.v2",
+                "role.development.v3",
             ),
             ("predecessor_lease_manifest_sha256", "7" * 64),
             ("predecessor_development_units", 1),

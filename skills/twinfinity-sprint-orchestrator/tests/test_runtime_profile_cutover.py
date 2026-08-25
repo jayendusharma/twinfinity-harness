@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import tomllib
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CODEX_HOME = Path("/home/ubuntu/.codex")
+CODEX_HOME = Path(os.environ["CODEX_HOME"])
 EXPECTED_ENDPOINTS = {
     "planner": ("role.planner.v2", 2),
     "development": ("role.development.v4", 4),

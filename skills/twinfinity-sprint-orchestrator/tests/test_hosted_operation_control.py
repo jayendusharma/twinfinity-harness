@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 import sys
 
 sys.path.insert(0, str(SCRIPTS))
@@ -39,11 +40,14 @@ from reconcile_routing_artifacts import (  # noqa: E402
     build_plan,
     load_legacy_alias_fixture,
 )
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
-SRE_SESSION = "role.sre.v2"
-PLANNER_SESSION = "role.planner.v1"
+SRE_SESSION = "role.sre.v4"
+PLANNER_SESSION = "role.planner.v2"
 AUTHORITY_BODY = "Exact bounded settings authority"
 AUTHORITY_SHA = hashlib.sha256(AUTHORITY_BODY.encode()).hexdigest()
 
@@ -55,6 +59,11 @@ class HostedOperationControlTests(unittest.TestCase):
         directory.mkdir(mode=0o700)
         self.database = directory / "state.sqlite3"
         self.control = HostedOperationControl(self.database)
+        apply_reviewed_current_endpoint_catalog(
+            self.control.connection,
+            ROOT,
+            operation_key="hosted-operation-control-tests",
+        )
         self.approval_guard = patch.object(
             HostedOperationControl, "_validate_approval_guard", return_value=None
         )
@@ -97,26 +106,12 @@ class HostedOperationControlTests(unittest.TestCase):
         return aliases
 
     def seed_current_sre_endpoint(self) -> None:
-        """Install only the current endpoint rows needed by supervisor unit tests."""
+        """Assert the shared fixture installed the reviewed current SRE endpoint."""
 
-        with self.control.store.transaction():
-            self.control.connection.execute(
-                """
-                INSERT OR IGNORE INTO executor_role_endpoints(
-                    endpoint_id, role, version, executor_profile, codex_profile,
-                    config_sha256, config_json, command_json, created_at
-                ) VALUES ('role.sre.v2', 'sre', 2, 'sre-v2', 'sre-v2', ?, '{}', '[]', ?)
-                """,
-                ("a" * 64, "2026-08-23T10:00:00Z"),
-            )
-            self.control.connection.execute(
-                """
-                INSERT OR REPLACE INTO executor_role_endpoint_current(
-                    role, endpoint_id, pointer_version, updated_at
-                ) VALUES ('sre', 'role.sre.v2', 1, ?)
-                """,
-                ("2026-08-23T10:00:00Z",),
-            )
+        row = self.control.connection.execute(
+            "SELECT endpoint_id FROM executor_role_endpoint_current WHERE role='sre'"
+        ).fetchone()
+        self.assertEqual(SRE_SESSION, row["endpoint_id"])
 
     def seed_active_sre_attempt(self, target_kind: str, target_key: str) -> None:
         with self.control.store.transaction():
@@ -126,11 +121,12 @@ class HostedOperationControlTests(unittest.TestCase):
                     attempt_id, role, endpoint_id, instance_id, token_sha256,
                     target_kind, target_key, state, process_id, exit_code,
                     heartbeat_at, version, created_at, updated_at, last_error
-                ) VALUES (?, 'sre', 'role.sre.v2', ?, ?, ?, ?, 'RUNNING',
+                ) VALUES (?, 'sre', ?, ?, ?, ?, ?, 'RUNNING',
                           1234, NULL, ?, 1, ?, ?, NULL)
                 """,
                 (
                     f"attempt-{target_kind}-{target_key}",
+                    SRE_SESSION,
                     f"instance-{target_kind}-{target_key}",
                     "b" * 64,
                     target_kind,
@@ -230,11 +226,11 @@ class HostedOperationControlTests(unittest.TestCase):
         ):
             self.control.prepare(transaction, "2026-08-24T10:00:01Z")
         with self.assertRaisesRegex(
-            CoordinationError, "CURRENT_ROLE_ENDPOINT_REQUIRED"
+            CoordinationError, "HOSTED_RECIPIENT_MISMATCH"
         ):
             self.control.claim(1, legacy_sre, "2026-08-24T10:00:02Z")
         with self.assertRaisesRegex(
-            CoordinationError, "CURRENT_ROLE_ENDPOINT_REQUIRED"
+            CoordinationError, "HOSTED_CLEARANCE_RECIPIENT_INVALID"
         ):
             clear_actions_rerun(
                 self.control,
@@ -409,9 +405,9 @@ class HostedOperationControlTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    "issue143-test-admission", "role.development.v2",
+                    "issue143-test-admission", "role.development.v3",
                     "development.admission", "2" * 64, "{}", "COMPLETE",
-                    "role.development.v2",
+                    "role.development.v3",
                     "2026-08-23T08:59:00Z", "2026-08-23T08:59:30Z", None,
                 ),
             ).lastrowid
@@ -429,7 +425,7 @@ class HostedOperationControlTests(unittest.TestCase):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    REPOSITORY, 143, 1, "role.development.v2",
+                    REPOSITORY, 143, 1, "role.development.v3",
                     self.source.payload_sha256, "1" * 64, admission_message_id, "2" * 64,
                     "codex/143-test", "/tmp/issue-143", "6" * 40, "8" * 40,
                     "3" * 64, 1, "focused", 0, "compose", 0, "owned-run", 1, 1,
@@ -451,7 +447,7 @@ class HostedOperationControlTests(unittest.TestCase):
                 """,
                 (
                     gate_id, REPOSITORY, 143, 1,
-                    "role.development.v2",
+                    "role.development.v3",
                     self.source.payload_sha256, "1" * 64, admission_message_id,
                     "codex/143-test",
                     "8" * 40, "origin", "6" * 64, "COMPLETE",
@@ -1980,7 +1976,7 @@ class HostedOperationControlTests(unittest.TestCase):
 
         self.assertEqual([row["id"]], result["launched"])
         self.assertEqual("sre", launched["role"])
-        self.assertEqual("role.sre.v2", launched["endpoint_id"])
+        self.assertEqual(SRE_SESSION, launched["endpoint_id"])
         self.assertEqual("hosted_operation", launched["target_kind"])
         self.assertEqual(str(row["id"]), launched["target_key"])
         self.assertNotIn("resume", str(launched))

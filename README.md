@@ -24,3 +24,15 @@ Changes that share SQLite transitions or supervisor behavior may be developed se
 - Preserve exact endpoint/profile hashes and update registry bindings atomically.
 - Validate the complete skill set and obtain an independent Governor disposition before promoting an integration branch to `main`.
 - Do not resume legacy Codex session UUIDs; every admitted Development or SRE attempt starts through a fresh bounded current role endpoint.
+
+## Validation
+
+Run the complete orchestrator suite through its hermetic source-bound runner:
+
+```bash
+python3 skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py
+```
+
+The runner uses a private temporary `CODEX_HOME` populated only with the exact
+versioned profiles declared by the checked-in schema-v2 registry; it never
+depends on or mutates installed profiles.
