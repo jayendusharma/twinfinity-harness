@@ -722,7 +722,32 @@ class PrePushControlTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="beta==2\nalpha==1\n", stderr=""
         )
+        uv = Path("/home/ubuntu/.local/bin/uv")
+        verifier_metadata = (root / "bin" / "ruff").lstat()
+        path_lstat = Path.lstat
+        path_is_symlink = Path.is_symlink
+
+        def fixture_lstat(path: Path):
+            if path == uv:
+                return verifier_metadata
+            return path_lstat(path)
+
+        def fixture_is_symlink(path: Path) -> bool:
+            if path == uv:
+                return False
+            return path_is_symlink(path)
+
         with (
+            patch(
+                "prepush_control.Path.lstat",
+                autospec=True,
+                side_effect=fixture_lstat,
+            ),
+            patch(
+                "prepush_control.Path.is_symlink",
+                autospec=True,
+                side_effect=fixture_is_symlink,
+            ),
             patch("prepush_control.subprocess.run", return_value=completed),
             patch.object(
                 self.control,
@@ -740,6 +765,16 @@ class PrePushControlTests(unittest.TestCase):
             args=[], returncode=0, stdout="alpha==9\nbeta==2\n", stderr=""
         )
         with (
+            patch(
+                "prepush_control.Path.lstat",
+                autospec=True,
+                side_effect=fixture_lstat,
+            ),
+            patch(
+                "prepush_control.Path.is_symlink",
+                autospec=True,
+                side_effect=fixture_is_symlink,
+            ),
             patch("prepush_control.subprocess.run", return_value=drifted),
             patch.object(
                 self.control,
