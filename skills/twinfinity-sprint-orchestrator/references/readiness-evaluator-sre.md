@@ -24,3 +24,10 @@ complete gate set exactly. A PASS requires every gate to pass. Use one
 consolidated actionable hold when work can autonomously close the evidence gap;
 use approval required only when the gate genuinely needs human authority; use a
 terminal hold only for a non-recoverable contradiction. Write no other file.
+
+The `resolution` object has exactly `role`, `actions`, and `approval`. PASS and
+terminal hold carry no actions or approval. An actionable hold carries only the
+schema's closed Planner action objects. Approval required carries the one closed
+material-approval action and the schema's complete approval input, including the
+full proposal packet and fixed decision mapping. Never replace that packet with
+a proposal digest or add a legacy `approval_proposal_sha256` field.

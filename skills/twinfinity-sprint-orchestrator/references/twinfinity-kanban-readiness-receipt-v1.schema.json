@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "twinfinity-kanban-readiness-receipt/v1",
+  "$id": "https://twinfinity.ai/schemas/twinfinity-kanban-readiness-receipt/v1",
+  "title": "Twinfinity canonical Kanban readiness receipt v1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -10,10 +11,15 @@
   ],
   "properties": {
     "schema": {"const": "twinfinity-kanban-readiness-receipt/v1"},
-    "repository": {"type": "string", "minLength": 1},
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
     "issue_number": {"type": "integer", "minimum": 1},
-    "readiness_plan_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "verdict": {"enum": ["PASS", "ACTIONABLE_HOLD", "APPROVAL_REQUIRED", "TERMINAL_HOLD"]},
+    "readiness_plan_sha256": {"$ref": "#/$defs/sha256"},
+    "verdict": {
+      "enum": ["PASS", "ACTIONABLE_HOLD", "APPROVAL_REQUIRED", "TERMINAL_HOLD"]
+    },
     "worker_role": {"enum": ["development", "sre"]},
     "message_id": {"type": "integer"},
     "attempt_id": {"type": "string"},
@@ -25,42 +31,277 @@
         "additionalProperties": false,
         "required": ["gate_key", "verdict", "evidence_sha256", "summary"],
         "properties": {
-          "gate_key": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+          "gate_key": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
           "verdict": {"enum": ["PASS", "HOLD"]},
-          "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-          "summary": {"type": "string", "pattern": ".*\\S.*"}
+          "evidence_sha256": {"$ref": "#/$defs/sha256"},
+          "summary": {"$ref": "#/$defs/non_empty_text"}
         }
       }
     },
     "resolution": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["role", "actions", "approval_proposal_sha256"],
+      "required": ["role", "actions", "approval"],
       "properties": {
         "role": {"type": ["string", "null"], "enum": ["planner", null]},
-        "actions": {"type": "array", "items": {"type": "string", "pattern": ".*\\S.*"}},
-        "approval_proposal_sha256": {
+        "actions": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {"$ref": "#/$defs/resolution_action"}
+        },
+        "approval": {
           "anyOf": [
             {"type": "null"},
-            {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            {"$ref": "#/$defs/readiness_approval_input"}
           ]
         }
       }
     },
-    "summary": {"type": "string", "pattern": ".*\\S.*"},
-    "observed_at": {"type": "string", "pattern": ".*\\S.*"}
+    "summary": {"$ref": "#/$defs/non_empty_text"},
+    "observed_at": {"$ref": "#/$defs/non_empty_text"}
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "non_empty_text": {
+      "type": "string",
+      "pattern": ".*\\S.*"
+    },
+    "closed_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "pattern": "^(?:\\S|\\S[\\s\\S]*\\S)$"
+    },
+    "closed_list_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "pattern": "^(?:\\S|\\S[\\s\\S]*\\S)$"
+    },
+    "resolution_action_base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "target", "expected_digest", "desired_digest",
+        "authority_class", "evidence_required"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "REFRESH_SOURCE_SNAPSHOT", "RECOMPUTE_DEPENDENCY_GRAPH",
+            "REBUILD_PREPARED_CANDIDATE", "REQUEST_MATERIAL_APPROVAL"
+          ]
+        },
+        "target": {"$ref": "#/$defs/non_empty_text"},
+        "expected_digest": {"$ref": "#/$defs/sha256"},
+        "desired_digest": {"$ref": "#/$defs/sha256"},
+        "authority_class": {"enum": ["PLANNER_OWNER_API", "HUMAN_APPROVAL"]},
+        "evidence_required": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/non_empty_text"}
+        }
+      }
+    },
+    "resolution_action": {
+      "allOf": [
+        {"$ref": "#/$defs/resolution_action_base"},
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {"const": "REFRESH_SOURCE_SNAPSHOT"},
+                "authority_class": {"const": "PLANNER_OWNER_API"},
+                "evidence_required": {
+                  "const": [
+                    "github_current.payload_sha256",
+                    "coordination_items.source_payload_sha256"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "kind": {"const": "RECOMPUTE_DEPENDENCY_GRAPH"},
+                "authority_class": {"const": "PLANNER_OWNER_API"},
+                "evidence_required": {
+                  "const": [
+                    "portfolio_graph_revisions.graph_sha256",
+                    "portfolio_graph_current.health"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "kind": {"const": "REBUILD_PREPARED_CANDIDATE"},
+                "authority_class": {"const": "PLANNER_OWNER_API"},
+                "evidence_required": {
+                  "const": [
+                    "portfolio_pull_buffer_current.candidate_id",
+                    "portfolio_pull_buffer_candidates.candidate_sha256"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "kind": {"const": "REQUEST_MATERIAL_APPROVAL"},
+                "authority_class": {"const": "HUMAN_APPROVAL"},
+                "evidence_required": {
+                  "const": ["approval_ledger.published_decision"]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "identity": {
+      "type": "string",
+      "pattern": "^(?:role\\.(?:planner|development|sre)\\.v[1-9][0-9]*|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+    },
+    "approval_option": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "effect", "machine_outcome"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,39}$"},
+        "label": {
+          "type": "string", "minLength": 1, "maxLength": 120,
+          "pattern": "^(?:\\S|\\S[\\s\\S]*\\S)$"
+        },
+        "effect": {
+          "type": "string", "minLength": 1, "maxLength": 800,
+          "pattern": "^(?:\\S|\\S[\\s\\S]*\\S)$"
+        },
+        "machine_outcome": {
+          "enum": ["APPROVE", "REJECT", "COURSE_CORRECT", "DEFER"]
+        }
+      }
+    },
+    "approval_packet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "decision_key", "repository", "owning_issue",
+        "source_snapshot_sha256", "execution_scope_sha256",
+        "requester_session_id", "recipient_session_id", "workstream",
+        "boundary", "priority", "urgency", "summary", "question",
+        "requested_action", "target", "affected_issues", "blocked_mutation",
+        "immediate_beneficiary", "evidence", "risk", "drift_guards",
+        "prohibited_side_effects", "options", "recommendation", "expires_at"
+      ],
+      "properties": {
+        "schema": {"const": "twinfinity.approval-proposal.v1"},
+        "decision_key": {
+          "type": "string", "pattern": "^[a-z0-9][a-z0-9._:/-]{2,159}$"
+        },
+        "repository": {
+          "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "owning_issue": {"type": "integer", "minimum": 1},
+        "source_snapshot_sha256": {"$ref": "#/$defs/sha256"},
+        "execution_scope_sha256": {"$ref": "#/$defs/sha256"},
+        "requester_session_id": {"$ref": "#/$defs/identity"},
+        "recipient_session_id": {"$ref": "#/$defs/identity"},
+        "workstream": {"const": "READINESS"},
+        "boundary": {
+          "enum": [
+            "PRODUCT_BEHAVIOR", "UX_FLOW", "PERSISTENT_DATA", "PUBLIC_CONTRACT",
+            "SECURITY_PRIVACY", "HOSTED_PROVIDER", "DESTRUCTIVE",
+            "EXTERNAL_COMMITMENT", "CAPACITY_POLICY", "OTHER_MATERIAL"
+          ]
+        },
+        "priority": {"enum": ["P0", "P1", "P2"]},
+        "urgency": {"enum": ["ACTIVE_BLOCKER", "READY_BLOCKER", "FUTURE", "INFORMATIONAL"]},
+        "summary": {"$ref": "#/$defs/closed_text"},
+        "question": {"$ref": "#/$defs/closed_text"},
+        "requested_action": {"$ref": "#/$defs/closed_text"},
+        "target": {"$ref": "#/$defs/closed_text"},
+        "affected_issues": {
+          "type": "array", "minItems": 1, "maxItems": 30, "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "blocked_mutation": {"$ref": "#/$defs/closed_text"},
+        "immediate_beneficiary": {"$ref": "#/$defs/closed_text"},
+        "evidence": {
+          "type": "array", "maxItems": 20,
+          "items": {"$ref": "#/$defs/closed_list_text"}
+        },
+        "risk": {"$ref": "#/$defs/closed_text"},
+        "drift_guards": {
+          "type": "array", "minItems": 1, "maxItems": 20,
+          "items": {"$ref": "#/$defs/closed_list_text"}
+        },
+        "prohibited_side_effects": {
+          "type": "array", "minItems": 1, "maxItems": 20,
+          "items": {"$ref": "#/$defs/closed_list_text"}
+        },
+        "options": {
+          "type": "array", "minItems": 2, "maxItems": 5,
+          "items": {"$ref": "#/$defs/approval_option"}
+        },
+        "recommendation": {
+          "type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,39}$"
+        },
+        "expires_at": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "string", "minLength": 1, "maxLength": 40,
+              "pattern": "^(?:\\S|\\S[\\s\\S]*\\S)$"
+            }
+          ]
+        }
+      }
+    },
+    "readiness_approval_input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "packet", "material_boundary", "decision_mapping"],
+      "properties": {
+        "schema": {"const": "twinfinity-kanban-readiness-approval-input/v1"},
+        "packet": {"$ref": "#/$defs/approval_packet"},
+        "material_boundary": {
+          "enum": [
+            "PRODUCT_BEHAVIOR", "UX_FLOW", "PERSISTENT_DATA", "PUBLIC_CONTRACT",
+            "SECURITY_PRIVACY", "HOSTED_PROVIDER", "DESTRUCTIVE",
+            "EXTERNAL_COMMITMENT", "CAPACITY_POLICY", "OTHER_MATERIAL"
+          ]
+        },
+        "decision_mapping": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["APPROVE", "REJECT", "DEFER", "COURSE_CORRECT"],
+          "properties": {
+            "APPROVE": {"const": "APPROVAL_RESUME"},
+            "REJECT": {"const": "HOLD"},
+            "DEFER": {"const": "HOLD"},
+            "COURSE_CORRECT": {"const": "HOLD"}
+          }
+        }
+      }
+    }
   },
   "allOf": [
     {
       "if": {"properties": {"verdict": {"const": "PASS"}}},
       "then": {
         "properties": {
-          "gate_results": {"items": {"properties": {"verdict": {"const": "PASS"}}}},
+          "gate_results": {
+            "items": {"properties": {"verdict": {"const": "PASS"}}}
+          },
           "resolution": {
             "properties": {
               "role": {"type": "null"},
               "actions": {"maxItems": 0},
-              "approval_proposal_sha256": {"type": "null"}
+              "approval": {"type": "null"}
             }
           }
         }
@@ -70,12 +311,32 @@
       "if": {"properties": {"verdict": {"const": "ACTIONABLE_HOLD"}}},
       "then": {
         "properties": {
-          "gate_results": {"contains": {"properties": {"verdict": {"const": "HOLD"}}}},
+          "gate_results": {
+            "contains": {"properties": {"verdict": {"const": "HOLD"}}}
+          },
           "resolution": {
             "properties": {
               "role": {"const": "planner"},
-              "actions": {"minItems": 1},
-              "approval_proposal_sha256": {"type": "null"}
+              "actions": {
+                "minItems": 1,
+                "items": {
+                  "allOf": [
+                    {"$ref": "#/$defs/resolution_action"},
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "REFRESH_SOURCE_SNAPSHOT",
+                            "RECOMPUTE_DEPENDENCY_GRAPH",
+                            "REBUILD_PREPARED_CANDIDATE"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "approval": {"type": "null"}
             }
           }
         }
@@ -85,12 +346,23 @@
       "if": {"properties": {"verdict": {"const": "APPROVAL_REQUIRED"}}},
       "then": {
         "properties": {
-          "gate_results": {"contains": {"properties": {"verdict": {"const": "HOLD"}}}},
+          "gate_results": {
+            "contains": {"properties": {"verdict": {"const": "HOLD"}}}
+          },
           "resolution": {
             "properties": {
               "role": {"const": "planner"},
-              "actions": {"minItems": 1},
-              "approval_proposal_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              "actions": {
+                "minItems": 1,
+                "maxItems": 1,
+                "items": {
+                  "allOf": [
+                    {"$ref": "#/$defs/resolution_action"},
+                    {"properties": {"kind": {"const": "REQUEST_MATERIAL_APPROVAL"}}}
+                  ]
+                }
+              },
+              "approval": {"$ref": "#/$defs/readiness_approval_input"}
             }
           }
         }
@@ -100,12 +372,14 @@
       "if": {"properties": {"verdict": {"const": "TERMINAL_HOLD"}}},
       "then": {
         "properties": {
-          "gate_results": {"contains": {"properties": {"verdict": {"const": "HOLD"}}}},
+          "gate_results": {
+            "contains": {"properties": {"verdict": {"const": "HOLD"}}}
+          },
           "resolution": {
             "properties": {
               "role": {"type": "null"},
               "actions": {"maxItems": 0},
-              "approval_proposal_sha256": {"type": "null"}
+              "approval": {"type": "null"}
             }
           }
         }

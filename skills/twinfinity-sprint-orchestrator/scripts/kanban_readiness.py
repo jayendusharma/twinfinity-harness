@@ -42,6 +42,9 @@ PLAN_SCHEMA = "twinfinity-kanban-readiness-phase/v1"
 SUCCESSOR_PLAN_SCHEMA = "twinfinity-kanban-readiness-phase/v2"
 TRANSITION_EVIDENCE_SCHEMA = "twinfinity-kanban-readiness-transition-evidence/v1"
 RECEIPT_SCHEMA = "twinfinity-kanban-readiness-receipt/v1"
+RECEIPT_JSON_SCHEMA_ID = (
+    "https://twinfinity.ai/schemas/twinfinity-kanban-readiness-receipt/v1"
+)
 RECEIPT_LOCATOR_SCHEMA = "twinfinity-kanban-readiness-receipt-locator/v1"
 READINESS_APPROVAL_INPUT_SCHEMA = "twinfinity-kanban-readiness-approval-input/v1"
 READINESS_RESOLUTION_CONTEXT_SCHEMA = (
@@ -4918,6 +4921,11 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
     if verdict not in {"PASS", "ACTIONABLE_HOLD", "APPROVAL_REQUIRED", "TERMINAL_HOLD"}:
         raise ReadinessError("READINESS_RECEIPT_INVALID")
     if receipt.get("worker_role") not in WORKER_ROLES:
+        raise ReadinessError("READINESS_RECEIPT_INVALID")
+    if (
+        not isinstance(receipt.get("repository"), str)
+        or not REPOSITORY.fullmatch(receipt["repository"])
+    ):
         raise ReadinessError("READINESS_RECEIPT_INVALID")
     if type(receipt.get("issue_number")) is not int or receipt["issue_number"] <= 0:
         raise ReadinessError("READINESS_RECEIPT_INVALID")

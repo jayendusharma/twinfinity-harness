@@ -41,6 +41,7 @@ from executor_registry import (
     utc_now,
 )
 from kanban_readiness import (
+    RECEIPT_JSON_SCHEMA_ID,
     RECEIPT_SCHEMA,
     ReadinessError,
     _artifact_matches_pickup,
@@ -471,7 +472,7 @@ def instruction_bundle(role: str) -> dict[str, Any]:
         raise BrokerError("BROKER_INSTRUCTION_BUNDLE_INVALID") from exc
     if (
         not isinstance(schema, dict)
-        or schema.get("$id") != RECEIPT_SCHEMA
+        or schema.get("$id") != RECEIPT_JSON_SCHEMA_ID
         or schema.get("additionalProperties") is not False
     ):
         raise BrokerError("BROKER_RECEIPT_SCHEMA_INVALID")
