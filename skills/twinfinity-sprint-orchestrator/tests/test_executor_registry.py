@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -36,6 +39,7 @@ from executor_registry import (  # noqa: E402
     load_legacy_aliases,
     load_registry_config,
     open_registry_database,
+    probe_systemd_unit,
     reserve_attempt,
     recover_stale_active_attempts,
     require_current_endpoint_identity,
@@ -58,7 +62,7 @@ from reviewed_endpoint_catalog_fixture import (  # noqa: E402
 )
 
 
-CONFIG = ROOT / "references" / "twinfinity-executor-registry.toml"
+CONFIG = ROOT / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
 ALIASES = ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
 REPOSITORY = "twinfinityai/twinfinityapp"
 DEVELOPMENT_UUID = "22222222-2222-4222-8222-222222222222"
@@ -150,12 +154,76 @@ class ExecutorRegistryTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
+        self.codex_home = Path(self.temp.name) / "codex-home"
+        self._install_role_profiles(self.codex_home)
+        self.environment = patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home)})
+        self.environment.start()
         self.config = load_registry_config(CONFIG)
+        self.registry_loader = patch(
+            "executor_registry.load_registry_config", return_value=self.config
+        )
+        self.runner_registry_loader = patch(
+            "run_role_executor.load_registry_config", return_value=self.config
+        )
+        self.readiness_registry_loader = patch(
+            "archive_readiness_audit.load_registry_config", return_value=self.config
+        )
+        self.registry_loader.start()
+        self.runner_registry_loader.start()
+        self.readiness_registry_loader.start()
         self.aliases, self.alias_sha = load_legacy_alias_fixture(ALIASES)
 
     def tearDown(self) -> None:
+        self.readiness_registry_loader.stop()
+        self.runner_registry_loader.stop()
+        self.registry_loader.stop()
+        self.environment.stop()
         self.store.close()
         self.temp.cleanup()
+
+    def test_systemd_probe_reads_exact_attempt_cgroup_limits(self) -> None:
+        fields = {
+            "Id": UNIT,
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "InvocationID": INVOCATION_ID,
+            "ControlGroup": CONTROL_GROUP,
+            "Result": "success",
+            "MemoryMax": "2147483648",
+            "TasksMax": "64",
+            "RuntimeMaxUSec": "11min",
+            "CPUQuotaPerSecUSec": "1s",
+        }
+
+        def runner(_command, **_kwargs):
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="".join(f"{key}={value}\n" for key, value in fields.items()),
+            )
+
+        evidence = probe_systemd_unit(UNIT, runner=runner)
+        self.assertEqual(
+            ("2147483648", "64", "11min", "1s"),
+            (
+                evidence.memory_max,
+                evidence.tasks_max,
+                evidence.runtime_max_usec,
+                evidence.cpu_quota_per_sec_usec,
+            ),
+        )
+        missing = dict(fields)
+        missing.pop("MemoryMax")
+        with self.assertRaisesRegex(RegistryError, "SYSTEMD_EVIDENCE_AMBIGUOUS"):
+            probe_systemd_unit(
+                UNIT,
+                runner=lambda _command, **_kwargs: types.SimpleNamespace(
+                    returncode=0,
+                    stdout="".join(
+                        f"{key}={value}\n" for key, value in missing.items()
+                    ),
+                ),
+            )
 
     @staticmethod
     def no_lineage(_connection: sqlite3.Connection) -> None:
@@ -278,7 +346,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             load_registry_config(aliased)
 
     def _install_role_profiles(self, codex_home: Path) -> None:
-        codex_home.mkdir()
+        codex_home.mkdir(exist_ok=True)
         for profile in (
             "twinfinity-planner-v2",
             "twinfinity-development-v3",
@@ -446,9 +514,17 @@ class ExecutorRegistryTests(unittest.TestCase):
                 },
                 set(rotated_config.endpoints),
             )
+            rotation_only = replace(
+                rotated_config,
+                roles={
+                    "planner": rotated_config.roles["planner"],
+                    "development": self.config.roles["development"],
+                    "sre": self.config.roles["sre"],
+                },
+            )
             plan = build_plan(
                 self.store.connection,
-                rotated_config,
+                rotation_only,
                 self.aliases,
                 alias_fixture_sha256=self.alias_sha,
             )

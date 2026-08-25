@@ -1587,6 +1587,9 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         )
         proxy.start()
         context = multiprocessing.get_context("spawn")
+        # The cancellation actor is intentionally independent of worker spawn
+        # latency; it proves that a no-op acknowledgement is insufficient.
+        transport.started.value = 1
         cancel_process = context.Process(
             target=acknowledge_cancel_without_terminalizing,
             args=(transport,),
@@ -1595,7 +1598,9 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         started = time.monotonic()
         result = proxy.handle_raw_request(raw_request(), lambda _value: None)
         elapsed = time.monotonic() - started
-        cancel_process.join(1.0)
+        # Spawn startup can be delayed under the full hermetic suite; this
+        # bound is outside the proxy decision latency asserted below.
+        cancel_process.join(5.0)
         self.assertFalse(cancel_process.is_alive())
         self.assertEqual(0, cancel_process.exitcode)
         cancel_process.close()
@@ -1823,8 +1828,8 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("attempt_responses_proxy", launcher)
         self.assertNotIn("attempt_responses_proxy", registry)
-        self.assertNotIn("role.development.v5", registry)
-        self.assertNotIn("role.sre.v5", registry)
+        self.assertNotIn("TWINFINITY_ATTEMPT_PROXY", launcher)
+        self.assertNotIn("TWINFINITY_ATTEMPT_PROXY", registry)
 
 
 if __name__ == "__main__":

@@ -11,11 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 CODEX_HOME = Path(os.environ["CODEX_HOME"])
 EXPECTED_ENDPOINTS = {
     "planner": ("role.planner.v2", 2),
-    "development": ("role.development.v4", 4),
-    "sre": ("role.sre.v4", 4),
+    "development": ("role.development.v5", 5),
+    "sre": ("role.sre.v5", 5),
 }
 class RuntimeProfileCutoverTests(unittest.TestCase):
-    def test_staged_role_profiles_are_digest_bound_v4_cutover_inputs(self) -> None:
+    def test_staged_role_profiles_are_digest_bound_v5_broker_inputs(self) -> None:
         registry = tomllib.loads(
             (ROOT / "references" / "twinfinity-executor-registry.toml").read_text(
                 encoding="utf-8"
@@ -41,7 +41,6 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                     (endpoint["endpoint_id"], endpoint["version"]),
                 )
                 profile = tomllib.loads(template.read_text(encoding="utf-8"))
-                self.assertEqual("on-request", profile["approval_policy"])
                 self.assertEqual("workspace-write", profile["sandbox_mode"])
                 self.assertFalse(profile["sandbox_workspace_write"]["network_access"])
                 self.assertFalse(profile["features"]["multi_agent"])
@@ -52,33 +51,30 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 }[role]
                 self.assertIn(f"Twinfinity {role_label}", profile["developer_instructions"])
                 if role == "planner":
+                    self.assertEqual("on-request", profile["approval_policy"])
                     self.assertNotIn("hooks", profile)
                     self.assertEqual(
                         ["/home/ubuntu/.codex/twinfinity-coordination"],
                         profile["sandbox_workspace_write"]["writable_roots"],
                     )
                 else:
-                    hooks = profile["hooks"]["PreToolUse"]
-                    self.assertEqual(1, len(hooks))
-                    self.assertTrue(
-                        hooks[0]["hooks"][0]["command"].endswith(
-                            "/scripts/delivery_guard.py"
-                        )
+                    self.assertEqual("readiness/v1", endpoint["execution_protocol"])
+                    self.assertEqual("never", profile["approval_policy"])
+                    self.assertFalse(profile["features"]["hooks"])
+                    self.assertFalse(profile["features"]["memories"])
+                    self.assertNotIn("hooks", profile)
+                    self.assertEqual(
+                        ["/run/twinfinity-attempt/out"],
+                        profile["sandbox_workspace_write"]["writable_roots"],
                     )
                     instructions = profile["developer_instructions"]
-                    self.assertIn("current-endpoint target", instructions)
-                    self.assertIn("non-authorizing coordination.notice", instructions)
+                    self.assertIn("brokered readiness/v1 boundary", instructions)
+                    self.assertIn("/run/twinfinity-attempt/contract.json", instructions)
+                    self.assertIn("/run/twinfinity-attempt/input/input.json", instructions)
+                    self.assertIn("/run/twinfinity-attempt/out/receipt.json", instructions)
+                    self.assertIn("Do not access SQLite, GitHub", instructions)
+                    self.assertIn("trusted outer broker", instructions)
                     self.assertIn("read-only", instructions)
-                    self.assertIn("writer WIP", instructions)
-                    self.assertIn("Every mutation requires", instructions)
-                    self.assertIn("resume a legacy Codex thread", instructions)
-                    if role == "development":
-                        self.assertIn(
-                            "zero Development and Shared writer WIP", instructions
-                        )
-                    else:
-                        self.assertIn("zero SRE writer WIP", instructions)
-                        self.assertIn("authorized read-only operational-audit", instructions)
                 command = endpoint["command_prefix"]
                 self.assertEqual(profile_name, command[command.index("--profile") + 1])
 
@@ -87,7 +83,13 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             for endpoint in registry["historical_endpoints"]
         }
         self.assertEqual(
-            {"role.development.v3", "role.sre.v3"}, set(history)
+            {
+                "role.development.v3",
+                "role.development.v4",
+                "role.sre.v3",
+                "role.sre.v4",
+            },
+            set(history),
         )
         for endpoint in history.values():
             versioned = (
@@ -99,6 +101,9 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 endpoint["profile_sha256"],
                 hashlib.sha256(versioned.read_bytes()).hexdigest(),
             )
+            historical_profile = tomllib.loads(versioned.read_text(encoding="utf-8"))
+            self.assertEqual("on-request", historical_profile["approval_policy"])
+            self.assertIn("hooks", historical_profile)
 
     def test_obsolete_runtime_artifacts_are_absent_and_uncalled(self) -> None:
         obsolete = (

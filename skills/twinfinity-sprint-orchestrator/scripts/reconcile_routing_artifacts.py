@@ -170,6 +170,112 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+def _broker_cutover_blockers(
+    connection: sqlite3.Connection,
+    endpoints: list[dict[str, Any]],
+    pointer_changes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Inventory work a readiness-only endpoint cannot execute after cutover."""
+
+    by_role = {endpoint["role"]: endpoint for endpoint in endpoints}
+    blockers: list[dict[str, Any]] = []
+    for change in pointer_changes:
+        endpoint = by_role[change["role"]]
+        before = change["before_endpoint_id"]
+        if (
+            endpoint.get("execution_protocol") != "readiness/v1"
+            or before == change["after_endpoint_id"]
+        ):
+            continue
+        blockers.append(
+            {
+                "role": change["role"],
+                "endpoint_id": change["after_endpoint_id"],
+                "kind": "credential_transport",
+                "key": "ATTEMPT_BOUND_RESPONSES_PROXY_NOT_IMPLEMENTED",
+            }
+        )
+        if before is None:
+            continue
+        item_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(coordination_items)")
+        } if _table_exists(connection, "coordination_items") else set()
+        item_query = (
+            """
+            SELECT repository || '#issue-' || issue_number AS key
+            FROM coordination_items
+            WHERE accountable_session_id=?
+              AND (allocation_class!='NONE' OR status IN
+                   ('READY','ACTIVE','ACTIVE_FENCED','MONITOR'))
+            ORDER BY repository, issue_number
+            """
+            if {"allocation_class", "status"}.issubset(item_columns)
+            else """
+            SELECT repository || '#issue-' || issue_number AS key
+            FROM coordination_items WHERE accountable_session_id=?
+            ORDER BY repository, issue_number
+            """
+        )
+        inventories = (
+            (
+                "coordination_messages",
+                "message",
+                """
+                SELECT CAST(id AS TEXT) AS key FROM coordination_messages
+                WHERE recipient_session_id=? AND state IN ('PREPARED','CLAIMED')
+                ORDER BY id
+                """,
+            ),
+            (
+                "coordination_items",
+                "item",
+                item_query,
+            ),
+            (
+                "coordination_terminal_watches",
+                "terminal_watch",
+                """
+                SELECT watch_key AS key FROM coordination_terminal_watches
+                WHERE accountable_session_id=? AND state='ACTIVE'
+                ORDER BY watch_key
+                """,
+            ),
+            (
+                "hosted_operations",
+                "hosted_operation",
+                """
+                SELECT CAST(id AS TEXT) AS key FROM hosted_operations
+                WHERE recipient_session_id=?
+                  AND state IN ('WAITING','PREPARED','CLAIMED')
+                ORDER BY id
+                """,
+            ),
+            (
+                "executor_attempts",
+                "attempt",
+                """
+                SELECT attempt_id AS key FROM executor_attempts
+                WHERE endpoint_id=? AND state IN ('RESERVED','LAUNCHING','RUNNING')
+                ORDER BY created_at, attempt_id
+                """,
+            ),
+        )
+        for table, kind, query in inventories:
+            if not _table_exists(connection, table):
+                continue
+            for row in connection.execute(query, (before,)).fetchall():
+                blockers.append(
+                    {
+                        "role": change["role"],
+                        "endpoint_id": before,
+                        "kind": kind,
+                        "key": str(row["key"]),
+                    }
+                )
+    return blockers
+
+
 def build_plan(
     connection: sqlite3.Connection,
     config: RegistryConfig,
@@ -295,6 +401,9 @@ def _build_plan_from_inputs(
             else active_uniqueness
         ),
         "pointer_changes": pointer_changes,
+        "broker_cutover_blockers": _broker_cutover_blockers(
+            connection, endpoints, pointer_changes
+        ),
         "item_changes": item_changes,
         "watch_changes": watch_changes,
         "immutable_message_aliases": immutable_messages,
@@ -390,6 +499,15 @@ def apply_plan(
         )
         if plan["plan_sha256"] != expected_plan_sha256:
             raise RegistryError("REGISTRY_MIGRATION_PLAN_MISMATCH")
+        actionable_broker_blockers = [
+            blocker
+            for blocker in plan.get("broker_cutover_blockers", [])
+            if blocker["kind"] != "credential_transport"
+        ]
+        if actionable_broker_blockers:
+            raise RegistryError("REGISTRY_BROKER_CUTOVER_ACTIONABLE_WORK")
+        if plan.get("broker_cutover_blockers"):
+            raise RegistryError("REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED")
         ensure_executor_registry_schema(connection)
         schema_current = attempt_schema_is_current(connection)
         if bool(plan.get("attempt_schema_upgrade")) == schema_current:
@@ -764,6 +882,16 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
         blockers.append("LEGACY_EXECUTABLE_MESSAGE_ACTIVE")
     if plan["github_routing_inventory_hints"]:
         blockers.append("ROUTING_DEPRECATION_INVENTORY_REQUIRED")
+    if any(
+        blocker["kind"] != "credential_transport"
+        for blocker in plan.get("broker_cutover_blockers", [])
+    ):
+        blockers.append("REGISTRY_BROKER_CUTOVER_ACTIONABLE_WORK")
+    if any(
+        blocker["kind"] == "credential_transport"
+        for blocker in plan.get("broker_cutover_blockers", [])
+    ):
+        blockers.append("REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED")
     return {
         "phase": "PASS" if not blockers else "HOLD",
         "plan_sha256": plan["plan_sha256"],

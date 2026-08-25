@@ -22,8 +22,12 @@ from coordination_store import (  # noqa: E402
     CoordinationStore,
     descriptor_file_sha256,
 )
-from executor_registry import load_registry_config  # noqa: E402
+from executor_registry import (  # noqa: E402
+    ensure_executor_registry_schema,
+    load_registry_config,
+)
 from reconcile_routing_artifacts import (  # noqa: E402
+    _verify_or_insert_endpoint,
     apply_plan,
     audit_plan,
     build_plan,
@@ -310,6 +314,19 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         self.store = CoordinationStore(directory / "state.sqlite3")
         config = load_registry_config(CONFIG)
         aliases, alias_sha = load_legacy_alias_fixture(ALIASES)
+        ensure_executor_registry_schema(self.store.connection)
+        for role, endpoint in config.roles.items():
+            _verify_or_insert_endpoint(
+                self.store.connection, endpoint.payload, UPDATED
+            )
+            self.store.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint.endpoint_id, UPDATED),
+            )
         plan_value = build_plan(
             self.store.connection, config, aliases, alias_fixture_sha256=alias_sha
         )

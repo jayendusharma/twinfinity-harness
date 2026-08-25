@@ -90,10 +90,10 @@ def apply_reviewed_current_endpoint_catalog(
     operation_key: str,
     now: str = "2026-08-24T09:59:59Z",
 ) -> RegistryConfig:
-    """Apply and verify the complete production-current pointer set in a test DB."""
+    """Apply the immutable v4 operational rollback catalog in a test DB."""
 
     config = load_registry_config(
-        skill_root / "references" / "twinfinity-executor-registry.toml"
+        skill_root / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
     )
     aliases, alias_sha256 = load_legacy_alias_fixture(
         skill_root / "tests" / "fixtures" / "legacy-role-aliases.json"
@@ -137,7 +137,7 @@ def reviewed_current_endpoint_catalog(
     skill_root: Path,
     temporary_root: Path,
 ) -> Iterator[RegistryConfig]:
-    """Yield the complete reviewed production-current catalog from temp files."""
+    """Yield the immutable v4 operational rollback catalog from temp files."""
 
     source_references = skill_root / "references"
     fixture_root = temporary_root / "reviewed-current-endpoint-catalog"
@@ -151,7 +151,7 @@ def reviewed_current_endpoint_catalog(
         shutil.copy2(source, codex_home / source.name)
     catalog_path = template_root / "twinfinity-executor-registry.toml"
     shutil.copy2(
-        source_references / "twinfinity-executor-registry.toml",
+        skill_root / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml",
         catalog_path,
     )
     config = load_registry_config(
@@ -209,7 +209,7 @@ def reviewed_planner_rotation_catalog(
         shutil.copy2(planner_v2, codex_home / filename)
 
     production_text = (
-        source_references / "twinfinity-executor-registry.toml"
+        skill_root / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
     ).read_text(encoding="utf-8")
     if production_text.count(_PLANNER_V2) != 1:
         raise AssertionError("production Planner-v2 registry stanza drifted")

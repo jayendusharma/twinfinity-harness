@@ -86,7 +86,7 @@ class HostedOperationControlTests(unittest.TestCase):
     def migrate_registry(self, operation_key: str) -> list[dict[str, str]]:
         root = Path(__file__).resolve().parents[1]
         config = load_registry_config(
-            root / "references" / "twinfinity-executor-registry.toml"
+            root / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
         )
         aliases, alias_sha = load_legacy_alias_fixture(
             root / "tests" / "fixtures" / "legacy-role-aliases.json"

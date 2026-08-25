@@ -17,41 +17,6 @@ command_prefix = [
 allowed_topics = ["coordination.notice"]
 
 [roles.development]
-endpoint_id = "role.development.v5"
-version = 5
-executor_profile = "development"
-codex_profile = "twinfinity-development"
-profile_sha256 = "d82fafe8e269b63aa95ec125afc9b151373f2a321fbffd1f90a9af1d59c0500b"
-execution_protocol = "readiness/v1"
-command_prefix = [
-  "/home/ubuntu/.local/bin/codex",
-  "exec",
-  "--profile",
-  "twinfinity-development",
-  "--strict-config",
-  "--json",
-]
-allowed_topics = ["coordination.notice"]
-
-[roles.sre]
-endpoint_id = "role.sre.v5"
-version = 5
-executor_profile = "sre"
-codex_profile = "twinfinity-sre"
-profile_sha256 = "010e8df7de6a99bf13f455cb915dec88f30100f221ff3f957f7a574edf8b0b17"
-execution_protocol = "readiness/v1"
-command_prefix = [
-  "/home/ubuntu/.local/bin/codex",
-  "exec",
-  "--profile",
-  "twinfinity-sre",
-  "--strict-config",
-  "--json",
-]
-allowed_topics = ["coordination.notice"]
-
-[[historical_endpoints]]
-role = "development"
 endpoint_id = "role.development.v4"
 version = 4
 executor_profile = "development"
@@ -73,8 +38,7 @@ allowed_topics = [
   "development.terminal_closeout",
 ]
 
-[[historical_endpoints]]
-role = "sre"
+[roles.sre]
 endpoint_id = "role.sre.v4"
 version = 4
 executor_profile = "sre"

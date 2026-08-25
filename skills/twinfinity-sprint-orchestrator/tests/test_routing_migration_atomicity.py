@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,8 +62,15 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             );
             """
         )
-        self.config = load_registry_config(CONFIG)
-        self.aliases, self.alias_sha = load_legacy_alias_fixture(ALIASES)
+        (
+            self.config,
+            self.aliases,
+            self.alias_sha,
+            _config_path,
+            _alias_path,
+            _template_root,
+            _codex_home,
+        ) = self._copied_review_inputs()
         self.alias_by_role = {
             entry["role"]: entry["alias"] for entry in self.aliases
         }
@@ -89,6 +97,21 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             """,
             (f"watch-{suffix}", identity, "2026-08-24T09:00:01Z"),
         )
+
+    def _seed_current_config_pointers(self, roles: tuple[str, ...]) -> None:
+        ensure_executor_registry_schema(self.connection)
+        now = "2026-08-24T09:00:00Z"
+        for role in roles:
+            endpoint = self.config.roles[role]
+            _verify_or_insert_endpoint(self.connection, endpoint.payload, now)
+            self.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint.endpoint_id, now),
+            )
 
     def _routing_state_bytes(self) -> bytes:
         schema = [
@@ -148,8 +171,10 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             "twinfinity-planner-v2",
             "twinfinity-development-v3",
             "twinfinity-development-v4",
+            "twinfinity-development-v5",
             "twinfinity-sre-v3",
             "twinfinity-sre-v4",
+            "twinfinity-sre-v5",
         ):
             source = ROOT / "references" / f"{profile}.config.toml"
             shutil.copy2(source, template_root / source.name)
@@ -292,7 +317,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 before = self._routing_state_bytes()
                 root = template_root if source_kind == "template" else codex_home
                 self._replace_with_same_bytes(
-                    root / "twinfinity-development-v4.config.toml"
+                    root / "twinfinity-development-v5.config.toml"
                 )
 
                 with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_DRIFT"):
@@ -309,6 +334,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 self.assertEqual(before, self._routing_state_bytes())
 
     def test_apply_is_atomic_and_first_cutover_rollback_is_forbidden(self) -> None:
+        self._seed_current_config_pointers(("development", "sre"))
         self._insert_legacy_item_and_watch("103")
         reviewed = self._dry_run_plan()
         statements: list[str] = []
@@ -351,7 +377,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_versioned_cutover_preserves_immutable_legacy_alias_provenance(self) -> None:
+    def test_versioned_cutover_holds_without_credential_transport_and_preserves_v3(self) -> None:
         ensure_executor_registry_schema(self.connection)
         now = "2026-08-24T09:00:00Z"
         for role in ROLES:
@@ -405,7 +431,14 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             )
 
         reviewed = self._dry_run_plan()
-        self._migrate(reviewed, "versioned-endpoint-cutover")
+        self.assertEqual(
+            {"credential_transport"},
+            {entry["kind"] for entry in reviewed["broker_cutover_blockers"]},
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED"
+        ):
+            self._migrate(reviewed, "versioned-endpoint-cutover")
 
         pointers = {
             row["role"]: (row["endpoint_id"], row["pointer_version"])
@@ -415,11 +448,11 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             )
         }
         self.assertEqual(
-            (self.config.roles["development"].endpoint_id, 2),
+            (prior_endpoints["development"], 1),
             pointers["development"],
         )
         self.assertEqual(
-            (self.config.roles["sre"].endpoint_id, 2), pointers["sre"]
+            (prior_endpoints["sre"], 1), pointers["sre"]
         )
         self.assertEqual(
             (self.config.roles["planner"].endpoint_id, 1), pointers["planner"]
@@ -445,7 +478,9 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 (entry["alias"],),
             ).fetchone()
             self.assertEqual(current_by_role[entry["role"]], stored["endpoint_id"])
-            with self.assertRaisesRegex(
+            with patch(
+                "executor_registry.load_registry_config", return_value=self.config
+            ), self.assertRaisesRegex(
                 RegistryError, "CURRENT_ROLE_ENDPOINT_REQUIRED"
             ):
                 require_current_endpoint_identity(
@@ -454,13 +489,168 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                     expected_role=entry["role"],
                 )
 
-    def test_versioned_cutover_rejects_alias_bound_to_wrong_role_endpoint(self) -> None:
+    def test_fresh_registry_holds_without_broker_credential_transport(self) -> None:
+        reviewed = self._dry_run_plan()
+        before = self._routing_state_bytes()
+
+        self.assertEqual(
+            {
+                ("development", "role.development.v5", "credential_transport"),
+                ("sre", "role.sre.v5", "credential_transport"),
+            },
+            {
+                (entry["role"], entry["endpoint_id"], entry["kind"])
+                for entry in reviewed["broker_cutover_blockers"]
+            },
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED"
+        ):
+            self._migrate(reviewed, "fresh-registry-broker-cutover")
+
+        self.assertEqual(before, self._routing_state_bytes())
+
+    def test_missing_sre_pointer_holds_without_broker_credential_transport(self) -> None:
         ensure_executor_registry_schema(self.connection)
         now = "2026-08-24T09:00:00Z"
-        for role in ROLES:
+        for role in ("planner", "development"):
+            endpoint_id = self.config.roles[role].endpoint_id
             _verify_or_insert_endpoint(
                 self.connection, self.config.roles[role].payload, now
             )
+            self.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint_id, now),
+            )
+        reviewed = self._dry_run_plan()
+        before = self._routing_state_bytes()
+
+        self.assertEqual(
+            [
+                {
+                    "role": "sre",
+                    "endpoint_id": "role.sre.v5",
+                    "kind": "credential_transport",
+                    "key": "ATTEMPT_BOUND_RESPONSES_PROXY_NOT_IMPLEMENTED",
+                }
+            ],
+            reviewed["broker_cutover_blockers"],
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED"
+        ):
+            self._migrate(reviewed, "missing-sre-pointer-broker-cutover")
+
+        self.assertEqual(before, self._routing_state_bytes())
+
+    def test_v4_to_v5_cutover_rejects_every_actionable_target_class_atomically(self) -> None:
+        ensure_executor_registry_schema(self.connection)
+        now = "2026-08-24T09:00:00Z"
+        for endpoint in self.config.endpoints.values():
+            _verify_or_insert_endpoint(self.connection, endpoint.payload, now)
+        current = {
+            "planner": "role.planner.v2",
+            "development": "role.development.v4",
+            "sre": "role.sre.v4",
+        }
+        for role, endpoint_id in current.items():
+            self.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint_id, now),
+            )
+        self.connection.execute(
+            """
+            INSERT INTO coordination_items(
+                repository, issue_number, accountable_session_id, version, updated_at
+            ) VALUES ('twinfinityai/twinfinityapp', 328, 'role.development.v4', 1, ?)
+            """,
+            (now,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO coordination_terminal_watches(
+                watch_key, accountable_session_id, state, updated_at
+            ) VALUES ('terminal-328', 'role.development.v4', 'ACTIVE', ?)
+            """,
+            (now,),
+        )
+        self.connection.executescript(
+            """
+            CREATE TABLE coordination_messages(
+                id INTEGER PRIMARY KEY,
+                recipient_session_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE hosted_operations(
+                id INTEGER PRIMARY KEY,
+                recipient_session_id TEXT NOT NULL,
+                state TEXT NOT NULL
+            );
+            INSERT INTO coordination_messages VALUES(
+                7, 'role.development.v4', 'development.admission', 'PREPARED',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            );
+            INSERT INTO hosted_operations VALUES(
+                9, 'role.sre.v4', 'CLAIMED'
+            );
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO executor_attempts(
+                attempt_id, role, endpoint_id, instance_id, token_sha256,
+                target_kind, target_key, state, heartbeat_at, version,
+                created_at, updated_at
+            ) VALUES ('attempt-v4', 'development', 'role.development.v4',
+                      'instance-v4', ?, 'message', '7', 'RESERVED', ?, 1, ?, ?)
+            """,
+            ("b" * 64, now, now, now),
+        )
+        reviewed = self._dry_run_plan()
+        self.assertEqual(
+            {
+                "credential_transport",
+                "message",
+                "item",
+                "terminal_watch",
+                "hosted_operation",
+                "attempt",
+            },
+            {entry["kind"] for entry in reviewed["broker_cutover_blockers"]},
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CUTOVER_ACTIONABLE_WORK"
+        ):
+            self._migrate(reviewed, "actionable-v4-cutover")
+        self.assertEqual(
+            current,
+            {
+                row["role"]: row["endpoint_id"]
+                for row in self.connection.execute(
+                    "SELECT role, endpoint_id FROM executor_role_endpoint_current"
+                )
+            },
+        )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM executor_registry_changes"
+            ).fetchone()[0],
+        )
+
+    def test_versioned_cutover_rejects_alias_bound_to_wrong_role_endpoint(self) -> None:
+        self._seed_current_config_pointers(ROLES)
+        now = "2026-08-24T09:00:00Z"
         development_alias = self.alias_by_role["development"]
         self.connection.execute(
             """

@@ -30,7 +30,7 @@ from reconcile_routing_artifacts import (  # noqa: E402
 )
 
 
-CONFIG = ROOT / "references" / "twinfinity-executor-registry.toml"
+CONFIG = ROOT / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
 ALIASES = ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
 REPOSITORY = "twinfinityai/twinfinityapp"
 DEVELOPMENT_ENDPOINT = "role.development.v4"

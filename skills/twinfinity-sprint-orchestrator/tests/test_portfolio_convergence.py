@@ -58,7 +58,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.store = CoordinationStore(self.database)
         skill_root = Path(__file__).resolve().parents[1]
         config = load_registry_config(
-            skill_root / "references" / "twinfinity-executor-registry.toml"
+            skill_root / "tests" / "fixtures" / "twinfinity-executor-registry-v4.toml"
         )
         aliases, alias_sha = load_legacy_alias_fixture(
             skill_root / "tests" / "fixtures" / "legacy-role-aliases.json"
