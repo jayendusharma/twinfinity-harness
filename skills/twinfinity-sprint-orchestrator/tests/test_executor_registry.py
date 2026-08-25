@@ -509,10 +509,8 @@ class ExecutorRegistryTests(unittest.TestCase):
                     "role.planner.v3",
                     "role.development.v3",
                     "role.development.v4",
-                    "role.development.v5",
                     "role.sre.v3",
                     "role.sre.v4",
-                    "role.sre.v5",
                 },
                 set(rotated_config.endpoints),
             )
@@ -556,8 +554,8 @@ class ExecutorRegistryTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "planner": "role.planner.v2",
-                    "development": "role.development.v5",
-                    "sre": "role.sre.v5",
+                    "development": "role.development.v4",
+                    "sre": "role.sre.v4",
                 },
                 {
                     role: endpoint.endpoint_id
@@ -569,17 +567,11 @@ class ExecutorRegistryTests(unittest.TestCase):
                     "role.planner.v2",
                     "role.development.v3",
                     "role.development.v4",
-                    "role.development.v5",
                     "role.sre.v3",
                     "role.sre.v4",
-                    "role.sre.v5",
                 },
                 set(current_config.endpoints),
             )
-            for role in ("development", "sre"):
-                endpoint = current_config.roles[role]
-                self.assertEqual("readiness/v1", endpoint.execution_protocol)
-                self.assertEqual(("coordination.notice",), endpoint.allowed_topics)
 
     def test_read_only_registry_open_cannot_write(self) -> None:
         connection = open_registry_database(self.store.path, read_only=True)

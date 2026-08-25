@@ -43,14 +43,20 @@ from executor_registry import (
 from kanban_readiness import (
     RECEIPT_SCHEMA,
     ReadinessError,
+    _artifact_matches_pickup,
+    _assert_artifact_current,
     _binding_reasons,
     _campaign,
+    _close_artifact,
     _event as readiness_event,
+    _mark_stale,
+    _open_staged_artifact,
+    _receipt_directory,
+    _receipt_locator,
     _validate_attempt,
     _validate_receipt,
-    _mark_stale,
     ensure_schema as ensure_readiness_schema,
-    record as record_readiness,
+    pickup_receipt as pickup_readiness_receipt,
 )
 from role_executor_transport import (
     BROKER_SYSTEMD_CPU_QUOTA_PERCENT,
@@ -1660,6 +1666,20 @@ def claim_attach_and_start(
         reasons = _binding_reasons(connection, campaign)
         if reasons:
             raise BrokerError("BROKER_READINESS_BINDING_DRIFT:" + ",".join(reasons))
+        readiness_pickup = connection.execute(
+            "SELECT * FROM portfolio_readiness_receipt_pickups WHERE campaign_id=?",
+            (int(run["campaign_id"]),),
+        ).fetchone()
+        readiness_locator = _receipt_locator(campaign)
+        if (
+            readiness_pickup is None
+            or int(readiness_pickup["message_id"]) != int(run["message_id"])
+            or readiness_pickup["locator_sha256"] != digest_json(readiness_locator)
+            or readiness_pickup["relative_path"] != readiness_locator["relative_path"]
+            or readiness_pickup["state"] != "PENDING"
+            or readiness_pickup["attempt_id"] is not None
+        ):
+            raise BrokerError("BROKER_READINESS_PICKUP_BINDING_INVALID")
         _validate_attempt(
             connection,
             campaign,
@@ -1700,6 +1720,23 @@ def claim_attach_and_start(
         )
         if attached.rowcount != 1:
             raise BrokerError("BROKER_READINESS_ATTACH_CONFLICT")
+        pickup_attached = connection.execute(
+            """
+            UPDATE portfolio_readiness_receipt_pickups
+            SET attempt_id=?, version=version+1, updated_at=?, last_error=NULL
+            WHERE campaign_id=? AND message_id=? AND state='PENDING'
+              AND attempt_id IS NULL AND version=?
+            """,
+            (
+                attempt_id,
+                now,
+                int(run["campaign_id"]),
+                int(run["message_id"]),
+                int(readiness_pickup["version"]),
+            ),
+        )
+        if pickup_attached.rowcount != 1:
+            raise BrokerError("BROKER_READINESS_PICKUP_ATTACH_CONFLICT")
         readiness_event(
             connection,
             int(run["campaign_id"]),
@@ -2548,6 +2585,207 @@ def _persist_pickup_disposition(
     return outcome
 
 
+def _stage_terminal_readiness_receipt(
+    connection: sqlite3.Connection,
+    receipt: dict[str, Any],
+    *,
+    now: str,
+) -> int:
+    """Bridge one terminal broker pickup into readiness's durable artifact lane."""
+
+    _validate_receipt(receipt)
+    store = _store_for_connection(connection)
+    campaign = _campaign(
+        connection, str(receipt["repository"]), int(receipt["issue_number"])
+    )
+    message_id = int(receipt["message_id"])
+    attempt_id = str(receipt["attempt_id"])
+    if (
+        campaign["state"] != "RUNNING"
+        or campaign["attempt_id"] != attempt_id
+        or int(campaign["message_id"]) != message_id
+        or receipt["readiness_plan_sha256"] != campaign["plan_sha256"]
+        or receipt["worker_role"] != campaign["worker_role"]
+    ):
+        raise ReadinessError("READINESS_RECEIPT_ATTEMPT_DRIFT")
+    if _binding_reasons(connection, campaign):
+        raise ReadinessError("READINESS_RECEIPT_CAMPAIGN_DRIFT")
+    _message, attempt = _validate_attempt(
+        connection, campaign, message_id, attempt_id, terminal=True
+    )
+    token_sha256 = attempt["token_sha256"]
+    if not isinstance(token_sha256, str) or SHA256.fullmatch(token_sha256) is None:
+        raise ReadinessError("READINESS_RECEIPT_PICKUP_TOKEN_INVALID")
+    pickup = connection.execute(
+        "SELECT * FROM portfolio_readiness_receipt_pickups WHERE campaign_id=?",
+        (int(campaign["id"]),),
+    ).fetchone()
+    locator = _receipt_locator(campaign)
+    if (
+        pickup is None
+        or pickup["state"] not in {"PENDING", "STAGED"}
+        or pickup["attempt_id"] != attempt_id
+        or int(pickup["message_id"]) != message_id
+        or pickup["relative_path"] != locator["relative_path"]
+        or pickup["locator_sha256"] != digest_json(locator)
+    ):
+        raise ReadinessError("READINESS_RECEIPT_PICKUP_BINDING_INVALID")
+
+    canonical_bytes = canonical_json(receipt).encode("utf-8")
+    root = _receipt_directory(store.path, create=True)
+    path = Path(store.path).parent / str(pickup["relative_path"])
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError:
+        artifact = _open_staged_artifact(store.path, str(pickup["relative_path"]))
+        if artifact["raw"] != canonical_bytes:
+            _close_artifact(artifact)
+            raise ReadinessError("READINESS_RECEIPT_ARTIFACT_CONFLICT")
+    except OSError as exc:
+        raise ReadinessError("READINESS_RECEIPT_ARTIFACT_UNSAFE") from exc
+    else:
+        try:
+            offset = 0
+            while offset < len(canonical_bytes):
+                offset += os.write(descriptor, canonical_bytes[offset:])
+            os.fsync(descriptor)
+        except Exception:
+            os.close(descriptor)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(descriptor)
+        directory_descriptor = os.open(
+            root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        artifact = _open_staged_artifact(store.path, str(pickup["relative_path"]))
+
+    try:
+        if artifact["raw"] != canonical_bytes:
+            raise ReadinessError("READINESS_RECEIPT_ARTIFACT_CHANGED")
+        _assert_artifact_current(artifact)
+        with store.transaction():
+            current_campaign = _campaign(
+                connection,
+                str(receipt["repository"]),
+                int(receipt["issue_number"]),
+            )
+            if (
+                int(current_campaign["id"]) != int(campaign["id"])
+                or current_campaign["state"] != "RUNNING"
+            ):
+                raise ReadinessError("READINESS_RECEIPT_CAMPAIGN_DRIFT")
+            _current_message, current_attempt = _validate_attempt(
+                connection,
+                current_campaign,
+                message_id,
+                attempt_id,
+                terminal=True,
+            )
+            if not secrets.compare_digest(
+                str(current_attempt["token_sha256"]), token_sha256
+            ):
+                raise ReadinessError("READINESS_RECEIPT_PICKUP_TOKEN_INVALID")
+            current_pickup = connection.execute(
+                "SELECT * FROM portfolio_readiness_receipt_pickups WHERE campaign_id=?",
+                (int(campaign["id"]),),
+            ).fetchone()
+            if current_pickup is None:
+                raise ReadinessError("READINESS_RECEIPT_PICKUP_MISSING")
+            if current_pickup["state"] == "STAGED":
+                if (
+                    current_pickup["attempt_token_sha256"] != token_sha256
+                    or not _artifact_matches_pickup(current_pickup, artifact)
+                ):
+                    raise ReadinessError("READINESS_RECEIPT_PICKUP_REPLAY_INVALID")
+            elif current_pickup["state"] == "PENDING":
+                changed = connection.execute(
+                    """
+                    UPDATE portfolio_readiness_receipt_pickups
+                    SET state='STAGED', attempt_token_sha256=?, artifact_sha256=?,
+                        artifact_size_bytes=?, artifact_device_id=?, artifact_inode=?,
+                        artifact_mode=?, artifact_uid=?, artifact_nlink=?,
+                        artifact_mtime_ns=?, artifact_ctime_ns=?,
+                        version=version+1, updated_at=?, last_error=NULL
+                    WHERE campaign_id=? AND state='PENDING' AND version=?
+                    """,
+                    (
+                        token_sha256,
+                        artifact["artifact_sha256"],
+                        artifact["size_bytes"],
+                        artifact["device_id"],
+                        artifact["inode"],
+                        artifact["mode"],
+                        artifact["uid"],
+                        artifact["nlink"],
+                        artifact["mtime_ns"],
+                        artifact["ctime_ns"],
+                        now,
+                        int(campaign["id"]),
+                        int(current_pickup["version"]),
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise ReadinessError("READINESS_RECEIPT_PICKUP_FENCE_LOST")
+            else:
+                raise ReadinessError("READINESS_RECEIPT_PICKUP_STATE_CONFLICT")
+            _assert_artifact_current(artifact)
+    finally:
+        _close_artifact(artifact)
+    return int(campaign["id"])
+
+
+def _record_brokered_readiness_receipt(
+    connection: sqlite3.Connection,
+    receipt: dict[str, Any],
+    *,
+    now: str,
+) -> dict[str, Any]:
+    """Record or replay one broker receipt through current readiness semantics."""
+
+    campaign = _campaign(
+        connection, str(receipt["repository"]), int(receipt["issue_number"])
+    )
+    receipt_sha256 = digest_json(receipt)
+    prior = connection.execute(
+        """
+        SELECT receipt.verdict, receipt.receipt_sha256, current.state
+        FROM portfolio_readiness_current current
+        JOIN portfolio_readiness_receipts receipt ON receipt.id=current.receipt_id
+        WHERE current.campaign_id=?
+        """,
+        (int(campaign["id"]),),
+    ).fetchone()
+    if prior is not None:
+        if prior["receipt_sha256"] != receipt_sha256:
+            raise ReadinessError("READINESS_PHASE_STATE_CONFLICT")
+        return {
+            "repository": receipt["repository"],
+            "issue_number": receipt["issue_number"],
+            "verdict": str(prior["verdict"]),
+            "receipt_sha256": receipt_sha256,
+            "state": str(prior["state"]),
+            "replay": True,
+        }
+    campaign_id = _stage_terminal_readiness_receipt(
+        connection, receipt, now=now
+    )
+    return pickup_readiness_receipt(
+        _store_for_connection(connection), campaign_id, now=now
+    )
+
+
 def consume_broker_pickup(
     connection: sqlite3.Connection,
     *,
@@ -2603,12 +2841,22 @@ def consume_broker_pickup(
             verdict=None,
         )
     try:
-        recorded = record_readiness(_store_for_connection(connection), receipt, now=now)
-    except ReadinessError as exc:
+        recorded = _record_brokered_readiness_receipt(
+            connection, receipt, now=now
+        )
+    except (ReadinessError, OSError, sqlite3.Error) as exc:
         return _persist_pickup_disposition(
             connection,
             attempt_id=attempt_id,
-            error=str(exc),
+            error=_error_code(exc, "BROKER_PICKUP_CONSUMPTION_FAILED"),
+            now=now,
+            verdict=str(receipt.get("verdict")),
+        )
+    if recorded.get("state") == "STALE" or recorded.get("verdict") is None:
+        return _persist_pickup_disposition(
+            connection,
+            attempt_id=attempt_id,
+            error="READINESS_BINDING_DRIFT",
             now=now,
             verdict=str(receipt.get("verdict")),
         )

@@ -476,7 +476,7 @@ class BrokerHarness:
             "resolution": {
                 "role": None,
                 "actions": [],
-                "approval_proposal_sha256": None,
+                "approval": None,
             },
             "summary": "All requested readiness evidence is sufficient.",
             "observed_at": NOW,

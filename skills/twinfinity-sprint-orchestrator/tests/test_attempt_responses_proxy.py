@@ -1823,8 +1823,8 @@ class AttemptResponsesProxyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("attempt_responses_proxy", launcher)
         self.assertNotIn("attempt_responses_proxy", registry)
-        self.assertNotIn("role.development.v5", registry)
-        self.assertNotIn("role.sre.v5", registry)
+        self.assertNotIn("TWINFINITY_ATTEMPT_PROXY", launcher)
+        self.assertNotIn("TWINFINITY_ATTEMPT_PROXY", registry)
 
 
 if __name__ == "__main__":
