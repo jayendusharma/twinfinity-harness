@@ -44,6 +44,8 @@ from sync_github_coordination import fetch_object
 
 
 SCHEMA = "twinfinity.approval-proposal.v1"
+REVIEW_BATCH_SCHEMA = "twinfinity.approval-review-batch.v2"
+BATCH_ANSWER_SCHEMA = "twinfinity.approval-batch-answer-map.v1"
 DECISIONS = {"APPROVE", "REJECT", "COURSE_CORRECT", "DEFER"}
 USER_EVENT_SOURCES = {
     "CODEX_DIRECT_USER_TURN",
@@ -265,7 +267,9 @@ def validate_packet(packet: Any) -> dict[str, Any]:
     normalized_options: list[dict[str, str]] = []
     option_ids: set[str] = set()
     for option in options:
-        if not isinstance(option, dict) or set(option) != {"id", "label", "effect"}:
+        if not isinstance(option, dict) or set(option) != {
+            "id", "label", "effect", "machine_outcome"
+        }:
             raise CoordinationError("APPROVAL_OPTIONS_INVALID")
         option_id = option["id"]
         if (
@@ -280,8 +284,11 @@ def validate_packet(packet: Any) -> dict[str, Any]:
                 "id": option_id,
                 "label": _validate_text(option["label"], "option", maximum=120),
                 "effect": _validate_text(option["effect"], "option", maximum=800),
+                "machine_outcome": option["machine_outcome"],
             }
         )
+        if option["machine_outcome"] not in DECISIONS:
+            raise CoordinationError("APPROVAL_OPTION_OUTCOME_INVALID")
     normalized["options"] = normalized_options
     if packet["recommendation"] not in option_ids:
         raise CoordinationError("APPROVAL_RECOMMENDATION_INVALID")
@@ -373,6 +380,9 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             user_event_id TEXT NOT NULL,
             user_input_sha256 TEXT NOT NULL,
             planner_session_id TEXT NOT NULL,
+            batch_sha256 TEXT,
+            batch_answer_map_sha256 TEXT,
+            batch_answer_map_json TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY(user_event_source, user_event_id)
         );
@@ -381,9 +391,13 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             decision_sha256 TEXT NOT NULL UNIQUE,
             decision TEXT NOT NULL CHECK(decision IN ('APPROVE','REJECT','COURSE_CORRECT','DEFER')),
             selected_option_id TEXT NOT NULL,
+            selected_option_machine_outcome TEXT,
             revisit_trigger TEXT,
             recipient_set_sha256 TEXT NOT NULL,
             execution_scope_sha256 TEXT NOT NULL,
+            batch_sha256 TEXT,
+            batch_answer_map_sha256 TEXT,
+            option_map_sha256 TEXT,
             decision_note TEXT NOT NULL,
             user_input_sha256 TEXT NOT NULL,
             user_event_source TEXT NOT NULL,
@@ -467,6 +481,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             repository TEXT NOT NULL,
             proposal_sha256_json TEXT NOT NULL,
             proposal_count INTEGER NOT NULL CHECK(proposal_count >= 0),
+            batch_json TEXT,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS approval_events (
@@ -526,9 +541,41 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS approval_delivery_notices_immutable_delete
         BEFORE DELETE ON approval_delivery_notices
         BEGIN SELECT RAISE(ABORT, 'APPROVAL_DELIVERY_NOTICE_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_review_batches_immutable_update
+        BEFORE UPDATE ON approval_review_batches
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_REVIEW_BATCH_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_review_batches_immutable_delete
+        BEFORE DELETE ON approval_review_batches
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_REVIEW_BATCH_IMMUTABLE'); END;
         COMMIT;
             """
         )
+        additions = {
+            "approval_user_events": {
+                "batch_sha256": "TEXT",
+                "batch_answer_map_sha256": "TEXT",
+                "batch_answer_map_json": "TEXT",
+            },
+            "approval_decisions": {
+                "selected_option_machine_outcome": "TEXT",
+                "batch_sha256": "TEXT",
+                "batch_answer_map_sha256": "TEXT",
+                "option_map_sha256": "TEXT",
+            },
+            "approval_review_batches": {"batch_json": "TEXT"},
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        for table, columns in additions.items():
+            present = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for column, declaration in columns.items():
+                if column not in present:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                    )
+        connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
@@ -1058,6 +1105,180 @@ def _pending_rows(
     return result
 
 
+def _proposal_batch_binding(
+    store: CoordinationStore,
+    proposal_sha256: str,
+    packet: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if packet is None:
+        row = store.connection.execute(
+            "SELECT packet_json FROM approval_proposals WHERE proposal_sha256=?",
+            (proposal_sha256,),
+        ).fetchone()
+        if row is None:
+            raise CoordinationError("APPROVAL_PROPOSAL_NOT_FOUND")
+        try:
+            packet = validate_packet(
+                json.loads(row["packet_json"], object_pairs_hook=_strict_object)
+            )
+        except (json.JSONDecodeError, CoordinationError) as exc:
+            raise CoordinationError("APPROVAL_BATCH_PROPOSAL_INVALID") from exc
+    recipients = sorted({
+        canonicalize_coordination_identity(
+            store.connection,
+            _historical_identity_current_route(
+                store, str(interest["recipient_session_id"])
+            ),
+        )
+        for interest in store.connection.execute(
+            "SELECT recipient_session_id FROM approval_interests "
+            "WHERE proposal_sha256=? ORDER BY recipient_session_id",
+            (proposal_sha256,),
+        )
+    })
+    if not recipients:
+        raise CoordinationError("APPROVAL_RECIPIENT_MISSING")
+    option_map = [
+        {
+            "id": option["id"],
+            "label": option["label"],
+            "effect": option["effect"],
+            "machine_outcome": option["machine_outcome"],
+        }
+        for option in packet["options"]
+    ]
+    return {
+        "proposal_sha256": proposal_sha256,
+        "source_snapshot_sha256": packet["source_snapshot_sha256"],
+        "execution_scope_sha256": packet["execution_scope_sha256"],
+        "recipient_session_ids": recipients,
+        "recipient_set_sha256": digest_json(recipients),
+        "option_map": option_map,
+        "option_map_sha256": digest_json(option_map),
+    }
+
+
+def _load_review_batch(
+    store: CoordinationStore,
+    batch_sha256: str,
+    proposal_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(batch_sha256, str) or not SHA256.fullmatch(batch_sha256):
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_REQUIRED")
+    row = store.connection.execute(
+        "SELECT * FROM approval_review_batches WHERE batch_sha256=?",
+        (batch_sha256,),
+    ).fetchone()
+    if row is None or row["batch_json"] is None:
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_REQUIRED")
+    try:
+        batch = json.loads(row["batch_json"], object_pairs_hook=_strict_object)
+    except (TypeError, json.JSONDecodeError, CoordinationError) as exc:
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_INVALID") from exc
+    if (
+        not isinstance(batch, dict)
+        or set(batch) != {"schema", "repository", "proposals"}
+        or batch.get("schema") != REVIEW_BATCH_SCHEMA
+        or canonical_json(batch) != row["batch_json"]
+        or digest_json(batch) != batch_sha256
+        or batch.get("repository") != row["repository"]
+        or not isinstance(batch.get("proposals"), list)
+        or len(batch["proposals"]) != int(row["proposal_count"])
+        or canonical_json(
+            [entry.get("proposal_sha256") for entry in batch["proposals"]]
+        ) != row["proposal_sha256_json"]
+    ):
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_INVALID")
+    matches = [
+        entry
+        for entry in batch["proposals"]
+        if isinstance(entry, dict)
+        and entry.get("proposal_sha256") == proposal_sha256
+    ]
+    if len(matches) != 1:
+        raise CoordinationError("APPROVAL_PROPOSAL_NOT_IN_BATCH")
+    frozen = matches[0]
+    if set(frozen) != {
+        "proposal_sha256", "source_snapshot_sha256",
+        "execution_scope_sha256", "recipient_session_ids",
+        "recipient_set_sha256", "option_map", "option_map_sha256",
+    }:
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_INVALID")
+    current = _proposal_batch_binding(store, proposal_sha256)
+    current_recipients = list(current["recipient_session_ids"])
+    frozen_recipients = list(frozen["recipient_session_ids"])
+    unmatched_frozen = list(frozen_recipients)
+    if len(current_recipients) != len(frozen_recipients):
+        raise CoordinationError("APPROVAL_BATCH_RECIPIENT_SET_DRIFT")
+    for recipient in current_recipients:
+        equivalent_index = next(
+            (
+                index
+                for index, frozen_recipient in enumerate(unmatched_frozen)
+                if identities_role_equivalent(
+                    store.connection, recipient, frozen_recipient
+                )
+            ),
+            None,
+        )
+        if equivalent_index is None:
+            raise CoordinationError("APPROVAL_BATCH_RECIPIENT_SET_DRIFT")
+        del unmatched_frozen[equivalent_index]
+    binding_keys = {
+        "proposal_sha256",
+        "source_snapshot_sha256",
+        "execution_scope_sha256",
+        "option_map",
+        "option_map_sha256",
+    }
+    if any(current[key] != frozen[key] for key in binding_keys):
+        raise CoordinationError("APPROVAL_BATCH_PROPOSAL_BINDING_DRIFT")
+    return batch, frozen
+
+
+def _validate_batch_answer_map(
+    batch: dict[str, Any],
+    answer_map: Any,
+) -> tuple[dict[str, str], str, str]:
+    if (
+        not isinstance(answer_map, dict)
+        or set(answer_map) != {"schema", "batch_sha256", "answers"}
+        or answer_map.get("schema") != BATCH_ANSWER_SCHEMA
+        or answer_map.get("batch_sha256") != digest_json(batch)
+        or not isinstance(answer_map.get("answers"), list)
+        or not answer_map["answers"]
+    ):
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+    proposal_order = {
+        entry["proposal_sha256"]: index
+        for index, entry in enumerate(batch["proposals"])
+    }
+    answers: dict[str, str] = {}
+    observed_order: list[int] = []
+    for answer in answer_map["answers"]:
+        if not isinstance(answer, dict) or set(answer) != {
+            "proposal_sha256", "selected_option_id"
+        }:
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+        proposal = answer.get("proposal_sha256")
+        option_id = answer.get("selected_option_id")
+        if (
+            proposal not in proposal_order
+            or proposal in answers
+            or not isinstance(option_id, str)
+        ):
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+        frozen = batch["proposals"][proposal_order[proposal]]
+        if option_id not in {option["id"] for option in frozen["option_map"]}:
+            raise CoordinationError("APPROVAL_SELECTED_OPTION_INVALID")
+        answers[proposal] = option_id
+        observed_order.append(proposal_order[proposal])
+    if observed_order != sorted(observed_order):
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+    canonical = canonical_json(answer_map)
+    return answers, digest_json(answer_map), canonical
+
+
 def create_review_batch(
     store: CoordinationStore, repository: str, now: str
 ) -> dict[str, Any]:
@@ -1066,21 +1287,35 @@ def create_review_batch(
     ensure_schema(store.connection)
     with store.transaction():
         proposals = _pending_rows(store, repository, now=now)
-        digests = [
-            entry["proposal_sha256"]
+        selected = [
+            entry
             for entry in proposals
             if entry["source_current"] and not entry["expired"]
         ]
-        batch = {"repository": repository, "proposal_sha256": digests}
+        bindings = [
+            _proposal_batch_binding(
+                store, str(entry["proposal_sha256"]), packet=entry
+            )
+            for entry in selected
+        ]
+        digests = [entry["proposal_sha256"] for entry in bindings]
+        batch = {
+            "schema": REVIEW_BATCH_SCHEMA,
+            "repository": repository,
+            "proposals": bindings,
+        }
         batch_sha256 = digest_json(batch)
         cursor = store.connection.execute(
             """
             INSERT OR IGNORE INTO approval_review_batches(
                 batch_sha256, repository, proposal_sha256_json,
-                proposal_count, created_at
-            ) VALUES (?,?,?,?,?)
+                proposal_count, batch_json, created_at
+            ) VALUES (?,?,?,?,?,?)
             """,
-            (batch_sha256, repository, canonical_json(digests), len(digests), now),
+            (
+                batch_sha256, repository, canonical_json(digests), len(digests),
+                canonical_json(batch), now,
+            ),
         )
         if cursor.rowcount == 1:
             _event(
@@ -1092,10 +1327,9 @@ def create_review_batch(
             )
     return {
         "batch_sha256": batch_sha256,
+        "batch": batch,
         "pending_count": len(digests),
-        "proposals": [
-            entry for entry in proposals if entry["source_current"] and not entry["expired"]
-        ],
+        "proposals": selected,
         "held": [
             {
                 "proposal_sha256": entry["proposal_sha256"],
@@ -1111,7 +1345,8 @@ def _decision_comment(
     packet: dict[str, Any], proposal_sha256: str, decision: str, note: str,
     *, selected_option_id: str, revisit_trigger: str | None,
     recipients: list[str], recipient_set_sha256: str, user_input_sha256: str,
-    user_event_source: str, user_event_id: str,
+    user_event_source: str, user_event_id: str, batch_sha256: str,
+    batch_answer_map_sha256: str, option_map_sha256: str,
 ) -> str:
     prohibited = "\n".join(
         f"- {value}" for value in packet["prohibited_side_effects"]
@@ -1121,6 +1356,9 @@ def _decision_comment(
         f"- Decision: `{decision}`\n"
         f"- Selected option: `{selected_option_id}`\n"
         f"- Proposal digest: `{proposal_sha256}`\n"
+        f"- Review-batch digest: `{batch_sha256}`\n"
+        f"- Batch-answer-map digest: `{batch_answer_map_sha256}`\n"
+        f"- Frozen option-map digest: `{option_map_sha256}`\n"
         f"- Decision key: `{packet['decision_key']}`\n"
         f"- Boundary: `{packet['boundary']}`\n"
         f"- Exact target: {packet['target']}\n"
@@ -1164,6 +1402,8 @@ def record_decision(
     store: CoordinationStore,
     *,
     proposal_sha256: str,
+    batch_sha256: str | None = None,
+    batch_answer_map: dict[str, Any] | None = None,
     decision: str,
     selected_option_id: str,
     revisit_trigger: str | None,
@@ -1182,8 +1422,12 @@ def record_decision(
     )
     if decision not in DECISIONS:
         raise CoordinationError("APPROVAL_DECISION_INVALID")
-    if not SHA256.fullmatch(proposal_sha256) or not SHA256.fullmatch(user_input_sha256):
+    if not SHA256.fullmatch(proposal_sha256) or not SHA256.fullmatch(
+        user_input_sha256
+    ):
         raise CoordinationError("APPROVAL_DIGEST_INVALID")
+    if not isinstance(batch_sha256, str) or not SHA256.fullmatch(batch_sha256):
+        raise CoordinationError("APPROVAL_REVIEW_BATCH_REQUIRED")
     if (
         user_event_source not in USER_EVENT_SOURCES
         or not isinstance(user_event_id, str)
@@ -1217,6 +1461,28 @@ def record_decision(
             raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_DRIFT")
         if _expired(packet, now):
             raise CoordinationError("APPROVAL_PROPOSAL_EXPIRED")
+        batch, frozen = _load_review_batch(
+            store, batch_sha256, proposal_sha256
+        )
+        answers, answer_map_sha256, answer_map_json = (
+            _validate_batch_answer_map(batch, batch_answer_map)
+        )
+        frozen_selected_option_id = answers.get(proposal_sha256)
+        if frozen_selected_option_id is None:
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MISSING")
+        if selected_option_id != frozen_selected_option_id:
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_MISMATCH")
+        selected_options = [
+            option
+            for option in frozen["option_map"]
+            if option["id"] == frozen_selected_option_id
+        ]
+        if len(selected_options) != 1:
+            raise CoordinationError("APPROVAL_SELECTED_OPTION_INVALID")
+        machine_outcome = str(selected_options[0]["machine_outcome"])
+        if decision != machine_outcome:
+            raise CoordinationError("APPROVAL_OPTION_OUTCOME_MISMATCH")
+        decision = machine_outcome
         readiness_submission_recipients = [
             str(submission["recipient_session_id"])
             for submission in store.connection.execute(
@@ -1227,24 +1493,10 @@ def record_decision(
         ]
         if decision == "DEFER" and readiness_submission_recipients:
             revisit_trigger = _readiness_revisit_at(revisit_trigger)
-        if selected_option_id not in {option["id"] for option in packet["options"]}:
-            raise CoordinationError("APPROVAL_SELECTED_OPTION_INVALID")
-        recipients = sorted({
-            canonicalize_coordination_identity(
-                store.connection,
-                _historical_identity_current_route(
-                    store, str(interest["recipient_session_id"])
-                ),
-            )
-            for interest in store.connection.execute(
-                "SELECT recipient_session_id FROM approval_interests "
-                "WHERE proposal_sha256=? ORDER BY recipient_session_id",
-                (proposal_sha256,),
-            )
-        })
+        recipients = list(frozen["recipient_session_ids"])
         if not recipients:
             raise CoordinationError("APPROVAL_RECIPIENT_MISSING")
-        recipient_set_sha256 = digest_json(recipients)
+        recipient_set_sha256 = str(frozen["recipient_set_sha256"])
         existing = store.connection.execute(
             "SELECT * FROM approval_decisions WHERE proposal_sha256=?",
             (proposal_sha256,),
@@ -1253,9 +1505,13 @@ def record_decision(
             "proposal_sha256": proposal_sha256,
             "decision": decision,
             "selected_option_id": selected_option_id,
+            "selected_option_machine_outcome": machine_outcome,
             "revisit_trigger": revisit_trigger,
             "recipient_set_sha256": recipient_set_sha256,
-            "execution_scope_sha256": packet["execution_scope_sha256"],
+            "execution_scope_sha256": frozen["execution_scope_sha256"],
+            "batch_sha256": batch_sha256,
+            "batch_answer_map_sha256": answer_map_sha256,
+            "option_map_sha256": frozen["option_map_sha256"],
             "decision_note": decision_note,
             "user_input_sha256": user_input_sha256,
             "user_event_source": user_event_source,
@@ -1284,16 +1540,27 @@ def record_decision(
             "SELECT * FROM approval_user_events WHERE user_event_source=? AND user_event_id=?",
             (user_event_source, user_event_id),
         ).fetchone()
-        if user_event is not None and (
-            user_event["user_input_sha256"] != user_input_sha256
-            or user_event["planner_session_id"] != planner_session_id
-        ):
-            raise CoordinationError("APPROVAL_USER_EVENT_CONFLICT")
+        if user_event is not None:
+            if user_event["batch_sha256"] != batch_sha256:
+                raise CoordinationError("APPROVAL_USER_EVENT_CROSS_BATCH_REUSE")
+            if (
+                user_event["user_input_sha256"] != user_input_sha256
+                or user_event["planner_session_id"] != planner_session_id
+                or user_event["batch_answer_map_sha256"] != answer_map_sha256
+                or user_event["batch_answer_map_json"] != answer_map_json
+            ):
+                raise CoordinationError("APPROVAL_USER_EVENT_CONFLICT")
         if user_event is None:
             store.connection.execute(
                 "INSERT INTO approval_user_events(user_event_source,user_event_id,"
-                "user_input_sha256,planner_session_id,created_at) VALUES (?,?,?,?,?)",
-                (user_event_source, user_event_id, user_input_sha256, planner_session_id, now),
+                "user_input_sha256,planner_session_id,batch_sha256,"
+                "batch_answer_map_sha256,batch_answer_map_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    user_event_source, user_event_id, user_input_sha256,
+                    planner_session_id, batch_sha256, answer_map_sha256,
+                    answer_map_json, now,
+                ),
             )
         body = _decision_comment(
             packet,
@@ -1307,6 +1574,9 @@ def record_decision(
             user_input_sha256=user_input_sha256,
             user_event_source=user_event_source,
             user_event_id=user_event_id,
+            batch_sha256=batch_sha256,
+            batch_answer_map_sha256=answer_map_sha256,
+            option_map_sha256=str(frozen["option_map_sha256"]),
         )
         outbox_id = store.enqueue_comment(
             idempotency_key=f"approval-decision:{decision_sha256}",
@@ -1322,20 +1592,26 @@ def record_decision(
             """
             INSERT INTO approval_decisions(
                 proposal_sha256, decision_sha256, decision, selected_option_id,
-                revisit_trigger, recipient_set_sha256, execution_scope_sha256,
+                selected_option_machine_outcome, revisit_trigger,
+                recipient_set_sha256, execution_scope_sha256,
+                batch_sha256, batch_answer_map_sha256, option_map_sha256,
                 decision_note,
                 user_input_sha256, user_event_source, user_event_id,
                 planner_session_id, owner_outbox_id, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 proposal_sha256,
                 decision_sha256,
                 decision,
                 selected_option_id,
+                machine_outcome,
                 revisit_trigger,
                 recipient_set_sha256,
-                packet["execution_scope_sha256"],
+                frozen["execution_scope_sha256"],
+                batch_sha256,
+                answer_map_sha256,
+                frozen["option_map_sha256"],
                 decision_note,
                 user_input_sha256,
                 user_event_source,
@@ -1457,7 +1733,8 @@ def revoke_decision(
             (user_event_source, user_event_id),
         ).fetchone()
         if user_event is not None and (
-            user_event["user_input_sha256"] != user_input_sha256
+            user_event["batch_sha256"] is not None
+            or user_event["user_input_sha256"] != user_input_sha256
             or user_event["planner_session_id"] != planner_session_id
         ):
             raise CoordinationError("APPROVAL_USER_EVENT_CONFLICT")
@@ -1847,8 +2124,11 @@ def claim_decision_in_transaction(
         raise CoordinationError("APPROVAL_EXPECTED_CURRENT_SOURCE_INVALID")
     row = store.connection.execute(
         """
-        SELECT x.*, d.decision, d.selected_option_id, d.revisit_trigger,
+        SELECT x.*, d.decision, d.selected_option_id,
+               d.selected_option_machine_outcome, d.revisit_trigger,
                d.execution_scope_sha256, d.decision_note, d.owner_outbox_id,
+               d.batch_sha256, d.batch_answer_map_sha256,
+               d.option_map_sha256, d.user_event_source, d.user_event_id,
                o.state AS outbox_state, o.remote_receipt,
                p.packet_json, p.source_snapshot_sha256,
                c.proposal_sha256 AS current_sha,
@@ -1885,6 +2165,51 @@ def claim_decision_in_transaction(
         raise CoordinationError("APPROVAL_ALREADY_ACKNOWLEDGED")
 
     packet = json.loads(row["packet_json"])
+    batch, frozen = _load_review_batch(
+        store, row["batch_sha256"], proposal_sha256
+    )
+    user_event = store.connection.execute(
+        "SELECT * FROM approval_user_events WHERE user_event_source=? "
+        "AND user_event_id=?",
+        (row["user_event_source"], row["user_event_id"]),
+    ).fetchone()
+    if (
+        user_event is None
+        or user_event["batch_sha256"] != row["batch_sha256"]
+        or user_event["batch_answer_map_sha256"]
+        != row["batch_answer_map_sha256"]
+        or user_event["batch_answer_map_json"] is None
+    ):
+        raise CoordinationError("APPROVAL_BATCH_DECISION_BINDING_INVALID")
+    try:
+        answer_map = json.loads(
+            user_event["batch_answer_map_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, CoordinationError) as exc:
+        raise CoordinationError(
+            "APPROVAL_BATCH_DECISION_BINDING_INVALID"
+        ) from exc
+    answers, answer_map_sha256, answer_map_json = _validate_batch_answer_map(
+        batch, answer_map
+    )
+    selected = next(
+        (
+            option for option in frozen["option_map"]
+            if option["id"] == answers.get(proposal_sha256)
+        ),
+        None,
+    )
+    if (
+        selected is None
+        or answers[proposal_sha256] != row["selected_option_id"]
+        or selected["machine_outcome"] != row["decision"]
+        or row["selected_option_machine_outcome"] != row["decision"]
+        or row["execution_scope_sha256"] != frozen["execution_scope_sha256"]
+        or row["option_map_sha256"] != frozen["option_map_sha256"]
+        or answer_map_sha256 != row["batch_answer_map_sha256"]
+        or answer_map_json != user_event["batch_answer_map_json"]
+    ):
+        raise CoordinationError("APPROVAL_BATCH_DECISION_BINDING_INVALID")
     original_row = store.connection.execute(
         """
         SELECT payload_json FROM github_snapshots
@@ -2332,6 +2657,41 @@ def load_packet(path: Path) -> dict[str, Any]:
     return validate_packet(packet)
 
 
+def load_batch_answer_map(path: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 256 * 1024
+        ):
+            raise CoordinationError("APPROVAL_BATCH_ANSWER_FILE_UNSAFE")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        value = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            object_pairs_hook=_strict_object,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not isinstance(value, dict):
+        raise CoordinationError("APPROVAL_BATCH_ANSWER_MAP_INVALID")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2344,6 +2704,8 @@ def main() -> int:
 
     decide = subparsers.add_parser("decide")
     decide.add_argument("--proposal-sha256", required=True)
+    decide.add_argument("--batch-sha256", required=True)
+    decide.add_argument("--batch-answer-map", type=Path, required=True)
     decide.add_argument("--decision", choices=sorted(DECISIONS), required=True)
     decide.add_argument("--selected-option-id", required=True)
     decide.add_argument("--revisit-trigger")
@@ -2386,6 +2748,8 @@ def main() -> int:
             result = record_decision(
                 store,
                 proposal_sha256=args.proposal_sha256,
+                batch_sha256=args.batch_sha256,
+                batch_answer_map=load_batch_answer_map(args.batch_answer_map),
                 decision=args.decision,
                 selected_option_id=args.selected_option_id,
                 revisit_trigger=args.revisit_trigger,

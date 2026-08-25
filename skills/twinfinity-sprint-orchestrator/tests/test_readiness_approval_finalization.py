@@ -23,6 +23,7 @@ from coordination_store import (  # noqa: E402
 from approval_guard import readiness_execution_scope_sha256  # noqa: E402
 from approval_ledger import (  # noqa: E402
     claim_decision,
+    create_review_batch,
     ensure_schema as ensure_approval_schema,
     record_decision,
     revoke_decision,
@@ -630,13 +631,24 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             "drift_guards": ["Recheck effectivity inside activation."],
             "prohibited_side_effects": ["No admission after revocation."],
             "options": [
-                {"id": "APPROVE", "label": "Approve", "effect": "Resume."},
-                {"id": "REJECT", "label": "Reject", "effect": "Hold."},
-                {"id": "DEFER", "label": "Defer", "effect": "Hold and revisit."},
+                {
+                    "id": "APPROVE", "label": "Approve", "effect": "Resume.",
+                    "machine_outcome": "APPROVE",
+                },
+                {
+                    "id": "REJECT", "label": "Reject", "effect": "Hold.",
+                    "machine_outcome": "REJECT",
+                },
+                {
+                    "id": "DEFER", "label": "Defer",
+                    "effect": "Hold and revisit.",
+                    "machine_outcome": "DEFER",
+                },
                 {
                     "id": "COURSE_CORRECT",
                     "label": "Course correct",
                     "effect": "Hold for a new proposal.",
+                    "machine_outcome": "COURSE_CORRECT",
                 },
             ],
             "recommendation": "APPROVE",
@@ -652,9 +664,24 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                 expected_execution_scope_sha256=scope,
                 now="2026-08-24T10:00:03Z",
             )
+        batch = create_review_batch(
+            self.store, REPOSITORY, "2026-08-24T10:00:04Z"
+        )
+        answer_map = {
+            "schema": "twinfinity.approval-batch-answer-map.v1",
+            "batch_sha256": batch["batch_sha256"],
+            "answers": [
+                {
+                    "proposal_sha256": proposal["proposal_sha256"],
+                    "selected_option_id": "APPROVE",
+                }
+            ],
+        }
         decision = record_decision(
             self.store,
             proposal_sha256=proposal["proposal_sha256"],
+            batch_sha256=batch["batch_sha256"],
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="APPROVE",
             revisit_trigger=None,

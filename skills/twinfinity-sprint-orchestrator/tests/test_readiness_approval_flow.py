@@ -15,6 +15,7 @@ sys.path.insert(0, str(STAGED))
 
 from approval_guard import readiness_execution_scope_sha256  # noqa: E402
 from approval_ledger import (  # noqa: E402
+    create_review_batch,
     enqueue_published_readiness_decision_notices,
     record_decision,
     revoke_decision,
@@ -388,21 +389,25 @@ class ApprovalFlowHarness:
                     "id": "APPROVE",
                     "label": "Approve",
                     "effect": "Register one deterministic approval-resume successor.",
+                    "machine_outcome": "APPROVE",
                 },
                 {
                     "id": "REJECT",
                     "label": "Reject",
                     "effect": "Preserve the readiness lineage on HOLD.",
+                    "machine_outcome": "REJECT",
                 },
                 {
                     "id": "DEFER",
                     "label": "Defer",
                     "effect": "Hold the lineage and arm one typed revisit.",
+                    "machine_outcome": "DEFER",
                 },
                 {
                     "id": "COURSE_CORRECT",
                     "label": "Course correct",
                     "effect": "Hold pending a newly scoped proposal.",
+                    "machine_outcome": "COURSE_CORRECT",
                 },
             ],
             "recommendation": "APPROVE",
@@ -487,7 +492,20 @@ class ApprovalFlowHarness:
 
     def decide(self, decision: str) -> dict:
         revisit = REVISIT_AT if decision == "DEFER" else None
+        batch = create_review_batch(self.store, REPOSITORY, PUBLISHED_AT)
+        answer_map = {
+            "schema": "twinfinity.approval-batch-answer-map.v1",
+            "batch_sha256": batch["batch_sha256"],
+            "answers": [
+                {
+                    "proposal_sha256": str(self.request["proposal_sha256"]),
+                    "selected_option_id": decision,
+                }
+            ],
+        }
         user_input = {
+            "batch_sha256": batch["batch_sha256"],
+            "answers": answer_map["answers"],
             "decision": decision,
             "selected_option_id": decision,
             "revisit_trigger": revisit,
@@ -495,6 +513,8 @@ class ApprovalFlowHarness:
         return record_decision(
             self.store,
             proposal_sha256=str(self.request["proposal_sha256"]),
+            batch_sha256=batch["batch_sha256"],
+            batch_answer_map=answer_map,
             decision=decision,
             selected_option_id=decision,
             revisit_trigger=revisit,

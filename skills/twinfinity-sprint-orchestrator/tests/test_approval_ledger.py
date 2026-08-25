@@ -105,8 +105,26 @@ class ApprovalLedgerTests(unittest.TestCase):
             "drift_guards": ["Owning issue source digest must remain current."],
             "prohibited_side_effects": ["No hosted or provider mutation."],
             "options": [
-                {"id": "ENABLE", "label": "Enable", "effect": "Enable the bounded behavior."},
-                {"id": "HOLD", "label": "Hold", "effect": "Keep the behavior unchanged."},
+                {
+                    "id": "ENABLE", "label": "Enable",
+                    "effect": "Enable the bounded behavior.",
+                    "machine_outcome": "APPROVE",
+                },
+                {
+                    "id": "HOLD", "label": "Hold",
+                    "effect": "Keep the behavior unchanged.",
+                    "machine_outcome": "REJECT",
+                },
+                {
+                    "id": "DEFER", "label": "Defer",
+                    "effect": "Hold until the named revisit trigger.",
+                    "machine_outcome": "DEFER",
+                },
+                {
+                    "id": "REVISE", "label": "Revise",
+                    "effect": "Return for a materially corrected proposal.",
+                    "machine_outcome": "COURSE_CORRECT",
+                },
             ],
             "recommendation": "ENABLE",
             "expires_at": None,
@@ -139,10 +157,34 @@ class ApprovalLedgerTests(unittest.TestCase):
                 now="2026-08-24T04:00:02Z",
             )
 
+    def batch_answer(
+        self,
+        proposal_sha256: str,
+        selected_option_id: str,
+        *,
+        now: str = "2026-08-24T04:00:03Z",
+    ) -> tuple[str, dict]:
+        batch = create_review_batch(self.store, REPOSITORY, now)
+        return batch["batch_sha256"], {
+            "schema": "twinfinity.approval-batch-answer-map.v1",
+            "batch_sha256": batch["batch_sha256"],
+            "answers": [
+                {
+                    "proposal_sha256": proposal_sha256,
+                    "selected_option_id": selected_option_id,
+                }
+            ],
+        }
+
     def decide(self, proposal_sha256: str) -> dict:
+        batch_sha256, answer_map = self.batch_answer(
+            proposal_sha256, "ENABLE"
+        )
         return record_decision(
             self.store,
             proposal_sha256=proposal_sha256,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="ENABLE",
             revisit_trigger=None,
@@ -224,6 +266,129 @@ class ApprovalLedgerTests(unittest.TestCase):
             [(PLANNER_SESSION, "coordination.notice", "PREPARED")],
             [tuple(row) for row in notice],
         )
+
+    def test_decision_requires_frozen_batch_and_matching_option_outcome(self) -> None:
+        proposal = submit_proposal(
+            self.store, self.packet(), "2026-08-24T04:00:02Z"
+        )["proposal_sha256"]
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_REVIEW_BATCH_REQUIRED"
+        ):
+            record_decision(
+                self.store,
+                proposal_sha256=proposal,
+                decision="APPROVE",
+                selected_option_id="ENABLE",
+                revisit_trigger=None,
+                decision_note="Must not decide without a frozen batch.",
+                user_input_sha256="1" * 64,
+                user_event_source="CODEX_DIRECT_USER_TURN",
+                user_event_id="planner-turn:unbatched-2026-08-24",
+                planner_session_id=PLANNER_SESSION,
+                now="2026-08-24T04:00:03Z",
+            )
+
+        cases = (("APPROVE", "HOLD"), ("REJECT", "ENABLE"))
+        for index, (decision, option_id) in enumerate(cases):
+            batch_sha256, answer_map = self.batch_answer(proposal, option_id)
+            with self.subTest(decision=decision, option_id=option_id), self.assertRaisesRegex(
+                CoordinationError, "APPROVAL_OPTION_OUTCOME_MISMATCH"
+            ):
+                record_decision(
+                    self.store,
+                    proposal_sha256=proposal,
+                    batch_sha256=batch_sha256,
+                    batch_answer_map=answer_map,
+                    decision=decision,
+                    selected_option_id=option_id,
+                    revisit_trigger=None,
+                    decision_note="Caller outcome must match the frozen option.",
+                    user_input_sha256=str(index + 2) * 64,
+                    user_event_source="CODEX_DIRECT_USER_TURN",
+                    user_event_id=f"planner-turn:mismatch-{index}-2026-08-24",
+                    planner_session_id=PLANNER_SESSION,
+                    now="2026-08-24T04:00:03Z",
+                )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM approval_decisions"
+            ).fetchone()[0],
+        )
+
+    def test_batch_rejects_late_recipient_and_cross_batch_event_reuse(self) -> None:
+        proposal = submit_proposal(
+            self.store, self.packet(), "2026-08-24T04:00:02Z"
+        )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
+        sre_packet = self.packet()
+        sre_packet["requester_session_id"] = SRE_SESSION
+        sre_packet["recipient_session_id"] = SRE_SESSION
+        sre_packet["workstream"] = "SRE"
+        submit_proposal(self.store, sre_packet, "2026-08-24T04:00:03Z")
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_BATCH_RECIPIENT_SET_DRIFT"
+        ):
+            record_decision(
+                self.store,
+                proposal_sha256=proposal,
+                batch_sha256=batch_sha256,
+                batch_answer_map=answer_map,
+                decision="APPROVE",
+                selected_option_id="ENABLE",
+                revisit_trigger=None,
+                decision_note="Late recipients require a fresh review batch.",
+                user_input_sha256="4" * 64,
+                user_event_source="CODEX_DIRECT_USER_TURN",
+                user_event_id="planner-turn:late-recipient-2026-08-24",
+                planner_session_id=PLANNER_SESSION,
+                now="2026-08-24T04:00:04Z",
+            )
+
+        fresh_batch_sha256, fresh_answer_map = self.batch_answer(
+            proposal, "ENABLE", now="2026-08-24T04:00:05Z"
+        )
+        first = record_decision(
+            self.store,
+            proposal_sha256=proposal,
+            batch_sha256=fresh_batch_sha256,
+            batch_answer_map=fresh_answer_map,
+            decision="APPROVE",
+            selected_option_id="ENABLE",
+            revisit_trigger=None,
+            decision_note="Approve the freshly frozen recipient set.",
+            user_input_sha256="5" * 64,
+            user_event_source="CODEX_DIRECT_USER_TURN",
+            user_event_id="planner-turn:cross-batch-2026-08-24",
+            planner_session_id=PLANNER_SESSION,
+            now="2026-08-24T04:00:05Z",
+        )
+        self.assertFalse(first["idempotent"])
+        second_packet = self.packet(key="issue-58:second-material-choice")
+        second = submit_proposal(
+            self.store, second_packet, "2026-08-24T04:00:06Z"
+        )["proposal_sha256"]
+        second_batch_sha256, second_answer_map = self.batch_answer(
+            second, "ENABLE", now="2026-08-24T04:00:07Z"
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_USER_EVENT_CROSS_BATCH_REUSE"
+        ):
+            record_decision(
+                self.store,
+                proposal_sha256=second,
+                batch_sha256=second_batch_sha256,
+                batch_answer_map=second_answer_map,
+                decision="APPROVE",
+                selected_option_id="ENABLE",
+                revisit_trigger=None,
+                decision_note="A different batch needs a different user event.",
+                user_input_sha256="5" * 64,
+                user_event_source="CODEX_DIRECT_USER_TURN",
+                user_event_id="planner-turn:cross-batch-2026-08-24",
+                planner_session_id=PLANNER_SESSION,
+                now="2026-08-24T04:00:07Z",
+            )
 
     def test_readiness_packet_can_only_be_submitted_by_terminal_pickup_path(self) -> None:
         packet = self.readiness_packet()
@@ -334,11 +499,14 @@ class ApprovalLedgerTests(unittest.TestCase):
 
     def test_defer_remains_claimable_after_publication_and_gets_one_wake(self) -> None:
         proposal = self.submit_readiness()["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "DEFER")
         decision = record_decision(
             self.store,
             proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="DEFER",
-            selected_option_id="HOLD",
+            selected_option_id="DEFER",
             revisit_trigger="2026-08-25T05:00:00Z",
             decision_note="Defer until the named portfolio trigger occurs.",
             user_input_sha256="c" * 64,
@@ -426,9 +594,12 @@ class ApprovalLedgerTests(unittest.TestCase):
             root, Path(self.temp.name)
         ) as config:
             self.rotate_planner_to_v3(config, "approval-planner-rotation-before")
+            batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
             decision = record_decision(
                 self.store,
                 proposal_sha256=proposal,
+                batch_sha256=batch_sha256,
+                batch_answer_map=answer_map,
                 decision="APPROVE",
                 selected_option_id="ENABLE",
                 revisit_trigger=None,
@@ -526,10 +697,13 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, self.packet(), "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
         with self.assertRaisesRegex(CoordinationError, "PLANNER_SESSION_REQUIRED"):
             record_decision(
                 self.store,
                 proposal_sha256=proposal,
+                batch_sha256=batch_sha256,
+                batch_answer_map=answer_map,
                 decision="APPROVE",
                 selected_option_id="ENABLE",
                 revisit_trigger=None,
@@ -914,11 +1088,14 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, self.packet(), "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "DEFER")
         decision = record_decision(
             self.store,
             proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="DEFER",
-            selected_option_id="HOLD",
+            selected_option_id="DEFER",
             revisit_trigger="Revisit after issue #115 reaches READY.",
             decision_note="Defer until the named portfolio trigger occurs.",
             user_input_sha256="c" * 64,
@@ -1008,11 +1185,14 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, self.packet(), "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "REVISE")
         decision = record_decision(
             self.store,
             proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="COURSE_CORRECT",
-            selected_option_id="HOLD",
+            selected_option_id="REVISE",
             revisit_trigger=None,
             decision_note="Use the non-recommended hold option and revise the proposal.",
             user_input_sha256="e" * 64,
@@ -1030,7 +1210,7 @@ class ApprovalLedgerTests(unittest.TestCase):
             source_refresher=self.refreshed_source,
         )
         self.assertEqual("COURSE_CORRECT", claimed["decision"])
-        self.assertEqual("HOLD", claimed["selected_option_id"])
+        self.assertEqual("REVISE", claimed["selected_option_id"])
         self.assertIsNone(claimed["revisit_trigger"])
 
     def test_decision_freezes_recipient_set_but_allows_same_recipient_evidence(self) -> None:
@@ -1041,9 +1221,12 @@ class ApprovalLedgerTests(unittest.TestCase):
         proposal = submit_proposal(
             self.store, planner, "2026-08-24T04:00:02Z"
         )["proposal_sha256"]
+        batch_sha256, answer_map = self.batch_answer(proposal, "ENABLE")
         decision = record_decision(
             self.store,
             proposal_sha256=proposal,
+            batch_sha256=batch_sha256,
+            batch_answer_map=answer_map,
             decision="APPROVE",
             selected_option_id="ENABLE",
             revisit_trigger=None,

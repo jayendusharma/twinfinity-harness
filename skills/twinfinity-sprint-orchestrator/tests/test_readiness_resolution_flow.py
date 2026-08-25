@@ -38,6 +38,7 @@ from kanban_readiness import (  # noqa: E402
     claim_readiness_resolution_context,
     dispatch,
     ensure_schema as ensure_readiness_schema,
+    execute_readiness_resolution_action,
     pickup_receipt,
     register,
     stage_receipt,
@@ -267,6 +268,21 @@ class ResolutionHarness:
             self.desired_packet, "corrected", CLAIMED_AT
         )
 
+    def execute_candidate_action(
+        self, message_id: int, context: dict, *, suffix: str = "corrected"
+    ) -> dict:
+        path = self._candidate_path(self.desired_packet, suffix)
+        return execute_readiness_resolution_action(
+            self.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            expected_context_sha256=context["context_sha256"],
+            action_sha256=digest_json(self.action()),
+            expected_digest=self.action()["expected_digest"],
+            action_input={"packet_path": str(path)},
+            now=CLAIMED_AT,
+        )
+
     def _plan(self) -> dict:
         policy = self._policy()
         return {
@@ -494,10 +510,10 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         self.assertFalse(context["execution"]["direct_database_authority"])
         self.assert_zero_writer_wip()
 
-        desired = self.h.register_desired_candidate()
-        self.assertEqual(
-            self.h.desired_candidate_sha256, desired["candidate_sha256"]
-        )
+        action_receipt = self.h.execute_candidate_action(message_id, context)
+        self.assertEqual("COMPLETE", action_receipt["state"])
+        replayed_receipt = self.h.execute_candidate_action(message_id, context)
+        self.assertTrue(replayed_receipt["replay"])
         result = apply_readiness_resolution(
             self.h.store,
             message_id=message_id,
@@ -554,7 +570,7 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
             planner_session_id=PLANNER,
             now=CLAIMED_AT,
         )
-        self.h.register_desired_candidate()
+        self.h.execute_candidate_action(message_id, context)
         self.h.store.close()
         self.h.store = CoordinationStore(self.h.database)
         result = apply_readiness_resolution(
@@ -597,9 +613,55 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         self.assertEqual("HOLD", replay["outcome"])
         self.assert_zero_writer_wip()
 
+    def test_target_mutation_before_claim_terminal_holds_without_successor(self) -> None:
+        self.h.finish_actionable()
+        message_id = self.h.resolution_message_id()
+        self.h.register_desired_candidate()
+        context = claim_readiness_resolution_context(
+            self.h.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            now=CLAIMED_AT,
+        )
+        self.assertEqual("HOLD", context["claim_outcome"]["outcome"])
+        self.assertEqual(
+            "TERMINAL_HOLD", context["claim_outcome"]["disposition"]
+        )
+        self.assertIn(
+            "READINESS_RESOLUTION_EVIDENCE_PRECLAIM_TARGET_DRIFT",
+            context["claim_outcome"]["reason"],
+        )
+        current = self.h.store.connection.execute(
+            "SELECT state FROM portfolio_readiness_current "
+            "WHERE repository=? AND issue_number=?",
+            (REPOSITORY, ISSUE),
+        ).fetchone()
+        self.assertEqual("HOLD", current["state"])
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_resolution_cycles "
+                "WHERE outcome='HOLD' AND successor_campaign_id IS NULL"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_campaigns"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            "COMPLETE",
+            self.h.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()[0],
+        )
+        self.assert_zero_writer_wip()
+
     def test_partial_failure_rolls_back_and_retry_consumes_once(self) -> None:
         message_id, context = self._claim()
-        self.h.register_desired_candidate()
+        self.h.execute_candidate_action(message_id, context)
         before_campaigns = self.h.store.connection.execute(
             "SELECT COUNT(*) FROM portfolio_readiness_campaigns"
         ).fetchone()[0]
@@ -745,38 +807,67 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
             now=CLAIMED_AT,
         )
 
-        self.h.store.ingest_snapshot(
-            repository=REPOSITORY,
-            object_kind="issue",
-            object_number=ISSUE,
-            payload=next_payload,
-            source_updated_at=CLAIMED_AT,
-            fetched_at=CLAIMED_AT,
-        )
-        graph_result = replace_graph(
-            self.h.store.connection, graph_plan, now=CLAIMED_AT
-        )
-        self.assertEqual(desired_graph_sha256, graph_result["graph_sha256"])
-        item = self.h.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=ISSUE,
-            status="PREPARED",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=None,
-            lease_manifest_sha256=None,
-            development_units=1,
-            shared_units=0,
-            sre_units=0,
-            expected_source_sha256=next_source_sha256,
-            expected_version=int(self.h.item["version"]),
+        source_receipt = execute_readiness_resolution_action(
+            self.h.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            expected_context_sha256=context["context_sha256"],
+            action_sha256=digest_json(actions[0]),
+            expected_digest=actions[0]["expected_digest"],
+            action_input={
+                "payload": next_payload,
+                "source_updated_at": CLAIMED_AT,
+                "fetched_at": CLAIMED_AT,
+            },
             now=CLAIMED_AT,
         )
-        self.assertEqual(int(self.h.item["version"]) + 1, item["version"])
-        candidate = self.h._register_candidate(
-            desired_packet, "full-correction", CLAIMED_AT
+        self.assertEqual("WAITING_DEPENDENCY", source_receipt["state"])
+        self.assertIsNone(source_receipt["after_binding_sha256"])
+        graph_receipt = execute_readiness_resolution_action(
+            self.h.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            expected_context_sha256=context["context_sha256"],
+            action_sha256=digest_json(actions[1]),
+            expected_digest=actions[1]["expected_digest"],
+            action_input={"plan": graph_plan},
+            now=CLAIMED_AT,
         )
-        self.assertEqual(desired_candidate_sha256, candidate["candidate_sha256"])
+        self.assertEqual("COMPLETE", graph_receipt["state"])
+        source_receipt = execute_readiness_resolution_action(
+            self.h.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            expected_context_sha256=context["context_sha256"],
+            action_sha256=digest_json(actions[0]),
+            expected_digest=actions[0]["expected_digest"],
+            action_input={
+                "payload": next_payload,
+                "source_updated_at": CLAIMED_AT,
+                "fetched_at": CLAIMED_AT,
+            },
+            now=CLAIMED_AT,
+        )
+        self.assertEqual("COMPLETE", source_receipt["state"])
+        item = self.h.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, ISSUE),
+        ).fetchone()
+        self.assertEqual(int(self.h.item["version"]) + 1, item["version"])
+        candidate_path = self.h._candidate_path(
+            desired_packet, "full-correction"
+        )
+        candidate_receipt = execute_readiness_resolution_action(
+            self.h.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            expected_context_sha256=context["context_sha256"],
+            action_sha256=digest_json(actions[2]),
+            expected_digest=actions[2]["expected_digest"],
+            action_input={"packet_path": str(candidate_path)},
+            now=CLAIMED_AT,
+        )
+        self.assertEqual("COMPLETE", candidate_receipt["state"])
 
         result = apply_readiness_resolution(
             self.h.store,
@@ -857,7 +948,40 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         context_envelope = json.loads(output.getvalue())
         context = context_envelope["result"]
         self.assertEqual("COMPLETE", context_envelope["phase"])
-        self.h.register_desired_candidate()
+        candidate_path = self.h._candidate_path(
+            self.h.desired_packet, "cli-corrected"
+        )
+        action_input_path = self.h.root / "candidate-action-input.json"
+        action_input_path.write_text(
+            canonical_json({"packet_path": str(candidate_path)}),
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        with patch.object(
+            kanban_pull_buffer, "DEFAULT_DATABASE", self.h.database
+        ), patch.object(
+            sys,
+            "argv",
+            [
+                "kanban_pull_buffer.py",
+                "readiness-execute-resolution-action",
+                "--message-id",
+                str(message_id),
+                "--planner-session-id",
+                PLANNER,
+                "--expected-context-sha256",
+                context["context_sha256"],
+                "--action-sha256",
+                digest_json(self.h.action()),
+                "--expected-digest",
+                self.h.action()["expected_digest"],
+                "--action-input",
+                str(action_input_path),
+            ],
+        ), redirect_stdout(output):
+            self.assertEqual(0, kanban_pull_buffer.main())
+        action_result = json.loads(output.getvalue())
+        self.assertEqual("COMPLETE", action_result["result"]["state"])
         output = io.StringIO()
         with patch.object(
             kanban_pull_buffer, "DEFAULT_DATABASE", self.h.database

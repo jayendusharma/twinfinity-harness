@@ -2530,6 +2530,15 @@ def main() -> int:
     readiness_resolution.add_argument(
         "--expected-context-sha256", required=True
     )
+    readiness_action = subparsers.add_parser(
+        "readiness-execute-resolution-action"
+    )
+    readiness_action.add_argument("--message-id", type=int, required=True)
+    readiness_action.add_argument("--planner-session-id", required=True)
+    readiness_action.add_argument("--expected-context-sha256", required=True)
+    readiness_action.add_argument("--action-sha256", required=True)
+    readiness_action.add_argument("--expected-digest", required=True)
+    readiness_action.add_argument("--action-input", type=Path, required=True)
     readiness_evaluate = subparsers.add_parser("readiness-evaluate")
     readiness_evaluate.add_argument("--repository", required=True)
     readiness_evaluate.add_argument("--issue", type=int, required=True)
@@ -2564,6 +2573,7 @@ def main() -> int:
                 discover as discover_readiness,
                 dispatch as dispatch_readiness,
                 evaluate as evaluate_readiness,
+                execute_readiness_resolution_action,
                 read_json as read_readiness_json,
                 register as register_readiness,
                 show as show_readiness,
@@ -2634,6 +2644,21 @@ def main() -> int:
                         message_id=args.message_id,
                         planner_session_id=args.planner_session_id,
                         expected_context_sha256=args.expected_context_sha256,
+                        now=utc_now(),
+                    )
+                finally:
+                    resolution_store.close()
+            elif args.command == "readiness-execute-resolution-action":
+                resolution_store = CoordinationStore(DEFAULT_DATABASE)
+                try:
+                    result = execute_readiness_resolution_action(
+                        resolution_store,
+                        message_id=args.message_id,
+                        planner_session_id=args.planner_session_id,
+                        expected_context_sha256=args.expected_context_sha256,
+                        action_sha256=args.action_sha256,
+                        expected_digest=args.expected_digest,
+                        action_input=read_readiness_json(args.action_input),
                         now=utc_now(),
                     )
                 finally:

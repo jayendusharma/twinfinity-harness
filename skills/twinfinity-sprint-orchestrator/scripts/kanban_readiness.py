@@ -35,7 +35,7 @@ from coordination_store import (
     timestamp_after,
 )
 from executor_registry import current_endpoint, identities_role_equivalent, identity_role
-from portfolio_graph import PortfolioGraphError, evaluate_graph
+from portfolio_graph import PortfolioGraphError, evaluate_graph, replace_graph
 
 
 PLAN_SCHEMA = "twinfinity-kanban-readiness-phase/v1"
@@ -52,6 +52,9 @@ READINESS_RESOLUTION_RESULT_SCHEMA = (
 )
 READINESS_RESOLUTION_FAILURE_SCHEMA = (
     "twinfinity-kanban-readiness-resolution-failure/v1"
+)
+READINESS_RESOLUTION_ACTION_RECEIPT_SCHEMA = (
+    "twinfinity-kanban-readiness-resolution-action-receipt/v1"
 )
 READINESS_DECISION_MAPPING = {
     "APPROVE": "APPROVAL_RESUME",
@@ -620,6 +623,52 @@ def ensure_schema(
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS portfolio_readiness_resolution_action_starts (
+                notice_message_id INTEGER NOT NULL,
+                action_sha256 TEXT NOT NULL,
+                action_index INTEGER NOT NULL CHECK(action_index >= 0),
+                campaign_id INTEGER NOT NULL,
+                receipt_id INTEGER NOT NULL,
+                context_sha256 TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                target TEXT NOT NULL,
+                expected_digest TEXT NOT NULL,
+                desired_digest TEXT NOT NULL,
+                action_input_sha256 TEXT NOT NULL,
+                before_binding_sha256 TEXT NOT NULL,
+                before_binding_json TEXT NOT NULL,
+                acting_planner_session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(notice_message_id, action_sha256),
+                UNIQUE(notice_message_id, action_index),
+                FOREIGN KEY(notice_message_id)
+                    REFERENCES coordination_messages(id),
+                FOREIGN KEY(campaign_id)
+                    REFERENCES portfolio_readiness_campaigns(id),
+                FOREIGN KEY(receipt_id)
+                    REFERENCES portfolio_readiness_receipts(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio_readiness_resolution_action_completions (
+                notice_message_id INTEGER NOT NULL,
+                action_sha256 TEXT NOT NULL,
+                context_sha256 TEXT NOT NULL,
+                after_binding_sha256 TEXT NOT NULL,
+                after_binding_json TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY(notice_message_id, action_sha256),
+                FOREIGN KEY(notice_message_id, action_sha256)
+                    REFERENCES portfolio_readiness_resolution_action_starts(
+                        notice_message_id, action_sha256
+                    )
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS portfolio_readiness_approval_requests (
                 campaign_id INTEGER PRIMARY KEY,
                 receipt_id INTEGER NOT NULL UNIQUE,
@@ -931,6 +980,18 @@ def ensure_schema(
             """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_cycles_immutable_delete
                BEFORE DELETE ON portfolio_readiness_resolution_cycles
                BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_CYCLE_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_action_starts_immutable_update
+               BEFORE UPDATE ON portfolio_readiness_resolution_action_starts
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_ACTION_START_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_action_starts_immutable_delete
+               BEFORE DELETE ON portfolio_readiness_resolution_action_starts
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_ACTION_START_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_action_completions_immutable_update
+               BEFORE UPDATE ON portfolio_readiness_resolution_action_completions
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_ACTION_COMPLETION_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_action_completions_immutable_delete
+               BEFORE DELETE ON portfolio_readiness_resolution_action_completions
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_ACTION_COMPLETION_IMMUTABLE'); END""",
             """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_approval_requests_immutable_update
                BEFORE UPDATE ON portfolio_readiness_approval_requests
                BEGIN SELECT RAISE(ABORT, 'READINESS_APPROVAL_REQUEST_IMMUTABLE'); END""",
@@ -1063,6 +1124,8 @@ def require_schema(connection: sqlite3.Connection) -> None:
         "portfolio_readiness_resolution_notices",
         "portfolio_readiness_resolution_contexts",
         "portfolio_readiness_resolution_cycles",
+        "portfolio_readiness_resolution_action_starts",
+        "portfolio_readiness_resolution_action_completions",
     }
     present = {
         str(row[0])
@@ -2191,6 +2254,155 @@ def _current_resolution_bindings(
     return prepared_candidate, bindings
 
 
+def _resolution_action_observation(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    action: dict[str, Any],
+) -> dict[str, Any]:
+    repository = str(row["repository"])
+    issue_number = int(row["issue_number"])
+    kind = str(action["kind"])
+    if kind == "REFRESH_SOURCE_SNAPSHOT":
+        source = connection.execute(
+            "SELECT payload_sha256,source_updated_at,fetched_at FROM github_current "
+            "WHERE repository=? AND object_kind='issue' AND object_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        item = connection.execute(
+            "SELECT generation,version,source_payload_sha256,status,"
+            "allocation_class,development_units,shared_units,sre_units "
+            "FROM coordination_items WHERE repository=? AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        observed_digest = None if source is None else source["payload_sha256"]
+        binding = {
+            "source_payload_sha256": observed_digest,
+            "source_updated_at": None if source is None else source["source_updated_at"],
+            "source_fetched_at": None if source is None else source["fetched_at"],
+            "item_source_payload_sha256": (
+                None if item is None else item["source_payload_sha256"]
+            ),
+            "item_generation": None if item is None else int(item["generation"]),
+            "item_version": None if item is None else int(item["version"]),
+            "item_status": None if item is None else item["status"],
+            "item_allocation_class": (
+                None if item is None else item["allocation_class"]
+            ),
+            "development_units": (
+                None if item is None else int(item["development_units"])
+            ),
+            "shared_units": None if item is None else int(item["shared_units"]),
+            "sre_units": None if item is None else int(item["sre_units"]),
+        }
+    elif kind == "RECOMPUTE_DEPENDENCY_GRAPH":
+        graph = connection.execute(
+            """
+            SELECT current.version, current.observed_main_sha, current.health,
+                   revision.graph_sha256
+            FROM portfolio_graph_current current
+            LEFT JOIN portfolio_graph_revisions revision
+              ON revision.repository=current.repository
+             AND revision.version=current.version
+            WHERE current.repository=?
+            """,
+            (repository,),
+        ).fetchone()
+        observed_digest = None if graph is None else graph["graph_sha256"]
+        binding = {
+            "graph_sha256": observed_digest,
+            "graph_version": None if graph is None else int(graph["version"]),
+            "accepted_main_sha": (
+                None if graph is None else graph["observed_main_sha"]
+            ),
+            "health": None if graph is None else graph["health"],
+        }
+    elif kind == "REBUILD_PREPARED_CANDIDATE":
+        candidate = connection.execute(
+            """
+            SELECT candidate.* FROM portfolio_pull_buffer_current pointer
+            JOIN portfolio_pull_buffer_candidates candidate
+              ON candidate.id=pointer.candidate_id
+            LEFT JOIN portfolio_pull_buffer_retirements retirement
+              ON retirement.candidate_id=candidate.id
+            WHERE pointer.repository=? AND pointer.issue_number=?
+              AND retirement.candidate_id IS NULL
+            """,
+            (repository, issue_number),
+        ).fetchone()
+        observed_digest = (
+            None if candidate is None else candidate["candidate_sha256"]
+        )
+        binding = {
+            "candidate_id": None if candidate is None else int(candidate["id"]),
+            "candidate_sha256": observed_digest,
+            "state": None if candidate is None else candidate["state"],
+            "generation": (
+                None if candidate is None else int(candidate["generation"])
+            ),
+            "item_version": (
+                None if candidate is None else int(candidate["item_version"])
+            ),
+            "source_payload_sha256": (
+                None if candidate is None else candidate["source_payload_sha256"]
+            ),
+            "accepted_main_sha": (
+                None if candidate is None else candidate["accepted_main_sha"]
+            ),
+            "graph_version": (
+                None if candidate is None else int(candidate["graph_version"])
+            ),
+            "capacity_policy_version": (
+                None
+                if candidate is None
+                else int(candidate["capacity_policy_version"])
+            ),
+        }
+    else:
+        raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+    return {
+        "kind": kind,
+        "target": action["target"],
+        "action_sha256": digest_json(action),
+        "observed_digest": observed_digest,
+        "binding": binding,
+        "binding_sha256": digest_json(binding),
+    }
+
+
+def _resolution_observation_matches(
+    observation: dict[str, Any], expected_digest: str
+) -> bool:
+    binding = observation["binding"]
+    kind = observation["kind"]
+    if observation["observed_digest"] != expected_digest:
+        return False
+    if kind == "REFRESH_SOURCE_SNAPSHOT":
+        return bool(
+            binding["item_source_payload_sha256"] == expected_digest
+            and binding["item_status"] == "PREPARED"
+            and binding["item_allocation_class"] == "NONE"
+        )
+    if kind == "RECOMPUTE_DEPENDENCY_GRAPH":
+        return binding["health"] == "CURRENT"
+    if kind == "REBUILD_PREPARED_CANDIDATE":
+        return binding["state"] == "PREPARED_NOT_READY"
+    return False
+
+
+def _resolution_action_start_matches(
+    observation: dict[str, Any], expected_digest: str
+) -> bool:
+    """Fence the frozen target while allowing an ordered prerequisite effect."""
+
+    if observation["observed_digest"] != expected_digest:
+        return False
+    if observation["kind"] == "RECOMPUTE_DEPENDENCY_GRAPH":
+        # A preceding source refresh deliberately makes the still-exact frozen
+        # graph revision stale before the graph owner API replaces it.
+        return True
+    return _resolution_observation_matches(observation, expected_digest)
+
+
 def _resolution_context_payload(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2201,6 +2413,10 @@ def _resolution_context_payload(
     claimed_at: str,
 ) -> dict[str, Any]:
     prepared_candidate, bindings = _current_resolution_bindings(connection, row)
+    target_preconditions = [
+        _resolution_action_observation(connection, row, action)
+        for action in actions
+    ]
     approval_values = {
         "proposal_sha256": row["approval_proposal_sha256"],
         "decision_sha256": row["approval_decision_sha256"],
@@ -2237,6 +2453,7 @@ def _resolution_context_payload(
             "action_set_sha256": row["notice_action_set_sha256"],
         },
         "current_bindings": bindings,
+        "target_preconditions": target_preconditions,
         "frozen_approval_reference": frozen_approval,
         "planner_notice": {
             "message_id": int(row["message_id"]),
@@ -2263,6 +2480,7 @@ def _resolution_context_payload(
             "acting_planner_session_id": planner_session_id,
             "claimed_at": claimed_at,
         },
+        "claim_outcome": None,
     }
 
 
@@ -2320,6 +2538,24 @@ def claim_readiness_resolution_context(
             planner_session_id=planner_session_id,
             claimed_at=now,
         )
+        mismatched_targets = [
+            action["kind"]
+            for action, observation in zip(
+                actions, context["target_preconditions"], strict=True
+            )
+            if not _resolution_observation_matches(
+                observation, str(action["expected_digest"])
+            )
+        ]
+        if mismatched_targets:
+            context["claim_outcome"] = {
+                "outcome": "HOLD",
+                "disposition": "TERMINAL_HOLD",
+                "reason": (
+                    "READINESS_RESOLUTION_EVIDENCE_PRECLAIM_TARGET_DRIFT:"
+                    + ",".join(mismatched_targets)
+                ),
+            }
         context_sha256 = digest_json(context)
         store.connection.execute(
             """
@@ -2347,7 +2583,351 @@ def claim_readiness_resolution_context(
             },
             now,
         )
+        if mismatched_targets:
+            reason = str(context["claim_outcome"]["reason"])
+            changed = store.connection.execute(
+                "UPDATE portfolio_readiness_current SET state='HOLD', "
+                "version=version+1, updated_at=?, last_error=? "
+                "WHERE campaign_id=? AND receipt_id=? "
+                "AND state='RESOLUTION_PENDING' AND version=?",
+                (
+                    now, reason, int(row["resolution_campaign_id"]),
+                    int(row["resolution_receipt_id"]),
+                    int(row["expected_readiness_version"]),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ReadinessError("READINESS_RESOLUTION_FENCE_LOST")
+            failure = {
+                "schema": READINESS_RESOLUTION_FAILURE_SCHEMA,
+                "parent_campaign_id": int(row["resolution_campaign_id"]),
+                "notice_message_id": message_id,
+                "action_set_sha256": row["notice_action_set_sha256"],
+                "context_sha256": context_sha256,
+                "reason": reason,
+            }
+            changed_evidence_sha256 = digest_json(failure)
+            result = {
+                "schema": READINESS_RESOLUTION_RESULT_SCHEMA,
+                "repository": row["repository"],
+                "issue_number": int(row["issue_number"]),
+                "parent_campaign_id": int(row["resolution_campaign_id"]),
+                "successor_campaign_id": None,
+                "outcome": "HOLD",
+                "disposition": "TERMINAL_HOLD",
+                "reason": reason,
+                "action_set_sha256": row["notice_action_set_sha256"],
+                "changed_evidence_sha256": changed_evidence_sha256,
+                "context_sha256": context_sha256,
+            }
+            _insert_resolution_cycle(
+                store.connection,
+                row,
+                context_sha256=context_sha256,
+                changed_evidence_sha256=changed_evidence_sha256,
+                outcome="HOLD",
+                successor_campaign_id=None,
+                disposition_reason=reason,
+                acting_planner_session_id=planner_session_id,
+                result=result,
+                now=now,
+            )
+            store.complete_readiness_resolution_message_in_transaction(
+                message_id, planner_session_id, now
+            )
+            _event(
+                store.connection,
+                int(row["resolution_campaign_id"]),
+                "READINESS_RESOLUTION_PRECLAIM_HELD",
+                result,
+                now,
+            )
     return {**context, "context_sha256": context_sha256, "replay": False}
+
+
+def execute_readiness_resolution_action(
+    store: CoordinationStore,
+    *,
+    message_id: int,
+    planner_session_id: str,
+    expected_context_sha256: str,
+    action_sha256: str,
+    expected_digest: str,
+    action_input: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    """Run one frozen action through its owner API and receipt both sides."""
+
+    if (
+        type(message_id) is not int
+        or message_id <= 0
+        or not isinstance(expected_context_sha256, str)
+        or SHA256.fullmatch(expected_context_sha256) is None
+        or not isinstance(action_sha256, str)
+        or SHA256.fullmatch(action_sha256) is None
+        or not isinstance(expected_digest, str)
+        or SHA256.fullmatch(expected_digest) is None
+        or not isinstance(action_input, dict)
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_ACTION_CALL_INVALID")
+    ensure_schema(store.connection)
+    _require_pull_buffer_schema(store.connection)
+    action_input_sha256 = digest_json(action_input)
+    execute_owner = True
+    start_before_binding: dict[str, Any]
+    start_binding_sha256: str
+    with store.transaction():
+        row = _resolution_notice_row(store.connection, message_id)
+        _parent_plan, _receipt, actions = _validate_resolution_notice_binding(
+            store.connection,
+            row,
+            planner_session_id=planner_session_id,
+            require_pending=True,
+        )
+        if (
+            row["context_sha256"] != expected_context_sha256
+            or row["context_json"] is None
+            or row["message_state"] != "CLAIMED"
+            or row["message_claimed_by"] is None
+            or not identities_role_equivalent(
+                store.connection,
+                str(row["message_claimed_by"]),
+                planner_session_id,
+            )
+        ):
+            raise ReadinessError("READINESS_RESOLUTION_CONTEXT_CLAIM_INVALID")
+        matches = [
+            (index, action)
+            for index, action in enumerate(actions)
+            if digest_json(action) == action_sha256
+        ]
+        if len(matches) != 1:
+            raise ReadinessError("READINESS_RESOLUTION_ACTION_IDENTITY_INVALID")
+        action_index, action = matches[0]
+        if action["expected_digest"] != expected_digest:
+            raise ReadinessError("READINESS_RESOLUTION_ACTION_EXPECTED_DRIFT")
+        observation = _resolution_action_observation(
+            store.connection, row, action
+        )
+        start = store.connection.execute(
+            "SELECT * FROM portfolio_readiness_resolution_action_starts "
+            "WHERE notice_message_id=? AND action_sha256=?",
+            (message_id, action_sha256),
+        ).fetchone()
+        completion = store.connection.execute(
+            "SELECT * FROM portfolio_readiness_resolution_action_completions "
+            "WHERE notice_message_id=? AND action_sha256=?",
+            (message_id, action_sha256),
+        ).fetchone()
+        if start is None:
+            if not _resolution_action_start_matches(
+                observation, expected_digest
+            ):
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_ACTION_EXPECTED_DRIFT"
+                )
+            store.connection.execute(
+                """
+                INSERT INTO portfolio_readiness_resolution_action_starts(
+                    notice_message_id, action_sha256, action_index,
+                    campaign_id, receipt_id, context_sha256, kind, target,
+                    expected_digest, desired_digest, action_input_sha256,
+                    before_binding_sha256, before_binding_json,
+                    acting_planner_session_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id, action_sha256, action_index,
+                    int(row["resolution_campaign_id"]),
+                    int(row["resolution_receipt_id"]), expected_context_sha256,
+                    action["kind"], action["target"], action["expected_digest"],
+                    action["desired_digest"], action_input_sha256,
+                    observation["binding_sha256"],
+                    canonical_json(observation["binding"]),
+                    planner_session_id, now,
+                ),
+            )
+            start_before_binding = observation["binding"]
+            start_binding_sha256 = observation["binding_sha256"]
+        else:
+            if (
+                int(start["action_index"]) != action_index
+                or int(start["campaign_id"])
+                != int(row["resolution_campaign_id"])
+                or int(start["receipt_id"])
+                != int(row["resolution_receipt_id"])
+                or start["context_sha256"] != expected_context_sha256
+                or start["kind"] != action["kind"]
+                or start["target"] != action["target"]
+                or start["expected_digest"] != expected_digest
+                or start["desired_digest"] != action["desired_digest"]
+                or start["action_input_sha256"] != action_input_sha256
+            ):
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_ACTION_RECEIPT_CONFLICT"
+                )
+            start_before_binding = _parse_bound_json(
+                start["before_binding_json"],
+                "READINESS_RESOLUTION_ACTION_RECEIPT_INVALID",
+            )
+            if digest_json(start_before_binding) != start["before_binding_sha256"]:
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_ACTION_RECEIPT_INVALID"
+                )
+            start_binding_sha256 = str(start["before_binding_sha256"])
+            if completion is not None:
+                if not _resolution_observation_matches(
+                    observation, str(action["desired_digest"])
+                ):
+                    raise ReadinessError(
+                        "READINESS_RESOLUTION_ACTION_AFTER_DRIFT"
+                    )
+                return {
+                    "schema": READINESS_RESOLUTION_ACTION_RECEIPT_SCHEMA,
+                    "message_id": message_id,
+                    "context_sha256": expected_context_sha256,
+                    "action_sha256": action_sha256,
+                    "before_binding_sha256": start["before_binding_sha256"],
+                    "after_binding_sha256": completion[
+                        "after_binding_sha256"
+                    ],
+                    "state": "COMPLETE",
+                    "replay": True,
+                }
+            execute_owner = not _resolution_observation_matches(
+                observation, str(action["desired_digest"])
+            )
+
+    kind = str(action["kind"])
+    if execute_owner:
+        if kind == "REFRESH_SOURCE_SNAPSHOT":
+            if set(action_input) != {
+                "payload", "source_updated_at", "fetched_at"
+            } or not isinstance(action_input["payload"], dict):
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_INVALID")
+            if digest_json(action_input["payload"]) != action["desired_digest"]:
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_DRIFT")
+            with store.transaction():
+                store.ingest_snapshot_in_transaction(
+                    repository=str(row["repository"]),
+                    object_kind="issue",
+                    object_number=int(row["issue_number"]),
+                    payload=action_input["payload"],
+                    source_updated_at=str(action_input["source_updated_at"]),
+                    fetched_at=str(action_input["fetched_at"]),
+                    expected_payload_sha256=str(action["desired_digest"]),
+                )
+            try:
+                store.set_issue_status(
+                    repository=str(row["repository"]),
+                    issue_number=int(row["issue_number"]),
+                    status="PREPARED",
+                    allocation_class="NONE",
+                    generation=int(start_before_binding["item_generation"]),
+                    accountable_session_id=None,
+                    lease_manifest_sha256=None,
+                    development_units=int(
+                        start_before_binding["development_units"]
+                    ),
+                    shared_units=int(start_before_binding["shared_units"]),
+                    sre_units=int(start_before_binding["sre_units"]),
+                    expected_source_sha256=str(action["desired_digest"]),
+                    expected_version=int(start_before_binding["item_version"]),
+                    now=now,
+                )
+            except CoordinationError as exc:
+                if str(exc) != "GRAPH_STALE":
+                    raise ReadinessError(str(exc)) from exc
+                return {
+                    "schema": READINESS_RESOLUTION_ACTION_RECEIPT_SCHEMA,
+                    "message_id": message_id,
+                    "context_sha256": expected_context_sha256,
+                    "action_sha256": action_sha256,
+                    "before_binding_sha256": start_binding_sha256,
+                    "after_binding_sha256": None,
+                    "state": "WAITING_DEPENDENCY",
+                    "replay": False,
+                }
+        elif kind == "RECOMPUTE_DEPENDENCY_GRAPH":
+            if set(action_input) != {"plan"} or not isinstance(
+                action_input["plan"], dict
+            ):
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_INVALID")
+            graph_payload = {
+                key: action_input["plan"].get(key)
+                for key in (
+                    "repository", "scope_milestones", "excluded_issues",
+                    "nodes", "relations",
+                )
+            }
+            if digest_json(graph_payload) != action["desired_digest"]:
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_DRIFT")
+            try:
+                replace_graph(store.connection, action_input["plan"], now=now)
+            except PortfolioGraphError as exc:
+                raise ReadinessError(str(exc)) from exc
+        elif kind == "REBUILD_PREPARED_CANDIDATE":
+            if set(action_input) != {"packet_path"} or not isinstance(
+                action_input["packet_path"], str
+            ):
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_INVALID")
+            from kanban_pull_buffer import PullBufferError, register_candidate
+
+            try:
+                candidate = register_candidate(
+                    store.connection,
+                    store.path,
+                    Path(action_input["packet_path"]),
+                    now=now,
+                )
+            except PullBufferError as exc:
+                raise ReadinessError(str(exc)) from exc
+            if candidate["candidate_sha256"] != action["desired_digest"]:
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_DRIFT")
+        else:
+            raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+
+    with store.transaction():
+        latest = _resolution_notice_row(store.connection, message_id)
+        _validate_resolution_notice_binding(
+            store.connection,
+            latest,
+            planner_session_id=planner_session_id,
+            require_pending=True,
+        )
+        after = _resolution_action_observation(store.connection, latest, action)
+        if not _resolution_observation_matches(
+            after, str(action["desired_digest"])
+        ):
+            raise ReadinessError("READINESS_RESOLUTION_ACTION_AFTER_DRIFT")
+        store.connection.execute(
+            """
+            INSERT INTO portfolio_readiness_resolution_action_completions(
+                notice_message_id, action_sha256, context_sha256,
+                after_binding_sha256, after_binding_json, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id, action_sha256, expected_context_sha256,
+                after["binding_sha256"], canonical_json(after["binding"]), now,
+            ),
+        )
+        start = store.connection.execute(
+            "SELECT before_binding_sha256 FROM "
+            "portfolio_readiness_resolution_action_starts "
+            "WHERE notice_message_id=? AND action_sha256=?",
+            (message_id, action_sha256),
+        ).fetchone()
+    return {
+        "schema": READINESS_RESOLUTION_ACTION_RECEIPT_SCHEMA,
+        "message_id": message_id,
+        "context_sha256": expected_context_sha256,
+        "action_sha256": action_sha256,
+        "before_binding_sha256": start_binding_sha256,
+        "after_binding_sha256": after["binding_sha256"],
+        "state": "COMPLETE",
+        "replay": False,
+    }
 
 
 def _resolution_observations_and_successor(
@@ -2364,156 +2944,107 @@ def _resolution_observations_and_successor(
     observations: list[dict[str, Any]] = []
     repository = str(row["repository"])
     issue_number = int(row["issue_number"])
-    for action in actions:
-        kind = str(action["kind"])
-        binding: dict[str, Any]
-        observed_digest: str | None
-        if kind == "REFRESH_SOURCE_SNAPSHOT":
-            source = connection.execute(
-                "SELECT payload_sha256 FROM github_current WHERE repository=? "
-                "AND object_kind='issue' AND object_number=?",
-                (repository, issue_number),
-            ).fetchone()
-            item = connection.execute(
-                "SELECT generation, version, source_payload_sha256, status, "
-                "allocation_class FROM coordination_items "
-                "WHERE repository=? AND issue_number=?",
-                (repository, issue_number),
-            ).fetchone()
-            observed_digest = None if source is None else source["payload_sha256"]
-            binding = {
-                "source_payload_sha256": observed_digest,
-                "item_source_payload_sha256": (
-                    None if item is None else item["source_payload_sha256"]
-                ),
-                "item_generation": None if item is None else int(item["generation"]),
-                "item_version": None if item is None else int(item["version"]),
-                "item_status": None if item is None else item["status"],
-                "item_allocation_class": (
-                    None if item is None else item["allocation_class"]
-                ),
-            }
-            if (
-                item is None
-                or observed_digest != action["desired_digest"]
-                or item["source_payload_sha256"] != action["desired_digest"]
-                or item["status"] != "PREPARED"
-                or item["allocation_class"] != "NONE"
-            ):
-                raise ReadinessError(
-                    "READINESS_RESOLUTION_EVIDENCE_DRIFT:REFRESH_SOURCE_SNAPSHOT"
-                )
-            successor["source_payload_sha256"] = observed_digest
-            successor["generation"] = int(item["generation"])
-            successor["item_version"] = int(item["version"])
-        elif kind == "RECOMPUTE_DEPENDENCY_GRAPH":
-            graph = connection.execute(
-                """
-                SELECT current.version, current.observed_main_sha, current.health,
-                       revision.graph_sha256
-                FROM portfolio_graph_current current
-                LEFT JOIN portfolio_graph_revisions revision
-                  ON revision.repository=current.repository
-                 AND revision.version=current.version
-                WHERE current.repository=?
-                """,
-                (repository,),
-            ).fetchone()
-            observed_digest = None if graph is None else graph["graph_sha256"]
-            binding = {
-                "graph_sha256": observed_digest,
-                "graph_version": None if graph is None else int(graph["version"]),
-                "accepted_main_sha": (
-                    None if graph is None else graph["observed_main_sha"]
-                ),
-                "health": None if graph is None else graph["health"],
-            }
-            if (
-                graph is None
-                or observed_digest != action["desired_digest"]
-                or graph["health"] != "CURRENT"
-            ):
-                raise ReadinessError(
-                    "READINESS_RESOLUTION_EVIDENCE_DRIFT:"
-                    "RECOMPUTE_DEPENDENCY_GRAPH"
-                )
-            successor["accepted_main_sha"] = graph["observed_main_sha"]
-            successor["graph_version"] = int(graph["version"])
-        elif kind == "REBUILD_PREPARED_CANDIDATE":
-            candidate = connection.execute(
-                """
-                SELECT candidate.* FROM portfolio_pull_buffer_current pointer
-                JOIN portfolio_pull_buffer_candidates candidate
-                  ON candidate.id=pointer.candidate_id
-                LEFT JOIN portfolio_pull_buffer_retirements retirement
-                  ON retirement.candidate_id=candidate.id
-                WHERE pointer.repository=? AND pointer.issue_number=?
-                  AND retirement.candidate_id IS NULL
-                """,
-                (repository, issue_number),
-            ).fetchone()
-            observed_digest = (
-                None if candidate is None else candidate["candidate_sha256"]
+    for action_index, action in enumerate(actions):
+        observation = _resolution_action_observation(connection, row, action)
+        if not _resolution_observation_matches(
+            observation, str(action["desired_digest"])
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_EVIDENCE_DRIFT:" + str(action["kind"])
             )
-            binding = {
-                "candidate_id": None if candidate is None else int(candidate["id"]),
-                "candidate_sha256": observed_digest,
-                "state": None if candidate is None else candidate["state"],
-                "generation": (
-                    None if candidate is None else int(candidate["generation"])
-                ),
-                "item_version": (
-                    None if candidate is None else int(candidate["item_version"])
-                ),
-                "source_payload_sha256": (
-                    None if candidate is None else candidate["source_payload_sha256"]
-                ),
-                "accepted_main_sha": (
-                    None if candidate is None else candidate["accepted_main_sha"]
-                ),
-                "graph_version": (
-                    None if candidate is None else int(candidate["graph_version"])
-                ),
-                "capacity_policy_version": (
-                    None
-                    if candidate is None
-                    else int(candidate["capacity_policy_version"])
-                ),
-            }
-            if (
-                candidate is None
-                or observed_digest != action["desired_digest"]
-                or candidate["state"] != "PREPARED_NOT_READY"
-            ):
-                raise ReadinessError(
-                    "READINESS_RESOLUTION_EVIDENCE_DRIFT:"
-                    "REBUILD_PREPARED_CANDIDATE"
-                )
+        action_sha256 = digest_json(action)
+        receipt = connection.execute(
+            """
+            SELECT start.*, completion.context_sha256 AS completion_context_sha256,
+                   completion.after_binding_sha256,
+                   completion.after_binding_json, completion.completed_at
+            FROM portfolio_readiness_resolution_action_starts start
+            LEFT JOIN portfolio_readiness_resolution_action_completions completion
+              USING(notice_message_id, action_sha256)
+            WHERE start.notice_message_id=? AND start.action_sha256=?
+            """,
+            (int(row["message_id"]), action_sha256),
+        ).fetchone()
+        if receipt is None or receipt["after_binding_json"] is None:
+            raise ReadinessError(
+                "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_INCOMPLETE"
+            )
+        try:
+            before_binding = _parse_bound_json(
+                receipt["before_binding_json"],
+                "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_INVALID",
+            )
+            after_binding = _parse_bound_json(
+                receipt["after_binding_json"],
+                "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_INVALID",
+            )
+        except ReadinessError as exc:
+            raise ReadinessError(
+                "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_INVALID"
+            ) from exc
+        if (
+            int(receipt["action_index"]) != action_index
+            or int(receipt["campaign_id"])
+            != int(row["resolution_campaign_id"])
+            or int(receipt["receipt_id"]) != int(row["resolution_receipt_id"])
+            or receipt["context_sha256"] != row["context_sha256"]
+            or receipt["completion_context_sha256"] != row["context_sha256"]
+            or receipt["kind"] != action["kind"]
+            or receipt["target"] != action["target"]
+            or receipt["expected_digest"] != action["expected_digest"]
+            or receipt["desired_digest"] != action["desired_digest"]
+            or digest_json(before_binding) != receipt["before_binding_sha256"]
+            or digest_json(after_binding) != receipt["after_binding_sha256"]
+            or after_binding != observation["binding"]
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_INVALID"
+            )
+        binding = observation["binding"]
+        kind = str(action["kind"])
+        if kind == "REFRESH_SOURCE_SNAPSHOT":
+            successor["source_payload_sha256"] = observation["observed_digest"]
+            successor["generation"] = int(binding["item_generation"])
+            successor["item_version"] = int(binding["item_version"])
+        elif kind == "RECOMPUTE_DEPENDENCY_GRAPH":
+            successor["accepted_main_sha"] = binding["accepted_main_sha"]
+            successor["graph_version"] = int(binding["graph_version"])
+        elif kind == "REBUILD_PREPARED_CANDIDATE":
             successor.update(
                 {
-                    "generation": int(candidate["generation"]),
-                    "item_version": int(candidate["item_version"]),
-                    "source_payload_sha256": candidate["source_payload_sha256"],
-                    "accepted_main_sha": candidate["accepted_main_sha"],
-                    "graph_version": int(candidate["graph_version"]),
+                    "generation": int(binding["generation"]),
+                    "item_version": int(binding["item_version"]),
+                    "source_payload_sha256": binding["source_payload_sha256"],
+                    "accepted_main_sha": binding["accepted_main_sha"],
+                    "graph_version": int(binding["graph_version"]),
                     "capacity_policy_version": int(
-                        candidate["capacity_policy_version"]
+                        binding["capacity_policy_version"]
                     ),
-                    "candidate_sha256": observed_digest,
+                    "candidate_sha256": observation["observed_digest"],
                 }
             )
-        else:
-            raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
         observations.append(
             {
-                "kind": kind,
-                "target": action["target"],
+                **observation,
                 "expected_digest": action["expected_digest"],
                 "desired_digest": action["desired_digest"],
-                "observed_digest": observed_digest,
-                "binding": binding,
-                "binding_sha256": digest_json(binding),
+                "before_binding_sha256": receipt["before_binding_sha256"],
+                "after_binding_sha256": receipt["after_binding_sha256"],
             }
+        )
+    counts = connection.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM portfolio_readiness_resolution_action_starts
+           WHERE notice_message_id=?) AS starts,
+          (SELECT COUNT(*) FROM portfolio_readiness_resolution_action_completions
+           WHERE notice_message_id=?) AS completions
+        """,
+        (int(row["message_id"]), int(row["message_id"])),
+    ).fetchone()
+    if int(counts["starts"]) != len(actions) or int(counts["completions"]) != len(actions):
+        raise ReadinessError(
+            "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_SET_INVALID"
         )
     frozen_approval_values = {
         "proposal_sha256": row["approval_proposal_sha256"],

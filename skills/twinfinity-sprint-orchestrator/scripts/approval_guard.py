@@ -11,10 +11,135 @@ from executor_registry import identities_role_equivalent, identity_role
 
 
 SHA256_LENGTH = 64
+REVIEW_BATCH_SCHEMA = "twinfinity.approval-review-batch.v2"
+BATCH_ANSWER_SCHEMA = "twinfinity.approval-batch-answer-map.v1"
 
 
 class ApprovalGuardError(ValueError):
     """Typed fail-closed approval guard error."""
+
+
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID")
+        result[key] = value
+    return result
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def _digest_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _require_frozen_batch_decision(row: sqlite3.Row) -> None:
+    """Revalidate the immutable user batch at the execution boundary."""
+
+    required = (
+        "batch_sha256",
+        "batch_answer_map_sha256",
+        "option_map_sha256",
+        "selected_option_machine_outcome",
+        "batch_json",
+        "batch_answer_map_json",
+    )
+    if any(not isinstance(row[key], str) or not row[key] for key in required):
+        raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID")
+    if (
+        row["event_batch_sha256"] != row["batch_sha256"]
+        or row["event_batch_answer_map_sha256"]
+        != row["batch_answer_map_sha256"]
+    ):
+        raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID")
+    try:
+        batch = json.loads(
+            row["batch_json"], object_pairs_hook=_strict_object
+        )
+        answer_map = json.loads(
+            row["batch_answer_map_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, ApprovalGuardError) as exc:
+        raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID") from exc
+    if (
+        not isinstance(batch, dict)
+        or set(batch) != {"schema", "repository", "proposals"}
+        or batch.get("schema") != REVIEW_BATCH_SCHEMA
+        or batch.get("repository") != row["repository"]
+        or _canonical_json(batch) != row["batch_json"]
+        or _digest_json(batch) != row["batch_sha256"]
+        or not isinstance(batch.get("proposals"), list)
+    ):
+        raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID")
+    proposals = [
+        proposal
+        for proposal in batch["proposals"]
+        if isinstance(proposal, dict)
+        and proposal.get("proposal_sha256") == row["proposal_sha256"]
+    ]
+    if len(proposals) != 1:
+        raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID")
+    frozen = proposals[0]
+    if set(frozen) != {
+        "proposal_sha256",
+        "source_snapshot_sha256",
+        "execution_scope_sha256",
+        "recipient_session_ids",
+        "recipient_set_sha256",
+        "option_map",
+        "option_map_sha256",
+    } or (
+        frozen["source_snapshot_sha256"] != row["proposal_source_sha256"]
+        or frozen["execution_scope_sha256"]
+        != row["approved_execution_scope_sha256"]
+        or frozen["recipient_set_sha256"] != row["recipient_set_sha256"]
+        or frozen["option_map_sha256"] != row["option_map_sha256"]
+        or not isinstance(frozen["recipient_session_ids"], list)
+        or row["recipient_session_id"] not in frozen["recipient_session_ids"]
+        or _digest_json(frozen["recipient_session_ids"])
+        != frozen["recipient_set_sha256"]
+        or not isinstance(frozen["option_map"], list)
+        or _digest_json(frozen["option_map"]) != frozen["option_map_sha256"]
+    ):
+        raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID")
+    selected = [
+        option
+        for option in frozen["option_map"]
+        if isinstance(option, dict)
+        and option.get("id") == row["selected_option_id"]
+    ]
+    if len(selected) != 1 or set(selected[0]) != {
+        "id", "label", "effect", "machine_outcome"
+    } or (
+        selected[0]["machine_outcome"] != row["decision"]
+        or row["selected_option_machine_outcome"] != row["decision"]
+    ):
+        raise ApprovalGuardError("APPROVAL_OPTION_OUTCOME_MISMATCH")
+    if (
+        not isinstance(answer_map, dict)
+        or set(answer_map) != {"schema", "batch_sha256", "answers"}
+        or answer_map.get("schema") != BATCH_ANSWER_SCHEMA
+        or answer_map.get("batch_sha256") != row["batch_sha256"]
+        or _canonical_json(answer_map) != row["batch_answer_map_json"]
+        or _digest_json(answer_map) != row["batch_answer_map_sha256"]
+        or not isinstance(answer_map.get("answers"), list)
+    ):
+        raise ApprovalGuardError("APPROVAL_BATCH_BINDING_INVALID")
+    answers = [
+        answer
+        for answer in answer_map["answers"]
+        if isinstance(answer, dict)
+        and answer.get("proposal_sha256") == row["proposal_sha256"]
+    ]
+    if len(answers) != 1 or set(answers[0]) != {
+        "proposal_sha256", "selected_option_id"
+    } or answers[0]["selected_option_id"] != row["selected_option_id"]:
+        raise ApprovalGuardError("APPROVAL_BATCH_ANSWER_MISMATCH")
 
 
 def _stable_payload_sha256(payload_json: str | None) -> str | None:
@@ -184,6 +309,8 @@ def require_effective_approval(
         "approval_proposals",
         "approval_submissions",
         "approval_interests",
+        "approval_review_batches",
+        "approval_user_events",
         "approval_decisions",
         "approval_deliveries",
         "approval_effectivity",
@@ -291,21 +418,35 @@ def require_effective_approval(
         raise ApprovalGuardError("APPROVAL_AUTHORITY_BINDING_MISSING")
     matches = connection.execute(
         f"""
-        SELECT p.proposal_sha256, p.boundary, x.recipient_session_id,
-               d.decision_sha256, d.decision,
+        SELECT p.proposal_sha256, p.repository, p.boundary,
+               p.source_snapshot_sha256 AS proposal_source_sha256,
+               x.recipient_session_id,
+               d.decision_sha256, d.decision, d.selected_option_id,
+               d.selected_option_machine_outcome, d.recipient_set_sha256,
+               d.batch_sha256, d.batch_answer_map_sha256,
+               d.option_map_sha256,
                x.state AS delivery_state, e.effective_source_sha256,
                e.remote_receipt, o.state AS outbox_state,
                o.remote_receipt AS outbox_receipt,
                current.payload_sha256 AS current_source_sha256,
                current_snapshot.payload_json AS current_source_json,
                d.execution_scope_sha256 AS approved_execution_scope_sha256,
-               d.planner_session_id
+               d.planner_session_id, batch.batch_json,
+               user_event.batch_sha256 AS event_batch_sha256,
+               user_event.batch_answer_map_sha256
+                   AS event_batch_answer_map_sha256,
+               user_event.batch_answer_map_json
         FROM approval_current c
         JOIN approval_proposals p USING(proposal_sha256)
         JOIN approval_decisions d USING(proposal_sha256)
         JOIN approval_deliveries x USING(proposal_sha256, decision_sha256)
         JOIN approval_effectivity e USING(proposal_sha256, decision_sha256)
         JOIN github_outbox o ON o.id=d.owner_outbox_id
+        LEFT JOIN approval_review_batches batch
+          ON batch.batch_sha256=d.batch_sha256
+        LEFT JOIN approval_user_events user_event
+          ON user_event.user_event_source=d.user_event_source
+         AND user_event.user_event_id=d.user_event_id
         LEFT JOIN approval_revocations r USING(proposal_sha256, decision_sha256)
         LEFT JOIN github_current current
           ON current.repository=p.repository
@@ -343,6 +484,7 @@ def require_effective_approval(
         raise ApprovalGuardError("APPROVAL_AUTHORITY_MISMATCH")
     if match["approved_execution_scope_sha256"] != execution_scope_sha256:
         raise ApprovalGuardError("APPROVAL_EXECUTION_SCOPE_MISMATCH")
+    _require_frozen_batch_decision(match)
     if required_boundary is not None and match["boundary"] != required_boundary:
         raise ApprovalGuardError("APPROVAL_BOUNDARY_MISMATCH")
     if (
