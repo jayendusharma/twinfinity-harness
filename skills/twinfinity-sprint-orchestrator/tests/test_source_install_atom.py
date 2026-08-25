@@ -319,18 +319,20 @@ class SourceInstallAtomTests(unittest.TestCase):
                     stage_root=stage,
                 )
                 if failure_kind == "mid-series":
-                    real_atomic = atom._atomic_replace_at
+                    real_atomic = atom._atomic_replace_leaf_at
                     injected = False
 
-                    def fail_second(root_descriptor, relative, contents, **kwargs):
+                    def fail_second(parent_descriptor, leaf, contents, **kwargs):
                         nonlocal injected
-                        if relative.as_posix() == "second-installed.txt" and not injected:
+                        if leaf == "second-installed.txt" and not injected:
                             injected = True
                             raise OSError("mid-series injection")
-                        return real_atomic(root_descriptor, relative, contents, **kwargs)
+                        return real_atomic(
+                            parent_descriptor, leaf, contents, **kwargs
+                        )
 
                     context = patch.object(
-                        atom, "_atomic_replace_at", side_effect=fail_second
+                        atom, "_atomic_replace_leaf_at", side_effect=fail_second
                     )
                     expected = "mid-series injection"
                 else:
@@ -419,6 +421,195 @@ class SourceInstallAtomTests(unittest.TestCase):
         self.assertEqual(
             "second-old\n",
             (self.destination / "second-installed.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_nested_parent_substitution_fails_and_recovers_held_tree(self) -> None:
+        manifest = self.manifest(two_entries=True)
+        nested = self.destination / "nested"
+        nested.mkdir(mode=0o700)
+        os.replace(self.destination / "installed.txt", nested / "installed.txt")
+        os.replace(
+            self.destination / "second-installed.txt",
+            nested / "second-installed.txt",
+        )
+        manifest["entries"][0]["destination_path"] = "nested/installed.txt"  # type: ignore[index]
+        manifest["entries"][1]["destination_path"] = "nested/second-installed.txt"  # type: ignore[index]
+        manifest["manifest_sha256"] = atom.manifest_digest(manifest)  # type: ignore[arg-type]
+        stage = self.root / "stage-parent-race"
+        rollback = self.root / "rollback-parent-race"
+        atom.stage_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=self.destination,
+            stage_root=stage,
+        )
+        displaced = self.destination / "nested-displaced"
+        real_atomic = atom._atomic_replace_leaf_at
+        substituted = False
+
+        def substitute_after_first(parent_descriptor, leaf, contents, **kwargs):
+            nonlocal substituted
+            result = real_atomic(parent_descriptor, leaf, contents, **kwargs)
+            if leaf == "installed.txt" and not substituted:
+                substituted = True
+                os.replace(nested, displaced)
+                nested.mkdir(mode=0o700)
+                (nested / "installed.txt").write_text(
+                    "substitute-first\n", encoding="utf-8"
+                )
+                (nested / "second-installed.txt").write_text(
+                    "substitute-second\n", encoding="utf-8"
+                )
+                (nested / "installed.txt").chmod(0o600)
+                (nested / "second-installed.txt").chmod(0o600)
+            return result
+
+        with patch.object(
+            atom,
+            "_atomic_replace_leaf_at",
+            side_effect=substitute_after_first,
+        ), self.assertRaisesRegex(
+            atom.SourceInstallAtomError,
+            "INSTALL_ATOM_DESTINATION_IDENTITY_DRIFT",
+        ):
+            atom.apply_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                source_root=self.source,
+                destination_root=self.destination,
+                stage_root=stage,
+                rollback_root=rollback,
+                confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+            )
+        self.assertEqual(
+            "old\n", (displaced / "installed.txt").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "second-old\n",
+            (displaced / "second-installed.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "substitute-first\n",
+            (nested / "installed.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "ROLLED_BACK",
+            json.loads((rollback / atom.ROLLBACK_RECEIPT).read_text())["state"],
+        )
+
+    def test_multi_parent_post_replace_failure_rolls_back_every_entry(self) -> None:
+        manifest = self.manifest(two_entries=True)
+        first_parent = self.destination / "first-parent"
+        second_parent = self.destination / "second-parent"
+        first_parent.mkdir(mode=0o700)
+        second_parent.mkdir(mode=0o700)
+        os.replace(
+            self.destination / "installed.txt", first_parent / "installed.txt"
+        )
+        os.replace(
+            self.destination / "second-installed.txt",
+            second_parent / "second-installed.txt",
+        )
+        manifest["entries"][0]["destination_path"] = "first-parent/installed.txt"  # type: ignore[index]
+        manifest["entries"][1]["destination_path"] = "second-parent/second-installed.txt"  # type: ignore[index]
+        manifest["manifest_sha256"] = atom.manifest_digest(manifest)  # type: ignore[arg-type]
+        stage = self.root / "stage-multi-parent"
+        rollback = self.root / "rollback-multi-parent"
+        atom.stage_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=self.destination,
+            stage_root=stage,
+        )
+        real_atomic = atom._atomic_replace_leaf_at
+        injected = False
+
+        def replace_second_then_fail(parent_descriptor, leaf, contents, **kwargs):
+            nonlocal injected
+            result = real_atomic(parent_descriptor, leaf, contents, **kwargs)
+            if leaf == "second-installed.txt" and not injected:
+                injected = True
+                raise OSError("multi-parent post-replace injection")
+            return result
+
+        with patch.object(
+            atom,
+            "_atomic_replace_leaf_at",
+            side_effect=replace_second_then_fail,
+        ), self.assertRaisesRegex(OSError, "multi-parent post-replace injection"):
+            atom.apply_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                source_root=self.source,
+                destination_root=self.destination,
+                stage_root=stage,
+                rollback_root=rollback,
+                confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+            )
+        self.assertEqual(
+            "old\n", (first_parent / "installed.txt").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "second-old\n",
+            (second_parent / "second-installed.txt").read_text(encoding="utf-8"),
+        )
+        receipt = json.loads((rollback / atom.ROLLBACK_RECEIPT).read_text())
+        self.assertEqual("ROLLED_BACK", receipt["state"])
+        self.assertTrue(
+            all(
+                entry["destination_parent_identity"]
+                for entry in receipt["entries"]
+            )
+        )
+
+    def test_later_rollback_refuses_nested_parent_identity_substitution(self) -> None:
+        manifest = self.manifest()
+        nested = self.destination / "nested-later"
+        nested.mkdir(mode=0o700)
+        os.replace(self.destination / "installed.txt", nested / "installed.txt")
+        manifest["entries"][0]["destination_path"] = "nested-later/installed.txt"  # type: ignore[index]
+        manifest["manifest_sha256"] = atom.manifest_digest(manifest)  # type: ignore[arg-type]
+        stage = self.root / "stage-later-parent"
+        rollback = self.root / "rollback-later-parent"
+        atom.stage_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=self.destination,
+            stage_root=stage,
+        )
+        atom.apply_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=self.destination,
+            stage_root=stage,
+            rollback_root=rollback,
+            confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+        )
+        displaced = self.destination / "nested-later-displaced"
+        os.replace(nested, displaced)
+        nested.mkdir(mode=0o700)
+        (nested / "installed.txt").write_text(
+            "substitute-installed\n", encoding="utf-8"
+        )
+        (nested / "installed.txt").chmod(0o600)
+        with self.assertRaisesRegex(
+            atom.SourceInstallAtomError,
+            "INSTALL_ATOM_DESTINATION_IDENTITY_DRIFT",
+        ):
+            atom.rollback_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                destination_root=self.destination,
+                rollback_root=rollback,
+                confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+            )
+        self.assertEqual(
+            "new\n", (displaced / "installed.txt").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "substitute-installed\n",
+            (nested / "installed.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "INSTALLED",
+            json.loads((rollback / atom.ROLLBACK_RECEIPT).read_text())["state"],
         )
 
     def test_source_commit_and_fixed_owner_group_are_enforced(self) -> None:
