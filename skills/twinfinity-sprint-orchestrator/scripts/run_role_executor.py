@@ -30,6 +30,7 @@ from executor_registry import (
     probe_systemd_unit,
     reserve_attempt,
     stable_systemd_unit,
+    target_progress_digest,
     transition_attempt,
     utc_now,
     validate_launch_systemd_evidence,
@@ -352,7 +353,24 @@ def execute_role(
             now=utc_now(),
             process_id=int(process.pid),
         )
-    state = "COMPLETE" if exit_code == 0 else "HOLD"
+    try:
+        terminal_progress_sha256 = target_progress_digest(
+            connection, target_kind, target_key
+        )
+    except (RegistryError, sqlite3.Error):
+        terminal_progress_sha256 = None
+    if exit_code != 0:
+        state = "HOLD"
+        terminal_error = "EXECUTOR_PROCESS_FAILED"
+    elif terminal_progress_sha256 is None or reserved["target_progress_sha256"] is None:
+        state = "HOLD"
+        terminal_error = "EXECUTOR_TARGET_READBACK_FAILED"
+    elif terminal_progress_sha256 == reserved["target_progress_sha256"]:
+        state = "HOLD"
+        terminal_error = "EXECUTOR_TARGET_NO_PROGRESS"
+    else:
+        state = "COMPLETE"
+        terminal_error = None
     terminal = transitioner(
         connection,
         attempt_id=attempt["attempt_id"],
@@ -361,7 +379,8 @@ def execute_role(
         new_state=state,
         now=utc_now(),
         exit_code=int(exit_code),
-        last_error=None if exit_code == 0 else "EXECUTOR_PROCESS_FAILED",
+        last_error=terminal_error,
+        terminal_progress_sha256=terminal_progress_sha256,
     )
     return {
         "phase": "PASS" if state == "COMPLETE" else "HOLD",
@@ -373,6 +392,9 @@ def execute_role(
         "target_key": terminal["target_key"],
         "state": terminal["state"],
         "exit_code": terminal["exit_code"],
+        "target_progress_sha256": terminal["target_progress_sha256"],
+        "terminal_progress_sha256": terminal["terminal_progress_sha256"],
+        "error": terminal["last_error"],
         "token_persisted": False,
     }
 

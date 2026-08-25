@@ -1294,6 +1294,7 @@ class CoordinationStore:
                 message_id INTEGER NOT NULL,
                 recipient_session_id TEXT NOT NULL,
                 message_payload_sha256 TEXT NOT NULL,
+                target_progress_sha256 TEXT,
                 state TEXT NOT NULL CHECK(state IN ('INFLIGHT', 'COMPLETE', 'HOLD')),
                 attempts INTEGER NOT NULL CHECK(attempts > 0),
                 process_id INTEGER,
@@ -1321,6 +1322,7 @@ class CoordinationStore:
                 state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'COMPLETE', 'HOLD')),
                 attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
                 process_id INTEGER,
+                target_progress_sha256 TEXT,
                 last_heartbeat_at TEXT NOT NULL,
                 next_wake_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -1498,6 +1500,24 @@ class CoordinationStore:
         if "environment_provenance_sha256" not in gate_columns:
             self.connection.execute(
                 "ALTER TABLE coordination_pre_push_gates ADD COLUMN environment_provenance_sha256 TEXT"
+            )
+        wake_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(coordination_wakes)")
+        }
+        if "target_progress_sha256" not in wake_columns:
+            self.connection.execute(
+                "ALTER TABLE coordination_wakes ADD COLUMN target_progress_sha256 TEXT"
+            )
+        watch_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(coordination_terminal_watches)"
+            )
+        }
+        if "target_progress_sha256" not in watch_columns:
+            self.connection.execute(
+                "ALTER TABLE coordination_terminal_watches ADD COLUMN target_progress_sha256 TEXT"
             )
         if "allocation_class" not in columns:
             self.connection.execute(
