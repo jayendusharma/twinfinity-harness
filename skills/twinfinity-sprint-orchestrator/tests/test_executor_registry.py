@@ -40,6 +40,7 @@ from executor_registry import (  # noqa: E402
     load_registry_config,
     open_registry_database,
     probe_systemd_unit,
+    registry_config_scope,
     reserve_attempt,
     recover_stale_active_attempts,
     require_current_endpoint_identity,
@@ -373,6 +374,10 @@ class ExecutorRegistryTests(unittest.TestCase):
             load_registry_config(CONFIG, codex_home=mismatched_home)
 
     def test_actual_v3_launch_preflight_requires_only_selected_current_profile(self) -> None:
+        # Exercise the real runner and registry loaders; the suite-level v4
+        # fixture mocks would otherwise hide ambient profile loading.
+        self.runner_registry_loader.stop()
+        self.registry_loader.stop()
         selected_home = Path(self.temp.name) / "selected-v3-codex-home"
         selected_home.mkdir(mode=0o700)
         selected_profile = selected_home / "twinfinity-development-v3.config.toml"
@@ -412,25 +417,26 @@ class ExecutorRegistryTests(unittest.TestCase):
                 )
 
                 def enqueue(key: str) -> int:
-                    return production.enqueue_message(
-                        idempotency_key=key,
-                        recipient_session_id=DEVELOPMENT_V3_ENDPOINT,
-                        topic="coordination.notice",
-                        payload={
-                            "source": {
-                                "repository": REPOSITORY,
-                                "object_kind": "issue",
-                                "object_number": 92,
-                                "payload_sha256": source.payload_sha256,
+                    with registry_config_scope(config):
+                        return production.enqueue_message(
+                            idempotency_key=key,
+                            recipient_session_id=DEVELOPMENT_V3_ENDPOINT,
+                            topic="coordination.notice",
+                            payload={
+                                "source": {
+                                    "repository": REPOSITORY,
+                                    "object_kind": "issue",
+                                    "object_number": 92,
+                                    "payload_sha256": source.payload_sha256,
+                                },
+                                "notice_kind": "status",
+                                "mutation_authority": False,
+                                "subject": "Selected v3 profile preflight",
+                                "summary": "Launch from a selected-profile-only CODEX_HOME.",
+                                "evidence": {},
                             },
-                            "notice_kind": "status",
-                            "mutation_authority": False,
-                            "subject": "Selected v3 profile preflight",
-                            "summary": "Launch from a selected-profile-only CODEX_HOME.",
-                            "evidence": {},
-                        },
-                        now="2026-08-25T22:00:02Z",
-                    )
+                            now="2026-08-25T22:00:02Z",
+                        )
 
                 message_id = enqueue("selected-v3-positive")
 
@@ -447,35 +453,56 @@ class ExecutorRegistryTests(unittest.TestCase):
                     )
                     return _ImmediateProcess()
 
-                with patch(
-                    "run_role_executor.load_registry_config",
-                    wraps=load_registry_config,
+                result = execute_role(
+                    production.connection,
+                    config_path=PRODUCTION_CONFIG,
+                    role="development",
+                    endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                    target_kind="message",
+                    target_key=str(message_id),
+                    prompt="Inspect the selected current v3 target.",
+                    systemd_invocation_id=INVOCATION_ID,
+                    systemd_evidence=systemd_evidence(
+                        target_key=str(message_id)
+                    ),
+                    popen=complete_target,
+                )
+                self.assertEqual("COMPLETE", result["state"])
+
+                wrong_endpoint_message_id = enqueue("selected-v3-wrong-endpoint")
+                attempt_count = production.connection.execute(
+                    "SELECT COUNT(*) FROM executor_attempts"
+                ).fetchone()[0]
+                with self.assertRaisesRegex(
+                    RegistryError, "REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT"
                 ):
-                    result = execute_role(
+                    execute_role(
                         production.connection,
                         config_path=PRODUCTION_CONFIG,
                         role="development",
-                        endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                        endpoint_id="role.development.v4",
                         target_kind="message",
-                        target_key=str(message_id),
-                        prompt="Inspect the selected current v3 target.",
+                        target_key=str(wrong_endpoint_message_id),
+                        prompt="Reject a noncurrent endpoint selection.",
                         systemd_invocation_id=INVOCATION_ID,
                         systemd_evidence=systemd_evidence(
-                            target_key=str(message_id)
+                            target_key=str(wrong_endpoint_message_id)
                         ),
-                        popen=complete_target,
+                        popen=lambda *_args, **_kwargs: _ImmediateProcess(),
                     )
-                self.assertEqual("COMPLETE", result["state"])
+                self.assertEqual(
+                    attempt_count,
+                    production.connection.execute(
+                        "SELECT COUNT(*) FROM executor_attempts"
+                    ).fetchone()[0],
+                )
 
                 rejected_message_id = enqueue("selected-v3-negative")
                 selected_profile.write_bytes(selected_profile.read_bytes() + b"\n")
                 attempt_count = production.connection.execute(
                     "SELECT COUNT(*) FROM executor_attempts"
                 ).fetchone()[0]
-                with patch(
-                    "run_role_executor.load_registry_config",
-                    wraps=load_registry_config,
-                ), self.assertRaisesRegex(
+                with self.assertRaisesRegex(
                     RegistryError, "REGISTRY_PROFILE_DIGEST_MISMATCH"
                 ):
                     execute_role(
