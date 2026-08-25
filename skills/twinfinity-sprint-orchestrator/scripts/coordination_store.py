@@ -654,9 +654,9 @@ def _utc_timestamp(value: str, *, error: str) -> datetime:
 
 
 def _fetch_terminal_live_observation(
-    repository: str, issue_number: int
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Fetch the fixed normalized GitHub issue and exact main ref."""
+    repository: str, issue_number: int, remote_receipt: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Fetch the fixed issue, main ref, receipt comment, and issue timeline."""
 
     from sync_github_coordination import (  # local import avoids a cycle
         _run_gh,
@@ -665,7 +665,65 @@ def _fetch_terminal_live_observation(
 
     issue_payload = fetch_object(repository, "issue", issue_number)
     main_ref = _run_gh(["api", f"repos/{repository}/git/ref/heads/main"])
-    return issue_payload, main_ref
+    receipt_match = REMOTE_COMMENT_RECEIPT.fullmatch(remote_receipt)
+    if receipt_match is None:
+        raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
+    comment = _run_gh(
+        [
+            "api",
+            f"repos/{repository}/issues/comments/{remote_receipt.split(':', 1)[1]}",
+        ]
+    )
+    raw_timeline = _run_gh(
+        [
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/issues/{issue_number}/timeline?per_page=100",
+        ]
+    )
+    if not isinstance(raw_timeline, list):
+        raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+    timeline = (
+        [
+            event
+            for page in raw_timeline
+            if isinstance(page, list)
+            for event in page
+            if isinstance(event, dict)
+        ]
+        if raw_timeline and all(isinstance(page, list) for page in raw_timeline)
+        else [event for event in raw_timeline if isinstance(event, dict)]
+    )
+    return issue_payload, main_ref, comment, timeline
+
+
+def _terminal_issue_material_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Exclude only GitHub's comment-volatile issue timestamp."""
+
+    material = dict(payload)
+    material.pop("updated_at", None)
+    return material
+
+
+def _terminal_timeline_activity(event: dict[str, Any]) -> dict[str, Any]:
+    """Normalize attribution fields without trusting unrelated timeline bytes."""
+
+    actor = event.get("user") or event.get("actor") or {}
+    body = event.get("body")
+    return {
+        "id": event.get("id"),
+        "event": event.get("event"),
+        "body_sha256": (
+            hashlib.sha256(body.encode("utf-8")).hexdigest()
+            if isinstance(body, str)
+            else None
+        ),
+        "publisher_login": actor.get("login") if isinstance(actor, dict) else None,
+        "created_at": event.get("created_at"),
+        "updated_at": event.get("updated_at"),
+        "issue_url": event.get("issue_url"),
+    }
 
 
 def terminal_watch_key(repository: str, issue_number: int, generation: int) -> str:
@@ -5871,7 +5929,10 @@ class CoordinationStore:
         publication = self.connection.execute(
             """
             SELECT outbox.state, outbox.remote_receipt,
-                   readback.remote_receipt AS readback_receipt
+                   outbox.idempotency_key, outbox.payload_json,
+                   readback.remote_receipt AS readback_receipt,
+                   readback.published_body_sha256,
+                   readback.publisher_login
             FROM github_outbox outbox
             LEFT JOIN coordination_terminal_outbox_readbacks readback
               ON readback.outbox_id=outbox.id
@@ -5891,8 +5952,13 @@ class CoordinationStore:
             raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
         observed_at = utc_now()
         _utc_timestamp(observed_at, error="TERMINAL_LIVE_EVIDENCE_INVALID")
-        issue_payload, main_ref = _fetch_terminal_live_observation(
-            str(packet["repository"]), int(packet["issue_number"])
+        remote_receipt = str(publication["remote_receipt"])
+        issue_payload, main_ref, published_comment, timeline = (
+            _fetch_terminal_live_observation(
+                str(packet["repository"]),
+                int(packet["issue_number"]),
+                remote_receipt,
+            )
         )
         if self.connection.in_transaction:
             raise CoordinationError("TERMINAL_LIVE_EVIDENCE_TRANSACTION_ACTIVE")
@@ -5909,6 +5975,51 @@ class CoordinationStore:
         current_main_sha = (
             main_object.get("sha") if isinstance(main_object, dict) else None
         )
+        comment_user = (
+            published_comment.get("user")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_id = (
+            published_comment.get("id")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_body = (
+            published_comment.get("body")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_created_at = (
+            published_comment.get("created_at")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_updated_at = (
+            published_comment.get("updated_at")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        comment_publisher_login = (
+            comment_user.get("login") if isinstance(comment_user, dict) else None
+        )
+        comment_issue_url = (
+            published_comment.get("issue_url")
+            if isinstance(published_comment, dict)
+            else None
+        )
+        try:
+            expected_body = terminal_published_body(
+                json.loads(str(publication["payload_json"]))["body"],
+                str(publication["idempotency_key"]),
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE") from exc
+        receipt_match = REMOTE_COMMENT_RECEIPT.fullmatch(remote_receipt)
+        expected_issue_url = (
+            f"https://api.github.com/repos/{packet['repository']}"
+            f"/issues/{packet['issue_number']}"
+        )
         if (
             not isinstance(issue_payload, dict)
             or issue_payload.get("number") != int(packet["issue_number"])
@@ -5918,8 +6029,61 @@ class CoordinationStore:
             or main_ref.get("ref") != "refs/heads/main"
             or not isinstance(current_main_sha, str)
             or GIT_SHA.fullmatch(current_main_sha) is None
+            or receipt_match is None
+            or comment_id != int(remote_receipt.split(":", 1)[1])
+            or comment_body != expected_body
+            or hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
+            != publication["published_body_sha256"]
+            or comment_publisher_login != publication["publisher_login"]
+            or comment_issue_url != expected_issue_url
+            or not isinstance(comment_created_at, str)
+            or not comment_created_at
+            or not isinstance(comment_updated_at, str)
+            or not comment_updated_at
         ):
             raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        _utc_timestamp(
+            comment_created_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        _utc_timestamp(
+            comment_updated_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        packet_created = _utc_timestamp(
+            str(packet["created_at"]), error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        comment_created = _utc_timestamp(
+            comment_created_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        observed = _utc_timestamp(
+            observed_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+        )
+        if (
+            comment_created < packet_created - timedelta(seconds=1)
+            or comment_created > observed
+        ):
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        comment_descriptor = {
+            "id": comment_id,
+            "event": "commented",
+            "body_sha256": hashlib.sha256(comment_body.encode("utf-8")).hexdigest(),
+            "publisher_login": comment_publisher_login,
+            "created_at": comment_created_at,
+            "updated_at": comment_updated_at,
+            "issue_url": comment_issue_url,
+        }
+        publication_window_start = packet_created - timedelta(seconds=1)
+        publication_activity = []
+        for event in timeline:
+            event_created_at = event.get("created_at")
+            if not isinstance(event_created_at, str):
+                raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+            event_created = _utc_timestamp(
+                event_created_at, error="TERMINAL_LIVE_EVIDENCE_INVALID"
+            )
+            if event_created >= publication_window_start:
+                publication_activity.append(_terminal_timeline_activity(event))
+        if publication_activity != [comment_descriptor]:
+            raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
         descriptor = {
             "schema": "twinfinity-terminal-live-evidence/v1",
             "closeout_key": closeout_key,
@@ -5927,8 +6091,18 @@ class CoordinationStore:
             "repository": str(packet["repository"]),
             "issue_number": int(packet["issue_number"]),
             "source_payload_sha256": digest_json(issue_payload),
+            "source_material_sha256": digest_json(
+                _terminal_issue_material_payload(issue_payload)
+            ),
             "source_updated_at": source_updated_at,
             "current_main_sha": current_main_sha,
+            "publication_comment_sha256": digest_json(comment_descriptor),
+            "publication_comment_id": comment_id,
+            "publication_comment_created_at": comment_created_at,
+            "publication_comment_updated_at": comment_updated_at,
+            "publication_publisher_login": comment_publisher_login,
+            "publication_issue_url": comment_issue_url,
+            "publication_activity_sha256": digest_json(publication_activity),
             "observed_at": observed_at,
         }
         return {**descriptor, "evidence_sha256": digest_json(descriptor)}
@@ -5947,8 +6121,16 @@ class CoordinationStore:
             "repository",
             "issue_number",
             "source_payload_sha256",
+            "source_material_sha256",
             "source_updated_at",
             "current_main_sha",
+            "publication_comment_sha256",
+            "publication_comment_id",
+            "publication_comment_created_at",
+            "publication_comment_updated_at",
+            "publication_publisher_login",
+            "publication_issue_url",
+            "publication_activity_sha256",
             "observed_at",
             "evidence_sha256",
         }
@@ -5975,13 +6157,39 @@ class CoordinationStore:
         if (
             not isinstance(evidence.get("source_payload_sha256"), str)
             or SHA256.fullmatch(evidence["source_payload_sha256"]) is None
+            or not isinstance(evidence.get("source_material_sha256"), str)
+            or SHA256.fullmatch(evidence["source_material_sha256"]) is None
             or not isinstance(evidence.get("source_updated_at"), str)
             or not evidence["source_updated_at"]
             or not isinstance(evidence.get("current_main_sha"), str)
             or GIT_SHA.fullmatch(evidence["current_main_sha"]) is None
             or not isinstance(evidence.get("observed_at"), str)
+            or not isinstance(evidence.get("publication_comment_sha256"), str)
+            or SHA256.fullmatch(evidence["publication_comment_sha256"]) is None
+            or not isinstance(evidence.get("publication_comment_id"), int)
+            or evidence["publication_comment_id"] <= 0
+            or not isinstance(
+                evidence.get("publication_comment_created_at"), str
+            )
+            or not isinstance(
+                evidence.get("publication_comment_updated_at"), str
+            )
+            or not isinstance(evidence.get("publication_publisher_login"), str)
+            or not evidence["publication_publisher_login"]
+            or not isinstance(evidence.get("publication_issue_url"), str)
+            or not evidence["publication_issue_url"]
+            or not isinstance(evidence.get("publication_activity_sha256"), str)
+            or SHA256.fullmatch(evidence["publication_activity_sha256"]) is None
         ):
             raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        _utc_timestamp(
+            evidence["publication_comment_created_at"],
+            error="TERMINAL_LIVE_EVIDENCE_INVALID",
+        )
+        _utc_timestamp(
+            evidence["publication_comment_updated_at"],
+            error="TERMINAL_LIVE_EVIDENCE_INVALID",
+        )
         observed = _utc_timestamp(
             evidence["observed_at"], error="TERMINAL_LIVE_EVIDENCE_INVALID"
         )
@@ -6189,14 +6397,67 @@ class CoordinationStore:
                 current_source.payload_sha256 != packet["source_payload_sha256"]
             ):
                 raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
+            expected_publication_issue_url = (
+                f"https://api.github.com/repos/{packet['repository']}"
+                f"/issues/{packet['issue_number']}"
+            )
+            publication_comment_descriptor = {
+                "id": int(str(outbox["remote_receipt"]).split(":", 1)[1]),
+                "event": "commented",
+                "body_sha256": readback["published_body_sha256"],
+                "publisher_login": readback["publisher_login"],
+                "created_at": live_evidence["publication_comment_created_at"],
+                "updated_at": live_evidence["publication_comment_updated_at"],
+                "issue_url": expected_publication_issue_url,
+            }
             if (
+                live_evidence["publication_comment_id"]
+                != publication_comment_descriptor["id"]
+                or live_evidence["publication_publisher_login"]
+                != publication_comment_descriptor["publisher_login"]
+                or live_evidence["publication_issue_url"]
+                != expected_publication_issue_url
+                or live_evidence["publication_comment_sha256"]
+                != digest_json(publication_comment_descriptor)
+                or live_evidence["publication_activity_sha256"]
+                != digest_json([publication_comment_descriptor])
+                or live_evidence["publication_comment_created_at"]
+                != live_evidence["publication_comment_updated_at"]
+            ):
+                raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
+            exact_source = (
+                live_evidence["source_payload_sha256"]
+                == packet["source_payload_sha256"]
+                == current_source.payload_sha256
+                and live_evidence["source_updated_at"]
+                == current_source.source_updated_at
+            )
+            publication_timestamp_only = (
                 live_evidence["source_payload_sha256"]
                 != packet["source_payload_sha256"]
-                or live_evidence["source_payload_sha256"]
-                != current_source.payload_sha256
-                or live_evidence["source_updated_at"]
+                and live_evidence["source_material_sha256"]
+                == digest_json(
+                    _terminal_issue_material_payload(current_source.payload)
+                )
+                and live_evidence["source_updated_at"]
                 != current_source.source_updated_at
-            ):
+                and _utc_timestamp(
+                    live_evidence["source_updated_at"],
+                    error="TERMINAL_LIVE_EVIDENCE_INVALID",
+                )
+                > _utc_timestamp(
+                    current_source.source_updated_at,
+                    error="TERMINAL_LIVE_EVIDENCE_INVALID",
+                )
+                and live_evidence["source_updated_at"]
+                == live_evidence["publication_comment_created_at"]
+                == live_evidence["publication_comment_updated_at"]
+                and live_evidence["publication_comment_id"]
+                == int(str(outbox["remote_receipt"]).split(":", 1)[1])
+                and live_evidence["publication_publisher_login"]
+                == readback["publisher_login"]
+            )
+            if not exact_source and not publication_timestamp_only:
                 raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
             current_graph = self._current_terminal_graph_binding(
                 repository=str(packet["repository"]),

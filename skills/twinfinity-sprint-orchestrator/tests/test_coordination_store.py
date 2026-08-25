@@ -30,6 +30,7 @@ from coordination_store import (  # noqa: E402
     terminal_publication_body,
 )
 import coordination_store as coordination_store_module  # noqa: E402
+import publish_coordination_outbox as publisher  # noqa: E402
 from executor_registry import (  # noqa: E402
     attempt_lineage_for_target,
     canonical_json,
@@ -76,6 +77,8 @@ class CoordinationStoreTests(unittest.TestCase):
         )
         self.remote_issue_payloads: dict[tuple[str, int], dict] = {}
         self.remote_main_shas: dict[str, str] = {}
+        self.remote_comments: dict[tuple[str, int], dict] = {}
+        self.remote_timelines: dict[tuple[str, int], list[dict]] = {}
         self.fixed_live_observation = (
             coordination_store_module._fetch_terminal_live_observation
         )
@@ -174,14 +177,35 @@ class CoordinationStoreTests(unittest.TestCase):
         self, outbox_id: int, remote_receipt: str, now: str
     ) -> None:
         row = self.store.connection.execute(
-            "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
+            "SELECT idempotency_key,payload_json,repository,object_number "
+            "FROM github_outbox WHERE id=?",
             (outbox_id,),
         ).fetchone()
         body = json.loads(row["payload_json"])["body"]
+        published_body = terminal_published_body(body, row["idempotency_key"])
+        comment_id = int(remote_receipt.split(":", 1)[1])
+        repository = str(row["repository"])
+        issue_number = int(row["object_number"])
+        self.remote_comments[(repository, comment_id)] = {
+            "id": comment_id,
+            "body": published_body,
+            "created_at": now,
+            "updated_at": now,
+            "issue_url": (
+                f"https://api.github.com/repos/{repository}/issues/{issue_number}"
+            ),
+            "user": {"login": "twinfinity-bot"},
+        }
+        self.remote_timelines[(repository, issue_number)] = [
+            {
+                **copy.deepcopy(self.remote_comments[(repository, comment_id)]),
+                "event": "commented",
+            }
+        ]
         self.store.complete_terminal_outbox_from_readback(
             outbox_id=outbox_id,
             remote_receipt=remote_receipt,
-            published_body=terminal_published_body(body, row["idempotency_key"]),
+            published_body=published_body,
             publisher_login="twinfinity-bot",
             now=now,
         )
@@ -195,15 +219,21 @@ class CoordinationStoreTests(unittest.TestCase):
         return self.store.reserve_outbox(outbox_id, now)
 
     def _terminal_live_observation(
-        self, repository: str, issue_number: int
-    ) -> tuple[dict, dict]:
+        self, repository: str, issue_number: int, remote_receipt: str
+    ) -> tuple[dict, dict, dict, list[dict]]:
         payload = copy.deepcopy(
             self.remote_issue_payloads[(repository, issue_number)]
         )
-        return payload, {
-            "ref": "refs/heads/main",
-            "object": {"sha": self.remote_main_shas[repository]},
-        }
+        comment_id = int(remote_receipt.split(":", 1)[1])
+        return (
+            payload,
+            {
+                "ref": "refs/heads/main",
+                "object": {"sha": self.remote_main_shas[repository]},
+            },
+            copy.deepcopy(self.remote_comments[(repository, comment_id)]),
+            copy.deepcopy(self.remote_timelines[(repository, issue_number)]),
+        )
 
     def test_terminal_live_observation_uses_fixed_normalized_issue_and_main_ref(
         self,
@@ -217,6 +247,15 @@ class CoordinationStoreTests(unittest.TestCase):
             "ref": "refs/heads/main",
             "object": {"sha": "a" * 40},
         }
+        comment = {
+            "id": 123,
+            "body": "receipt",
+            "created_at": "2026-08-22T10:00:02Z",
+            "updated_at": "2026-08-22T10:00:02Z",
+            "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/92",
+            "user": {"login": "twinfinity-bot"},
+        }
+        timeline = [{**comment, "event": "commented"}]
         with (
             patch(
                 "sync_github_coordination.fetch_object",
@@ -224,15 +263,31 @@ class CoordinationStoreTests(unittest.TestCase):
             ) as fetch_issue,
             patch(
                 "sync_github_coordination._run_gh",
-                return_value=main_ref,
+                side_effect=[main_ref, comment, [timeline]],
             ) as run_gh,
         ):
-            observed = self.fixed_live_observation(REPOSITORY, 92)
+            observed = self.fixed_live_observation(REPOSITORY, 92, "comment:123")
 
-        self.assertEqual((issue_payload, main_ref), observed)
+        self.assertEqual((issue_payload, main_ref, comment, timeline), observed)
         fetch_issue.assert_called_once_with(REPOSITORY, "issue", 92)
-        run_gh.assert_called_once_with(
-            ["api", f"repos/{REPOSITORY}/git/ref/heads/main"]
+        self.assertEqual(
+            [
+                unittest.mock.call(
+                    ["api", f"repos/{REPOSITORY}/git/ref/heads/main"]
+                ),
+                unittest.mock.call(
+                    ["api", f"repos/{REPOSITORY}/issues/comments/123"]
+                ),
+                unittest.mock.call(
+                    [
+                        "api",
+                        "--paginate",
+                        "--slurp",
+                        f"repos/{REPOSITORY}/issues/92/timeline?per_page=100",
+                    ]
+                ),
+            ],
+            run_gh.call_args_list,
         )
 
     def install_all_current_endpoints(self) -> None:
@@ -2327,9 +2382,48 @@ class CoordinationStoreTests(unittest.TestCase):
                 "SELECT state FROM github_outbox WHERE id=?", (outbox_id,)
             ).fetchone()[0],
         )
-        self.reserve_terminal_outbox(outbox_id, "2026-08-22T10:00:09Z")
-        self.complete_terminal_outbox(
-            outbox_id, "comment:123", "2026-08-22T10:00:10Z"
+        outbox_row = self.store.connection.execute(
+            "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
+            (outbox_id,),
+        ).fetchone()
+        publication_body = terminal_published_body(
+            json.loads(outbox_row["payload_json"])["body"],
+            outbox_row["idempotency_key"],
+        )
+        published_comment = {
+            "id": 123,
+            "body": publication_body,
+            "created_at": "2026-08-22T10:00:10Z",
+            "updated_at": "2026-08-22T10:00:10Z",
+            "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/92",
+            "user": {"login": "twinfinity-bot"},
+        }
+        with (
+            patch.object(publisher, "fetch_object", return_value=copy.deepcopy(
+                self.remote_issue_payloads[(REPOSITORY, 92)]
+            )),
+            patch.object(
+                publisher,
+                "_gh_json",
+                side_effect=[
+                    {"login": "twinfinity-bot"},
+                    published_comment,
+                    published_comment,
+                ],
+            ),
+        ):
+            publication_result = publisher.publish(self.store, outbox_id)
+        self.assertEqual("comment:123", publication_result["receipt"])
+        self.remote_comments[(REPOSITORY, 123)] = copy.deepcopy(published_comment)
+        self.remote_timelines[(REPOSITORY, 92)] = [
+            {**copy.deepcopy(published_comment), "event": "commented"}
+        ]
+        publication_only_payload = copy.deepcopy(
+            self.remote_issue_payloads[(REPOSITORY, 92)]
+        )
+        publication_only_payload["updated_at"] = "2026-08-22T10:00:10Z"
+        self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(
+            publication_only_payload
         )
         self.live_observation.reset_mock()
         with self.store.transaction():
@@ -2409,7 +2503,9 @@ class CoordinationStoreTests(unittest.TestCase):
                 attempt_id=running["attempt_id"],
                 executor_token=token,
             )
-        self.live_observation.assert_called_once_with(REPOSITORY, 92)
+        self.live_observation.assert_called_once_with(
+            REPOSITORY, 92, "comment:123"
+        )
         after_remote_drift = (
             tuple(
                 self.store.connection.execute(
@@ -2434,8 +2530,103 @@ class CoordinationStoreTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(before_remote_drift, after_remote_drift)
+        self.remote_issue_payloads[(REPOSITORY, 92)] = {
+            **copy.deepcopy(cached_source.payload),
+            "updated_at": "2026-08-22T10:00:20Z",
+        }
+        before_unattributed_activity = after_remote_drift
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_CLOSEOUT_SOURCE_DRIFT"
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=running["attempt_id"],
+                executor_token=token,
+            )
+        self.assertEqual(
+            before_unattributed_activity,
+            (
+                tuple(
+                    self.store.connection.execute(
+                        "SELECT status,allocation_class,version "
+                        "FROM coordination_items WHERE repository=? "
+                        "AND issue_number=92",
+                        (REPOSITORY,),
+                    ).fetchone()
+                ),
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (admission_id,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_terminal_watches "
+                    "WHERE watch_key=?",
+                    (watch_key,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM portfolio_dirty_events"
+                ).fetchone()[0],
+            ),
+        )
         self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(
-            cached_source.payload
+            publication_only_payload
+        )
+        self.remote_timelines[(REPOSITORY, 92)].append(
+            {
+                "id": 124,
+                "event": "labeled",
+                "created_at": "2026-08-22T10:00:11Z",
+                "updated_at": "2026-08-22T10:00:11Z",
+                "issue_url": (
+                    f"https://api.github.com/repos/{REPOSITORY}/issues/92"
+                ),
+                "actor": {"login": "concurrent-actor"},
+            }
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "TERMINAL_CLOSEOUT_SOURCE_DRIFT"
+        ):
+            self.store.commit_terminal_closeout(
+                closeout_key=closeout_key,
+                attempt_id=running["attempt_id"],
+                executor_token=token,
+            )
+        self.assertEqual(
+            before_unattributed_activity,
+            (
+                tuple(
+                    self.store.connection.execute(
+                        "SELECT status,allocation_class,version "
+                        "FROM coordination_items WHERE repository=? "
+                        "AND issue_number=92",
+                        (REPOSITORY,),
+                    ).fetchone()
+                ),
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (admission_id,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_terminal_watches "
+                    "WHERE watch_key=?",
+                    (watch_key,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM portfolio_dirty_events"
+                ).fetchone()[0],
+            ),
+        )
+        self.remote_timelines[(REPOSITORY, 92)] = [
+            {**copy.deepcopy(published_comment), "event": "commented"}
+        ]
+        self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(
+            publication_only_payload
         )
         completed_preparer = transition_attempt(
             self.store.connection,
@@ -2740,7 +2931,7 @@ class CoordinationStoreTests(unittest.TestCase):
             (REPOSITORY,),
         )
         self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(
-            cached_source.payload
+            publication_only_payload
         )
         before_stale_evidence = terminal_fingerprint()
         with (
@@ -2748,8 +2939,8 @@ class CoordinationStoreTests(unittest.TestCase):
                 coordination_store_module,
                 "utc_now",
                 side_effect=[
-                    "2026-08-22T09:58:00Z",
-                    "2026-08-22T10:00:11Z",
+                    "2026-08-22T10:00:10Z",
+                    "2026-08-22T10:02:11Z",
                 ],
             ),
             self.assertRaisesRegex(
@@ -2915,11 +3106,21 @@ class CoordinationStoreTests(unittest.TestCase):
             persisted_live_evidence["evidence_sha256"],
         )
         self.assertEqual(
-            (cached_source.payload_sha256, "a" * 40),
+            (digest_json(publication_only_payload), "a" * 40),
             (
                 persisted_live_evidence["source_payload_sha256"],
                 persisted_live_evidence["current_main_sha"],
             ),
+        )
+        self.assertEqual(
+            digest_json(
+                {
+                    key: value
+                    for key, value in cached_source.payload.items()
+                    if key != "updated_at"
+                }
+            ),
+            persisted_live_evidence["source_material_sha256"],
         )
         self.assertEqual(
             1,

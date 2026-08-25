@@ -66,6 +66,8 @@ class _FlowHarness:
         self.store = CoordinationStore(self.database)
         self.sources: dict[int, str] = {}
         self.remote_issues: dict[int, dict[str, object]] = {}
+        self.remote_comments: dict[int, dict[str, object]] = {}
+        self.remote_timelines: dict[int, list[dict[str, object]]] = {}
         self.items: dict[int, dict[str, object]] = {}
         self.attempts_by_message: dict[int, tuple[dict[str, object], str]] = {}
         self.message_by_issue: dict[int, int] = {}
@@ -84,13 +86,24 @@ class _FlowHarness:
         self.temporary.cleanup()
 
     def _terminal_live_observation(
-        self, repository: str, issue_number: int
-    ) -> tuple[dict[str, object], dict[str, object]]:
+        self, repository: str, issue_number: int, remote_receipt: str
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        list[dict[str, object]],
+    ]:
         self.assert_repository(repository)
-        return dict(self.remote_issues[issue_number]), {
-            "ref": "refs/heads/main",
-            "object": {"sha": MAIN},
-        }
+        comment_id = int(remote_receipt.split(":", 1)[1])
+        return (
+            dict(self.remote_issues[issue_number]),
+            {
+                "ref": "refs/heads/main",
+                "object": {"sha": MAIN},
+            },
+            dict(self.remote_comments[comment_id]),
+            [dict(event) for event in self.remote_timelines[issue_number]],
+        )
 
     @staticmethod
     def assert_repository(repository: str) -> None:
@@ -575,15 +588,33 @@ class _FlowHarness:
             (prepared["outbox_id"],),
         ).fetchone()
         body = json.loads(outbox["payload_json"])["body"]
+        published_body = terminal_published_body(
+            body, str(outbox["idempotency_key"])
+        )
+        comment = {
+            "id": issue_number,
+            "event": "commented",
+            "body": published_body,
+            "created_at": now,
+            "updated_at": now,
+            "issue_url": (
+                f"https://api.github.com/repos/{REPOSITORY}/issues/{issue_number}"
+            ),
+            "user": {"login": "twinfinity-bot"},
+        }
+        self.remote_comments[issue_number] = dict(comment)
+        self.remote_timelines[issue_number] = [dict(comment)]
         self.store.complete_terminal_outbox_from_readback(
             outbox_id=int(prepared["outbox_id"]),
             remote_receipt=f"comment:{issue_number}",
-            published_body=terminal_published_body(
-                body, str(outbox["idempotency_key"])
-            ),
+            published_body=published_body,
             publisher_login="twinfinity-bot",
             now=now,
         )
+        self.remote_issues[issue_number] = {
+            **self.remote_issues[issue_number],
+            "updated_at": now,
+        }
         self.store.commit_terminal_closeout(
             closeout_key=closeout_key,
             attempt_id=str(running["attempt_id"]),

@@ -1026,13 +1026,14 @@ class CoordinationSupervisorTests(unittest.TestCase):
             "SELECT idempotency_key,payload_json FROM github_outbox WHERE id=?",
             (prepared["outbox_id"],),
         ).fetchone()
+        published_body = terminal_published_body(
+            json.loads(outbox["payload_json"])["body"],
+            outbox["idempotency_key"],
+        )
         self.store.complete_terminal_outbox_from_readback(
             outbox_id=prepared["outbox_id"],
             remote_receipt="comment:123",
-            published_body=terminal_published_body(
-                json.loads(outbox["payload_json"])["body"],
-                outbox["idempotency_key"],
-            ),
+            published_body=published_body,
             publisher_login="twinfinity-bot",
             now="2026-08-22T10:20:02Z",
         )
@@ -1073,11 +1074,35 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 coordination_store_module,
                 "_fetch_terminal_live_observation",
                 return_value=(
-                    source.payload,
+                    {**source.payload, "updated_at": "2026-08-22T10:20:02Z"},
                     {
                         "ref": "refs/heads/main",
                         "object": {"sha": "a" * 40},
                     },
+                    {
+                        "id": 123,
+                        "body": published_body,
+                        "created_at": "2026-08-22T10:20:02Z",
+                        "updated_at": "2026-08-22T10:20:02Z",
+                        "issue_url": (
+                            f"https://api.github.com/repos/{REPOSITORY}/issues/92"
+                        ),
+                        "user": {"login": "twinfinity-bot"},
+                    },
+                    [
+                        {
+                            "id": 123,
+                            "event": "commented",
+                            "body": published_body,
+                            "created_at": "2026-08-22T10:20:02Z",
+                            "updated_at": "2026-08-22T10:20:02Z",
+                            "issue_url": (
+                                f"https://api.github.com/repos/{REPOSITORY}"
+                                "/issues/92"
+                            ),
+                            "user": {"login": "twinfinity-bot"},
+                        }
+                    ],
                 ),
             ) as live_observation,
             patch.object(
@@ -1091,7 +1116,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 attempt_id=fresh_running["attempt_id"],
                 executor_token=fresh_token,
             )
-        live_observation.assert_called_once_with(REPOSITORY, 92)
+        live_observation.assert_called_once_with(REPOSITORY, 92, "comment:123")
 
         result = self.supervisor.run_once("2026-08-22T10:20:06Z")
         repeated = self.supervisor.run_once("2026-08-22T10:20:07Z")
