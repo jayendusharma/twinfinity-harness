@@ -28,6 +28,10 @@ HARNESS_MAIN = subprocess.run(
 ).stdout.strip()
 APPLICATION_MAIN = "a" * 40
 NOW = "2026-08-25T20:00:00Z"
+AUTHORITATIVE_STRANDED_IDENTITIES = (
+    (328, 2, "c448fd19-40a6-4511-bdf7-9ca7bbbb2788"),
+    (329, 1, "d7f69b5a-dc4c-4d1e-b434-da4ab6cdb2d5"),
+)
 
 
 def sha(path: Path) -> str:
@@ -51,7 +55,14 @@ class CleanControlPlaneTests(unittest.TestCase):
                 graph_version INTEGER, capacity_policy_version INTEGER,
                 candidate_sha256 TEXT, worker_role TEXT, phase_summary TEXT,
                 plan_sha256 TEXT, plan_json TEXT, parent_campaign_id INTEGER,
-                transition_kind TEXT, resolution_ordinal INTEGER
+                transition_kind TEXT, resolution_ordinal INTEGER,
+                changed_evidence_sha256 TEXT,
+                resolution_action_set_sha256 TEXT,
+                approval_proposal_sha256 TEXT,
+                approval_decision_sha256 TEXT,
+                approval_recipient_session_id TEXT,
+                approval_execution_scope_sha256 TEXT,
+                created_at TEXT
             );
             CREATE TABLE portfolio_readiness_current(
                 repository TEXT, issue_number INTEGER, campaign_id INTEGER,
@@ -73,10 +84,9 @@ class CleanControlPlaneTests(unittest.TestCase):
             """
         )
         self.archive_lineages: list[dict[str, object]] = []
-        for ordinal, (issue_number, identity) in enumerate(
-            clean.STRANDED_IDENTITIES.items(), start=1
+        for ordinal, (issue_number, campaign_id, attempt_id) in enumerate(
+            AUTHORITATIVE_STRANDED_IDENTITIES, start=1
         ):
-            campaign_id, attempt_id = identity
             message_id = 3_000 + issue_number
             source_sha = f"{ordinal}" * 64
             candidate_sha = f"{ordinal + 2}" * 64
@@ -113,9 +123,13 @@ class CleanControlPlaneTests(unittest.TestCase):
             }
             connection.execute(
                 """
-                INSERT INTO portfolio_readiness_campaigns VALUES(
-                    ?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?
-                )
+                INSERT INTO portfolio_readiness_campaigns(
+                    id,repository,issue_number,generation,item_version,
+                    source_payload_sha256,accepted_main_sha,graph_version,
+                    capacity_policy_version,candidate_sha256,worker_role,
+                    phase_summary,plan_sha256,plan_json,parent_campaign_id,
+                    transition_kind,resolution_ordinal,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     campaign_id,
@@ -135,6 +149,7 @@ class CleanControlPlaneTests(unittest.TestCase):
                     None,
                     None,
                     0,
+                    NOW,
                 ),
             )
             connection.execute(
@@ -193,6 +208,113 @@ class CleanControlPlaneTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def legacy_archive(self) -> tuple[Path, list[dict[str, object]]]:
+        legacy = self.root / "legacy-archive.sqlite3"
+        source = sqlite3.connect(self.archive)
+        source.row_factory = sqlite3.Row
+        target = sqlite3.connect(legacy)
+        target.executescript(
+            """
+            CREATE TABLE portfolio_readiness_campaigns(
+                id INTEGER PRIMARY KEY, repository TEXT, issue_number INTEGER,
+                generation INTEGER, item_version INTEGER,
+                source_payload_sha256 TEXT, accepted_main_sha TEXT,
+                graph_version INTEGER, capacity_policy_version INTEGER,
+                candidate_sha256 TEXT, worker_role TEXT, phase_summary TEXT,
+                plan_sha256 TEXT, plan_json TEXT, created_at TEXT
+            );
+            CREATE TABLE portfolio_readiness_current(
+                repository TEXT, issue_number INTEGER, campaign_id INTEGER,
+                state TEXT, message_id INTEGER, attempt_id TEXT,
+                endpoint_id TEXT, version INTEGER
+            );
+            CREATE TABLE portfolio_pull_buffer_candidates(
+                repository TEXT, issue_number INTEGER, candidate_sha256 TEXT,
+                state TEXT
+            );
+            CREATE TABLE coordination_messages(
+                id INTEGER PRIMARY KEY, state TEXT, payload_sha256 TEXT
+            );
+            CREATE TABLE executor_attempts(
+                attempt_id TEXT PRIMARY KEY, state TEXT, target_kind TEXT,
+                target_key TEXT, endpoint_id TEXT
+            );
+            CREATE TABLE portfolio_readiness_receipts(campaign_id INTEGER);
+            """
+        )
+        campaign_columns = ",".join(clean.ARCHIVE_CAMPAIGN_BASE_COLUMNS) + ",created_at"
+        campaign_placeholders = ",".join("?" for _ in range(15))
+        for row in source.execute(
+            f"SELECT {campaign_columns} FROM portfolio_readiness_campaigns"
+        ):
+            target.execute(
+                f"INSERT INTO portfolio_readiness_campaigns({campaign_columns}) "
+                f"VALUES({campaign_placeholders})",
+                tuple(row),
+            )
+        table_columns = {
+            "portfolio_readiness_current": (
+                "repository,issue_number,campaign_id,state,message_id,attempt_id,endpoint_id,version"
+            ),
+            "portfolio_pull_buffer_candidates": (
+                "repository,issue_number,candidate_sha256,state"
+            ),
+            "coordination_messages": "id,state,payload_sha256",
+            "executor_attempts": (
+                "attempt_id,state,target_kind,target_key,endpoint_id"
+            ),
+        }
+        for table, columns in table_columns.items():
+            rows = source.execute(f"SELECT {columns} FROM {table}").fetchall()
+            placeholders = ",".join("?" for _ in columns.split(","))
+            target.executemany(
+                f"INSERT INTO {table}({columns}) VALUES({placeholders})", rows
+            )
+        target.commit()
+        target.close()
+
+        legacy_lineages = copy.deepcopy(self.archive_lineages)
+        for lineage in legacy_lineages:
+            row = source.execute(
+                """
+                SELECT campaign.repository,campaign.issue_number,
+                       campaign.generation,campaign.id AS campaign_id,
+                       campaign.item_version,campaign.source_payload_sha256,
+                       campaign.accepted_main_sha,campaign.graph_version,
+                       campaign.capacity_policy_version,
+                       campaign.candidate_sha256,campaign.worker_role,
+                       campaign.phase_summary,campaign.plan_sha256,
+                       campaign.plan_json,current.state AS campaign_state,
+                       current.message_id,current.attempt_id,current.endpoint_id,
+                       current.version AS current_version
+                FROM portfolio_readiness_campaigns AS campaign
+                JOIN portfolio_readiness_current AS current
+                  ON current.campaign_id=campaign.id
+                WHERE campaign.issue_number=?
+                """,
+                (lineage["issue_number"],),
+            ).fetchone()
+            assert row is not None
+            projection = dict(row)
+            projection.update(clean.ARCHIVE_LEGACY_TRANSITION_SENTINELS)
+            lineage["campaign_sha256"] = clean.digest_json(projection)
+        source.close()
+        legacy.chmod(0o600)
+        return legacy, legacy_lineages
+
+    def bind_archive(
+        self,
+        manifest: dict[str, object],
+        archive: Path,
+        lineages: list[dict[str, object]],
+    ) -> None:
+        old = manifest["old_control_plane"]
+        assert isinstance(old, dict)
+        old["archive_path"] = str(archive)
+        old["archive_sha256"] = sha(archive)
+        old["excluded_lineages"] = copy.deepcopy(lineages)
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
 
     def manifest(self, *, retained: bool = False) -> dict[str, object]:
         references = SKILL_ROOT / "references"
@@ -501,6 +623,107 @@ class CleanControlPlaneTests(unittest.TestCase):
                 harness_main_sha=HARNESS_MAIN,
             )
 
+    def test_real_archive_lineage_identities_cannot_swap(self) -> None:
+        expected = {
+            328: (2, "c448fd19-40a6-4511-bdf7-9ca7bbbb2788"),
+            329: (1, "d7f69b5a-dc4c-4d1e-b434-da4ab6cdb2d5"),
+        }
+        self.assertEqual(expected, clean.STRANDED_IDENTITIES)
+        self.assertEqual(
+            expected,
+            {
+                int(lineage["issue_number"]): (
+                    int(lineage["campaign_id"]),
+                    str(lineage["attempt_id"]),
+                )
+                for lineage in self.archive_lineages
+            },
+        )
+
+        manifest = self.manifest()
+        lineages = manifest["old_control_plane"]["excluded_lineages"]  # type: ignore[index]
+        lineages[0]["campaign_id"], lineages[1]["campaign_id"] = (  # type: ignore[index]
+            lineages[1]["campaign_id"],  # type: ignore[index]
+            lineages[0]["campaign_id"],  # type: ignore[index]
+        )
+        lineages[0]["attempt_id"], lineages[1]["attempt_id"] = (  # type: ignore[index]
+            lineages[1]["attempt_id"],  # type: ignore[index]
+            lineages[0]["attempt_id"],  # type: ignore[index]
+        )
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError,
+            "BOOTSTRAP_ARCHIVE_LINEAGE_SCHEMA_INVALID",
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "candidate.sqlite3",
+                harness_main_sha=HARNESS_MAIN,
+            )
+
+    def test_current_and_legacy_campaign_schemas_have_exact_digests(self) -> None:
+        self.assertEqual(
+            {
+                328: "232b3fea182452ec467e497643feab6f9d34d49862ecc57fc5f286adcc196d2a",
+                329: "f255e616e66e29ab6708957df78f7f18998bc1a90c2044386e1a1c4f18f023c5",
+            },
+            {
+                int(lineage["issue_number"]): lineage["campaign_sha256"]
+                for lineage in self.archive_lineages
+            },
+        )
+        current_manifest = self.manifest()
+        clean._validate_manifest(
+            current_manifest,
+            source_root=SOURCE_ROOT,
+            database=self.root / "current-candidate.sqlite3",
+            harness_main_sha=HARNESS_MAIN,
+        )
+
+        legacy, legacy_lineages = self.legacy_archive()
+        self.assertEqual(
+            {
+                328: "a6d9a4ef4aeef8110d64559e2860609f4fdc9c48323220016cd91588ae311ad9",
+                329: "2c38b355df0cb913d81c41b3d653d324c7dfeb51eb95b4a7cef9836a4649256f",
+            },
+            {
+                int(lineage["issue_number"]): lineage["campaign_sha256"]
+                for lineage in legacy_lineages
+            },
+        )
+        legacy_manifest = self.manifest()
+        self.bind_archive(legacy_manifest, legacy, legacy_lineages)
+        clean._validate_manifest(
+            legacy_manifest,
+            source_root=SOURCE_ROOT,
+            database=self.root / "legacy-candidate.sqlite3",
+            harness_main_sha=HARNESS_MAIN,
+        )
+
+    def test_partial_or_unknown_campaign_schema_fails_closed(self) -> None:
+        legacy, legacy_lineages = self.legacy_archive()
+        connection = sqlite3.connect(legacy)
+        connection.execute(
+            "ALTER TABLE portfolio_readiness_campaigns "
+            "ADD COLUMN parent_campaign_id INTEGER"
+        )
+        connection.commit()
+        connection.close()
+        legacy.chmod(0o600)
+        manifest = self.manifest()
+        self.bind_archive(manifest, legacy, legacy_lineages)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError,
+            "BOOTSTRAP_ARCHIVE_CAMPAIGN_SCHEMA_INVALID",
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "partial-candidate.sqlite3",
+                harness_main_sha=HARNESS_MAIN,
+            )
+
     def test_archive_rejects_canonical_path_and_descriptor_replacement_race(self) -> None:
         manifest = self.manifest()
         manifest["old_control_plane"]["archive_path"] = str(  # type: ignore[index]
@@ -555,7 +778,8 @@ class CleanControlPlaneTests(unittest.TestCase):
         manifest["old_control_plane"]["archive_sha256"] = sha(unrelated)  # type: ignore[index]
         manifest["manifest_sha256"] = clean.manifest_digest(manifest)
         with self.assertRaisesRegex(
-            clean.CleanControlPlaneError, "BOOTSTRAP_ARCHIVE_UNREADABLE"
+            clean.CleanControlPlaneError,
+            "BOOTSTRAP_ARCHIVE_CAMPAIGN_SCHEMA_INVALID",
         ):
             clean._validate_manifest(
                 manifest,
