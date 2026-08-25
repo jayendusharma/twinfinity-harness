@@ -54,8 +54,52 @@ EXPECTED_ENDPOINTS = {
 }
 SOURCE_HARNESS_REPOSITORY = "jayendusharma/twinfinity-harness"
 STRANDED_IDENTITIES = {
-    328: (1, "d7f69b5a-dc4c-4d1e-b434-da4ab6cdb2d5"),
-    329: (2, "c448fd19-40a6-4511-bdf7-9ca7bbbb2788"),
+    328: (2, "c448fd19-40a6-4511-bdf7-9ca7bbbb2788"),
+    329: (1, "d7f69b5a-dc4c-4d1e-b434-da4ab6cdb2d5"),
+}
+ARCHIVE_CAMPAIGN_BASE_COLUMNS = (
+    "id",
+    "repository",
+    "issue_number",
+    "generation",
+    "item_version",
+    "source_payload_sha256",
+    "accepted_main_sha",
+    "graph_version",
+    "capacity_policy_version",
+    "candidate_sha256",
+    "worker_role",
+    "phase_summary",
+    "plan_sha256",
+    "plan_json",
+)
+ARCHIVE_CAMPAIGN_TRANSITION_COLUMNS = (
+    "parent_campaign_id",
+    "transition_kind",
+    "resolution_ordinal",
+)
+ARCHIVE_CAMPAIGN_CURRENT_ONLY_COLUMNS = (
+    "changed_evidence_sha256",
+    "resolution_action_set_sha256",
+    "approval_proposal_sha256",
+    "approval_decision_sha256",
+    "approval_recipient_session_id",
+    "approval_execution_scope_sha256",
+)
+ARCHIVE_LEGACY_CAMPAIGN_COLUMNS = frozenset(
+    (*ARCHIVE_CAMPAIGN_BASE_COLUMNS, "created_at")
+)
+ARCHIVE_CURRENT_CAMPAIGN_COLUMNS = frozenset(
+    (
+        *ARCHIVE_CAMPAIGN_BASE_COLUMNS,
+        *ARCHIVE_CAMPAIGN_TRANSITION_COLUMNS,
+        *ARCHIVE_CAMPAIGN_CURRENT_ONLY_COLUMNS,
+        "created_at",
+    )
+)
+ARCHIVE_LEGACY_TRANSITION_SENTINELS = {
+    field: f"LEGACY_SCHEMA_FIELD_ABSENT:{field}"
+    for field in ARCHIVE_CAMPAIGN_TRANSITION_COLUMNS
 }
 ARCHIVE_CAMPAIGN_FIELDS = (
     "campaign_id",
@@ -113,6 +157,20 @@ def archive_campaign_digest(row: sqlite3.Row) -> str:
     """Digest the exact archived campaign and current-pointer projection."""
 
     return digest_json({field: row[field] for field in ARCHIVE_CAMPAIGN_FIELDS})
+
+
+def _archive_campaign_schema(connection: sqlite3.Connection) -> str:
+    columns = frozenset(
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(portfolio_readiness_campaigns)"
+        )
+    )
+    if columns == ARCHIVE_CURRENT_CAMPAIGN_COLUMNS:
+        return "current"
+    if columns == ARCHIVE_LEGACY_CAMPAIGN_COLUMNS:
+        return "legacy"
+    raise CleanControlPlaneError("BOOTSTRAP_ARCHIVE_CAMPAIGN_SCHEMA_INVALID")
 
 
 def manifest_digest(manifest: dict[str, Any]) -> str:
@@ -278,9 +336,25 @@ def _validate_archive_lineages(
     lineages: list[dict[str, Any]],
     application_repository: str,
 ) -> None:
+    campaign_schema = _archive_campaign_schema(connection)
+    if campaign_schema == "current":
+        transition_projection = """
+                   campaign.parent_campaign_id,campaign.transition_kind,
+                   campaign.resolution_ordinal,
+        """
+        transition_parameters: tuple[str, ...] = ()
+    else:
+        transition_projection = """
+                   ? AS parent_campaign_id,? AS transition_kind,
+                   ? AS resolution_ordinal,
+        """
+        transition_parameters = tuple(
+            ARCHIVE_LEGACY_TRANSITION_SENTINELS[field]
+            for field in ARCHIVE_CAMPAIGN_TRANSITION_COLUMNS
+        )
     for lineage in lineages:
         campaign = connection.execute(
-            """
+            f"""
             SELECT campaign.repository,campaign.issue_number,campaign.generation,
                    campaign.id AS campaign_id,
                    campaign.item_version,campaign.source_payload_sha256,
@@ -288,8 +362,8 @@ def _validate_archive_lineages(
                    campaign.capacity_policy_version,campaign.candidate_sha256,
                    campaign.worker_role,campaign.phase_summary,
                    campaign.plan_sha256,campaign.plan_json,
-                   campaign.parent_campaign_id,campaign.transition_kind,
-                   campaign.resolution_ordinal,current.state AS campaign_state,
+                   {transition_projection}
+                   current.state AS campaign_state,
                    current.message_id,current.attempt_id,current.endpoint_id,
                    current.version AS current_version
             FROM portfolio_readiness_campaigns AS campaign
@@ -299,6 +373,7 @@ def _validate_archive_lineages(
               AND campaign.issue_number=?
             """,
             (
+                *transition_parameters,
                 lineage["campaign_id"],
                 application_repository,
                 lineage["issue_number"],
