@@ -72,7 +72,12 @@ from role_executor_transport import (  # noqa: E402
 from run_role_executor import execute_role  # noqa: E402
 
 
-CONFIG = ROOT / "references" / "twinfinity-executor-registry.toml"
+CONFIG = (
+    ROOT
+    / "tests"
+    / "fixtures"
+    / "twinfinity-executor-registry-v5-experimental.toml"
+)
 REPOSITORY = "twinfinityai/twinfinityapp"
 MAIN = "a" * 40
 NOW = "2026-08-25T05:00:00Z"

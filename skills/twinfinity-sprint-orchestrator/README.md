@@ -34,14 +34,36 @@ systemctl --user is-system-running
 | Canonical repository checkout | `/home/ubuntu/code/twinfinityapp` |
 | User unit directory | `/home/ubuntu/.config/systemd/user` |
 | Endpoint registry config | `/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml` |
-| Planner installed profile | `/home/ubuntu/.codex/twinfinity-planner.config.toml` |
-| Planner portable template | `/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-planner.config.toml` |
-| Development installed profile | `/home/ubuntu/.codex/twinfinity-development.config.toml` |
-| Development portable template | `/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-development.config.toml` |
-| SRE installed profile | `/home/ubuntu/.codex/twinfinity-sre.config.toml` |
-| SRE portable template | `/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-sre.config.toml` |
+| Planner current profile | `/home/ubuntu/.codex/twinfinity-planner-v2.config.toml` |
+| Development current profile | `/home/ubuntu/.codex/twinfinity-development-v3.config.toml` |
+| SRE current profile | `/home/ubuntu/.codex/twinfinity-sre-v3.config.toml` |
 
-Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The closed-schema endpoint TOML binds every role endpoint to the SHA-256 of its exact portable template; every config load and attempt requires the installed copy to match byte-for-byte. Planner, Development, and SRE retain distinct role instructions. Planner remains non-coding and accepts only non-authorizing notices; Development and SRE retain mutually exclusive mutating topics. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
+Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The production catalog points to Planner v2, Development v3, and SRE v3. A current runtime launch validates only its exact selected current installed profile; other current roles and staged v4/v5 bytes are not launch prerequisites. An explicit catalog audit or staged activation boundary uses `executor_registry.py --profile-root <absolute-staged-reference-root> audit-config` and validates the complete catalog without reading or writing live `CODEX_HOME`. V4/v5 remain staged artifacts only, and v5 is dormant experimental hardening. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
+
+## Clean control-plane bootstrap
+
+`scripts/clean_control_plane.py` creates only an explicit nonexisting, noncanonical database. Its closed manifest binds the reviewed source main, registry and current-profile hashes, approved goal, application main and exact GitHub snapshots, capacity authority, v2/v3/v3 pointers, optional retained #320 evidence, and an immutable old-database archive digest. `validate` is read-only and manifest-authenticated. Neither command switches the canonical database or starts timers.
+
+Create the candidate in the private coordination root, validate it, then use SQLite backup to place a byte-equivalent candidate under `backups/` for the existing stopped-state `environment_restore_control.py` dry-run/apply seam. That restore keeps the former canonical database and sidecars queryable in its unique forensic directory and rolls filesystem placement back on failure. Do not drop tables or overwrite the old archive.
+
+```bash
+python3 scripts/clean_control_plane.py bootstrap \
+  --database /home/ubuntu/.codex/twinfinity-coordination/clean-candidate.<id>.sqlite3 \
+  --manifest /path/to/reviewed-bootstrap.json \
+  --source-root /path/to/reviewed-harness-main \
+  --harness-main-sha '<exact-main-sha>'
+python3 scripts/clean_control_plane.py validate \
+  --database /home/ubuntu/.codex/twinfinity-coordination/clean-candidate.<id>.sqlite3 \
+  --manifest /path/to/reviewed-bootstrap.json \
+  --source-root /path/to/reviewed-harness-main \
+  --harness-main-sha '<exact-main-sha>'
+```
+
+The manifest's old-control-plane disposition durably supersedes stranded readiness campaigns 1 and 2 without replaying their attempts or fabricating receipts. Omitting `retained_item` creates no retained work; when supplied, it may bind only #320 with exact SRE v3, source, lease, and registered artifact evidence.
+
+## Source installation atom
+
+`scripts/source_install_atom.py` stages only manifest-listed relative paths, independently verifies the source Git commit and file bytes, verifies destination prior hashes/modes/UIDs/GIDs, and emits rollback data. A separately authorized stopped-state `apply` revalidates the stage under an exclusive destination lock, holds every validated destination-parent descriptor through backup, replacement, postcondition, and recovery, and persists both the parent identity chains and a `PREPARED` recovery journal before the first replacement. After an error or interruption, explicit `rollback` derives each file's exact prior/installed state through those bindings and restores all changed entries; it refuses receipt tampering, parent-identity drift, or any unbound byte, mode, UID, or GID. This is a journaled multi-file install, not a filesystem-atomic transaction or package manager. Reviewed source, staged validation, installation, database replacement, endpoint activation, and timer start remain separate decisions.
 
 ## Owner-safe SQLite backup
 

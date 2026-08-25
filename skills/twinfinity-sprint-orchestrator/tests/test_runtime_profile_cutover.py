@@ -1,21 +1,186 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import tomllib
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from executor_registry import RegistryError, load_registry_config  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT.parents[1]
 CODEX_HOME = Path(os.environ["CODEX_HOME"])
 EXPECTED_ENDPOINTS = {
     "planner": ("role.planner.v2", 2),
-    "development": ("role.development.v5", 5),
-    "sre": ("role.sre.v5", 5),
+    "development": ("role.development.v3", 3),
+    "sre": ("role.sre.v3", 3),
 }
 class RuntimeProfileCutoverTests(unittest.TestCase):
-    def test_staged_role_profiles_are_digest_bound_v5_broker_inputs(self) -> None:
+    def audit_command(self, *extra: str) -> list[str]:
+        return [
+            sys.executable,
+            str(ROOT / "scripts" / "executor_registry.py"),
+            "--config",
+            str(ROOT / "references" / "twinfinity-executor-registry.toml"),
+            *extra,
+            "audit-config",
+        ]
+
+    def test_source_profile_audit_does_not_read_or_write_live_codex_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            absent_codex_home = Path(temporary) / "must-remain-absent"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "executor_registry.py"),
+                    "--config",
+                    str(ROOT / "references" / "twinfinity-executor-registry.toml"),
+                    "--profile-root",
+                    str(ROOT / "references"),
+                    "audit-config",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "CODEX_HOME": str(absent_codex_home)},
+            )
+            result = json.loads(completed.stdout)
+            self.assertEqual("PASS", result["phase"])
+            self.assertEqual(
+                {
+                    "planner": "role.planner.v2",
+                    "development": "role.development.v3",
+                    "sre": "role.sre.v3",
+                },
+                result["endpoints"],
+            )
+            self.assertEqual(
+                [
+                    "role.development.v4",
+                    "role.development.v5",
+                    "role.sre.v4",
+                    "role.sre.v5",
+                ],
+                result["staged_endpoints"],
+            )
+            self.assertFalse(absent_codex_home.exists())
+
+    def test_profile_root_rejects_symlink_and_world_writable_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            symlink_root = temporary_root / "profile-link"
+            symlink_root.symlink_to(ROOT / "references", target_is_directory=True)
+            completed = subprocess.run(
+                self.audit_command("--profile-root", str(symlink_root)),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, completed.returncode)
+            self.assertEqual(
+                "REGISTRY_CODEX_HOME_UNSAFE",
+                json.loads(completed.stdout)["error"],
+            )
+            self.assertNotIn("Traceback", completed.stderr)
+
+            writable_root = temporary_root / "world-writable"
+            shutil.copytree(ROOT / "references", writable_root)
+            writable_root.chmod(0o777)
+            completed = subprocess.run(
+                self.audit_command("--profile-root", str(writable_root)),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, completed.returncode)
+            self.assertEqual(
+                "REGISTRY_CODEX_HOME_UNSAFE",
+                json.loads(completed.stdout)["error"],
+            )
+            self.assertNotIn("Traceback", completed.stderr)
+
+    def test_audit_config_omitted_profile_root_uses_safe_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "codex-home"
+            codex_home.mkdir(mode=0o700)
+            for profile in (ROOT / "references").glob("*.config.toml"):
+                shutil.copy2(profile, codex_home / profile.name)
+            completed = subprocess.run(
+                self.audit_command(),
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "CODEX_HOME": str(codex_home)},
+            )
+            self.assertEqual("PASS", json.loads(completed.stdout)["phase"])
+
+    def test_invalid_profile_root_type_is_a_closed_registry_error(self) -> None:
+        with self.assertRaisesRegex(RegistryError, "REGISTRY_CODEX_HOME_INVALID"):
+            load_registry_config(
+                ROOT / "references" / "twinfinity-executor-registry.toml",
+                codex_home=object(),  # type: ignore[arg-type]
+                profile_template_root=ROOT / "references",
+            )
+
+    def test_current_only_install_is_runtime_valid_but_not_catalog_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_home = Path(temporary) / "current-only"
+            codex_home.mkdir(mode=0o700)
+            for profile in (
+                "twinfinity-planner-v2.config.toml",
+                "twinfinity-development-v3.config.toml",
+                "twinfinity-sre-v3.config.toml",
+            ):
+                shutil.copy2(ROOT / "references" / profile, codex_home / profile)
+            config = load_registry_config(
+                ROOT / "references" / "twinfinity-executor-registry.toml",
+                codex_home=codex_home,
+            )
+            self.assertEqual(
+                {
+                    "role.planner.v2",
+                    "role.development.v3",
+                    "role.sre.v3",
+                },
+                {
+                    endpoint.endpoint_id for endpoint in config.roles.values()
+                },
+            )
+            with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_MISSING"):
+                load_registry_config(
+                    ROOT / "references" / "twinfinity-executor-registry.toml",
+                    codex_home=codex_home,
+                    profile_validation_scope="catalog",
+                )
+
+    def test_readme_source_audit_command_executes_verbatim(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        marked = readme.split("<!-- source-profile-audit:start -->", 1)[1].split(
+            "<!-- source-profile-audit:end -->", 1
+        )[0]
+        command = marked.split("```bash", 1)[1].split("```", 1)[0].strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            absent_codex_home = Path(temporary) / "must-remain-absent"
+            completed = subprocess.run(
+                ["/bin/bash", "-eu", "-o", "pipefail", "-c", command],
+                cwd=REPOSITORY_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "CODEX_HOME": str(absent_codex_home)},
+            )
+            self.assertEqual("PASS", json.loads(completed.stdout)["phase"])
+            self.assertFalse(absent_codex_home.exists())
+
+    def test_current_direct_profiles_and_staged_profiles_are_digest_bound(self) -> None:
         registry = tomllib.loads(
             (ROOT / "references" / "twinfinity-executor-registry.toml").read_text(
                 encoding="utf-8"
@@ -58,40 +223,40 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                         profile["sandbox_workspace_write"]["writable_roots"],
                     )
                 else:
-                    self.assertEqual("readiness/v1", endpoint["execution_protocol"])
-                    self.assertEqual("never", profile["approval_policy"])
-                    self.assertFalse(profile["features"]["hooks"])
-                    self.assertFalse(profile["features"]["memories"])
-                    self.assertNotIn("hooks", profile)
+                    self.assertEqual("legacy", endpoint.get("execution_protocol", "legacy"))
+                    self.assertEqual("on-request", profile["approval_policy"])
+                    self.assertTrue(profile["features"]["hooks"])
                     self.assertEqual(
-                        ["/run/twinfinity-attempt/out"],
+                        [
+                            "/home/ubuntu/code",
+                            "/home/ubuntu/.codex/twinfinity-coordination",
+                        ],
                         profile["sandbox_workspace_write"]["writable_roots"],
                     )
                     instructions = profile["developer_instructions"]
-                    self.assertIn("brokered readiness/v1 boundary", instructions)
-                    self.assertIn("/run/twinfinity-attempt/contract.json", instructions)
-                    self.assertIn("/run/twinfinity-attempt/input/input.json", instructions)
-                    self.assertIn("/run/twinfinity-attempt/out/receipt.json", instructions)
-                    self.assertIn("Do not access SQLite, GitHub", instructions)
-                    self.assertIn("trusted outer broker", instructions)
-                    self.assertIn("read-only", instructions)
+                    self.assertIn("fresh bounded Twinfinity", instructions)
+                    if role == "development":
+                        self.assertIn("SQLite coordination rows", instructions)
+                    else:
+                        self.assertIn("hosted authority", instructions)
                 command = endpoint["command_prefix"]
                 self.assertEqual(profile_name, command[command.index("--profile") + 1])
 
-        history = {
+        self.assertEqual([], registry["historical_endpoints"])
+        staged = {
             endpoint["endpoint_id"]: endpoint
-            for endpoint in registry["historical_endpoints"]
+            for endpoint in registry["staged_endpoints"]
         }
         self.assertEqual(
             {
-                "role.development.v3",
                 "role.development.v4",
-                "role.sre.v3",
+                "role.development.v5",
                 "role.sre.v4",
+                "role.sre.v5",
             },
-            set(history),
+            set(staged),
         )
-        for endpoint in history.values():
+        for endpoint in staged.values():
             versioned = (
                 ROOT
                 / "references"
@@ -101,9 +266,15 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 endpoint["profile_sha256"],
                 hashlib.sha256(versioned.read_bytes()).hexdigest(),
             )
-            historical_profile = tomllib.loads(versioned.read_text(encoding="utf-8"))
-            self.assertEqual("on-request", historical_profile["approval_policy"])
-            self.assertIn("hooks", historical_profile)
+            staged_profile = tomllib.loads(versioned.read_text(encoding="utf-8"))
+            if endpoint["version"] == 5:
+                self.assertEqual("readiness/v1", endpoint["execution_protocol"])
+                self.assertEqual("never", staged_profile["approval_policy"])
+                self.assertFalse(staged_profile["features"]["hooks"])
+                self.assertIn("brokered readiness/v1 boundary", staged_profile["developer_instructions"])
+            else:
+                self.assertEqual("on-request", staged_profile["approval_policy"])
+                self.assertIn("hooks", staged_profile)
 
     def test_obsolete_runtime_artifacts_are_absent_and_uncalled(self) -> None:
         obsolete = (

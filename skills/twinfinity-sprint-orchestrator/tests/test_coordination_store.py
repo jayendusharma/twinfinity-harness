@@ -57,7 +57,7 @@ from tests.canonical_ready_fixture import (  # noqa: E402
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 SESSION = "role.development.v4"
-DEVELOPMENT_V5 = "role.development.v5"
+DEVELOPMENT_ROTATED = "role.development.v3"
 SRE_SESSION = "role.sre.v4"
 PLANNER_SESSION = "role.planner.v2"
 LEASE = "5" * 64
@@ -2781,30 +2781,11 @@ class CoordinationStoreTests(unittest.TestCase):
         self.assertEqual("COMMIT_READY", replayed_prepare["state"])
         self.assertEqual(prepared["packet_sha256"], replayed_prepare["packet_sha256"])
         self.assertEqual(prepared["outbox_id"], replayed_prepare["outbox_id"])
-        old_endpoint = self.store.connection.execute(
+        rotated_endpoint = self.store.connection.execute(
             "SELECT * FROM executor_role_endpoints WHERE endpoint_id=?",
-            (SESSION,),
+            (DEVELOPMENT_ROTATED,),
         ).fetchone()
-        endpoint_payload = json.loads(old_endpoint["config_json"])
-        endpoint_payload["endpoint_id"] = DEVELOPMENT_V5
-        endpoint_payload["version"] = 5
-        self.store.connection.execute(
-            """
-            INSERT INTO executor_role_endpoints(
-                endpoint_id,role,version,executor_profile,codex_profile,
-                config_sha256,config_json,command_json,created_at
-            ) VALUES (?, 'development', 5, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                DEVELOPMENT_V5,
-                old_endpoint["executor_profile"],
-                old_endpoint["codex_profile"],
-                digest_json(endpoint_payload),
-                canonical_json(endpoint_payload),
-                old_endpoint["command_json"],
-                "2026-08-22T10:00:10Z",
-            ),
-        )
+        endpoint_payload = json.loads(rotated_endpoint["config_json"])
         before_rotation = self.store.connection.execute(
             "SELECT version FROM coordination_items WHERE repository=? "
             "AND issue_number=92",
@@ -2816,7 +2797,7 @@ class CoordinationStoreTests(unittest.TestCase):
                     "repository": REPOSITORY,
                     "issue_number": 92,
                     "before_identity": SESSION,
-                    "after_identity": DEVELOPMENT_V5,
+                    "after_identity": DEVELOPMENT_ROTATED,
                     "before_version": before_rotation,
                     "after_version": before_rotation + 1,
                 }
@@ -2825,17 +2806,17 @@ class CoordinationStoreTests(unittest.TestCase):
         self.store.connection.execute(
             "UPDATE executor_role_endpoint_current SET endpoint_id=?,"
             "pointer_version=pointer_version+1,updated_at=? WHERE role='development'",
-            (DEVELOPMENT_V5, "2026-08-22T10:00:10Z"),
+            (DEVELOPMENT_ROTATED, "2026-08-22T10:00:10Z"),
         )
         self.store.connection.execute(
             "UPDATE coordination_items SET accountable_session_id=?,"
             "version=version+1,updated_at=? WHERE repository=? AND issue_number=92",
-            (DEVELOPMENT_V5, "2026-08-22T10:00:10Z", REPOSITORY),
+            (DEVELOPMENT_ROTATED, "2026-08-22T10:00:10Z", REPOSITORY),
         )
         self.store.connection.execute(
             "UPDATE coordination_terminal_watches SET accountable_session_id=?,"
             "updated_at=? WHERE watch_key=?",
-            (DEVELOPMENT_V5, "2026-08-22T10:00:10Z", watch_key),
+            (DEVELOPMENT_ROTATED, "2026-08-22T10:00:10Z", watch_key),
         )
         self.store.connection.execute(
             """
@@ -2851,8 +2832,8 @@ class CoordinationStoreTests(unittest.TestCase):
                 digest_json(endpoint_payload),
                 digest_json(rotation_plan),
                 canonical_json(rotation_plan),
-                digest_json({"endpoint": DEVELOPMENT_V5}),
-                canonical_json({"endpoint": DEVELOPMENT_V5}),
+                digest_json({"endpoint": DEVELOPMENT_ROTATED}),
+                canonical_json({"endpoint": DEVELOPMENT_ROTATED}),
                 "2026-08-22T10:00:10Z",
                 "2026-08-22T10:00:10Z",
             ),
@@ -2943,7 +2924,7 @@ class CoordinationStoreTests(unittest.TestCase):
             (
                 "TERMINAL_ATTEMPT_LINEAGE_MISMATCH",
                 "development",
-                DEVELOPMENT_V5,
+                DEVELOPMENT_ROTATED,
                 "message",
                 "999999",
             ),
@@ -2964,7 +2945,7 @@ class CoordinationStoreTests(unittest.TestCase):
                 self.store.connection.execute(
                     "UPDATE executor_role_endpoint_current SET endpoint_id=? "
                     "WHERE role='development'",
-                    (DEVELOPMENT_V5,),
+                    (DEVELOPMENT_ROTATED,),
                 )
             before_invalid = terminal_fingerprint()
             with self.assertRaisesRegex(CoordinationError, expected_error):
@@ -2984,7 +2965,7 @@ class CoordinationStoreTests(unittest.TestCase):
                 now="2026-08-22T10:00:10Z",
             )
         watcher, watcher_token = self.running_terminal_watch_attempt(
-            watch_key, endpoint_id=DEVELOPMENT_V5
+            watch_key, endpoint_id=DEVELOPMENT_ROTATED
         )
         for invalid_attempt_id, invalid_token, expected_error in (
             (watcher["attempt_id"], "wrong-token", "TERMINAL_ATTEMPT_TOKEN_MISMATCH"),

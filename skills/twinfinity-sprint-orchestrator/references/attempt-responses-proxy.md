@@ -1,8 +1,9 @@
-# Attempt-bound Responses proxy foundation
+# Dormant experimental attempt-bound Responses proxy foundation
 
 This reference describes the dormant, credential-free foundation in
 `scripts/attempt_responses_proxy.py`. It is not installed in a current role
 endpoint and does not authorize an upstream API call.
+It is not a prerequisite for current direct v3 readiness or writer throughput.
 
 ## Activation boundary
 

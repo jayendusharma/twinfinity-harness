@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -64,7 +65,13 @@ ATTEMPT_STATES = {
 ACTIVE_ATTEMPT_STATES = {"RESERVED", "LAUNCHING", "RUNNING"}
 TARGET_KINDS = {"message", "terminal_watch", "hosted_operation"}
 NONMUTATING_MESSAGE_TOPIC = "coordination.notice"
-ROOT_KEYS = {"schema_version", "roles", "historical_endpoints"}
+ROOT_KEYS = {
+    "schema_version",
+    "roles",
+    "historical_endpoints",
+    "staged_endpoints",
+}
+LEGACY_ROOT_KEYS = ROOT_KEYS - {"staged_endpoints"}
 COMMON_ROLE_KEYS = {
     "endpoint_id",
     "version",
@@ -203,11 +210,34 @@ class RegistryConfig:
     schema_version: int
     roles: dict[str, EndpointConfig]
     endpoints: dict[str, EndpointConfig]
+    staged_endpoint_ids: tuple[str, ...]
     source_sha256: str
     source_evidence: OwnerFileEvidence
     profile_evidence: tuple[OwnerFileEvidence, ...]
+    profile_validation_scope: str
+    selected_profile_endpoint_id: str | None
     codex_home: str
     profile_template_root: str
+
+
+_REGISTRY_CONFIG_SCOPE: ContextVar[RegistryConfig | None] = ContextVar(
+    "twinfinity_registry_config_scope", default=None
+)
+
+
+@contextmanager
+def registry_config_scope(config: RegistryConfig) -> Iterator[None]:
+    """Temporarily bind one explicitly validated source/staged catalog.
+
+    The binding is process-local and never mutates ``CODEX_HOME`` or another
+    ambient configuration path.
+    """
+
+    token = _REGISTRY_CONFIG_SCOPE.set(config)
+    try:
+        yield
+    finally:
+        _REGISTRY_CONFIG_SCOPE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -486,6 +516,50 @@ def _read_regular_owner_file(
         os.close(descriptor)
 
 
+def _validate_profile_directory(value: Any, error_prefix: str) -> Path:
+    """Reject profile roots that traverse links or mutable shared directories."""
+
+    try:
+        path = Path(os.fspath(value))
+    except TypeError as exc:
+        raise RegistryError(f"{error_prefix}_INVALID") from exc
+    if not path.is_absolute():
+        raise RegistryError(f"{error_prefix}_INVALID")
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    anchor_metadata = current.lstat()
+    if (
+        not stat.S_ISDIR(anchor_metadata.st_mode)
+        or anchor_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RegistryError(f"{error_prefix}_UNSAFE")
+    parts = absolute.parts[1:]
+    for ordinal, part in enumerate(parts):
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise RegistryError(f"{error_prefix}_MISSING") from exc
+        is_final = ordinal == len(parts) - 1
+        shared_sticky_ancestor = not is_final and bool(
+            metadata.st_mode & stat.S_ISVTX
+        )
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (
+                metadata.st_uid not in {0, os.getuid()}
+                and not shared_sticky_ancestor
+            )
+            or (
+                metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                and not shared_sticky_ancestor
+            )
+        ):
+            raise RegistryError(f"{error_prefix}_UNSAFE")
+    return absolute
+
+
 def revalidate_owner_file_evidence(
     evidence: OwnerFileEvidence, error_prefix: str
 ) -> bytes:
@@ -504,6 +578,8 @@ def revalidate_registry_inputs(config: RegistryConfig) -> RegistryConfig:
         Path(config.source_evidence.path),
         codex_home=Path(config.codex_home),
         profile_template_root=Path(config.profile_template_root),
+        profile_validation_scope=config.profile_validation_scope,
+        selected_current_endpoint_id=config.selected_profile_endpoint_id,
     )
     if current.source_evidence != config.source_evidence:
         raise RegistryError("REGISTRY_CONFIG_DRIFT")
@@ -513,7 +589,11 @@ def revalidate_registry_inputs(config: RegistryConfig) -> RegistryConfig:
         current.schema_version != config.schema_version
         or current.roles != config.roles
         or current.endpoints != config.endpoints
+        or current.staged_endpoint_ids != config.staged_endpoint_ids
         or current.source_sha256 != config.source_sha256
+        or current.profile_validation_scope != config.profile_validation_scope
+        or current.selected_profile_endpoint_id
+        != config.selected_profile_endpoint_id
         or current.codex_home != config.codex_home
         or current.profile_template_root != config.profile_template_root
     ):
@@ -656,7 +736,9 @@ def load_registry_config(
     path: Path = DEFAULT_CONFIG,
     *,
     codex_home: Path | None = None,
-    profile_template_root: Path = DEFAULT_PROFILE_TEMPLATE_ROOT,
+    profile_template_root: Path | None = DEFAULT_PROFILE_TEMPLATE_ROOT,
+    profile_validation_scope: str = "current",
+    selected_current_endpoint_id: str | None = None,
 ) -> RegistryConfig:
     """Load the closed current-and-rollback endpoint catalog."""
 
@@ -665,13 +747,14 @@ def load_registry_config(
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise RegistryError("REGISTRY_CONFIG_INVALID_TOML") from exc
-    if set(parsed) != ROOT_KEYS or parsed.get("schema_version") != 2:
+    if set(parsed) not in {frozenset(ROOT_KEYS), frozenset(LEGACY_ROOT_KEYS)} or parsed.get("schema_version") != 2:
         raise RegistryError("REGISTRY_CONFIG_SCHEMA_INVALID")
     role_values = parsed.get("roles")
     historical_values = parsed.get("historical_endpoints")
+    staged_values = parsed.get("staged_endpoints", [])
     if not isinstance(role_values, dict) or set(role_values) != set(ROLES):
         raise RegistryError("REGISTRY_CONFIG_ROLES_INVALID")
-    if not isinstance(historical_values, list):
+    if not isinstance(historical_values, list) or not isinstance(staged_values, list):
         raise RegistryError("REGISTRY_CONFIG_HISTORY_INVALID")
 
     roles = {
@@ -697,6 +780,24 @@ def load_registry_config(
         endpoints[endpoint.endpoint_id] = endpoint
         versions.add((endpoint.role, endpoint.version))
 
+    staged_endpoint_ids: list[str] = []
+    for value in staged_values:
+        if not isinstance(value, dict) or type(value.get("role")) is not str:
+            raise RegistryError("REGISTRY_CONFIG_STAGED_INVALID")
+        role = str(value["role"])
+        endpoint = _parse_endpoint_config(
+            role, {key: item for key, item in value.items() if key != "role"}
+        )
+        if (
+            endpoint.endpoint_id in endpoints
+            or (endpoint.role, endpoint.version) in versions
+            or endpoint.version <= roles[endpoint.role].version
+        ):
+            raise RegistryError("REGISTRY_CONFIG_STAGED_INVALID")
+        endpoints[endpoint.endpoint_id] = endpoint
+        versions.add((endpoint.role, endpoint.version))
+        staged_endpoint_ids.append(endpoint.endpoint_id)
+
     current_mutating = {
         role: {
             topic
@@ -707,21 +808,50 @@ def load_registry_config(
     }
     if current_mutating["development"] & current_mutating["sre"]:
         raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
-    effective_codex_home = codex_home or _default_codex_home()
+    if profile_validation_scope not in {"current", "catalog"}:
+        raise RegistryError("REGISTRY_PROFILE_VALIDATION_SCOPE_INVALID")
+    if selected_current_endpoint_id is not None:
+        selected = endpoints.get(selected_current_endpoint_id)
+        if (
+            profile_validation_scope != "current"
+            or selected is None
+            or roles[selected.role].endpoint_id != selected_current_endpoint_id
+        ):
+            raise RegistryError("REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT")
+        profiled_endpoints = {selected_current_endpoint_id: selected}
+    elif profile_validation_scope == "catalog":
+        profiled_endpoints = endpoints
+    else:
+        profiled_endpoints = {
+            endpoint.endpoint_id: endpoint for endpoint in roles.values()
+        }
+    effective_codex_home = _validate_profile_directory(
+        _default_codex_home() if codex_home is None else codex_home,
+        "REGISTRY_CODEX_HOME",
+    )
+    effective_template_root = _validate_profile_directory(
+        DEFAULT_PROFILE_TEMPLATE_ROOT
+        if profile_template_root is None
+        else profile_template_root,
+        "REGISTRY_PROFILE_ROOT",
+    )
     profile_evidence = _validate_role_profiles(
-        endpoints,
+        profiled_endpoints,
         codex_home=effective_codex_home,
-        profile_template_root=profile_template_root,
+        profile_template_root=effective_template_root,
     )
     return RegistryConfig(
         schema_version=2,
         roles=roles,
         endpoints=endpoints,
+        staged_endpoint_ids=tuple(sorted(staged_endpoint_ids)),
         source_sha256=hashlib.sha256(raw).hexdigest(),
         source_evidence=source_evidence,
         profile_evidence=profile_evidence,
+        profile_validation_scope=profile_validation_scope,
+        selected_profile_endpoint_id=selected_current_endpoint_id,
         codex_home=os.path.abspath(os.fspath(effective_codex_home)),
-        profile_template_root=os.path.abspath(os.fspath(profile_template_root)),
+        profile_template_root=os.path.abspath(os.fspath(effective_template_root)),
     )
 
 
@@ -1314,7 +1444,8 @@ def configured_identity_role(identity: str) -> str | None:
 
     if not isinstance(identity, str):
         return None
-    endpoint = load_registry_config().endpoints.get(identity)
+    scoped = _REGISTRY_CONFIG_SCOPE.get()
+    endpoint = (scoped or load_registry_config()).endpoints.get(identity)
     return None if endpoint is None else endpoint.role
 
 
@@ -2429,6 +2560,14 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--profile-root",
+        type=Path,
+        help=(
+            "read both portable and staged installed profile bytes from this "
+            "directory; audit-config only"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("audit-config")
     recover = subparsers.add_parser("recover-reserved")
@@ -2438,13 +2577,24 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "audit-config":
-            config = load_registry_config(args.config)
+            if args.profile_root is None:
+                config = load_registry_config(args.config)
+            else:
+                config = load_registry_config(
+                    args.config,
+                    codex_home=args.profile_root,
+                    profile_template_root=args.profile_root,
+                    profile_validation_scope="catalog",
+                )
             print(canonical_json({
                 "phase": "PASS",
                 "config_sha256": config.source_sha256,
                 "endpoints": {role: value.endpoint_id for role, value in config.roles.items()},
+                "staged_endpoints": list(config.staged_endpoint_ids),
             }))
             return 0
+        if args.profile_root is not None:
+            raise RegistryError("REGISTRY_PROFILE_ROOT_AUDIT_ONLY")
         if args.older_than_seconds <= 0:
             raise RegistryError("RECOVERY_WINDOW_INVALID")
         now = utc_now()

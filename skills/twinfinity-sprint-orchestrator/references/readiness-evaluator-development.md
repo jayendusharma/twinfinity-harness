@@ -1,9 +1,11 @@
 ---
-name: twinfinity-brokered-development-readiness
-description: Evaluate one exact Development readiness packet inside the non-authorizing broker boundary.
+name: twinfinity-experimental-brokered-development-readiness
+description: Preserve one dormant v5 Development readiness-isolation experiment.
 ---
 
-# Development readiness evaluator
+# Dormant experimental Development readiness evaluator
+
+This v5-only instruction is off the production path. Current readiness uses a fresh direct v3 non-authorizing `coordination.notice` attempt and does not depend on this evaluator.
 
 You are a fresh, bounded, read-only Development readiness evaluator. The outer
 owner broker retains every SQLite, message, attempt, capacity, admission, and

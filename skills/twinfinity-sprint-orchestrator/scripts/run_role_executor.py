@@ -33,6 +33,7 @@ from executor_registry import (
     load_registry_config,
     open_registry_database,
     probe_systemd_unit,
+    registry_config_scope,
     reserve_attempt,
     stable_systemd_unit,
     target_progress_digest,
@@ -341,9 +342,11 @@ def execute_role(
         invocation_id=systemd_invocation_id,
         evidence=systemd_evidence,
     )
-    config = load_registry_config(config_path)
-    configured = config.endpoints.get(endpoint_id)
-    if configured is None or configured.role != role:
+    config = load_registry_config(
+        config_path, selected_current_endpoint_id=endpoint_id
+    )
+    configured = config.roles.get(role)
+    if configured is None or configured.endpoint_id != endpoint_id:
         raise RegistryError("EXECUTOR_CONFIG_ENDPOINT_MISMATCH")
     endpoint = current_endpoint(connection, role)
     if (
@@ -354,41 +357,42 @@ def execute_role(
         or json.loads(endpoint["command_json"]) != list(configured.command_prefix)
     ):
         raise RegistryError("EXECUTOR_CONFIG_ENDPOINT_MISMATCH")
-    target_validator = lambda candidate: _validate_target(
-        candidate,
-        role=role,
-        endpoint_id=endpoint_id,
-        target_kind=target_kind,
-        target_key=target_key,
-        allowed_topics=set(configured.allowed_topics),
-    )
-    if configured.execution_protocol is not None:
-        if configured.execution_protocol != BROKER_PROTOCOL:
-            raise RegistryError("BROKER_PROTOCOL_INVALID")
-        return execute_brokered_readiness(
-            connection,
-            configured=configured,
-            profile_path=(
-                Path(config.codex_home)
-                / f"{configured.runtime_codex_profile}.config.toml"
-            ),
+    with registry_config_scope(config):
+        target_validator = lambda candidate: _validate_target(
+            candidate,
+            role=role,
+            endpoint_id=endpoint_id,
             target_kind=target_kind,
             target_key=target_key,
-            systemd_evidence=systemd_evidence,
-            target_precondition=target_validator,
-            runtime=broker_runtime,
-            popen=popen,
-            heartbeat_seconds=heartbeat_seconds,
+            allowed_topics=set(configured.allowed_topics),
         )
-    reserved, token = reserve_attempt(
-        connection,
-        role=role,
-        endpoint_id=endpoint_id,
-        target_kind=target_kind,
-        target_key=target_key,
-        now=utc_now(),
-        precondition=target_validator,
-    )
+        if configured.execution_protocol is not None:
+            if configured.execution_protocol != BROKER_PROTOCOL:
+                raise RegistryError("BROKER_PROTOCOL_INVALID")
+            return execute_brokered_readiness(
+                connection,
+                configured=configured,
+                profile_path=(
+                    Path(config.codex_home)
+                    / f"{configured.runtime_codex_profile}.config.toml"
+                ),
+                target_kind=target_kind,
+                target_key=target_key,
+                systemd_evidence=systemd_evidence,
+                target_precondition=target_validator,
+                runtime=broker_runtime,
+                popen=popen,
+                heartbeat_seconds=heartbeat_seconds,
+            )
+        reserved, token = reserve_attempt(
+            connection,
+            role=role,
+            endpoint_id=endpoint_id,
+            target_kind=target_kind,
+            target_key=target_key,
+            now=utc_now(),
+            precondition=target_validator,
+        )
     command = build_endpoint_runtime_command(configured, prompt)
     environment = build_child_environment(
         os.environ.copy(),
@@ -427,14 +431,15 @@ def execute_role(
             pass
         raise RegistryError("EXECUTOR_LAUNCHING_TRANSITION_FAILED") from exc
     try:
-        process = popen(
-            command,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=None,
-            stderr=None,
-            start_new_session=True,
-        )
+        with registry_config_scope(config):
+            process = popen(
+                command,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
+                start_new_session=True,
+            )
     except OSError:
         failed = transitioner(
             connection,
