@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "twinfinity-kanban-readiness-receipt/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "repository", "issue_number", "readiness_plan_sha256",
+    "verdict", "worker_role", "message_id", "attempt_id", "gate_results",
+    "resolution", "summary", "observed_at"
+  ],
+  "properties": {
+    "schema": {"const": "twinfinity-kanban-readiness-receipt/v1"},
+    "repository": {"type": "string", "minLength": 1},
+    "issue_number": {"type": "integer", "minimum": 1},
+    "readiness_plan_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "verdict": {"enum": ["PASS", "ACTIONABLE_HOLD", "APPROVAL_REQUIRED", "TERMINAL_HOLD"]},
+    "worker_role": {"enum": ["development", "sre"]},
+    "message_id": {"type": "integer"},
+    "attempt_id": {"type": "string"},
+    "gate_results": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate_key", "verdict", "evidence_sha256", "summary"],
+        "properties": {
+          "gate_key": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+          "verdict": {"enum": ["PASS", "HOLD"]},
+          "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "summary": {"type": "string", "pattern": ".*\\S.*"}
+        }
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "actions", "approval_proposal_sha256"],
+      "properties": {
+        "role": {"type": ["string", "null"], "enum": ["planner", null]},
+        "actions": {"type": "array", "items": {"type": "string", "pattern": ".*\\S.*"}},
+        "approval_proposal_sha256": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          ]
+        }
+      }
+    },
+    "summary": {"type": "string", "pattern": ".*\\S.*"},
+    "observed_at": {"type": "string", "pattern": ".*\\S.*"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"verdict": {"const": "PASS"}}},
+      "then": {
+        "properties": {
+          "gate_results": {"items": {"properties": {"verdict": {"const": "PASS"}}}},
+          "resolution": {
+            "properties": {
+              "role": {"type": "null"},
+              "actions": {"maxItems": 0},
+              "approval_proposal_sha256": {"type": "null"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verdict": {"const": "ACTIONABLE_HOLD"}}},
+      "then": {
+        "properties": {
+          "gate_results": {"contains": {"properties": {"verdict": {"const": "HOLD"}}}},
+          "resolution": {
+            "properties": {
+              "role": {"const": "planner"},
+              "actions": {"minItems": 1},
+              "approval_proposal_sha256": {"type": "null"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verdict": {"const": "APPROVAL_REQUIRED"}}},
+      "then": {
+        "properties": {
+          "gate_results": {"contains": {"properties": {"verdict": {"const": "HOLD"}}}},
+          "resolution": {
+            "properties": {
+              "role": {"const": "planner"},
+              "actions": {"minItems": 1},
+              "approval_proposal_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verdict": {"const": "TERMINAL_HOLD"}}},
+      "then": {
+        "properties": {
+          "gate_results": {"contains": {"properties": {"verdict": {"const": "HOLD"}}}},
+          "resolution": {
+            "properties": {
+              "role": {"type": "null"},
+              "actions": {"maxItems": 0},
+              "approval_proposal_sha256": {"type": "null"}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

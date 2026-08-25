@@ -2078,11 +2078,24 @@ def recover_reserved_attempts(
         raise RegistryError("EXECUTOR_ATTEMPT_SCHEMA_MIGRATION_REQUIRED")
     recovered: list[str] = []
     with immediate_transaction(connection):
-        rows = connection.execute(
+        broker_table = connection.execute(
             """
-            SELECT attempt_id, version FROM executor_attempts
-            WHERE state='RESERVED' AND heartbeat_at<? ORDER BY created_at
-            """,
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='role_executor_broker_runs'
+            """
+        ).fetchone() is not None
+        broker_fence = (
+            " AND NOT EXISTS (SELECT 1 FROM role_executor_broker_runs broker "
+            "WHERE broker.attempt_id=executor_attempts.attempt_id "
+            "AND broker.state IN ('PREPARING','LAUNCHING','RUNNING'))"
+            if broker_table
+            else ""
+        )
+        rows = connection.execute(
+            "SELECT attempt_id, version FROM executor_attempts "
+            "WHERE state='RESERVED' AND heartbeat_at<?"
+            + broker_fence
+            + " ORDER BY created_at",
             (before,),
         ).fetchall()
         for row in rows:
@@ -2123,12 +2136,24 @@ def recover_stale_active_attempts(
     ensure_executor_registry_schema(connection)
     if not attempt_schema_is_current(connection):
         raise RegistryError("EXECUTOR_ATTEMPT_SCHEMA_MIGRATION_REQUIRED")
-    candidates = connection.execute(
+    broker_table = connection.execute(
         """
-        SELECT * FROM executor_attempts
-        WHERE state IN ('LAUNCHING','RUNNING') AND heartbeat_at<?
-        ORDER BY created_at
-        """,
+        SELECT 1 FROM sqlite_master
+        WHERE type='table' AND name='role_executor_broker_runs'
+        """
+    ).fetchone() is not None
+    broker_fence = (
+        " AND NOT EXISTS (SELECT 1 FROM role_executor_broker_runs broker "
+        "WHERE broker.attempt_id=executor_attempts.attempt_id "
+        "AND broker.state IN ('PREPARING','LAUNCHING','RUNNING'))"
+        if broker_table
+        else ""
+    )
+    candidates = connection.execute(
+        "SELECT * FROM executor_attempts "
+        "WHERE state IN ('LAUNCHING','RUNNING') AND heartbeat_at<?"
+        + broker_fence
+        + " ORDER BY created_at",
         (before,),
     ).fetchall()
     results: list[dict[str, str]] = []
@@ -2199,6 +2224,24 @@ def recover_stale_active_attempts(
             current = connection.execute(
                 "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
             ).fetchone()
+            broker_active = (
+                connection.execute(
+                    """
+                    SELECT 1 FROM role_executor_broker_runs
+                    WHERE attempt_id=? AND state IN ('PREPARING','LAUNCHING','RUNNING')
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+                if broker_table
+                else None
+            )
+            if broker_active is not None:
+                results.append({
+                    "attempt_id": attempt_id,
+                    "phase": "HOLD",
+                    "error": "STALE_RECOVERY_BROKER_OWNS_ATTEMPT",
+                })
+                continue
             if (
                 current is None
                 or current["state"] != candidate["state"]

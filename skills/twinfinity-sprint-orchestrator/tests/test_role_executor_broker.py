@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -18,18 +20,22 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import CoordinationStore, canonical_json  # noqa: E402
+from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from executor_registry import (  # noqa: E402
     RegistryError,
     SystemdUnitEvidence,
     ensure_executor_registry_schema,
     load_registry_config,
+    recover_reserved_attempts,
     reserve_attempt,
     stable_systemd_unit,
+    transition_attempt,
 )
 from kanban_pull_buffer import ensure_pull_buffer_schema  # noqa: E402
 from kanban_readiness import PLAN_SCHEMA, RECEIPT_SCHEMA, dispatch, register  # noqa: E402
 from portfolio_graph import replace_graph  # noqa: E402
 from reconcile_routing_artifacts import _verify_or_insert_endpoint  # noqa: E402
+import role_executor_broker as broker  # noqa: E402
 from role_executor_broker import (  # noqa: E402
     BROKER_PROTOCOL,
     CONTRACT_SCHEMA,
@@ -38,14 +44,21 @@ from role_executor_broker import (  # noqa: E402
     RESULT_PATH,
     BrokerError,
     BrokerRuntimePaths,
+    _build_input_projection,
+    _execute_brokered_readiness_mechanics,
+    attest_bwrap_command,
+    broker_terminal_readback,
+    build_bwrap_command,
     claim_attach_and_start,
     complete_broker_receipt,
+    consume_broker_pickup,
     hold_broker_run,
     mark_broker_launching,
     prepare_broker_run,
     prepare_spool,
     read_receipt_file,
     replay_broker_receipt,
+    recover_stale_broker_runs,
 )
 from run_role_executor import execute_role  # noqa: E402
 
@@ -91,6 +104,29 @@ class _ReceiptProcess:
             self._gate_fd = -1
             self._finished = True
         return 0
+
+    def terminate(self):
+        self.terminated = True
+        if self._gate_fd >= 0:
+            os.close(self._gate_fd)
+            self._gate_fd = -1
+
+    def wait(self, timeout=None):
+        return -15
+
+    def kill(self):
+        self.terminate()
+
+
+class _NeverProcess:
+    pid = 43211
+
+    def __init__(self, gate_fd: int):
+        self._gate_fd = os.dup(gate_fd)
+        self.terminated = False
+
+    def poll(self):
+        return None
 
     def terminate(self):
         self.terminated = True
@@ -155,25 +191,16 @@ class BrokerHarness:
         runtime = self.root / "runtime"
         runtime.mkdir(mode=0o700)
         files: dict[str, Path] = {}
-        for name in ("bwrap", "setpriv", "codex", "auth.json"):
+        for name in ("bwrap", "setpriv", "codex"):
             path = runtime / name
             path.write_bytes(b"test-runtime\n")
-            path.chmod(0o700 if name != "auth.json" else 0o600)
+            path.chmod(0o700)
             files[name] = path
-        development = runtime / "development-skill"
-        sre = runtime / "sre-skill"
-        development.mkdir()
-        sre.mkdir()
-        (development / "SKILL.md").write_text("development\n", encoding="utf-8")
-        (sre / "SKILL.md").write_text("sre\n", encoding="utf-8")
         return BrokerRuntimePaths(
             spool_root=self.root / "spool",
             bwrap_path=files["bwrap"],
             setpriv_path=files["setpriv"],
             codex_binary_path=files["codex"],
-            codex_auth_path=files["auth.json"],
-            development_skill_root=development,
-            sre_skill_root=sre,
         )
 
     def seed(self, *, role: str = "development") -> int:
@@ -371,14 +398,24 @@ class BrokerHarness:
             self.store.connection,
             configured=endpoint,
             attempt_id=str(reserved["attempt_id"]),
+            profile_path=ROOT
+            / "references"
+            / f"{endpoint.runtime_codex_profile}.config.toml",
             now=NOW,
         )
         spool = prepare_spool(self.runtime, run)
+        command = build_bwrap_command(
+            configured=endpoint,
+            runtime=self.runtime,
+            spool=spool,
+            start_gate_fd=3,
+        )
         mark_broker_launching(
             self.store.connection,
             attempt_id=str(reserved["attempt_id"]),
             token=token,
             evidence=systemd_evidence(role, "message", str(self.message_id)),
+            command_attestation=attest_bwrap_command(command),
             now=NOW,
         )
         return endpoint, reserved, token, spool
@@ -436,6 +473,11 @@ class RoleExecutorBrokerTests(unittest.TestCase):
                 "TWINFINITY_EXECUTOR_TOKEN",
                 profile_path.read_text(encoding="utf-8"),
             )
+            provider = profile["model_providers"]["twinfinity-attempt-proxy"]
+            self.assertEqual("responses", provider["wire_api"])
+            self.assertFalse(provider["requires_openai_auth"])
+            self.assertNotIn("env_key", provider)
+            self.assertNotIn("auth.json", profile_path.read_text(encoding="utf-8"))
 
     def test_v5_catalog_rejects_protocol_or_topic_authority_expansion(self) -> None:
         raw = CONFIG.read_text(encoding="utf-8")
@@ -519,20 +561,19 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             return _ReceiptProcess(kwargs["pass_fds"][0], write_receipt)
 
         endpoint = self.h.config.roles["development"]
-        result = execute_role(
+        result = _execute_brokered_readiness_mechanics(
             self.h.store.connection,
-            config_path=CONFIG,
-            role="development",
-            endpoint_id=endpoint.endpoint_id,
+            configured=endpoint,
+            profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
             target_kind="message",
             target_key=str(self.h.message_id),
-            prompt="This caller prompt must not become authority.",
-            systemd_invocation_id="b" * 32,
             systemd_evidence=systemd_evidence(
                 "development", "message", str(self.h.message_id)
             ),
+            target_precondition=lambda _connection: None,
             popen=launch,
-            broker_runtime=self.h.runtime,
+            runtime=self.h.runtime,
+            heartbeat_seconds=1,
         )
         self.assertEqual(("PASS", "STAGED"), (result["phase"], result["pickup_state"]))
         run = self.h.store.connection.execute(
@@ -546,6 +587,25 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         self.assertEqual(INPUT_SCHEMA, projection["schema"])
         self.assertEqual(RESULT_PATH, contract["result_path"])
         self.assertEqual(RESULT_MAX_BYTES, contract["result_max_bytes"])
+        bundle = projection["instruction_bundle"]
+        self.assertEqual(
+            contract["instruction_closure_sha256"],
+            hashlib.sha256(canonical_json(bundle).encode()).hexdigest(),
+        )
+        self.assertEqual(
+            bundle["instruction"]["sha256"],
+            hashlib.sha256(
+                (self.h.runtime.spool_root / result["attempt_id"] / "instructions" / "SKILL.md").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            bundle["receipt_schema"]["sha256"],
+            hashlib.sha256(
+                (self.h.runtime.spool_root / result["attempt_id"] / "receipt.schema.json").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual("NOT_IMPLEMENTED", contract["model_transport"]["state"])
+        self.assertFalse(contract["model_transport"]["requires_openai_auth"])
         self.assertEqual(
             run["input_projection_sha256"],
             hashlib.sha256(run["input_projection_json"].encode()).hexdigest(),
@@ -591,9 +651,22 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         self.assertNotIn(str(self.h.store.path), joined)
         self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", joined)
         self.assertNotIn("TWINFINITY_EXECUTOR_TOKEN", joined)
+        self.assertNotIn("auth.json", joined)
         self.assertIn(
             "/home/ubuntu/.codex/twinfinity-coordination", joined
         )
+        for name, invalid in (
+            ("missing-cgroup", [part for part in command if part != "--unshare-cgroup"]),
+            ("best-effort-cgroup", [
+                "--unshare-cgroup-try" if part == "--unshare-cgroup" else part
+                for part in command
+            ]),
+            ("credential-mount", [*command, "auth.json"]),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                BrokerError, "BROKER_NAMESPACE_POLICY_INVALID"
+            ):
+                attest_bwrap_command(invalid)
         self.assertEqual("COMPLETE", run["state"])
         self.assertEqual(
             "COMPLETE",
@@ -610,7 +683,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            "RUNNING",
+            "READY_ELIGIBLE",
             self.h.store.connection.execute(
                 """
                 SELECT state FROM portfolio_readiness_current
@@ -620,9 +693,15 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            0,
+            1,
             self.h.store.connection.execute(
                 "SELECT COUNT(*) FROM portfolio_readiness_receipts"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
             ).fetchone()[0],
         )
 
@@ -678,6 +757,280 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_exact_bwrap_command_runs_with_mandatory_namespaces_and_start_gate(self) -> None:
+        if not Path("/usr/bin/bwrap").exists() or not Path("/usr/bin/setpriv").exists():
+            self.skipTest("bubblewrap runtime unavailable")
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        reserved, _token = reserve_attempt(
+            self.h.store.connection,
+            role="development",
+            endpoint_id=endpoint.endpoint_id,
+            target_kind="message",
+            target_key=str(self.h.message_id),
+            now=NOW,
+            precondition=lambda _connection: None,
+        )
+        run = prepare_broker_run(
+            self.h.store.connection,
+            configured=endpoint,
+            attempt_id=str(reserved["attempt_id"]),
+            profile_path=ROOT
+            / "references"
+            / "twinfinity-development-v5.config.toml",
+            now=NOW,
+        )
+        runtime = replace(
+            self.h.runtime,
+            bwrap_path=Path("/usr/bin/bwrap"),
+            setpriv_path=Path("/usr/bin/setpriv"),
+            codex_binary_path=Path("/usr/bin/true"),
+        )
+        spool = prepare_spool(runtime, run)
+        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        try:
+            command = build_bwrap_command(
+                configured=endpoint,
+                runtime=runtime,
+                spool=spool,
+                start_gate_fd=gate_read,
+            )
+            attest_bwrap_command(command)
+            process = subprocess.Popen(
+                command,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                pass_fds=(gate_read,),
+                preexec_fn=broker._apply_child_resource_limits,
+            )
+            os.close(gate_read)
+            gate_read = -1
+            os.write(gate_write, b"1")
+            os.close(gate_write)
+            gate_write = -1
+            self.assertEqual(0, process.wait(timeout=10))
+        finally:
+            for descriptor in (gate_read, gate_write):
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+    def test_runtime_profile_is_snapshotted_before_source_path_drift(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        source = ROOT / "references" / "twinfinity-development-v5.config.toml"
+        copied = self.h.root / "reviewed-profile.config.toml"
+        copied.write_bytes(source.read_bytes())
+        copied.chmod(0o600)
+        reserved, _token = reserve_attempt(
+            self.h.store.connection,
+            role="development",
+            endpoint_id=endpoint.endpoint_id,
+            target_kind="message",
+            target_key=str(self.h.message_id),
+            now=NOW,
+            precondition=lambda _connection: None,
+        )
+        run = prepare_broker_run(
+            self.h.store.connection,
+            configured=endpoint,
+            attempt_id=str(reserved["attempt_id"]),
+            profile_path=copied,
+            now=NOW,
+        )
+        copied.write_text("tampered after snapshot\n", encoding="utf-8")
+        spool = prepare_spool(self.h.runtime, run)
+        self.assertEqual(source.read_bytes(), spool.runtime_profile_path.read_bytes())
+        command = build_bwrap_command(
+            configured=endpoint,
+            runtime=self.h.runtime,
+            spool=spool,
+            start_gate_fd=3,
+        )
+        self.assertIn(str(spool.runtime_profile_path), command)
+        self.assertNotIn(str(copied), command)
+
+    def test_supported_readiness_holds_before_reservation_without_credentials(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        with self.assertRaisesRegex(
+            BrokerError, "BROKER_CREDENTIAL_TRANSPORT_NOT_IMPLEMENTED"
+        ):
+            execute_role(
+                self.h.store.connection,
+                config_path=CONFIG,
+                role="development",
+                endpoint_id=endpoint.endpoint_id,
+                target_kind="message",
+                target_key=str(self.h.message_id),
+                prompt="ignored",
+                systemd_invocation_id="b" * 32,
+                systemd_evidence=systemd_evidence(
+                    "development", "message", str(self.h.message_id)
+                ),
+                broker_runtime=self.h.runtime,
+            )
+        self.assertEqual(
+            (0, "PREPARED", None),
+            (
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM executor_attempts"
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (self.h.message_id,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT attempt_id FROM portfolio_readiness_current"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_preclaimed_and_preattached_inputs_never_reserve_a_fresh_attempt(self) -> None:
+        endpoint = self.h.config.roles["development"]
+        with self.subTest(state="preclaimed"):
+            self.h.seed()
+            with self.h.store.transaction():
+                self.h.store.connection.execute(
+                    """
+                    UPDATE coordination_messages
+                    SET state='CLAIMED', claimed_by=?, updated_at=? WHERE id=?
+                    """,
+                    (endpoint.endpoint_id, NOW, self.h.message_id),
+                )
+            with self.assertRaisesRegex(BrokerError, "BROKER_MESSAGE_NOT_PREPARED"):
+                _build_input_projection(
+                    self.h.store.connection,
+                    role="development",
+                    endpoint_id=endpoint.endpoint_id,
+                    target_kind="message",
+                    target_key=str(self.h.message_id),
+                )
+            self.assertEqual(
+                0,
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM executor_attempts"
+                ).fetchone()[0],
+            )
+
+        self.h.close()
+        self.h = BrokerHarness()
+        self.h.seed()
+        reserved, token = reserve_attempt(
+            self.h.store.connection,
+            role="development",
+            endpoint_id=endpoint.endpoint_id,
+            target_kind="message",
+            target_key=str(self.h.message_id),
+            now=NOW,
+            precondition=lambda _connection: None,
+        )
+        transition_attempt(
+            self.h.store.connection,
+            attempt_id=str(reserved["attempt_id"]),
+            token=token,
+            expected_version=int(reserved["version"]),
+            new_state="LAUNCH_FAILED",
+            now=NOW,
+            last_error="synthetic prior",
+        )
+        with self.h.store.transaction():
+            self.h.store.connection.execute(
+                "UPDATE portfolio_readiness_current SET attempt_id=?",
+                (reserved["attempt_id"],),
+            )
+        with self.assertRaisesRegex(BrokerError, "BROKER_READINESS_ALREADY_ATTACHED"):
+            _build_input_projection(
+                self.h.store.connection,
+                role="development",
+                endpoint_id=endpoint.endpoint_id,
+                target_kind="message",
+                target_key=str(self.h.message_id),
+            )
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM executor_attempts"
+            ).fetchone()[0],
+        )
+
+    def test_claim_race_reports_authoritative_terminal_readback(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+
+        def launch(_command, **kwargs):
+            with self.h.store.transaction():
+                self.h.store.connection.execute(
+                    """
+                    UPDATE coordination_messages SET state='CLAIMED', claimed_by=?,
+                        updated_at=? WHERE id=? AND state='PREPARED'
+                    """,
+                    (endpoint.endpoint_id, NOW, self.h.message_id),
+                )
+            return _ReceiptProcess(kwargs["pass_fds"][0], lambda: None)
+
+        result = _execute_brokered_readiness_mechanics(
+            self.h.store.connection,
+            configured=endpoint,
+            profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
+            target_kind="message",
+            target_key=str(self.h.message_id),
+            systemd_evidence=systemd_evidence(
+                "development", "message", str(self.h.message_id)
+            ),
+            target_precondition=lambda _connection: None,
+            popen=launch,
+            runtime=self.h.runtime,
+            heartbeat_seconds=1,
+        )
+        self.assertEqual(
+            ("HOLD", "LAUNCH_FAILED", "HOLD", "CLAIMED", "RUNNING", None),
+            (
+                result["phase"],
+                result["state"],
+                result["broker_state"],
+                result["message_state"],
+                result["readiness_state"],
+                result["readiness_attempt_id"],
+            ),
+        )
+
+    def test_cleanup_failure_never_fabricates_terminal_state(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+
+        def fail(_command, **_kwargs):
+            self.h.store.connection.execute(
+                """
+                CREATE TRIGGER synthetic_broker_hold_abort
+                BEFORE UPDATE OF state ON role_executor_broker_runs
+                WHEN NEW.state='HOLD'
+                BEGIN SELECT RAISE(ABORT, 'synthetic hold abort'); END
+                """
+            )
+            raise OSError("synthetic launch failure")
+
+        result = _execute_brokered_readiness_mechanics(
+            self.h.store.connection,
+            configured=endpoint,
+            profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
+            target_kind="message",
+            target_key=str(self.h.message_id),
+            systemd_evidence=systemd_evidence(
+                "development", "message", str(self.h.message_id)
+            ),
+            target_precondition=lambda _connection: None,
+            popen=fail,
+            runtime=self.h.runtime,
+            heartbeat_seconds=1,
+        )
+        self.assertEqual("BROKER_CLEANUP_FAILED", result["error"])
+        self.assertEqual(("LAUNCHING", "LAUNCHING", "PREPARED"), (
+            result["state"], result["broker_state"], result["message_state"]
+        ))
+
     def test_sre_readiness_uses_the_sre_v5_boundary(self) -> None:
         self.h.seed(role="sre")
         observed: dict[str, object] = {}
@@ -703,25 +1056,24 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             return _ReceiptProcess(kwargs["pass_fds"][0], write_receipt)
 
         endpoint = self.h.config.roles["sre"]
-        result = execute_role(
+        result = _execute_brokered_readiness_mechanics(
             self.h.store.connection,
-            config_path=CONFIG,
-            role="sre",
-            endpoint_id=endpoint.endpoint_id,
+            configured=endpoint,
+            profile_path=ROOT / "references" / "twinfinity-sre-v5.config.toml",
             target_kind="message",
             target_key=str(self.h.message_id),
-            prompt="ignored",
-            systemd_invocation_id="b" * 32,
             systemd_evidence=systemd_evidence(
                 "sre", "message", str(self.h.message_id)
             ),
+            target_precondition=lambda _connection: None,
             popen=launch,
-            broker_runtime=self.h.runtime,
+            runtime=self.h.runtime,
+            heartbeat_seconds=1,
         )
         self.assertEqual(("PASS", "COMPLETE"), (result["phase"], result["state"]))
         command = observed["command"]
         self.assertIn("twinfinity-sre-v5", command)
-        self.assertIn(str(self.h.runtime.sre_skill_root), command)
+        self.assertIn("/run/twinfinity-attempt/instructions/SKILL.md", "\n".join(command))
         run = self.h.store.connection.execute(
             "SELECT role, endpoint_id, state FROM role_executor_broker_runs"
         ).fetchone()
@@ -734,20 +1086,19 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         def fail(_command, **_kwargs):
             raise OSError("synthetic")
 
-        result = execute_role(
+        result = _execute_brokered_readiness_mechanics(
             self.h.store.connection,
-            config_path=CONFIG,
-            role="development",
-            endpoint_id=endpoint.endpoint_id,
+            configured=endpoint,
+            profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
             target_kind="message",
             target_key=str(self.h.message_id),
-            prompt="ignored",
-            systemd_invocation_id="b" * 32,
             systemd_evidence=systemd_evidence(
                 "development", "message", str(self.h.message_id)
             ),
+            target_precondition=lambda _connection: None,
             popen=fail,
-            broker_runtime=self.h.runtime,
+            runtime=self.h.runtime,
+            heartbeat_seconds=1,
         )
         self.assertEqual("HOLD", result["phase"])
         self.assertEqual(
@@ -780,20 +1131,19 @@ class RoleExecutorBrokerTests(unittest.TestCase):
 
             return _ReceiptProcess(kwargs["pass_fds"][0], write_invalid)
 
-        result = execute_role(
+        result = _execute_brokered_readiness_mechanics(
             self.h.store.connection,
-            config_path=CONFIG,
-            role="development",
-            endpoint_id=endpoint.endpoint_id,
+            configured=endpoint,
+            profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
             target_kind="message",
             target_key=str(self.h.message_id),
-            prompt="ignored",
-            systemd_invocation_id="b" * 32,
             systemd_evidence=systemd_evidence(
                 "development", "message", str(self.h.message_id)
             ),
+            target_precondition=lambda _connection: None,
             popen=launch,
-            broker_runtime=self.h.runtime,
+            runtime=self.h.runtime,
+            heartbeat_seconds=1,
         )
         self.assertEqual("HOLD", result["phase"])
         self.assertEqual(
@@ -829,6 +1179,84 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         receipt_path.write_bytes(b"x" * (RESULT_MAX_BYTES + 1))
         with self.assertRaisesRegex(BrokerError, "BROKER_RECEIPT_FILE_INVALID"):
             read_receipt_file(receipt_path, observed_at=NOW)
+
+    def test_kernel_file_and_open_file_limits_are_enforced_in_real_children(self) -> None:
+        oversized = self.h.root / "rlimit-output.bin"
+        file_result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    f"Path({str(oversized)!r}).write_bytes(b'x'*{RESULT_MAX_BYTES + 1})"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=broker._apply_child_resource_limits,
+            check=False,
+        )
+        self.assertNotEqual(0, file_result.returncode)
+        self.assertLessEqual(oversized.stat().st_size, RESULT_MAX_BYTES)
+
+        nofile_result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; opened=[]; "
+                    "\ntry:\n"
+                    "  [opened.append(open('/dev/null','rb')) for _ in range(128)]\n"
+                    "except OSError:\n  sys.exit(23)\n"
+                    "sys.exit(0)"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=broker._apply_child_resource_limits,
+            check=False,
+        )
+        self.assertEqual(23, nofile_result.returncode)
+        self.assertIsNone(nofile_result.stdout)
+        self.assertIsNone(nofile_result.stderr)
+
+    def test_wall_deadline_terminates_child_and_holds_attached_truth(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        observed: dict[str, object] = {}
+
+        def launch(_command, **kwargs):
+            observed.update(kwargs)
+            process = _NeverProcess(kwargs["pass_fds"][0])
+            observed["process"] = process
+            return process
+
+        with patch.object(broker, "BROKER_WALL_SECONDS", 0):
+            result = _execute_brokered_readiness_mechanics(
+                self.h.store.connection,
+                configured=endpoint,
+                profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
+                target_kind="message",
+                target_key=str(self.h.message_id),
+                systemd_evidence=systemd_evidence(
+                    "development", "message", str(self.h.message_id)
+                ),
+                target_precondition=lambda _connection: None,
+                popen=launch,
+                runtime=self.h.runtime,
+                heartbeat_seconds=1,
+            )
+        self.assertEqual("BROKER_CHILD_DEADLINE_EXCEEDED", result["boundary_error"])
+        self.assertEqual(("HOLD", "HOLD", "HOLD", "HOLD"), (
+            result["phase"], result["state"], result["broker_state"],
+            result["readiness_state"],
+        ))
+        self.assertTrue(observed["process"].terminated)
+        self.assertIs(subprocess.DEVNULL, observed["stdout"])
+        self.assertIs(subprocess.DEVNULL, observed["stderr"])
+        self.assertIs(broker._apply_child_resource_limits, observed["preexec_fn"])
 
     def test_claim_attach_is_atomic_and_replayable(self) -> None:
         self.h.seed()
@@ -960,6 +1388,245 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             now=NOW,
         )
         self.assertEqual(staged["receipt_sha256"], repeated["receipt_sha256"])
+        consumed = consume_broker_pickup(
+            self.h.store.connection, attempt_id=attempt_id, now=NOW
+        )
+        repeated_consumption = consume_broker_pickup(
+            self.h.store.connection, attempt_id=attempt_id, now=NOW
+        )
+        self.assertEqual(consumed, repeated_consumption)
+        self.assertEqual("READY_ELIGIBLE", consumed["readiness_state"])
+        self.assertEqual(
+            canonical_json(receipt),
+            self.h.store.connection.execute(
+                "SELECT receipt_json FROM portfolio_readiness_receipts"
+            ).fetchone()[0],
+        )
+
+    def test_generic_recovery_skips_broker_and_broker_recovers_preparing(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        reserved, _token = reserve_attempt(
+            self.h.store.connection,
+            role="development",
+            endpoint_id=endpoint.endpoint_id,
+            target_kind="message",
+            target_key=str(self.h.message_id),
+            now=NOW,
+            precondition=lambda _connection: None,
+        )
+        prepare_broker_run(
+            self.h.store.connection,
+            configured=endpoint,
+            attempt_id=str(reserved["attempt_id"]),
+            profile_path=ROOT
+            / "references"
+            / "twinfinity-development-v5.config.toml",
+            now=NOW,
+        )
+        self.assertEqual(
+            [],
+            recover_reserved_attempts(
+                self.h.store.connection,
+                before="2026-08-25T05:01:00Z",
+                now="2026-08-25T05:02:00Z",
+            ),
+        )
+        recovered = recover_stale_broker_runs(
+            self.h.store.connection,
+            before="2026-08-25T05:01:00Z",
+            now="2026-08-25T05:02:00Z",
+            runtime=self.h.runtime,
+        )
+        self.assertEqual("RECOVERED", recovered[0]["phase"])
+        self.assertEqual(
+            ("LAUNCH_FAILED", "HOLD", "PREPARED", None),
+            (
+                recovered[0]["state"],
+                recovered[0]["broker_state"],
+                recovered[0]["message_state"],
+                recovered[0]["readiness_attempt_id"],
+            ),
+        )
+
+    def test_supervisor_consumes_a_crash_left_immutable_pickup(self) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        receipt = self.h.receipt(attempt_id)
+        spool.receipt_path.write_text(canonical_json(receipt), encoding="utf-8")
+        replay_broker_receipt(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            runtime=self.h.runtime,
+            now=NOW,
+        )
+        supervisor = CoordinationSupervisor(
+            self.h.store,
+            launcher=lambda _identity, _message_id: 1,
+            terminal_watch_launcher=lambda _identity, _watch_key: 1,
+            process_checker=lambda _identity, _kind, _key: True,
+        )
+        result = supervisor.run_once("2026-08-25T05:00:30Z")
+        self.assertEqual(1, len(result["broker_pickups"]))
+        self.assertEqual("READY_ELIGIBLE", result["broker_pickups"][0]["readiness_state"])
+        self.assertEqual(
+            ("READY_ELIGIBLE", 1),
+            (
+                self.h.store.connection.execute(
+                    "SELECT state FROM portfolio_readiness_current"
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_pickup_consumption_crash_replays_without_duplicate_planner_notice(self) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        spool.receipt_path.write_text(
+            canonical_json(self.h.receipt(attempt_id)), encoding="utf-8"
+        )
+        replay_broker_receipt(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            runtime=self.h.runtime,
+            now=NOW,
+        )
+        self.h.store.connection.execute(
+            """
+            CREATE TRIGGER synthetic_consumption_abort
+            BEFORE INSERT ON role_executor_broker_pickup_consumptions
+            BEGIN SELECT RAISE(ABORT, 'synthetic consumption abort'); END
+            """
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            consume_broker_pickup(
+                self.h.store.connection, attempt_id=attempt_id, now=NOW
+            )
+        self.assertEqual(
+            ("READY_ELIGIBLE", 0, 1),
+            (
+                self.h.store.connection.execute(
+                    "SELECT state FROM portfolio_readiness_current"
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM coordination_messages
+                    WHERE idempotency_key LIKE 'kanban-readiness-planner:%'
+                    """
+                ).fetchone()[0],
+            ),
+        )
+        self.h.store.connection.execute("DROP TRIGGER synthetic_consumption_abort")
+        replayed = consume_broker_pickup(
+            self.h.store.connection, attempt_id=attempt_id, now=NOW
+        )
+        self.assertEqual("READY_ELIGIBLE", replayed["readiness_state"])
+        self.assertEqual(
+            (1, 1),
+            (
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM coordination_messages
+                    WHERE idempotency_key LIKE 'kanban-readiness-planner:%'
+                    """
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_stale_running_recovery_replays_once_across_terminal_race(self) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        spool.receipt_path.write_text(
+            canonical_json(self.h.receipt(attempt_id)), encoding="utf-8"
+        )
+        raced = False
+
+        def inactive(unit: str) -> SystemdUnitEvidence:
+            nonlocal raced
+            if not raced:
+                raced = True
+                replay_broker_receipt(
+                    self.h.store.connection,
+                    attempt_id=attempt_id,
+                    runtime=self.h.runtime,
+                    now="2026-08-25T05:02:00Z",
+                )
+                consume_broker_pickup(
+                    self.h.store.connection,
+                    attempt_id=attempt_id,
+                    now="2026-08-25T05:02:00Z",
+                )
+            active = systemd_evidence(
+                "development", "message", str(self.h.message_id)
+            )
+            self.assertEqual(active.unit, unit)
+            return SystemdUnitEvidence(
+                unit=active.unit,
+                load_state="loaded",
+                active_state="inactive",
+                sub_state="dead",
+                invocation_id=active.invocation_id,
+                control_group=active.control_group,
+                result="success",
+            )
+
+        recovered = recover_stale_broker_runs(
+            self.h.store.connection,
+            before="2026-08-25T05:01:00Z",
+            now="2026-08-25T05:02:00Z",
+            runtime=self.h.runtime,
+            evidence_reader=inactive,
+        )
+        self.assertEqual(1, len(recovered))
+        self.assertEqual(("RECOVERED", "COMPLETE", "COMPLETE", "READY_ELIGIBLE"), (
+            recovered[0]["phase"],
+            recovered[0]["state"],
+            recovered[0]["broker_state"],
+            recovered[0]["readiness_state"],
+        ))
+        self.assertEqual(
+            (1, 1),
+            (
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM role_executor_broker_receipt_pickups"
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+                ).fetchone()[0],
+            ),
+        )
 
     def test_binding_drift_never_stages_or_completes(self) -> None:
         self.h.seed()

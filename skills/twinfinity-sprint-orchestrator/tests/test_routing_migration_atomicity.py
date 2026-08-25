@@ -361,7 +361,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_versioned_cutover_preserves_immutable_legacy_alias_provenance(self) -> None:
+    def test_versioned_cutover_holds_without_credential_transport_and_preserves_v3(self) -> None:
         ensure_executor_registry_schema(self.connection)
         now = "2026-08-24T09:00:00Z"
         for role in ROLES:
@@ -415,7 +415,14 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             )
 
         reviewed = self._dry_run_plan()
-        self._migrate(reviewed, "versioned-endpoint-cutover")
+        self.assertEqual(
+            {"credential_transport"},
+            {entry["kind"] for entry in reviewed["broker_cutover_blockers"]},
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CREDENTIAL_TRANSPORT_REQUIRED"
+        ):
+            self._migrate(reviewed, "versioned-endpoint-cutover")
 
         pointers = {
             row["role"]: (row["endpoint_id"], row["pointer_version"])
@@ -425,11 +432,11 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             )
         }
         self.assertEqual(
-            (self.config.roles["development"].endpoint_id, 2),
+            (prior_endpoints["development"], 1),
             pointers["development"],
         )
         self.assertEqual(
-            (self.config.roles["sre"].endpoint_id, 2), pointers["sre"]
+            (prior_endpoints["sre"], 1), pointers["sre"]
         )
         self.assertEqual(
             (self.config.roles["planner"].endpoint_id, 1), pointers["planner"]
@@ -465,6 +472,107 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                     entry["alias"],
                     expected_role=entry["role"],
                 )
+
+    def test_v4_to_v5_cutover_rejects_every_actionable_target_class_atomically(self) -> None:
+        ensure_executor_registry_schema(self.connection)
+        now = "2026-08-24T09:00:00Z"
+        for endpoint in self.config.endpoints.values():
+            _verify_or_insert_endpoint(self.connection, endpoint.payload, now)
+        current = {
+            "planner": "role.planner.v2",
+            "development": "role.development.v4",
+            "sre": "role.sre.v4",
+        }
+        for role, endpoint_id in current.items():
+            self.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint_id, now),
+            )
+        self.connection.execute(
+            """
+            INSERT INTO coordination_items(
+                repository, issue_number, accountable_session_id, version, updated_at
+            ) VALUES ('twinfinityai/twinfinityapp', 328, 'role.development.v4', 1, ?)
+            """,
+            (now,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO coordination_terminal_watches(
+                watch_key, accountable_session_id, state, updated_at
+            ) VALUES ('terminal-328', 'role.development.v4', 'ACTIVE', ?)
+            """,
+            (now,),
+        )
+        self.connection.executescript(
+            """
+            CREATE TABLE coordination_messages(
+                id INTEGER PRIMARY KEY,
+                recipient_session_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                state TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE hosted_operations(
+                id INTEGER PRIMARY KEY,
+                recipient_session_id TEXT NOT NULL,
+                state TEXT NOT NULL
+            );
+            INSERT INTO coordination_messages VALUES(
+                7, 'role.development.v4', 'development.admission', 'PREPARED',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            );
+            INSERT INTO hosted_operations VALUES(
+                9, 'role.sre.v4', 'CLAIMED'
+            );
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO executor_attempts(
+                attempt_id, role, endpoint_id, instance_id, token_sha256,
+                target_kind, target_key, state, heartbeat_at, version,
+                created_at, updated_at
+            ) VALUES ('attempt-v4', 'development', 'role.development.v4',
+                      'instance-v4', ?, 'message', '7', 'RESERVED', ?, 1, ?, ?)
+            """,
+            ("b" * 64, now, now, now),
+        )
+        reviewed = self._dry_run_plan()
+        self.assertEqual(
+            {
+                "credential_transport",
+                "message",
+                "item",
+                "terminal_watch",
+                "hosted_operation",
+                "attempt",
+            },
+            {entry["kind"] for entry in reviewed["broker_cutover_blockers"]},
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_BROKER_CUTOVER_ACTIONABLE_WORK"
+        ):
+            self._migrate(reviewed, "actionable-v4-cutover")
+        self.assertEqual(
+            current,
+            {
+                row["role"]: row["endpoint_id"]
+                for row in self.connection.execute(
+                    "SELECT role, endpoint_id FROM executor_role_endpoint_current"
+                )
+            },
+        )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM executor_registry_changes"
+            ).fetchone()[0],
+        )
 
     def test_versioned_cutover_rejects_alias_bound_to_wrong_role_endpoint(self) -> None:
         ensure_executor_registry_schema(self.connection)

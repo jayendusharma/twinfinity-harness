@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -469,9 +470,17 @@ class ExecutorRegistryTests(unittest.TestCase):
                 },
                 set(rotated_config.endpoints),
             )
+            rotation_only = replace(
+                rotated_config,
+                roles={
+                    "planner": rotated_config.roles["planner"],
+                    "development": self.config.roles["development"],
+                    "sre": self.config.roles["sre"],
+                },
+            )
             plan = build_plan(
                 self.store.connection,
-                rotated_config,
+                rotation_only,
                 self.aliases,
                 alias_fixture_sha256=self.alias_sha,
             )

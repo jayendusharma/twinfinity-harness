@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import resource
 import secrets
 import sqlite3
 import stat
@@ -27,9 +28,11 @@ from executor_registry import (
     EndpointConfig,
     RegistryError,
     SHA256,
+    SYSTEMD_INVOCATION_ID,
     SystemdUnitEvidence,
     _insert_attempt_event,
     current_endpoint,
+    probe_systemd_unit,
     reserve_attempt,
     stable_systemd_unit,
     transition_attempt,
@@ -44,6 +47,7 @@ from kanban_readiness import (
     _validate_attempt,
     _validate_receipt,
     ensure_schema as ensure_readiness_schema,
+    record as record_readiness,
 )
 
 
@@ -52,9 +56,19 @@ INPUT_SCHEMA = "twinfinity-role-broker-input/v1"
 ISOLATION_SCHEMA = "twinfinity-role-broker-isolation/v1"
 RESULT_PATH = "/run/twinfinity-attempt/out/receipt.json"
 RESULT_MAX_BYTES = 1_048_576
+RESULT_SCHEMA_PATH = "/run/twinfinity-attempt/receipt.schema.json"
+INSTRUCTION_PATH = "/run/twinfinity-attempt/instructions/SKILL.md"
+INSTRUCTION_BUNDLE_SCHEMA = "twinfinity-readiness-instruction-bundle/v1"
+PICKUP_CONSUMPTION_SCHEMA = "twinfinity-role-broker-pickup-consumption/v1"
+MODEL_TRANSPORT_SCHEMA = "twinfinity-attempt-bound-responses-proxy/v1"
+BROKER_WALL_SECONDS = 600
+BROKER_CPU_SECONDS = 300
+BROKER_NOFILE_LIMIT = 64
+BROKER_LOG_BYTES = 0
 BROKER_STATES = {"PREPARING", "LAUNCHING", "RUNNING", "COMPLETE", "HOLD"}
 BROKER_ACTIVE_STATES = {"PREPARING", "LAUNCHING", "RUNNING"}
 BROKER_PROTOCOL = BROKERED_READINESS_PROTOCOL
+REFERENCE_ROOT = Path(__file__).resolve().parents[1] / "references"
 
 
 class BrokerError(RegistryError):
@@ -69,16 +83,6 @@ class BrokerRuntimePaths:
     bwrap_path: Path
     setpriv_path: Path
     codex_binary_path: Path
-    codex_auth_path: Path
-    development_skill_root: Path
-    sre_skill_root: Path
-
-    def role_skill_root(self, role: str) -> Path:
-        if role == "development":
-            return self.development_skill_root
-        if role == "sre":
-            return self.sre_skill_root
-        raise BrokerError("BROKER_ROLE_INVALID")
 
 
 @dataclass(frozen=True)
@@ -88,23 +92,20 @@ class BrokerSpool:
     root: Path
     contract_path: Path
     input_path: Path
+    instruction_path: Path
+    receipt_schema_path: Path
+    runtime_profile_path: Path
     receipt_path: Path
     masked_coordination_root: Path
 
 
 def default_runtime_paths() -> BrokerRuntimePaths:
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    codex_home = home / ".codex"
     return BrokerRuntimePaths(
         spool_root=Path(f"/run/user/{os.getuid()}/twinfinity-role-broker"),
         bwrap_path=Path("/usr/bin/bwrap"),
         setpriv_path=Path("/usr/bin/setpriv"),
         codex_binary_path=(home / ".local/bin/codex").resolve(),
-        codex_auth_path=codex_home / "auth.json",
-        development_skill_root=codex_home
-        / "skills"
-        / "twinfinity-development-executor",
-        sre_skill_root=codex_home / "skills" / "twinfinity-devops-sre",
     )
 
 
@@ -186,6 +187,17 @@ def ensure_broker_schema(connection: sqlite3.Connection) -> None:
                 FOREIGN KEY(campaign_id) REFERENCES portfolio_readiness_campaigns(id),
                 FOREIGN KEY(message_id) REFERENCES coordination_messages(id)
             );
+            CREATE TABLE IF NOT EXISTS role_executor_broker_pickup_consumptions (
+                attempt_id TEXT PRIMARY KEY,
+                campaign_id INTEGER NOT NULL,
+                receipt_sha256 TEXT NOT NULL UNIQUE,
+                outcome_sha256 TEXT NOT NULL,
+                outcome_json TEXT NOT NULL,
+                consumed_at TEXT NOT NULL,
+                FOREIGN KEY(attempt_id)
+                    REFERENCES role_executor_broker_receipt_pickups(attempt_id),
+                FOREIGN KEY(campaign_id) REFERENCES portfolio_readiness_campaigns(id)
+            );
             CREATE TABLE IF NOT EXISTS role_executor_broker_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 attempt_id TEXT NOT NULL,
@@ -248,6 +260,12 @@ def ensure_broker_schema(connection: sqlite3.Connection) -> None:
             CREATE TRIGGER IF NOT EXISTS role_executor_broker_pickup_delete
             BEFORE DELETE ON role_executor_broker_receipt_pickups
             BEGIN SELECT RAISE(ABORT, 'BROKER_RECEIPT_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS role_executor_broker_consumption_update
+            BEFORE UPDATE ON role_executor_broker_pickup_consumptions
+            BEGIN SELECT RAISE(ABORT, 'BROKER_CONSUMPTION_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS role_executor_broker_consumption_delete
+            BEFORE DELETE ON role_executor_broker_pickup_consumptions
+            BEGIN SELECT RAISE(ABORT, 'BROKER_CONSUMPTION_IMMUTABLE'); END;
             CREATE TRIGGER IF NOT EXISTS role_executor_broker_event_update
             BEFORE UPDATE ON role_executor_broker_events
             BEGIN SELECT RAISE(ABORT, 'BROKER_EVENT_IMMUTABLE'); END;
@@ -307,12 +325,20 @@ def isolation_manifest(configured: EndpointConfig) -> dict[str, Any]:
         "capabilities": "DROP_ALL",
         "no_new_privileges": True,
         "namespaces": ["user", "pid", "ipc", "uts", "cgroup"],
-        "network_namespace": "HOST_FOR_MODEL_TRANSPORT",
+        "network_namespace": "HOST_FOR_FUTURE_ATTEMPT_BOUND_RESPONSES_PROXY",
+        "credential_transport": "NOT_IMPLEMENTED",
         "private_mounts": ["/proc", "/tmp", "/run", "/dev"],
         "coordination_root": "MASKED_READ_ONLY",
         "owner_database": "ABSENT",
         "user_dbus": "ABSENT",
         "persistent_writes": [RESULT_PATH],
+        "limits": {
+            "wall_seconds": BROKER_WALL_SECONDS,
+            "cpu_seconds": BROKER_CPU_SECONDS,
+            "file_bytes": RESULT_MAX_BYTES,
+            "open_files": BROKER_NOFILE_LIMIT,
+            "captured_log_bytes": BROKER_LOG_BYTES,
+        },
         "profile_sha256": configured.profile_sha256,
     }
 
@@ -331,6 +357,82 @@ def _parse_canonical_json(raw: str, expected_sha256: str, error: str) -> Any:
     if digest_json(value) != expected_sha256 or canonical_json(value) != raw:
         raise BrokerError(error)
     return value
+
+
+def _instruction_source(role: str) -> Path:
+    if role == "development":
+        return REFERENCE_ROOT / "readiness-evaluator-development.md"
+    if role == "sre":
+        return REFERENCE_ROOT / "readiness-evaluator-sre.md"
+    raise BrokerError("BROKER_ROLE_INVALID")
+
+
+def _read_reviewed_reference(path: Path, code: str) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        raise BrokerError(code) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or before.st_nlink != 1
+        or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or len(raw) != before.st_size
+    ):
+        raise BrokerError(code)
+    return raw
+
+
+def instruction_bundle(role: str) -> dict[str, Any]:
+    """Load the complete reviewed evaluator closure as digest-bound bytes."""
+
+    instruction_raw = _read_reviewed_reference(
+        _instruction_source(role), "BROKER_INSTRUCTION_BUNDLE_INVALID"
+    )
+    schema_raw = _read_reviewed_reference(
+        REFERENCE_ROOT / "twinfinity-kanban-readiness-receipt-v1.schema.json",
+        "BROKER_RECEIPT_SCHEMA_INVALID",
+    )
+    try:
+        instruction_text = instruction_raw.decode("utf-8")
+        schema_text = schema_raw.decode("utf-8")
+        schema = json.loads(schema_text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BrokerError("BROKER_INSTRUCTION_BUNDLE_INVALID") from exc
+    if (
+        not isinstance(schema, dict)
+        or schema.get("$id") != RECEIPT_SCHEMA
+        or schema.get("additionalProperties") is not False
+    ):
+        raise BrokerError("BROKER_RECEIPT_SCHEMA_INVALID")
+    return {
+        "schema": INSTRUCTION_BUNDLE_SCHEMA,
+        "instruction": {
+            "path": INSTRUCTION_PATH,
+            "sha256": hashlib.sha256(instruction_raw).hexdigest(),
+            "text": instruction_text,
+        },
+        "receipt_schema": {
+            "path": RESULT_SCHEMA_PATH,
+            "sha256": hashlib.sha256(schema_raw).hexdigest(),
+            "text": schema_text,
+        },
+    }
 
 
 def _build_input_projection(
@@ -356,11 +458,12 @@ def _build_input_projection(
         "BROKER_MESSAGE_MISSING",
     )
     if (
-        message["state"] not in {"PREPARED", "CLAIMED"}
-        or message["recipient_session_id"] != endpoint_id
+        message["recipient_session_id"] != endpoint_id
         or message["topic"] != "coordination.notice"
     ):
         raise BrokerError("BROKER_RPC_NOT_IMPLEMENTED")
+    if message["state"] != "PREPARED" or message["claimed_by"] is not None:
+        raise BrokerError("BROKER_MESSAGE_NOT_PREPARED")
     payload = _parse_canonical_json(
         str(message["payload_json"]),
         str(message["payload_sha256"]),
@@ -400,6 +503,8 @@ def _build_input_projection(
         ).fetchone(),
         "BROKER_READINESS_CAMPAIGN_MISSING",
     )
+    if campaign["attempt_id"] is not None:
+        raise BrokerError("BROKER_READINESS_ALREADY_ATTACHED")
     if (
         campaign["worker_role"] != role
         or campaign["state"] != "RUNNING"
@@ -532,6 +637,7 @@ def _build_input_projection(
     ):
         raise BrokerError("BROKER_READINESS_BINDING_INVALID")
 
+    bundle = instruction_bundle(role)
     projection = {
         "schema": INPUT_SCHEMA,
         "message": {
@@ -564,6 +670,7 @@ def _build_input_projection(
         },
         "capacity_policy": policy,
         "candidate": candidate,
+        "instruction_bundle": bundle,
     }
     binding = {
         "message_id": message_id,
@@ -581,6 +688,9 @@ def _build_input_projection(
         "capacity_policy_version": int(campaign["capacity_policy_version"]),
         "capacity_policy_sha256": digest_json(policy),
         "gate_set_sha256": digest_json(gates),
+        "instruction_closure_sha256": digest_json(bundle),
+        "instruction_sha256": bundle["instruction"]["sha256"],
+        "receipt_schema_sha256": bundle["receipt_schema"]["sha256"],
     }
     return projection, binding
 
@@ -607,6 +717,19 @@ def _build_contract(
         "result_schema": RECEIPT_SCHEMA,
         "result_path": RESULT_PATH,
         "result_max_bytes": RESULT_MAX_BYTES,
+        "instruction_path": INSTRUCTION_PATH,
+        "receipt_schema_path": RESULT_SCHEMA_PATH,
+        "model_transport": {
+            "schema": MODEL_TRANSPORT_SCHEMA,
+            "state": "NOT_IMPLEMENTED",
+            "kind": "ATTEMPT_BOUND_HOST_RESPONSES_PROXY",
+            "requires_openai_auth": False,
+            "environment_key": None,
+            "credential_mount": None,
+        },
+        "runtime_profile_path": (
+            f"/tmp/codex-home/{configured.runtime_codex_profile}.config.toml"
+        ),
         "isolation_sha256": isolation_sha256,
         "profile_sha256": configured.profile_sha256,
     }
@@ -617,6 +740,7 @@ def prepare_broker_run(
     *,
     configured: EndpointConfig,
     attempt_id: str,
+    profile_path: Path,
     now: str,
 ) -> dict[str, Any]:
     """Persist one immutable PREPARING contract before any child exists."""
@@ -662,6 +786,20 @@ def prepare_broker_run(
             target_kind=str(attempt["target_kind"]),
             target_key=str(attempt["target_key"]),
         )
+        profile_raw = _read_reviewed_reference(
+            profile_path, "BROKER_PROFILE_INVALID"
+        )
+        if hashlib.sha256(profile_raw).hexdigest() != configured.profile_sha256:
+            raise BrokerError("BROKER_PROFILE_DIGEST_MISMATCH")
+        try:
+            profile_text = profile_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise BrokerError("BROKER_PROFILE_INVALID") from exc
+        projection["runtime_profile"] = {
+            "path": f"/tmp/codex-home/{configured.runtime_codex_profile}.config.toml",
+            "sha256": configured.profile_sha256,
+            "text": profile_text,
+        }
         projection_json = canonical_json(projection)
         projection_sha256 = hashlib.sha256(projection_json.encode("utf-8")).hexdigest()
         contract = _build_contract(
@@ -812,10 +950,46 @@ def prepare_spool(runtime: BrokerRuntimePaths, run: dict[str, Any]) -> BrokerSpo
     except FileExistsError:
         pass
     _safe_directory(root, create=False)
+    projection = _parse_canonical_json(
+        str(run["input_projection_json"]),
+        str(run["input_projection_sha256"]),
+        "BROKER_INPUT_PROJECTION_INVALID",
+    )
+    contract = _parse_canonical_json(
+        str(run["contract_json"]),
+        str(run["contract_sha256"]),
+        "BROKER_CONTRACT_INVALID",
+    )
+    bundle = projection.get("instruction_bundle") if isinstance(projection, dict) else None
+    if (
+        not isinstance(bundle, dict)
+        or digest_json(bundle)
+        != contract.get("instruction_closure_sha256")
+        or not isinstance(bundle.get("instruction"), dict)
+        or not isinstance(bundle.get("receipt_schema"), dict)
+        or bundle["instruction"].get("path") != contract.get("instruction_path")
+        or bundle["instruction"].get("sha256")
+        != contract.get("instruction_sha256")
+        or bundle["receipt_schema"].get("path")
+        != contract.get("receipt_schema_path")
+        or bundle["receipt_schema"].get("sha256")
+        != contract.get("receipt_schema_sha256")
+    ):
+        raise BrokerError("BROKER_INSTRUCTION_BUNDLE_INVALID")
+    runtime_profile = (
+        projection.get("runtime_profile") if isinstance(projection, dict) else None
+    )
+    if (
+        not isinstance(runtime_profile, dict)
+        or runtime_profile.get("sha256") != run["profile_sha256"]
+        or runtime_profile.get("path") != contract.get("runtime_profile_path")
+    ):
+        raise BrokerError("BROKER_PROFILE_INVALID")
     input_root = root / "input"
+    instruction_root = root / "instructions"
     output_root = root / "out"
     masked = root / "masked-coordination"
-    for directory in (input_root, output_root, masked):
+    for directory in (input_root, instruction_root, output_root, masked):
         try:
             directory.mkdir(mode=0o700)
         except FileExistsError:
@@ -823,6 +997,9 @@ def prepare_spool(runtime: BrokerRuntimePaths, run: dict[str, Any]) -> BrokerSpo
         _safe_directory(directory, create=False)
     contract_path = root / "contract.json"
     input_path = input_root / "input.json"
+    instruction_path = instruction_root / "SKILL.md"
+    receipt_schema_path = root / "receipt.schema.json"
+    runtime_profile_path = root / "runtime-profile.config.toml"
     receipt_path = output_root / "receipt.json"
     _write_immutable_file(
         contract_path, str(run["contract_json"]).encode("utf-8"), 0o400
@@ -830,12 +1007,40 @@ def prepare_spool(runtime: BrokerRuntimePaths, run: dict[str, Any]) -> BrokerSpo
     _write_immutable_file(
         input_path, str(run["input_projection_json"]).encode("utf-8"), 0o400
     )
+    instruction_text = bundle["instruction"].get("text")
+    schema_text = bundle["receipt_schema"].get("text")
+    if not isinstance(instruction_text, str) or not isinstance(schema_text, str):
+        raise BrokerError("BROKER_INSTRUCTION_BUNDLE_INVALID")
+    if (
+        hashlib.sha256(instruction_text.encode("utf-8")).hexdigest()
+        != bundle["instruction"].get("sha256")
+        or hashlib.sha256(schema_text.encode("utf-8")).hexdigest()
+        != bundle["receipt_schema"].get("sha256")
+    ):
+        raise BrokerError("BROKER_INSTRUCTION_BUNDLE_INVALID")
+    _write_immutable_file(instruction_path, instruction_text.encode("utf-8"), 0o400)
+    _write_immutable_file(receipt_schema_path, schema_text.encode("utf-8"), 0o400)
+    profile_text = runtime_profile.get("text")
+    profile_target = runtime_profile.get("path")
+    if (
+        not isinstance(profile_text, str)
+        or not isinstance(profile_target, str)
+        or not profile_target.startswith("/tmp/codex-home/twinfinity-")
+        or not profile_target.endswith(".config.toml")
+        or hashlib.sha256(profile_text.encode("utf-8")).hexdigest()
+        != run["profile_sha256"]
+    ):
+        raise BrokerError("BROKER_PROFILE_INVALID")
+    _write_immutable_file(runtime_profile_path, profile_text.encode("utf-8"), 0o400)
     if not receipt_path.exists():
         _write_immutable_file(receipt_path, b"", 0o600)
     return BrokerSpool(
         root=root,
         contract_path=contract_path,
         input_path=input_path,
+        instruction_path=instruction_path,
+        receipt_schema_path=receipt_schema_path,
+        runtime_profile_path=runtime_profile_path,
         receipt_path=receipt_path,
         masked_coordination_root=masked,
     )
@@ -856,8 +1061,9 @@ def broker_prompt(role: str) -> str:
     if role not in {"development", "sre"}:
         raise BrokerError("BROKER_ROLE_INVALID")
     return (
-        "Read the exact broker contract and canonical input projection at the "
-        "paths named by TWINFINITY_BROKER_CONTRACT and TWINFINITY_BROKER_INPUT. "
+        f"Read and apply {INSTRUCTION_PATH} completely. Then read the exact "
+        "broker contract and canonical input projection at the paths named by "
+        "TWINFINITY_BROKER_CONTRACT and TWINFINITY_BROKER_INPUT. "
         "Evaluate every gate once without mutation. Write exactly one strict "
         f"{RECEIPT_SCHEMA} JSON object to {RESULT_PATH}; do not write any other "
         "persistent file."
@@ -867,7 +1073,6 @@ def broker_prompt(role: str) -> str:
 def build_bwrap_command(
     *,
     configured: EndpointConfig,
-    profile_path: Path,
     runtime: BrokerRuntimePaths,
     spool: BrokerSpool,
     start_gate_fd: int,
@@ -884,12 +1089,12 @@ def build_bwrap_command(
         (runtime.bwrap_path, False, "BROKER_BWRAP_MISSING"),
         (runtime.setpriv_path, False, "BROKER_SETPRIV_MISSING"),
         (runtime.codex_binary_path, False, "BROKER_CODEX_MISSING"),
-        (runtime.codex_auth_path, False, "BROKER_CODEX_AUTH_MISSING"),
-        (runtime.role_skill_root(configured.role), True, "BROKER_ROLE_SKILL_MISSING"),
-        (profile_path, False, "BROKER_PROFILE_MISSING"),
+        (spool.runtime_profile_path, False, "BROKER_PROFILE_MISSING"),
         (spool.root, True, "BROKER_SPOOL_UNSAFE"),
         (spool.contract_path, False, "BROKER_SPOOL_UNSAFE"),
         (spool.input_path, False, "BROKER_SPOOL_UNSAFE"),
+        (spool.instruction_path, False, "BROKER_SPOOL_UNSAFE"),
+        (spool.receipt_schema_path, False, "BROKER_SPOOL_UNSAFE"),
         (spool.receipt_path, False, "BROKER_SPOOL_UNSAFE"),
         (spool.masked_coordination_root, True, "BROKER_SPOOL_UNSAFE"),
     ):
@@ -907,8 +1112,9 @@ def build_bwrap_command(
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
-        "--unshare-cgroup-try",
+        "--unshare-cgroup",
         "--disable-userns",
+        "--assert-userns-disabled",
         "--cap-drop",
         "ALL",
         "--block-fd",
@@ -935,6 +1141,9 @@ def build_bwrap_command(
         "--setenv",
         "TWINFINITY_BROKER_RESULT",
         RESULT_PATH,
+        "--setenv",
+        "TWINFINITY_BROKER_RESULT_SCHEMA",
+        RESULT_SCHEMA_PATH,
         "--tmpfs",
         "/",
         "--ro-bind",
@@ -984,21 +1193,9 @@ def build_bwrap_command(
         "/tmp/broker-home",
         "--dir",
         "/tmp/codex-home",
-        "--dir",
-        "/tmp/codex-home/skills",
         "--ro-bind",
-        os.fspath(runtime.codex_auth_path),
-        "/tmp/codex-home/auth.json",
-        "--ro-bind",
-        os.fspath(profile_path),
+        os.fspath(spool.runtime_profile_path),
         f"/tmp/codex-home/{configured.runtime_codex_profile}.config.toml",
-        "--ro-bind",
-        os.fspath(runtime.role_skill_root(configured.role)),
-        (
-            "/tmp/codex-home/skills/twinfinity-development-executor"
-            if configured.role == "development"
-            else "/tmp/codex-home/skills/twinfinity-devops-sre"
-        ),
     ]
     for source, target in (
         (Path("/etc/ssl/certs"), "/etc/ssl/certs"),
@@ -1032,6 +1229,56 @@ def build_bwrap_command(
         ]
     )
     return command
+
+
+def attest_bwrap_command(command: list[str]) -> dict[str, Any]:
+    """Validate and digest the exact pre-launch isolation command."""
+
+    required_once = {
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--disable-userns",
+        "--assert-userns-disabled",
+        "--cap-drop",
+        "--block-fd",
+        "--clearenv",
+    }
+    if any(command.count(flag) != 1 for flag in required_once):
+        raise BrokerError("BROKER_NAMESPACE_POLICY_INVALID")
+    joined = "\n".join(command)
+    if (
+        "auth.json" in joined
+        or "TWINFINITY_EXECUTOR_TOKEN" in joined
+        or "DBUS_SESSION_BUS_ADDRESS" in joined
+        or "--unshare-cgroup-try" in command
+        or command.count("--bind") != 1
+        or RESULT_PATH not in command
+        or INSTRUCTION_PATH not in joined
+        or RESULT_SCHEMA_PATH not in joined
+    ):
+        raise BrokerError("BROKER_NAMESPACE_POLICY_INVALID")
+    return {
+        "schema": "twinfinity-role-broker-command-attestation/v1",
+        "command_sha256": digest_json(command),
+        "required_flags": sorted(required_once),
+        "credential_mount": None,
+        "writable_paths": [RESULT_PATH],
+        "limits": {
+            "wall_seconds": BROKER_WALL_SECONDS,
+            "cpu_seconds": BROKER_CPU_SECONDS,
+            "file_bytes": RESULT_MAX_BYTES,
+            "open_files": BROKER_NOFILE_LIMIT,
+            "captured_log_bytes": BROKER_LOG_BYTES,
+        },
+    }
 
 
 def _attempt_transition(
@@ -1140,6 +1387,7 @@ def mark_broker_launching(
     attempt_id: str,
     token: str,
     evidence: SystemdUnitEvidence,
+    command_attestation: dict[str, Any],
     now: str,
 ) -> dict[str, Any]:
     """Atomically bind systemd identity and enter broker LAUNCHING."""
@@ -1157,6 +1405,13 @@ def mark_broker_launching(
         if run is None or attempt is None or run["state"] != "PREPARING":
             raise BrokerError("BROKER_RUN_STATE_CONFLICT")
         _require_attempt_token(attempt, token)
+        if (
+            command_attestation.get("schema")
+            != "twinfinity-role-broker-command-attestation/v1"
+            or not SHA256.fullmatch(str(command_attestation.get("command_sha256", "")))
+            or command_attestation.get("credential_mount") is not None
+        ):
+            raise BrokerError("BROKER_COMMAND_ATTESTATION_INVALID")
         _attempt_transition(
             connection,
             attempt,
@@ -1184,7 +1439,7 @@ def mark_broker_launching(
             from_version=int(run["version"]),
             to_version=new_version,
             reason="BROKER_CHILD_GATED",
-            payload=None,
+            payload=command_attestation,
             now=now,
         )
         updated = connection.execute(
@@ -1461,15 +1716,15 @@ def hold_broker_run(
         campaign = _campaign(
             connection, str(run["repository"]), int(run["issue_number"])
         )
-        after_attach = (
-            run["state"] == "RUNNING"
-            and message is not None
-            and message["state"] == "CLAIMED"
-            and message["claimed_by"] == run["endpoint_id"]
-            and campaign["attempt_id"] == attempt_id
-        )
+        after_attach = campaign["attempt_id"] == attempt_id
         if after_attach:
-            if attempt["state"] != "RUNNING":
+            if (
+                run["state"] != "RUNNING"
+                or attempt["state"] != "RUNNING"
+                or message is None
+                or message["state"] != "CLAIMED"
+                or message["claimed_by"] != run["endpoint_id"]
+            ):
                 raise BrokerError("BROKER_ATTEMPT_STATE_CONFLICT")
             held_message = connection.execute(
                 """
@@ -1507,18 +1762,16 @@ def hold_broker_run(
                 exit_code=exit_code,
             )
         else:
-            if (
-                message is None
-                or message["state"] != "PREPARED"
-                or message["claimed_by"] is not None
-                or campaign["attempt_id"] is not None
-                or attempt["state"] not in {"RESERVED", "LAUNCHING"}
-            ):
+            if attempt["state"] not in {"RESERVED", "LAUNCHING", "RUNNING"}:
                 raise BrokerError("BROKER_PRECLAIM_STATE_CONFLICT")
             _attempt_transition(
                 connection,
                 attempt,
-                new_state="LAUNCH_FAILED",
+                new_state=(
+                    "LAUNCH_FAILED"
+                    if attempt["state"] in {"RESERVED", "LAUNCHING"}
+                    else "HOLD"
+                ),
                 now=now,
                 reason=error,
                 exit_code=exit_code,
@@ -1544,7 +1797,15 @@ def hold_broker_run(
             from_version=old_version,
             to_version=new_version,
             reason=error,
-            payload={"after_attach": after_attach, "exit_code": exit_code},
+            payload={
+                "after_attach": after_attach,
+                "exit_code": exit_code,
+                "observed_message_state": None if message is None else message["state"],
+                "observed_message_claimed_by": (
+                    None if message is None else message["claimed_by"]
+                ),
+                "observed_readiness_attempt_id": campaign["attempt_id"],
+            },
             now=now,
         )
         result = connection.execute(
@@ -1906,6 +2167,141 @@ def replay_broker_receipt(
     )
 
 
+def consume_broker_pickup(
+    connection: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    now: str,
+) -> dict[str, Any]:
+    """Record only the immutable SQLite pickup into readiness, idempotently."""
+
+    ensure_broker_schema(connection)
+    existing = connection.execute(
+        "SELECT * FROM role_executor_broker_pickup_consumptions WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    if existing is not None:
+        outcome = _parse_canonical_json(
+            str(existing["outcome_json"]),
+            str(existing["outcome_sha256"]),
+            "BROKER_CONSUMPTION_INVALID",
+        )
+        return outcome
+    pickup = connection.execute(
+        """
+        SELECT pickup.*, run.state AS run_state,
+               run.receipt_sha256 AS run_receipt_sha256
+        FROM role_executor_broker_receipt_pickups pickup
+        JOIN role_executor_broker_runs run ON run.attempt_id=pickup.attempt_id
+        WHERE pickup.attempt_id=?
+        """,
+        (attempt_id,),
+    ).fetchone()
+    if (
+        pickup is None
+        or pickup["run_state"] != "COMPLETE"
+        or pickup["state"] != "STAGED"
+        or pickup["receipt_sha256"] != pickup["run_receipt_sha256"]
+    ):
+        raise BrokerError("BROKER_PICKUP_BINDING_INVALID")
+    receipt = _parse_canonical_json(
+        str(pickup["receipt_json"]),
+        str(pickup["receipt_sha256"]),
+        "BROKER_PICKUP_BINDING_INVALID",
+    )
+    if not isinstance(receipt, dict) or receipt.get("attempt_id") != attempt_id:
+        raise BrokerError("BROKER_PICKUP_BINDING_INVALID")
+    try:
+        recorded = record_readiness(_store_for_connection(connection), receipt, now=now)
+    except ReadinessError as exc:
+        raise BrokerError(str(exc)) from exc
+    outcome = {
+        "schema": PICKUP_CONSUMPTION_SCHEMA,
+        "attempt_id": attempt_id,
+        "campaign_id": int(pickup["campaign_id"]),
+        "receipt_sha256": str(pickup["receipt_sha256"]),
+        "readiness_state": str(recorded["state"]),
+        "verdict": str(recorded["verdict"]),
+    }
+    outcome_json = canonical_json(outcome)
+    outcome_sha256 = hashlib.sha256(outcome_json.encode("utf-8")).hexdigest()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        current_pickup = connection.execute(
+            """
+            SELECT pickup.receipt_sha256, run.state AS run_state
+            FROM role_executor_broker_receipt_pickups pickup
+            JOIN role_executor_broker_runs run ON run.attempt_id=pickup.attempt_id
+            WHERE pickup.attempt_id=?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if (
+            current_pickup is None
+            or current_pickup["run_state"] != "COMPLETE"
+            or current_pickup["receipt_sha256"] != pickup["receipt_sha256"]
+        ):
+            raise BrokerError("BROKER_PICKUP_BINDING_INVALID")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO role_executor_broker_pickup_consumptions(
+                attempt_id, campaign_id, receipt_sha256, outcome_sha256,
+                outcome_json, consumed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_id,
+                int(pickup["campaign_id"]),
+                str(pickup["receipt_sha256"]),
+                outcome_sha256,
+                outcome_json,
+                now,
+            ),
+        )
+        stored = connection.execute(
+            "SELECT * FROM role_executor_broker_pickup_consumptions WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if (
+            stored is None
+            or stored["receipt_sha256"] != pickup["receipt_sha256"]
+            or stored["outcome_sha256"] != outcome_sha256
+            or stored["outcome_json"] != outcome_json
+        ):
+            raise BrokerError("BROKER_CONSUMPTION_CONFLICT")
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    return outcome
+
+
+def consume_staged_broker_pickups(
+    connection: sqlite3.Connection, *, now: str
+) -> list[dict[str, Any]]:
+    """Consume all canonical staged pickups; caller bytes are never accepted."""
+
+    ensure_broker_schema(connection)
+    attempt_ids = [
+        str(row["attempt_id"])
+        for row in connection.execute(
+            """
+            SELECT pickup.attempt_id
+            FROM role_executor_broker_receipt_pickups pickup
+            LEFT JOIN role_executor_broker_pickup_consumptions consumed
+              ON consumed.attempt_id=pickup.attempt_id
+            WHERE pickup.state='STAGED' AND consumed.attempt_id IS NULL
+            ORDER BY pickup.id
+            """
+        )
+    ]
+    return [
+        consume_broker_pickup(connection, attempt_id=attempt_id, now=now)
+        for attempt_id in attempt_ids
+    ]
+
+
 def _terminate_child(process: subprocess.Popen[Any]) -> None:
     try:
         process.terminate()
@@ -1915,6 +2311,14 @@ def _terminate_child(process: subprocess.Popen[Any]) -> None:
             process.kill()
         except Exception:
             pass
+
+
+def _apply_child_resource_limits() -> None:
+    """Install non-expandable kernel limits before setpriv/bwrap executes."""
+
+    resource.setrlimit(resource.RLIMIT_FSIZE, (RESULT_MAX_BYTES, RESULT_MAX_BYTES))
+    resource.setrlimit(resource.RLIMIT_CPU, (BROKER_CPU_SECONDS, BROKER_CPU_SECONDS))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (BROKER_NOFILE_LIMIT, BROKER_NOFILE_LIMIT))
 
 
 def _error_code(exc: BaseException, fallback: str) -> str:
@@ -1927,6 +2331,214 @@ def _error_code(exc: BaseException, fallback: str) -> str:
     ):
         return value
     return fallback
+
+
+def broker_terminal_readback(
+    connection: sqlite3.Connection,
+    *,
+    attempt_id: str,
+) -> dict[str, Any]:
+    """Read exact terminal/active row truth; never infer it from control flow."""
+
+    attempt = connection.execute(
+        "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+    ).fetchone()
+    if attempt is None:
+        raise BrokerError("BROKER_ATTEMPT_MISSING")
+    run = connection.execute(
+        "SELECT * FROM role_executor_broker_runs WHERE attempt_id=?", (attempt_id,)
+    ).fetchone()
+    message = None
+    readiness = None
+    if run is not None:
+        message = connection.execute(
+            "SELECT state, claimed_by FROM coordination_messages WHERE id=?",
+            (int(run["message_id"]),),
+        ).fetchone()
+        readiness = connection.execute(
+            """
+            SELECT state, attempt_id FROM portfolio_readiness_current
+            WHERE campaign_id=?
+            """,
+            (int(run["campaign_id"]),),
+        ).fetchone()
+    elif attempt["target_kind"] == "message":
+        try:
+            message_id = int(attempt["target_key"])
+        except (TypeError, ValueError):
+            message_id = -1
+        message = connection.execute(
+            "SELECT state, claimed_by FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+    return {
+        "state": str(attempt["state"]),
+        "broker_state": None if run is None else str(run["state"]),
+        "message_state": None if message is None else str(message["state"]),
+        "message_claimed_by": None if message is None else message["claimed_by"],
+        "readiness_state": None if readiness is None else str(readiness["state"]),
+        "readiness_attempt_id": (
+            None if readiness is None else readiness["attempt_id"]
+        ),
+    }
+
+
+def _inactive_systemd_evidence(
+    attempt: sqlite3.Row,
+    evidence_reader: Callable[[str], SystemdUnitEvidence],
+) -> tuple[SystemdUnitEvidence | None, str | None]:
+    unit = str(attempt["systemd_unit"] or "")
+    invocation_id = str(attempt["systemd_invocation_id"] or "")
+    control_group = str(attempt["systemd_control_group"] or "")
+    expected_unit = stable_systemd_unit(
+        str(attempt["role"]), str(attempt["target_kind"]), str(attempt["target_key"])
+    )
+    if (
+        unit != expected_unit
+        or SYSTEMD_INVOCATION_ID.fullmatch(invocation_id) is None
+        or not control_group.startswith("/")
+        or not control_group.endswith(f"/{unit}")
+    ):
+        return None, "BROKER_RECOVERY_STORED_IDENTITY_INVALID"
+    try:
+        evidence = evidence_reader(unit)
+    except (OSError, subprocess.SubprocessError, RegistryError):
+        return None, "BROKER_RECOVERY_SYSTEMD_EVIDENCE_FAILED"
+    if (
+        evidence.unit != unit
+        or evidence.invocation_id != invocation_id
+        or evidence.control_group != control_group
+    ):
+        return None, "BROKER_RECOVERY_SYSTEMD_IDENTITY_MISMATCH"
+    if (
+        evidence.load_state != "loaded"
+        or evidence.active_state != "inactive"
+        or evidence.sub_state != "dead"
+        or evidence.result
+        not in {
+            "success",
+            "exit-code",
+            "signal",
+            "core-dump",
+            "watchdog",
+            "timeout",
+            "resources",
+            "protocol",
+        }
+    ):
+        return None, "BROKER_RECOVERY_SYSTEMD_NOT_PROVEN_INACTIVE"
+    return evidence, None
+
+
+def recover_stale_broker_runs(
+    connection: sqlite3.Connection,
+    *,
+    before: str,
+    now: str,
+    runtime: BrokerRuntimePaths | None = None,
+    evidence_reader: Callable[[str], SystemdUnitEvidence] = probe_systemd_unit,
+) -> list[dict[str, Any]]:
+    """Recover active broker rows without letting generic recovery split truth."""
+
+    ensure_broker_schema(connection)
+    candidates = connection.execute(
+        """
+        SELECT run.attempt_id, run.state AS broker_state, run.updated_at AS broker_updated,
+               attempt.*
+        FROM role_executor_broker_runs run
+        JOIN executor_attempts attempt ON attempt.attempt_id=run.attempt_id
+        WHERE run.state IN ('PREPARING','LAUNCHING','RUNNING')
+          AND attempt.heartbeat_at<?
+        ORDER BY run.created_at
+        """,
+        (before,),
+    ).fetchall()
+    results: list[dict[str, Any]] = []
+    for candidate in candidates:
+        attempt_id = str(candidate["attempt_id"])
+        broker_state = str(candidate["broker_state"])
+        if broker_state != "PREPARING":
+            _evidence, evidence_error = _inactive_systemd_evidence(
+                candidate, evidence_reader
+            )
+            if evidence_error is not None:
+                results.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "phase": "HOLD",
+                        "error": evidence_error,
+                        **broker_terminal_readback(connection, attempt_id=attempt_id),
+                    }
+                )
+                continue
+        if broker_state == "RUNNING":
+            try:
+                replayed = replay_broker_receipt(
+                    connection,
+                    attempt_id=attempt_id,
+                    runtime=runtime,
+                    now=now,
+                )
+                consumed = consume_broker_pickup(
+                    connection, attempt_id=attempt_id, now=now
+                )
+                results.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "phase": "RECOVERED",
+                        "receipt_sha256": replayed["receipt_sha256"],
+                        "readiness_state": consumed["readiness_state"],
+                        **broker_terminal_readback(connection, attempt_id=attempt_id),
+                    }
+                )
+                continue
+            except BrokerError as exc:
+                recovery_error = _error_code(
+                    exc, "BROKER_RECOVERY_RECEIPT_UNAVAILABLE"
+                )
+        else:
+            recovery_error = "BROKER_RECOVERED_STALE_PRECLAIM"
+        try:
+            hold_broker_run(
+                connection,
+                attempt_id=attempt_id,
+                error=recovery_error,
+                now=now,
+                exit_code=None,
+            )
+            readback = broker_terminal_readback(connection, attempt_id=attempt_id)
+            results.append(
+                {
+                    "attempt_id": attempt_id,
+                    "phase": "RECOVERED",
+                    "error": recovery_error,
+                    **readback,
+                }
+            )
+        except BrokerError as exc:
+            readback = broker_terminal_readback(connection, attempt_id=attempt_id)
+            if readback["state"] in {"COMPLETE", "HOLD", "LAUNCH_FAILED"}:
+                results.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "phase": "OBSERVED_TERMINAL",
+                        "error": _error_code(exc, "BROKER_RECOVERY_RACE"),
+                        **readback,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "attempt_id": attempt_id,
+                        "phase": "HOLD",
+                        "error": "BROKER_RECOVERY_TERMINALIZATION_FAILED",
+                        "terminalization_error": _error_code(
+                            exc, "BROKER_RECOVERY_TERMINALIZATION_FAILED"
+                        ),
+                        **readback,
+                    }
+                )
+    return results
 
 
 def execute_brokered_readiness(
@@ -1961,6 +2573,38 @@ def execute_brokered_readiness(
         raise
     except Exception as exc:
         raise BrokerError("BROKER_INPUT_PROJECTION_INVALID") from exc
+    # Codex currently needs model credentials, but mounting auth.json would
+    # expose the same credential to every tool child in the sandbox.  A later
+    # exact attempt-bound local Responses proxy may satisfy the contract with
+    # requires_openai_auth=false.  Until then, never reserve or claim work.
+    raise BrokerError("BROKER_CREDENTIAL_TRANSPORT_NOT_IMPLEMENTED")
+
+
+def _execute_brokered_readiness_mechanics(
+    connection: sqlite3.Connection,
+    *,
+    configured: EndpointConfig,
+    profile_path: Path,
+    target_kind: str,
+    target_key: str,
+    systemd_evidence: SystemdUnitEvidence,
+    target_precondition: Callable[[sqlite3.Connection], Any],
+    runtime: BrokerRuntimePaths,
+    popen: Callable[..., subprocess.Popen[Any]],
+    heartbeat_seconds: int,
+) -> dict[str, Any]:
+    """Latent owner mechanics; production dispatch is fenced by preflight."""
+
+    def reservation_precondition(candidate: sqlite3.Connection) -> Any:
+        _build_input_projection(
+            candidate,
+            role=configured.role,
+            endpoint_id=configured.endpoint_id,
+            target_kind=target_kind,
+            target_key=target_key,
+        )
+        return target_precondition(candidate)
+
     reserved, token = reserve_attempt(
         connection,
         role=configured.role,
@@ -1968,20 +2612,19 @@ def execute_brokered_readiness(
         target_kind=target_kind,
         target_key=target_key,
         now=utc_now(),
-        precondition=target_precondition,
+        precondition=reservation_precondition,
     )
     attempt_id = str(reserved["attempt_id"])
-    runtime = runtime or default_runtime_paths()
     process: subprocess.Popen[Any] | None = None
     gate_read = -1
     gate_write = -1
     run_created = False
-    claimed = False
     try:
         run = prepare_broker_run(
             connection,
             configured=configured,
             attempt_id=attempt_id,
+            profile_path=profile_path,
             now=utc_now(),
         )
         run_created = True
@@ -1989,26 +2632,28 @@ def execute_brokered_readiness(
         gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
         command = build_bwrap_command(
             configured=configured,
-            profile_path=profile_path,
             runtime=runtime,
             spool=spool,
             start_gate_fd=gate_read,
         )
+        command_attestation = attest_bwrap_command(command)
         mark_broker_launching(
             connection,
             attempt_id=attempt_id,
             token=token,
             evidence=systemd_evidence,
+            command_attestation=command_attestation,
             now=utc_now(),
         )
         process = popen(
             command,
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
             stdin=subprocess.DEVNULL,
-            stdout=None,
-            stderr=None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
             pass_fds=(gate_read,),
+            preexec_fn=_apply_child_resource_limits,
         )
         os.close(gate_read)
         gate_read = -1
@@ -2019,14 +2664,16 @@ def execute_brokered_readiness(
             process_id=int(process.pid),
             now=utc_now(),
         )
-        claimed = True
         os.write(gate_write, b"1")
         os.close(gate_write)
         gate_write = -1
+        deadline = time.monotonic() + BROKER_WALL_SECONDS
         while True:
             exit_code = process.poll()
             if exit_code is not None:
                 break
+            if time.monotonic() >= deadline:
+                raise BrokerError("BROKER_CHILD_DEADLINE_EXCEEDED")
             time.sleep(heartbeat_seconds)
             heartbeat_broker_run(
                 connection,
@@ -2047,8 +2694,8 @@ def execute_brokered_readiness(
             return {
                 "phase": "HOLD",
                 "attempt_id": attempt_id,
-                "state": "HOLD",
                 "error": error,
+                **broker_terminal_readback(connection, attempt_id=attempt_id),
             }
         receipt, receipt_json, observation = read_receipt_file(
             spool.receipt_path, observed_at=utc_now()
@@ -2060,6 +2707,9 @@ def execute_brokered_readiness(
             receipt_json=receipt_json,
             observation=observation,
             now=utc_now(),
+        )
+        consumed = consume_broker_pickup(
+            connection, attempt_id=attempt_id, now=utc_now()
         )
         return {
             "phase": "PASS",
@@ -2073,12 +2723,14 @@ def execute_brokered_readiness(
             "exit_code": 0,
             "receipt_sha256": completed["receipt_sha256"],
             "pickup_state": "STAGED",
+            "readiness_state": consumed["readiness_state"],
             "token_persisted": False,
         }
     except Exception as exc:
         error = _error_code(exc, "BROKER_BOUNDARY_FAILED")
         if process is not None:
             _terminate_child(process)
+        cleanup_error: str | None = None
         try:
             if run_created:
                 hold_broker_run(
@@ -2098,13 +2750,16 @@ def execute_brokered_readiness(
                     now=utc_now(),
                     last_error=error,
                 )
-        except Exception:
-            pass
+        except Exception as cleanup_exc:
+            cleanup_error = _error_code(cleanup_exc, "BROKER_CLEANUP_FAILED")
+        readback = broker_terminal_readback(connection, attempt_id=attempt_id)
         return {
             "phase": "HOLD",
             "attempt_id": attempt_id,
-            "state": "HOLD" if claimed else "LAUNCH_FAILED",
-            "error": error,
+            "error": error if cleanup_error is None else "BROKER_CLEANUP_FAILED",
+            "boundary_error": error,
+            "cleanup_error": cleanup_error,
+            **readback,
         }
     finally:
         for descriptor in (gate_read, gate_write):

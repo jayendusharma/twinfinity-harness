@@ -40,6 +40,10 @@ from executor_registry import (
     target_progress_digest,
 )
 from role_executor_transport import launch_role_executor, role_executor_command
+from role_executor_broker import (
+    consume_staged_broker_pickups,
+    recover_stale_broker_runs,
+)
 from portfolio_convergence import (
     DEFAULT_CONVERGENCE_LIMIT,
     MAX_CONVERGENCE_LIMIT,
@@ -99,6 +103,15 @@ def _epoch(timestamp: str) -> float:
     from datetime import datetime
 
     return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+
+
+def _before(timestamp: str, seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    value = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    return (value - timedelta(seconds=seconds)).astimezone(timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
 
 
 def _retry_seconds(attempts: int) -> int:
@@ -1384,6 +1397,17 @@ class CoordinationSupervisor:
         # READY dirty event is allowed to select it. Activation repeats the
         # approval-effectivity guard inside its own transaction for the race
         # between this scan-level stop and admission.
+        broker_pickups = consume_staged_broker_pickups(
+            self.store.connection, now=observed_at
+        )
+        broker_recovery = recover_stale_broker_runs(
+            self.store.connection,
+            before=_before(observed_at, 120),
+            now=observed_at,
+        )
+        # Release events are committed by coordination_store with the item
+        # transition. Consume them before housekeeping or ordinary inbox wakes;
+        # a successful admission is durable before its canonical session launch.
         convergence_results = self.convergence.consume_due(
             limit=self.convergence_limit, now=observed_at
         )
@@ -1639,6 +1663,8 @@ class CoordinationSupervisor:
                 "messages": message_launch_attempts,
                 "terminal_watches": terminal_watch_launch_attempts,
             },
+            "broker_pickups": broker_pickups,
+            "broker_recovery": broker_recovery,
             "artifact_gc": artifact_gc,
             "readiness_receipt_pickup": readiness_receipt_pickup,
             "readiness_decision_notices": readiness_decision_notices,
@@ -1666,7 +1692,7 @@ def main() -> int:
     try:
         result = CoordinationSupervisor(store).run_once()
         print(canonical_json(result))
-    except CoordinationError as exc:
+    except (CoordinationError, RegistryError) as exc:
         print(canonical_json({"phase": "HOLD", "error": str(exc)}))
         return 1
     finally:
