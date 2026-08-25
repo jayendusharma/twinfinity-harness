@@ -750,6 +750,8 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
             target_kind TEXT NOT NULL CHECK(target_kind IN ('message','terminal_watch','hosted_operation')),
             target_key TEXT NOT NULL,
             repository_scope TEXT,
+            target_progress_sha256 TEXT,
+            terminal_progress_sha256 TEXT,
             lineage_repository TEXT,
             lineage_issue_number INTEGER,
             lineage_generation INTEGER,
@@ -766,6 +768,8 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_error TEXT,
+            CHECK (target_progress_sha256 IS NULL OR length(target_progress_sha256)=64),
+            CHECK (terminal_progress_sha256 IS NULL OR length(terminal_progress_sha256)=64),
             CHECK (
                 (lineage_sha256 IS NULL
                  AND lineage_repository IS NULL
@@ -867,6 +871,8 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
           OR NEW.target_kind IS NOT OLD.target_kind
           OR NEW.target_key IS NOT OLD.target_key
           OR NEW.repository_scope IS NOT OLD.repository_scope
+          OR NEW.target_progress_sha256 IS NOT OLD.target_progress_sha256
+          OR (OLD.terminal_progress_sha256 IS NOT NULL AND NEW.terminal_progress_sha256 IS NOT OLD.terminal_progress_sha256)
           OR NEW.lineage_repository IS NOT OLD.lineage_repository
           OR NEW.lineage_issue_number IS NOT OLD.lineage_issue_number
           OR NEW.lineage_generation IS NOT OLD.lineage_generation
@@ -984,6 +990,8 @@ def attempt_schema_is_current(connection: sqlite3.Connection) -> bool:
         "systemd_invocation_id",
         "systemd_control_group",
         "repository_scope",
+        "target_progress_sha256",
+        "terminal_progress_sha256",
         "lineage_repository",
         "lineage_issue_number",
         "lineage_generation",
@@ -1039,6 +1047,13 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
     repository_scope = (
         "lower(repository_scope)" if "repository_scope" in old_columns else "NULL"
     )
+    target_progress_sha256 = (
+        "target_progress_sha256" if "target_progress_sha256" in old_columns else "NULL"
+    )
+    terminal_progress_sha256 = (
+        "terminal_progress_sha256"
+        if "terminal_progress_sha256" in old_columns else "NULL"
+    )
     lineage_repository = (
         "lineage_repository" if "lineage_repository" in old_columns else "NULL"
     )
@@ -1074,6 +1089,8 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
             target_kind TEXT NOT NULL CHECK(target_kind IN ('message','terminal_watch','hosted_operation')),
             target_key TEXT NOT NULL,
             repository_scope TEXT,
+            target_progress_sha256 TEXT,
+            terminal_progress_sha256 TEXT,
             lineage_repository TEXT,
             lineage_issue_number INTEGER,
             lineage_generation INTEGER,
@@ -1090,6 +1107,8 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_error TEXT,
+            CHECK (target_progress_sha256 IS NULL OR length(target_progress_sha256)=64),
+            CHECK (terminal_progress_sha256 IS NULL OR length(terminal_progress_sha256)=64),
             CHECK (
                 (lineage_sha256 IS NULL
                  AND lineage_repository IS NULL
@@ -1107,14 +1126,17 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
         )""",
         f"""INSERT INTO executor_attempts(
             attempt_id, role, endpoint_id, instance_id, token_sha256,
-            target_kind, target_key, repository_scope,
+            target_kind, target_key, repository_scope, target_progress_sha256,
+            terminal_progress_sha256,
             lineage_repository, lineage_issue_number,
             lineage_generation, lineage_lease_sha256, lineage_sha256,
             state, process_id, exit_code,
             systemd_unit, systemd_invocation_id, systemd_control_group,
             heartbeat_at, version, created_at, updated_at, last_error
         ) SELECT attempt_id, role, endpoint_id, instance_id, token_sha256,
-                 target_kind, target_key, {repository_scope}, {lineage_repository},
+                 target_kind, target_key, {repository_scope},
+                 {target_progress_sha256}, {terminal_progress_sha256},
+                 {lineage_repository},
                  {lineage_issue_number}, {lineage_generation},
                  {lineage_lease_sha256}, {lineage_sha256},
                  state, process_id, exit_code,
@@ -1142,6 +1164,8 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
           OR NEW.target_kind IS NOT OLD.target_kind
           OR NEW.target_key IS NOT OLD.target_key
           OR NEW.repository_scope IS NOT OLD.repository_scope
+          OR NEW.target_progress_sha256 IS NOT OLD.target_progress_sha256
+          OR (OLD.terminal_progress_sha256 IS NOT NULL AND NEW.terminal_progress_sha256 IS NOT OLD.terminal_progress_sha256)
           OR NEW.lineage_repository IS NOT OLD.lineage_repository
           OR NEW.lineage_issue_number IS NOT OLD.lineage_issue_number
           OR NEW.lineage_generation IS NOT OLD.lineage_generation
@@ -1549,6 +1573,117 @@ def repository_scope_for_target(
     raise RegistryError("EXECUTOR_REPOSITORY_SCOPE_INVALID")
 
 
+def target_progress_digest(
+    connection: sqlite3.Connection, target_kind: str, target_key: str
+) -> str:
+    """Digest authoritative target progress while excluding scheduler bookkeeping."""
+
+    if target_kind == "message":
+        try:
+            message_id = int(target_key)
+        except (TypeError, ValueError) as exc:
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID") from exc
+        row = connection.execute(
+            "SELECT topic,payload_sha256,payload_json,state,claimed_by "
+            "FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID")
+        try:
+            payload = json.loads(row["payload_json"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID") from exc
+        source = payload.get("source") if isinstance(payload, dict) else None
+        repository = source.get("repository") if isinstance(source, dict) else None
+        issue_number = (
+            payload.get("issue_number")
+            if isinstance(payload, dict)
+            else None
+        )
+        if type(issue_number) is not int and isinstance(source, dict):
+            issue_number = source.get("object_number")
+        progress: dict[str, Any] = {
+            "claimed_by": row["claimed_by"],
+            "payload_sha256": row["payload_sha256"],
+            "state": row["state"],
+            "topic": row["topic"],
+        }
+        if (
+            row["topic"] != NONMUTATING_MESSAGE_TOPIC
+            and isinstance(repository, str)
+            and type(issue_number) is int
+        ):
+            item_row = connection.execute(
+                """SELECT status,allocation_class,generation,accountable_session_id,
+                          lease_manifest_sha256,source_payload_sha256,version
+                   FROM coordination_items WHERE repository=? AND issue_number=?""",
+                (repository, issue_number),
+            ).fetchone()
+            progress["item"] = None if item_row is None else dict(item_row)
+            generation = payload.get("generation")
+            watch_row = None
+            if type(generation) is int:
+                watch_row = connection.execute(
+                    """SELECT state,last_heartbeat_at,generation,
+                              accountable_session_id,lease_manifest_sha256
+                       FROM coordination_terminal_watches
+                       WHERE repository=? AND issue_number=? AND generation=?""",
+                    (repository, issue_number, generation),
+                ).fetchone()
+            progress["terminal_watch"] = (
+                None if watch_row is None else dict(watch_row)
+            )
+        return digest_json(progress)
+    if target_kind == "terminal_watch":
+        watch = connection.execute(
+            """SELECT repository,issue_number,generation,accountable_session_id,
+                      lease_manifest_sha256,state,last_heartbeat_at
+               FROM coordination_terminal_watches WHERE watch_key=?""",
+            (target_key,),
+        ).fetchone()
+        if watch is None:
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID")
+        item = connection.execute(
+            """SELECT status,allocation_class,generation,accountable_session_id,
+                      lease_manifest_sha256,source_payload_sha256,version
+               FROM coordination_items WHERE repository=? AND issue_number=?""",
+            (watch["repository"], watch["issue_number"]),
+        ).fetchone()
+        return digest_json(
+            {
+                "item": None if item is None else dict(item),
+                "watch": dict(watch),
+            }
+        )
+    if target_kind == "hosted_operation":
+        try:
+            operation_id = int(target_key)
+        except (TypeError, ValueError) as exc:
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID") from exc
+        row = connection.execute(
+            "SELECT * FROM hosted_operations WHERE id=?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID")
+        values = dict(row)
+        progress_fields = (
+            "state",
+            "claimed_by",
+            "scope_sha256",
+            "receipt_outbox_id",
+            "remote_receipt",
+            "receipt_outcome",
+            "receipt_payload_sha256",
+            "retired_by_idempotency_key",
+            "retired_at",
+        )
+        return digest_json(
+            {field: values.get(field) for field in progress_fields if field in values}
+        )
+    raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID")
+
+
 def planner_repository_for_target(
     connection: sqlite3.Connection, target_kind: str, target_key: str
 ) -> str | None:
@@ -1604,6 +1739,15 @@ def reserve_attempt(
         repository_scope = repository_scope_for_target(
             connection, target_kind, target_key
         )
+        try:
+            target_progress_sha256 = target_progress_digest(
+                connection, target_kind, target_key
+            )
+        except RegistryError:
+            # Low-level registry callers may reserve synthetic non-Planner
+            # targets behind their own precondition. Canonical role executors
+            # always validate a concrete row and therefore persist a digest.
+            target_progress_sha256 = None
         if role == "planner" and repository_scope is None:
             raise RegistryError("EXECUTOR_REPOSITORY_SCOPE_INVALID")
         endpoint = current_endpoint(connection, role)
@@ -1638,11 +1782,12 @@ def reserve_attempt(
             INSERT INTO executor_attempts(
                 attempt_id, role, endpoint_id, instance_id, token_sha256,
                 target_kind, target_key, repository_scope,
+                target_progress_sha256, terminal_progress_sha256,
                 lineage_repository, lineage_issue_number,
                 lineage_generation, lineage_lease_sha256, lineage_sha256,
                 state, process_id, exit_code,
                 heartbeat_at, version, created_at, updated_at, last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?,
                       'RESERVED', NULL, NULL, ?, 1, ?, ?, NULL)
             """,
             (
@@ -1654,6 +1799,7 @@ def reserve_attempt(
                 target_kind,
                 target_key,
                 repository_scope,
+                target_progress_sha256,
                 None if lineage is None else lineage.repository,
                 None if lineage is None else lineage.issue_number,
                 None if lineage is None else lineage.generation,
@@ -1702,6 +1848,24 @@ def active_attempt_for_lineage(
     ).fetchone()
 
 
+def active_planner_attempt_for_repository(
+    connection: sqlite3.Connection, repository: str
+) -> sqlite3.Row | None:
+    """Return the sole active Planner attempt for one canonical repository."""
+
+    repository_scope = canonical_repository_scope(repository)
+    if repository_scope is None or not attempt_schema_is_current(connection):
+        raise RegistryError("EXECUTOR_REPOSITORY_FENCE_UNAVAILABLE")
+    return connection.execute(
+        """
+        SELECT * FROM executor_attempts
+        WHERE role='planner' AND repository_scope=?
+          AND state IN ('RESERVED','LAUNCHING','RUNNING')
+        """,
+        (repository_scope,),
+    ).fetchone()
+
+
 def transition_attempt(
     connection: sqlite3.Connection,
     *,
@@ -1716,6 +1880,7 @@ def transition_attempt(
     systemd_unit: str | None = None,
     systemd_invocation_id: str | None = None,
     systemd_control_group: str | None = None,
+    terminal_progress_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Apply a token-bound optimistic transition or heartbeat."""
 
@@ -1746,6 +1911,23 @@ def transition_attempt(
         }
         if new_state not in allowed[old_state]:
             raise RegistryError("EXECUTOR_ATTEMPT_STATE_CONFLICT")
+        if terminal_progress_sha256 is not None and (
+            new_state not in {"COMPLETE", "HOLD", "LAUNCH_FAILED"}
+            or SHA256.fullmatch(terminal_progress_sha256) is None
+        ):
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_INVALID")
+        prior_terminal_progress = row["terminal_progress_sha256"]
+        if (
+            prior_terminal_progress is not None
+            and terminal_progress_sha256 is not None
+            and terminal_progress_sha256 != prior_terminal_progress
+        ):
+            raise RegistryError("EXECUTOR_TARGET_PROGRESS_CONFLICT")
+        effective_terminal_progress = (
+            prior_terminal_progress
+            if terminal_progress_sha256 is None
+            else terminal_progress_sha256
+        )
         unit = row["systemd_unit"] if systemd_unit is None else systemd_unit
         invocation_id = (
             row["systemd_invocation_id"]
@@ -1804,7 +1986,7 @@ def transition_attempt(
             UPDATE executor_attempts
             SET state=?, process_id=?, exit_code=?, systemd_unit=?,
                 systemd_invocation_id=?, systemd_control_group=?, heartbeat_at=?,
-                version=?, updated_at=?, last_error=?
+                terminal_progress_sha256=?, version=?, updated_at=?, last_error=?
             WHERE attempt_id=? AND version=?
             """,
             (
@@ -1815,6 +1997,7 @@ def transition_attempt(
                 invocation_id,
                 control_group,
                 now,
+                effective_terminal_progress,
                 version,
                 now,
                 last_error,
@@ -1830,6 +2013,11 @@ def transition_attempt(
                 "systemd_unit": unit,
                 "systemd_invocation_id": invocation_id,
                 "systemd_control_group": control_group,
+            }
+        elif terminal_progress_sha256 is not None:
+            evidence = {
+                "target_progress_sha256": row["target_progress_sha256"],
+                "terminal_progress_sha256": terminal_progress_sha256,
             }
         _insert_attempt_event(
             connection,

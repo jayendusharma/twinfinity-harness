@@ -6,7 +6,9 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 
@@ -186,6 +188,37 @@ class ExecutorRegistryTests(unittest.TestCase):
             payload=payload,
             source_updated_at="2026-08-24T09:00:00Z",
             fetched_at="2026-08-24T09:00:01Z",
+        )
+
+    def planner_notice(
+        self, *, repository: str, issue_number: int, idempotency_key: str
+    ) -> int:
+        source = self.store.ingest_snapshot(
+            repository=repository,
+            object_kind="issue",
+            object_number=issue_number,
+            payload={"number": issue_number, "title": idempotency_key},
+            source_updated_at="2026-08-24T09:00:00Z",
+            fetched_at="2026-08-24T09:00:01Z",
+        )
+        return self.store.enqueue_message(
+            idempotency_key=idempotency_key,
+            recipient_session_id=PLANNER_ENDPOINT,
+            topic="coordination.notice",
+            payload={
+                "source": {
+                    "repository": repository,
+                    "object_kind": "issue",
+                    "object_number": issue_number,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "notice_kind": "status",
+                "mutation_authority": False,
+                "subject": "Planner repository fence",
+                "summary": "Exercise one repository-scoped Planner attempt.",
+                "evidence": {},
+            },
+            now="2026-08-24T10:00:00Z",
         )
 
     def launched_attempt(self, *, running: bool = True):
@@ -932,6 +965,105 @@ class ExecutorRegistryTests(unittest.TestCase):
         self.assertIsNone(notice_a["lineage_sha256"])
         self.assertIsNone(notice_b["lineage_sha256"])
 
+    def test_planner_repository_fence_is_immutable_and_keeps_distinct_repositories_parallel(self) -> None:
+        self.migrate("planner-repository-fence")
+        first_message = self.planner_notice(
+            repository=REPOSITORY,
+            issue_number=92,
+            idempotency_key="planner-repository-first",
+        )
+        second_message = self.planner_notice(
+            repository=REPOSITORY,
+            issue_number=93,
+            idempotency_key="planner-repository-second",
+        )
+        other_repository = "twinfinityai/twinfinity-companion"
+        other_message = self.planner_notice(
+            repository=other_repository,
+            issue_number=1,
+            idempotency_key="planner-repository-other",
+        )
+
+        first, _token = reserve_attempt(
+            self.store.connection,
+            role="planner",
+            endpoint_id=PLANNER_ENDPOINT,
+            target_kind="message",
+            target_key=str(first_message),
+            now="2026-08-24T10:00:01Z",
+            precondition=self.no_lineage,
+        )
+        self.assertEqual(REPOSITORY, first["repository_scope"])
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "EXECUTOR_ATTEMPT_IDENTITY_IMMUTABLE"
+        ):
+            self.store.connection.execute(
+                "UPDATE executor_attempts SET repository_scope=? WHERE attempt_id=?",
+                (other_repository, first["attempt_id"]),
+            )
+        with self.assertRaisesRegex(RegistryError, "EXECUTOR_REPOSITORY_BUSY"):
+            reserve_attempt(
+                self.store.connection,
+                role="planner",
+                endpoint_id=PLANNER_ENDPOINT,
+                target_kind="message",
+                target_key=str(second_message),
+                now="2026-08-24T10:00:02Z",
+                precondition=self.no_lineage,
+            )
+        other, _other_token = reserve_attempt(
+            self.store.connection,
+            role="planner",
+            endpoint_id=PLANNER_ENDPOINT,
+            target_kind="message",
+            target_key=str(other_message),
+            now="2026-08-24T10:00:02Z",
+            precondition=self.no_lineage,
+        )
+        self.assertEqual(other_repository, other["repository_scope"])
+
+    def test_planner_repository_fence_serializes_two_connection_race(self) -> None:
+        self.migrate("planner-repository-race")
+        message_ids = [
+            self.planner_notice(
+                repository=REPOSITORY,
+                issue_number=issue_number,
+                idempotency_key=f"planner-race-{issue_number}",
+            )
+            for issue_number in (92, 93)
+        ]
+        barrier = threading.Barrier(2)
+
+        def compete(message_id: int) -> str:
+            contender = CoordinationStore(self.store.path)
+            try:
+                barrier.wait(timeout=5)
+                reserve_attempt(
+                    contender.connection,
+                    role="planner",
+                    endpoint_id=PLANNER_ENDPOINT,
+                    target_kind="message",
+                    target_key=str(message_id),
+                    now="2026-08-24T10:00:01Z",
+                    precondition=self.no_lineage,
+                )
+                return "RESERVED"
+            except RegistryError as exc:
+                return str(exc)
+            finally:
+                contender.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(compete, message_ids))
+        self.assertCountEqual(
+            ["RESERVED", "EXECUTOR_REPOSITORY_BUSY"], outcomes
+        )
+        active = self.store.connection.execute(
+            "SELECT repository_scope FROM executor_attempts "
+            "WHERE role='planner' AND state IN ('RESERVED','LAUNCHING','RUNNING')"
+        ).fetchall()
+        self.assertEqual([REPOSITORY], [row["repository_scope"] for row in active])
+
     def test_role_executor_reserves_before_launch_and_never_resumes(self) -> None:
         source = self.snapshot()
         self.migrate()
@@ -996,6 +1128,12 @@ class ExecutorRegistryTests(unittest.TestCase):
         def succeed(command, **kwargs):
             environments.append(kwargs["env"])
             self.assertNotIn("resume", command)
+            self.store.claim_message(
+                message_id, DEVELOPMENT_ENDPOINT, "2026-08-24T10:00:02Z"
+            )
+            self.store.complete_message(
+                message_id, DEVELOPMENT_ENDPOINT, "2026-08-24T10:00:03Z"
+            )
             return _ImmediateProcess()
 
         complete = execute_role(
@@ -1013,6 +1151,137 @@ class ExecutorRegistryTests(unittest.TestCase):
         self.assertEqual("COMPLETE", complete["state"])
         self.assertTrue(environments[0]["TWINFINITY_EXECUTOR_TOKEN"])
         self.assertFalse(complete["token_persisted"])
+
+    def test_exit_zero_without_target_progress_holds_with_digest_readback(self) -> None:
+        source = self.snapshot()
+        self.migrate("zero-exit-no-progress")
+        message_id = self.store.enqueue_message(
+            idempotency_key="zero-exit-no-progress",
+            recipient_session_id=DEVELOPMENT_ENDPOINT,
+            topic="coordination.notice",
+            payload={
+                "source": {
+                    "repository": REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": 92,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "notice_kind": "status",
+                "mutation_authority": False,
+                "subject": "No-op readback",
+                "summary": "An exit-zero child must still advance its target.",
+                "evidence": {},
+            },
+            now="2026-08-24T10:00:01Z",
+        )
+
+        result = execute_role(
+            self.store.connection,
+            config_path=CONFIG,
+            role="development",
+            endpoint_id=DEVELOPMENT_ENDPOINT,
+            target_kind="message",
+            target_key=str(message_id),
+            prompt="Return without changing the target.",
+            systemd_invocation_id=INVOCATION_ID,
+            systemd_evidence=systemd_evidence(target_key=str(message_id)),
+            popen=lambda *_args, **_kwargs: _ImmediateProcess(),
+        )
+
+        self.assertEqual("HOLD", result["state"])
+        self.assertEqual("EXECUTOR_TARGET_NO_PROGRESS", result["error"])
+        self.assertEqual(
+            result["target_progress_sha256"], result["terminal_progress_sha256"]
+        )
+        self.assertEqual(
+            "PREPARED",
+            self.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()[0],
+        )
+
+    def test_nonmutating_notice_ignores_referenced_item_version_drift(self) -> None:
+        source = self.snapshot()
+        self.migrate("notice-item-drift")
+        item = self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="READY",
+            allocation_class="NONE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_ENDPOINT,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-24T10:00:01Z",
+        )
+        message_id = self.store.enqueue_message(
+            idempotency_key="notice-external-item-drift",
+            recipient_session_id=DEVELOPMENT_ENDPOINT,
+            topic="coordination.notice",
+            payload={
+                "source": {
+                    "repository": REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": 92,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "notice_kind": "status",
+                "mutation_authority": False,
+                "subject": "External item drift",
+                "summary": "Only the exact notice lifecycle counts as notice progress.",
+                "evidence": {},
+            },
+            now="2026-08-24T10:00:02Z",
+        )
+
+        def drift_referenced_item(*_args, **_kwargs):
+            self.store.set_issue_status(
+                repository=REPOSITORY,
+                issue_number=92,
+                status="READY",
+                allocation_class="NONE",
+                generation=1,
+                accountable_session_id=DEVELOPMENT_ENDPOINT,
+                lease_manifest_sha256=LEASE,
+                development_units=1,
+                shared_units=0,
+                sre_units=0,
+                expected_source_sha256=source.payload_sha256,
+                expected_version=int(item["version"]),
+                now="2026-08-24T10:00:03Z",
+            )
+            return _ImmediateProcess()
+
+        result = execute_role(
+            self.store.connection,
+            config_path=CONFIG,
+            role="development",
+            endpoint_id=DEVELOPMENT_ENDPOINT,
+            target_kind="message",
+            target_key=str(message_id),
+            prompt="Do not confuse referenced-item drift with notice progress.",
+            systemd_invocation_id=INVOCATION_ID,
+            systemd_evidence=systemd_evidence(target_key=str(message_id)),
+            popen=drift_referenced_item,
+        )
+
+        self.assertEqual("HOLD", result["state"])
+        self.assertEqual("EXECUTOR_TARGET_NO_PROGRESS", result["error"])
+        self.assertEqual(
+            result["target_progress_sha256"], result["terminal_progress_sha256"]
+        )
+        self.assertEqual(
+            int(item["version"]) + 1,
+            self.store.connection.execute(
+                "SELECT version FROM coordination_items "
+                "WHERE repository=? AND issue_number=92",
+                (REPOSITORY,),
+            ).fetchone()[0],
+        )
 
     def test_v3_launch_v4_cutover_launch_rollback_and_v3_launch(self) -> None:
         source = self.snapshot()
@@ -1059,6 +1328,12 @@ class ExecutorRegistryTests(unittest.TestCase):
 
             def succeed(command, **_kwargs):
                 observed_profiles.append(command[command.index("--profile") + 1])
+                self.store.claim_message(
+                    message_id, endpoint_id, f"2026-08-24T10:00:1{suffix}Z"
+                )
+                self.store.complete_message(
+                    message_id, endpoint_id, f"2026-08-24T10:00:2{suffix}Z"
+                )
                 return _ImmediateProcess()
 
             result = execute_role(
@@ -1361,6 +1636,12 @@ class ExecutorRegistryTests(unittest.TestCase):
             "INSERT INTO hosted_operations VALUES (328, ?, 'PREPARED')",
             (SRE_ENDPOINT,),
         )
+        def complete_hosted(*_args, **_kwargs):
+            self.store.connection.execute(
+                "UPDATE hosted_operations SET state='COMPLETE' WHERE id=328"
+            )
+            return _ImmediateProcess()
+
         complete = execute_role(
             self.store.connection,
             config_path=CONFIG,
@@ -1376,7 +1657,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                 target_key="328",
                 invocation_id="b" * 32,
             ),
-            popen=lambda *_args, **_kwargs: _ImmediateProcess(),
+            popen=complete_hosted,
         )
         self.assertEqual("COMPLETE", complete["state"])
         self.assertEqual("hosted_operation", complete["target_kind"])
@@ -1670,6 +1951,112 @@ class ExecutorRegistryTests(unittest.TestCase):
             "SELECT 1 FROM sqlite_master WHERE type='index' "
             "AND name='executor_one_active_attempt_per_target'"
         ).fetchone())
+
+    def test_planner_repository_schema_upgrade_is_atomic_and_preserves_progress(self) -> None:
+        self.migrate("planner-fence-upgrade-base")
+        message_id = self.planner_notice(
+            repository=REPOSITORY,
+            issue_number=92,
+            idempotency_key="planner-fence-upgrade-history",
+        )
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="planner",
+            endpoint_id=PLANNER_ENDPOINT,
+            target_kind="message",
+            target_key=str(message_id),
+            now="2026-08-24T10:00:01Z",
+            precondition=self.no_lineage,
+        )
+        transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="HOLD",
+            now="2026-08-24T10:00:02Z",
+            last_error="TEST_TERMINAL",
+        )
+        self.store.connection.execute(
+            "DROP INDEX executor_one_active_planner_per_repository"
+        )
+        plan = build_plan(
+            self.store.connection,
+            self.config,
+            self.aliases,
+            alias_fixture_sha256=self.alias_sha,
+        )
+        self.assertTrue(plan["attempt_schema_upgrade"])
+        apply_plan(
+            self.store.connection,
+            plan=plan,
+            operation_key="planner-fence-upgrade",
+            expected_plan_sha256=plan["plan_sha256"],
+            now="2026-08-24T10:00:03Z",
+        )
+
+        historical = self.store.connection.execute(
+            "SELECT repository_scope,target_progress_sha256,state "
+            "FROM executor_attempts WHERE attempt_id=?",
+            (reserved["attempt_id"],),
+        ).fetchone()
+        self.assertEqual(REPOSITORY, historical["repository_scope"])
+        self.assertEqual(reserved["target_progress_sha256"], historical["target_progress_sha256"])
+        self.assertEqual("HOLD", historical["state"])
+        self.assertTrue(attempt_schema_is_current(self.store.connection))
+        self.assertEqual(
+            [],
+            self.store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_legacy_schema'"
+            ).fetchall(),
+        )
+
+    def test_planner_repository_schema_upgrade_active_conflict_rolls_back_cleanly(self) -> None:
+        self.migrate("planner-fence-active-base")
+        message_id = self.planner_notice(
+            repository=REPOSITORY,
+            issue_number=92,
+            idempotency_key="planner-fence-active-conflict",
+        )
+        reserved, _token = reserve_attempt(
+            self.store.connection,
+            role="planner",
+            endpoint_id=PLANNER_ENDPOINT,
+            target_kind="message",
+            target_key=str(message_id),
+            now="2026-08-24T10:00:01Z",
+            precondition=self.no_lineage,
+        )
+        self.store.connection.execute(
+            "DROP INDEX executor_one_active_planner_per_repository"
+        )
+        plan = build_plan(
+            self.store.connection,
+            self.config,
+            self.aliases,
+            alias_fixture_sha256=self.alias_sha,
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "EXECUTOR_ATTEMPT_SCHEMA_ACTIVE_CONFLICT"
+        ):
+            apply_plan(
+                self.store.connection,
+                plan=plan,
+                operation_key="planner-fence-active-upgrade",
+                expected_plan_sha256=plan["plan_sha256"],
+                now="2026-08-24T10:00:02Z",
+            )
+        current = self.store.connection.execute(
+            "SELECT state,repository_scope FROM executor_attempts WHERE attempt_id=?",
+            (reserved["attempt_id"],),
+        ).fetchone()
+        self.assertEqual(("RESERVED", REPOSITORY), tuple(current))
+        self.assertEqual(
+            [],
+            self.store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_legacy_schema'"
+            ).fetchall(),
+        )
 
     def test_github_routing_hint_is_digest_only_and_comments_are_history(self) -> None:
         self.migrate()

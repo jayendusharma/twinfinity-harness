@@ -721,13 +721,23 @@ class CapacityDispatchFlowTests(unittest.TestCase):
                     issue, f"2026-08-24T10:00:{offset:02d}Z"
                 )
 
-            result = harness.supervisor().run_once("2026-08-24T10:01:00Z")
+            supervisor = harness.supervisor()
+            results = [
+                supervisor.run_once("2026-08-24T10:01:00Z"),
+                supervisor.run_once("2026-08-24T10:01:01Z"),
+                supervisor.run_once("2026-08-24T10:01:02Z"),
+            ]
+            result = results[0]
             admitted = [
                 entry["admitted_issue_number"]
                 for entry in result["portfolio_convergence"]
                 if entry.get("outcome") == "ADMITTED"
             ]
-            launched_messages = [entry["message_id"] for entry in result["launched"]]
+            launched_messages = [
+                entry["message_id"]
+                for pass_result in results
+                for entry in pass_result["launched"]
+            ]
             launched_issues = [
                 int(json.loads(harness.store.connection.execute(
                     "SELECT payload_json FROM coordination_messages WHERE id=?", (message_id,)
@@ -736,7 +746,7 @@ class CapacityDispatchFlowTests(unittest.TestCase):
             ]
             self.assertEqual(9, len(selected["selected"]), selected)
             self.assertEqual(9, len(admitted), result["portfolio_convergence"])
-            self.assertEqual(9, len(launched_issues), result["launched"])
+            self.assertEqual(9, len(launched_issues), launched_messages)
             self.assertEqual(
                 (len(selected["selected"]), len(admitted), len(launched_issues)),
                 (9, 9, 9),
@@ -744,7 +754,15 @@ class CapacityDispatchFlowTests(unittest.TestCase):
             )
             self.assertEqual(expected_issues, admitted, result["portfolio_convergence"])
             self.assertEqual(expected_issues, launched_issues)
-            self.assertEqual([], result["terminal_watch_launches"])
+            self.assertTrue(
+                all(
+                    pass_result["launch_attempts"]["total"] <= 4
+                    for pass_result in results
+                )
+            )
+            self.assertTrue(
+                all(not pass_result["terminal_watch_launches"] for pass_result in results)
+            )
 
             active = harness.store.connection.execute(
                 "SELECT role,target_kind,target_key,lineage_sha256,systemd_unit,"

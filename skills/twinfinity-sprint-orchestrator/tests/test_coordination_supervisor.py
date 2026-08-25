@@ -20,6 +20,7 @@ from coordination_store import (  # noqa: E402
 )
 from coordination_supervisor import (  # noqa: E402
     CoordinationSupervisor,
+    SchedulerLaunchPolicy,
     _canonical_session_command,
     launch_canonical_session,
     launch_terminal_watch_session,
@@ -105,6 +106,42 @@ class CoordinationSupervisorTests(unittest.TestCase):
             fetched_at="2026-08-22T10:00:01Z",
         )
 
+    def notice(
+        self,
+        *,
+        idempotency_key: str,
+        issue_number: int,
+        recipient: str = DEVELOPMENT_SESSION,
+        repository: str = REPOSITORY,
+    ) -> int:
+        source = self.store.ingest_snapshot(
+            repository=repository,
+            object_kind="issue",
+            object_number=issue_number,
+            payload={"number": issue_number, "title": idempotency_key},
+            source_updated_at="2026-08-22T10:00:00Z",
+            fetched_at="2026-08-22T10:00:01Z",
+        )
+        return self.store.enqueue_message(
+            idempotency_key=idempotency_key,
+            recipient_session_id=recipient,
+            topic="coordination.notice",
+            payload={
+                "source": {
+                    "repository": repository,
+                    "object_kind": "issue",
+                    "object_number": issue_number,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "notice_kind": "status",
+                "mutation_authority": False,
+                "subject": "Supervisor launch policy",
+                "summary": "Exercise a bounded transport selection.",
+                "evidence": {},
+            },
+            now="2026-08-22T10:00:02Z",
+        )
+
     def claimed_admission(self) -> tuple[object, int]:
         source = self.snapshot()
         active = self.store.set_issue_status(
@@ -157,7 +194,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
         )
         return source, message_id
 
-    def test_claimed_valid_message_retries_with_backoff(self) -> None:
+    def test_due_terminal_watch_preempts_same_lineage_message_retry(self) -> None:
         _source, message_id = self.claimed_admission()
 
         first = self.supervisor.run_once("2026-08-22T10:00:05Z")
@@ -166,7 +203,8 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
         self.assertEqual(1, len(first["launched"]))
         self.assertEqual([], early["launched"])
-        self.assertEqual(1, len(retry["launched"]))
+        self.assertEqual([], retry["launched"])
+        self.assertEqual(1, len(retry["terminal_watch_launches"]))
         observed = self.store.connection.execute(
             "SELECT state, last_error FROM coordination_messages WHERE id=?",
             (message_id,),
@@ -176,7 +214,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             (f"message:{message_id}:claimed",),
         ).fetchone()
         self.assertEqual(("CLAIMED", None), tuple(observed))
-        self.assertEqual(("INFLIGHT", 2), tuple(wake))
+        self.assertEqual(("INFLIGHT", 1), tuple(wake))
 
     def test_claimed_retry_backoff_does_not_block_a_different_target(self) -> None:
         source, message_id = self.claimed_admission()
@@ -362,7 +400,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
         self.assertEqual("CLAIMED", observed["state"])
         self.assertEqual("a" * 40, json.loads(observed["payload_json"])["base_sha"])
 
-    def test_prepared_message_wake_is_idempotent_with_bounded_retry(self) -> None:
+    def test_accepted_noop_wakes_exhaust_identical_progress_budget(self) -> None:
         source = self.snapshot()
         message_id = self.store.enqueue_message(
             idempotency_key="prepared-status",
@@ -387,18 +425,80 @@ class CoordinationSupervisorTests(unittest.TestCase):
         first = self.supervisor.run_once("2026-08-22T10:00:03Z")
         second = self.supervisor.run_once("2026-08-22T10:00:30Z")
         third = self.supervisor.run_once("2026-08-22T10:01:04Z")
+        fourth = self.supervisor.run_once("2026-08-22T10:03:05Z")
+        exhausted = self.supervisor.run_once("2026-08-22T10:07:06Z")
 
         self.assertEqual([(DEVELOPMENT_SESSION, message_id)], self.launches[:1])
         self.assertEqual(1, len(first["launched"]))
         self.assertEqual([], second["launched"])
         self.assertEqual(1, len(third["launched"]))
+        self.assertEqual(1, len(fourth["launched"]))
+        self.assertEqual([], exhausted["launched"])
         wake = self.store.connection.execute(
-            "SELECT state, attempts FROM coordination_wakes WHERE wake_key=?",
+            "SELECT state, attempts, last_error FROM coordination_wakes WHERE wake_key=?",
             (f"message:{message_id}:prepared",),
         ).fetchone()
-        self.assertEqual(("INFLIGHT", 2), tuple(wake))
+        self.assertEqual(("HOLD", 3, "WAKE_RETRY_EXHAUSTED"), tuple(wake))
+        message = self.store.connection.execute(
+            "SELECT state,last_error FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        self.assertEqual(("HOLD", "WAKE_RETRY_EXHAUSTED"), tuple(message))
 
-    def test_launch_failures_retry_with_capped_backoff_without_orphaning_inbox(self) -> None:
+    def test_due_retry_is_starvation_free_under_sustained_fresh_arrivals(self) -> None:
+        retry_message_id = self.notice(
+            idempotency_key="starvation-free-retry",
+            issue_number=400,
+        )
+        first = self.supervisor.run_once("2026-08-22T10:00:03Z")
+        self.assertEqual(
+            [retry_message_id], [row["message_id"] for row in first["launched"]]
+        )
+
+        results = []
+        for batch, timestamp in (
+            (410, "2026-08-22T10:01:04Z"),
+            (420, "2026-08-22T10:03:05Z"),
+            (430, "2026-08-22T10:07:06Z"),
+        ):
+            for issue_number in range(batch, batch + 4):
+                self.notice(
+                    idempotency_key=f"sustained-fresh-{issue_number}",
+                    issue_number=issue_number,
+                )
+            results.append(self.supervisor.run_once(timestamp))
+
+        self.assertEqual(
+            [retry_message_id],
+            [row["message_id"] for row in results[0]["launched"][:1]],
+        )
+        self.assertEqual(
+            [retry_message_id],
+            [row["message_id"] for row in results[1]["launched"][:1]],
+        )
+        self.assertTrue(
+            all(
+                result["launch_policy_decision"][
+                    "due_message_retry_slot_reserved"
+                ]
+                for result in results
+            )
+        )
+        self.assertEqual(
+            3,
+            sum(
+                candidate_message_id == retry_message_id
+                for _session_id, candidate_message_id in self.launches
+            ),
+        )
+        wake = self.store.connection.execute(
+            "SELECT state,attempts,last_error FROM coordination_wakes "
+            "WHERE message_id=?",
+            (retry_message_id,),
+        ).fetchone()
+        self.assertEqual(("HOLD", 3, "WAKE_RETRY_EXHAUSTED"), tuple(wake))
+
+    def test_launch_failures_exhaust_identical_progress_into_typed_hold(self) -> None:
         source = self.snapshot()
         message_id = self.store.enqueue_message(
             idempotency_key="prepared-launch-retry",
@@ -449,11 +549,183 @@ class CoordinationSupervisorTests(unittest.TestCase):
         message = self.store.connection.execute(
             "SELECT state FROM coordination_messages WHERE id=?", (message_id,)
         ).fetchone()
-        self.assertEqual(6, len(failures))
+        self.assertEqual(3, len(failures))
         self.assertEqual(
-            ("INFLIGHT", 6, None, "WAKE_LAUNCH_FAILED"), tuple(wake)
+            ("HOLD", 3, None, "WAKE_RETRY_EXHAUSTED"), tuple(wake)
         )
-        self.assertEqual("PREPARED", message["state"])
+        self.assertEqual("HOLD", message["state"])
+
+    def test_third_message_launch_failure_rereads_progress_before_exhaustion(self) -> None:
+        _source, message_id = self.claimed_admission()
+        watch = self.store.connection.execute(
+            "SELECT watch_key FROM coordination_terminal_watches"
+        ).fetchone()
+        watch_key = str(watch["watch_key"])
+        self.store.heartbeat_terminal_watch(
+            watch_key=watch_key,
+            session_id=DEVELOPMENT_SESSION,
+            generation=1,
+            delay_seconds=1800,
+            now="2026-08-22T10:00:04Z",
+        )
+        failures: list[int] = []
+
+        def failing_launcher(_session_id: str, candidate_message_id: int) -> int:
+            failures.append(candidate_message_id)
+            if len(failures) == 3:
+                self.store.heartbeat_terminal_watch(
+                    watch_key=watch_key,
+                    session_id=DEVELOPMENT_SESSION,
+                    generation=1,
+                    delay_seconds=1800,
+                    now="2026-08-22T10:03:07Z",
+                )
+            raise OSError("launch failed")
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=failing_launcher,
+            terminal_watch_launcher=lambda _session, _key: 1,
+            process_checker=lambda *_: False,
+        )
+        supervisor.run_once("2026-08-22T10:00:05Z")
+        supervisor.run_once("2026-08-22T10:01:06Z")
+        supervisor.run_once("2026-08-22T10:03:07Z")
+
+        after = self.store.connection.execute(
+            "SELECT state,attempts,target_progress_sha256,last_error "
+            "FROM coordination_wakes WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        self.assertEqual("INFLIGHT", after["state"])
+        self.assertEqual(1, after["attempts"])
+        self.assertEqual("WAKE_LAUNCH_FAILED_AFTER_PROGRESS", after["last_error"])
+        self.assertEqual(3, len(failures))
+
+        retry = supervisor.run_once("2026-08-22T10:04:08Z")
+        self.assertEqual(1, retry["launch_attempts"]["messages"])
+        self.assertEqual(4, len(failures))
+        self.assertEqual(
+            ("INFLIGHT", 2, "WAKE_LAUNCH_FAILED"),
+            tuple(self.store.connection.execute(
+                "SELECT state,attempts,last_error FROM coordination_wakes "
+                "WHERE message_id=?",
+                (message_id,),
+            ).fetchone()),
+        )
+
+    def test_terminal_watch_launch_failures_exhaust_into_typed_hold(self) -> None:
+        source = self.snapshot()
+        self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="ACTIVE",
+            allocation_class="ACTIVE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_SESSION,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-22T10:00:02Z",
+        )
+        failures: list[str] = []
+
+        def fail_watch(_session_id: str, watch_key: str) -> int:
+            failures.append(watch_key)
+            raise OSError("watch launch failed")
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: 1,
+            terminal_watch_launcher=fail_watch,
+            process_checker=lambda *_: False,
+        )
+        results = [
+            supervisor.run_once(timestamp)
+            for timestamp in (
+                "2026-08-22T10:01:03Z",
+                "2026-08-22T10:02:04Z",
+                "2026-08-22T10:03:05Z",
+            )
+        ]
+
+        self.assertEqual(3, len(failures))
+        self.assertTrue(
+            all(result["launch_attempts"]["terminal_watches"] == 1 for result in results)
+        )
+        watch = self.store.connection.execute(
+            "SELECT state,attempts,last_error FROM coordination_terminal_watches"
+        ).fetchone()
+        self.assertEqual(
+            ("HOLD", 3, "TERMINAL_WATCH_RETRY_EXHAUSTED"), tuple(watch)
+        )
+
+    def test_third_terminal_watch_failure_rereads_progress_before_exhaustion(self) -> None:
+        source = self.snapshot()
+        self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="ACTIVE",
+            allocation_class="ACTIVE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_SESSION,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-22T10:00:02Z",
+        )
+        watch_key = str(self.store.connection.execute(
+            "SELECT watch_key FROM coordination_terminal_watches"
+        ).fetchone()["watch_key"])
+        failures: list[str] = []
+
+        def fail_after_progress(_session_id: str, candidate_watch_key: str) -> int:
+            failures.append(candidate_watch_key)
+            if len(failures) == 3:
+                self.store.heartbeat_terminal_watch(
+                    watch_key=watch_key,
+                    session_id=DEVELOPMENT_SESSION,
+                    generation=1,
+                    delay_seconds=600,
+                    now="2026-08-22T10:03:05Z",
+                )
+            raise OSError("watch launch failed")
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: 1,
+            terminal_watch_launcher=fail_after_progress,
+            process_checker=lambda *_: False,
+        )
+        for timestamp in (
+            "2026-08-22T10:01:03Z",
+            "2026-08-22T10:02:04Z",
+            "2026-08-22T10:03:05Z",
+        ):
+            supervisor.run_once(timestamp)
+
+        watch = self.store.connection.execute(
+            "SELECT state,attempts,next_wake_at,last_error "
+            "FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        self.assertEqual("ACTIVE", watch["state"])
+        self.assertEqual(0, watch["attempts"])
+        self.assertEqual("2026-08-22T10:13:05Z", watch["next_wake_at"])
+        self.assertEqual(
+            "TERMINAL_WATCH_WAKE_FAILED_AFTER_PROGRESS", watch["last_error"]
+        )
+        self.assertEqual(3, len(failures))
+
+        retry = supervisor.run_once("2026-08-22T10:13:06Z")
+        self.assertEqual(1, retry["launch_attempts"]["terminal_watches"])
+        self.assertEqual(4, len(failures))
 
     def test_capacity_release_consumes_dirty_event_without_planner_notice(self) -> None:
         source = self.snapshot()
@@ -898,6 +1170,139 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 (DEVELOPMENT_SESSION,),
             ).fetchone()[0],
         )
+
+    def test_launch_policy_reserves_terminal_watch_and_leaves_overflow_untouched(self) -> None:
+        source = self.snapshot()
+        self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="ACTIVE",
+            allocation_class="ACTIVE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_SESSION,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-22T10:00:02Z",
+        )
+        message_ids = [
+            self.notice(
+                idempotency_key=f"launch-budget-{issue_number}",
+                issue_number=issue_number,
+            )
+            for issue_number in (101, 102, 103, 104)
+        ]
+
+        first = self.supervisor.run_once("2026-08-22T10:01:03Z")
+
+        self.assertEqual(
+            {"total": 4, "messages": 3, "terminal_watches": 1},
+            first["launch_policy"],
+        )
+        self.assertEqual(
+            {
+                "terminal_watch_slot_reserved": True,
+                "message_limit": 3,
+                "due_message_retry_slot_reserved": False,
+                "due_message_retry_limit": 1,
+            },
+            first["launch_policy_decision"],
+        )
+        self.assertEqual(first["launch_policy"], first["launch_attempts"])
+        self.assertEqual(message_ids[:3], [row["message_id"] for row in first["launched"]])
+        self.assertEqual(1, len(first["terminal_watch_launches"]))
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_wakes WHERE message_id=?",
+                (message_ids[3],),
+            ).fetchone()[0],
+        )
+
+        second = self.supervisor.run_once("2026-08-22T10:01:04Z")
+        self.assertEqual([message_ids[3]], [row["message_id"] for row in second["launched"]])
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT attempts FROM coordination_wakes WHERE message_id=?",
+                (message_ids[3],),
+            ).fetchone()[0],
+        )
+
+    def test_launch_policy_lends_watch_reserve_to_fourth_message_when_no_watch_is_due(self) -> None:
+        message_ids = [
+            self.notice(
+                idempotency_key=f"borrowed-watch-slot-{issue_number}",
+                issue_number=issue_number,
+            )
+            for issue_number in (301, 302, 303, 304, 305)
+        ]
+
+        result = self.supervisor.run_once("2026-08-22T10:00:03Z")
+
+        self.assertEqual(
+            {
+                "terminal_watch_slot_reserved": False,
+                "message_limit": 4,
+                "due_message_retry_slot_reserved": False,
+                "due_message_retry_limit": 1,
+            },
+            result["launch_policy_decision"],
+        )
+        self.assertEqual(
+            {"total": 4, "messages": 4, "terminal_watches": 0},
+            result["launch_attempts"],
+        )
+        self.assertEqual(
+            message_ids[:4], [row["message_id"] for row in result["launched"]]
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_wakes WHERE message_id=?",
+                (message_ids[4],),
+            ).fetchone()[0],
+        )
+
+    def test_planner_launches_one_target_per_repository_and_distinct_repositories(self) -> None:
+        same_repository = [
+            self.notice(
+                idempotency_key=f"planner-same-repository-{issue_number}",
+                issue_number=issue_number,
+                recipient=PLANNER_SESSION,
+            )
+            for issue_number in (201, 202)
+        ]
+        other_repository_message = self.notice(
+            idempotency_key="planner-other-repository",
+            issue_number=1,
+            recipient=PLANNER_SESSION,
+            repository="twinfinityai/twinfinity-companion",
+        )
+
+        result = self.supervisor.run_once("2026-08-22T10:00:03Z")
+
+        self.assertEqual(
+            [same_repository[0], other_repository_message],
+            [row["message_id"] for row in result["launched"]],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_wakes WHERE message_id=?",
+                (same_repository[1],),
+            ).fetchone()[0],
+        )
+
+    def test_launch_policy_validation_fails_closed(self) -> None:
+        for values in ((0, 0, 0), (4, 4, 1), (4, 3, 0), (4, True, 1)):
+            with self.subTest(values=values), self.assertRaisesRegex(
+                CoordinationError, "SCHEDULER_LAUNCH_POLICY_INVALID"
+            ):
+                SchedulerLaunchPolicy(*values)
 
     def test_disjoint_mixed_role_notices_launch_in_one_scan(self) -> None:
         source = self.snapshot()
