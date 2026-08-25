@@ -47,6 +47,7 @@ UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SYSTEMD_INVOCATION_ID = re.compile(r"^[0-9a-f]{32}$")
 SYSTEMD_UNIT = re.compile(
     r"^twinfinity-role-executor-(planner|development|sre)-"
@@ -63,7 +64,7 @@ ATTEMPT_STATES = {
 ACTIVE_ATTEMPT_STATES = {"RESERVED", "LAUNCHING", "RUNNING"}
 TARGET_KINDS = {"message", "terminal_watch", "hosted_operation"}
 NONMUTATING_MESSAGE_TOPIC = "coordination.notice"
-ROOT_KEYS = {"schema_version", "roles"}
+ROOT_KEYS = {"schema_version", "roles", "historical_endpoints"}
 COMMON_ROLE_KEYS = {
     "endpoint_id",
     "version",
@@ -152,6 +153,15 @@ def digest_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def canonical_repository_scope(repository: str) -> str:
+    """Return the case-insensitive canonical identity for one GitHub repository."""
+
+    if not isinstance(repository, str) or REPOSITORY.fullmatch(repository) is None:
+        raise RegistryError("EXECUTOR_REPOSITORY_SCOPE_INVALID")
+    owner, name = repository.split("/", 1)
+    return f"{owner.casefold()}/{name.casefold()}"
+
+
 @dataclass(frozen=True)
 class EndpointConfig:
     role: str
@@ -176,11 +186,18 @@ class EndpointConfig:
     def config_sha256(self) -> str:
         return digest_json(self.payload)
 
+    @property
+    def runtime_codex_profile(self) -> str:
+        """Return the immutable on-disk profile name for this endpoint version."""
+
+        return f"{self.codex_profile}-v{self.version}"
+
 
 @dataclass(frozen=True)
 class RegistryConfig:
     schema_version: int
     roles: dict[str, EndpointConfig]
+    endpoints: dict[str, EndpointConfig]
     source_sha256: str
     source_evidence: OwnerFileEvidence
     profile_evidence: tuple[OwnerFileEvidence, ...]
@@ -474,6 +491,7 @@ def revalidate_registry_inputs(config: RegistryConfig) -> RegistryConfig:
     if (
         current.schema_version != config.schema_version
         or current.roles != config.roles
+        or current.endpoints != config.endpoints
         or current.source_sha256 != config.source_sha256
         or current.codex_home != config.codex_home
         or current.profile_template_root != config.profile_template_root
@@ -489,20 +507,23 @@ def _validate_role_profiles(
     profile_template_root: Path,
 ) -> tuple[OwnerFileEvidence, ...]:
     evidence: list[OwnerFileEvidence] = []
-    for role, expected_name in EXPECTED_CODEX_PROFILES.items():
-        endpoint = endpoints[role]
+    for endpoint_id in sorted(endpoints):
+        endpoint = endpoints[endpoint_id]
+        role = endpoint.role
+        expected_name = EXPECTED_CODEX_PROFILES[role]
         if (
             endpoint.codex_profile != expected_name
             or CODEX_PROFILE_NAME.fullmatch(endpoint.codex_profile) is None
             or SHA256.fullmatch(endpoint.profile_sha256) is None
         ):
             raise RegistryError("REGISTRY_PROFILE_CONTRACT_INVALID")
+        profile_filename = f"{endpoint.runtime_codex_profile}.config.toml"
         template, template_evidence = _read_regular_owner_file(
-            profile_template_root / f"{endpoint.codex_profile}.config.toml",
+            profile_template_root / profile_filename,
             "REGISTRY_PROFILE_TEMPLATE",
         )
         installed, installed_evidence = _read_regular_owner_file(
-            codex_home / f"{endpoint.codex_profile}.config.toml",
+            codex_home / profile_filename,
             "REGISTRY_PROFILE",
         )
         if hashlib.sha256(template).hexdigest() != endpoint.profile_sha256:
@@ -513,101 +534,133 @@ def _validate_role_profiles(
     return tuple(evidence)
 
 
+def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
+    """Parse one exact reviewed endpoint manifest without syntax-only authority."""
+
+    if not isinstance(value, dict) or set(value) != PROFILED_ROLE_KEYS:
+        raise RegistryError("REGISTRY_CONFIG_ROLE_SCHEMA_INVALID")
+    endpoint_id = value.get("endpoint_id")
+    version = value.get("version")
+    executor_profile = value.get("executor_profile")
+    codex_profile = value.get("codex_profile")
+    profile_sha256 = value.get("profile_sha256", "")
+    if (
+        role not in ROLES
+        or type(endpoint_id) is not str
+        or ENDPOINT_ID.fullmatch(endpoint_id) is None
+        or endpoint_id != f"role.{role}.v{version}"
+        or type(version) is not int
+        or version <= 0
+        or type(executor_profile) is not str
+        or executor_profile != role
+        or type(codex_profile) is not str
+        or type(profile_sha256) is not str
+        or SHA256.fullmatch(profile_sha256) is None
+    ):
+        raise RegistryError("REGISTRY_CONFIG_ROLE_INVALID")
+    command_prefix = _validate_string_list(
+        value.get("command_prefix"), "REGISTRY_CONFIG_COMMAND_INVALID"
+    )
+    allowed_topics = _validate_string_list(
+        value.get("allowed_topics"), "REGISTRY_CONFIG_TOPICS_INVALID"
+    )
+    expected_name = EXPECTED_CODEX_PROFILES[role]
+    expected_command = (
+        "/home/ubuntu/.local/bin/codex",
+        "exec",
+        "--profile",
+        expected_name,
+        "--strict-config",
+        "--json",
+    )
+    if (
+        command_prefix != expected_command
+        or codex_profile != expected_name
+        or "resume" in command_prefix
+        or any(UUID.fullmatch(token) for token in command_prefix)
+        or any("bypass" in token.casefold() for token in command_prefix)
+        or len(set(allowed_topics)) != len(allowed_topics)
+    ):
+        raise RegistryError("REGISTRY_CONFIG_COMMAND_INVALID")
+    role_mutating = {
+        topic for topic in allowed_topics if topic != NONMUTATING_MESSAGE_TOPIC
+    }
+    if role == "development" and any(
+        not topic.startswith("development.") for topic in role_mutating
+    ):
+        raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
+    if role == "sre" and any(
+        not topic.startswith("sre.") for topic in role_mutating
+    ):
+        raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
+    if role == "planner" and role_mutating:
+        raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
+    return EndpointConfig(
+        role=role,
+        endpoint_id=endpoint_id,
+        version=version,
+        executor_profile=executor_profile,
+        codex_profile=codex_profile,
+        profile_sha256=profile_sha256,
+        command_prefix=command_prefix,
+        allowed_topics=allowed_topics,
+    )
+
+
 def load_registry_config(
     path: Path = DEFAULT_CONFIG,
     *,
     codex_home: Path | None = None,
     profile_template_root: Path = DEFAULT_PROFILE_TEMPLATE_ROOT,
 ) -> RegistryConfig:
-    """Load a closed-schema TOML registry configuration."""
+    """Load the closed current-and-rollback endpoint catalog."""
 
     raw, source_evidence = _read_regular_owner_file(path, "REGISTRY_CONFIG")
     try:
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise RegistryError("REGISTRY_CONFIG_INVALID_TOML") from exc
-    if set(parsed) != ROOT_KEYS or parsed.get("schema_version") != 1:
+    if set(parsed) != ROOT_KEYS or parsed.get("schema_version") != 2:
         raise RegistryError("REGISTRY_CONFIG_SCHEMA_INVALID")
     role_values = parsed.get("roles")
+    historical_values = parsed.get("historical_endpoints")
     if not isinstance(role_values, dict) or set(role_values) != set(ROLES):
         raise RegistryError("REGISTRY_CONFIG_ROLES_INVALID")
-    endpoints: dict[str, EndpointConfig] = {}
-    profiles: set[str] = set()
-    endpoint_ids: set[str] = set()
-    mutating_topics: dict[str, set[str]] = {}
-    for role in ROLES:
-        value = role_values[role]
-        expected_keys = PROFILED_ROLE_KEYS
-        if not isinstance(value, dict) or set(value) != expected_keys:
-            raise RegistryError("REGISTRY_CONFIG_ROLE_SCHEMA_INVALID")
-        endpoint_id = value.get("endpoint_id")
-        version = value.get("version")
-        executor_profile = value.get("executor_profile")
-        codex_profile = value.get("codex_profile")
-        profile_sha256 = value.get("profile_sha256", "")
-        if (
-            type(endpoint_id) is not str
-            or not ENDPOINT_ID.fullmatch(endpoint_id)
-            or not endpoint_id.startswith(f"role.{role}.")
-            or type(version) is not int
-            or version <= 0
-            or endpoint_id != f"role.{role}.v{version}"
-            or type(executor_profile) is not str
-            or executor_profile != role
-            or type(codex_profile) is not str
-            or type(profile_sha256) is not str
-        ):
-            raise RegistryError("REGISTRY_CONFIG_ROLE_INVALID")
-        command_prefix = _validate_string_list(
-            value.get("command_prefix"), "REGISTRY_CONFIG_COMMAND_INVALID"
-        )
-        allowed_topics = _validate_string_list(
-            value.get("allowed_topics"), "REGISTRY_CONFIG_TOPICS_INVALID"
+    if not isinstance(historical_values, list):
+        raise RegistryError("REGISTRY_CONFIG_HISTORY_INVALID")
+
+    roles = {
+        role: _parse_endpoint_config(role, role_values[role]) for role in ROLES
+    }
+    endpoints: dict[str, EndpointConfig] = {
+        endpoint.endpoint_id: endpoint for endpoint in roles.values()
+    }
+    versions = {(endpoint.role, endpoint.version) for endpoint in roles.values()}
+    for value in historical_values:
+        if not isinstance(value, dict) or type(value.get("role")) is not str:
+            raise RegistryError("REGISTRY_CONFIG_HISTORY_INVALID")
+        role = str(value["role"])
+        endpoint = _parse_endpoint_config(
+            role, {key: item for key, item in value.items() if key != "role"}
         )
         if (
-            command_prefix[:2] != ("/home/ubuntu/.local/bin/codex", "exec")
-            or "resume" in command_prefix
-            or any(UUID.fullmatch(token) for token in command_prefix)
-            or any("bypass" in token.casefold() for token in command_prefix)
-            or len(set(allowed_topics)) != len(allowed_topics)
+            endpoint.endpoint_id in endpoints
+            or (endpoint.role, endpoint.version) in versions
+            or endpoint.version >= roles[endpoint.role].version
         ):
-            raise RegistryError("REGISTRY_CONFIG_COMMAND_INVALID")
-        expected_name = EXPECTED_CODEX_PROFILES[role]
-        expected_command = (
-            "/home/ubuntu/.local/bin/codex",
-            "exec",
-            "--profile",
-            expected_name,
-            "--strict-config",
-            "--json",
-        )
-        if codex_profile != expected_name or command_prefix != expected_command:
-            raise RegistryError("REGISTRY_CONFIG_COMMAND_PROFILE_MISMATCH")
-        role_mutating = {topic for topic in allowed_topics if topic != "coordination.notice"}
-        if role == "development" and any(
-            not topic.startswith("development.") for topic in role_mutating
-        ):
-            raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
-        if role == "sre" and any(not topic.startswith("sre.") for topic in role_mutating):
-            raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
-        if role == "planner" and role_mutating:
-            raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
-        if endpoint_id in endpoint_ids or executor_profile in profiles:
-            raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
-        endpoint_ids.add(endpoint_id)
-        profiles.add(executor_profile)
-        mutating_topics[role] = role_mutating
-        endpoints[role] = EndpointConfig(
-            role=role,
-            endpoint_id=endpoint_id,
-            version=version,
-            executor_profile=executor_profile,
-            codex_profile=codex_profile,
-            profile_sha256=profile_sha256,
-            command_prefix=command_prefix,
-            allowed_topics=allowed_topics,
-        )
-    if mutating_topics["development"] & mutating_topics["sre"]:
+            raise RegistryError("REGISTRY_CONFIG_HISTORY_INVALID")
+        endpoints[endpoint.endpoint_id] = endpoint
+        versions.add((endpoint.role, endpoint.version))
+
+    current_mutating = {
+        role: {
+            topic
+            for topic in endpoint.allowed_topics
+            if topic != NONMUTATING_MESSAGE_TOPIC
+        }
+        for role, endpoint in roles.items()
+    }
+    if current_mutating["development"] & current_mutating["sre"]:
         raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
     effective_codex_home = codex_home or _default_codex_home()
     profile_evidence = _validate_role_profiles(
@@ -616,8 +669,9 @@ def load_registry_config(
         profile_template_root=profile_template_root,
     )
     return RegistryConfig(
-        schema_version=1,
-        roles=endpoints,
+        schema_version=2,
+        roles=roles,
+        endpoints=endpoints,
         source_sha256=hashlib.sha256(raw).hexdigest(),
         source_evidence=source_evidence,
         profile_evidence=profile_evidence,
@@ -663,6 +717,15 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             UNIQUE(role, version)
         );
+        CREATE TABLE IF NOT EXISTS executor_registry_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            cutover_state TEXT NOT NULL CHECK(cutover_state IN ('PRE_CUTOVER','CUTOVER_COMPLETE')),
+            version INTEGER NOT NULL CHECK(version > 0),
+            completed_at TEXT
+        );
+        INSERT OR IGNORE INTO executor_registry_state(
+            singleton, cutover_state, version, completed_at
+        ) VALUES (1, 'PRE_CUTOVER', 1, NULL);
         CREATE TABLE IF NOT EXISTS executor_role_endpoint_current (
             role TEXT PRIMARY KEY CHECK(role IN ('planner','development','sre')),
             endpoint_id TEXT NOT NULL,
@@ -686,6 +749,7 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
             token_sha256 TEXT NOT NULL,
             target_kind TEXT NOT NULL CHECK(target_kind IN ('message','terminal_watch','hosted_operation')),
             target_key TEXT NOT NULL,
+            repository_scope TEXT,
             lineage_repository TEXT,
             lineage_issue_number INTEGER,
             lineage_generation INTEGER,
@@ -749,6 +813,44 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS executor_role_endpoint_immutable_delete
         BEFORE DELETE ON executor_role_endpoints
         BEGIN SELECT RAISE(ABORT, 'EXECUTOR_ENDPOINT_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS executor_registry_state_monotonic_update
+        BEFORE UPDATE ON executor_registry_state
+        WHEN NEW.singleton IS NOT OLD.singleton
+          OR OLD.cutover_state='CUTOVER_COMPLETE'
+          OR NEW.cutover_state!='CUTOVER_COMPLETE'
+          OR NEW.version!=OLD.version+1
+          OR NEW.completed_at IS NULL
+        BEGIN SELECT RAISE(ABORT, 'EXECUTOR_CUTOVER_STATE_MONOTONIC'); END;
+        CREATE TRIGGER IF NOT EXISTS executor_registry_state_immutable_delete
+        BEFORE DELETE ON executor_registry_state
+        BEGIN SELECT RAISE(ABORT, 'EXECUTOR_CUTOVER_STATE_MONOTONIC'); END;
+        CREATE TRIGGER IF NOT EXISTS executor_current_endpoint_role_insert
+        BEFORE INSERT ON executor_role_endpoint_current
+        WHEN NOT EXISTS (
+            SELECT 1 FROM executor_role_endpoints endpoint
+            WHERE endpoint.endpoint_id=NEW.endpoint_id AND endpoint.role=NEW.role
+        )
+        BEGIN SELECT RAISE(ABORT, 'EXECUTOR_POINTER_ROLE_MISMATCH'); END;
+        CREATE TRIGGER IF NOT EXISTS executor_current_endpoint_role_update
+        BEFORE UPDATE OF role, endpoint_id ON executor_role_endpoint_current
+        WHEN NOT EXISTS (
+            SELECT 1 FROM executor_role_endpoints endpoint
+            WHERE endpoint.endpoint_id=NEW.endpoint_id AND endpoint.role=NEW.role
+        )
+        BEGIN SELECT RAISE(ABORT, 'EXECUTOR_POINTER_ROLE_MISMATCH'); END;
+        CREATE TRIGGER IF NOT EXISTS executor_current_endpoint_cutover_insert
+        AFTER INSERT ON executor_role_endpoint_current
+        WHEN (SELECT cutover_state FROM executor_registry_state WHERE singleton=1)='PRE_CUTOVER'
+        BEGIN
+            UPDATE executor_registry_state
+            SET cutover_state='CUTOVER_COMPLETE', version=version+1,
+                completed_at=NEW.updated_at
+            WHERE singleton=1 AND cutover_state='PRE_CUTOVER';
+        END;
+        CREATE TRIGGER IF NOT EXISTS executor_current_endpoint_monotonic_delete
+        BEFORE DELETE ON executor_role_endpoint_current
+        WHEN (SELECT cutover_state FROM executor_registry_state WHERE singleton=1)='CUTOVER_COMPLETE'
+        BEGIN SELECT RAISE(ABORT, 'REGISTRY_ROLLBACK_PRECUTOVER_FORBIDDEN'); END;
         CREATE TRIGGER IF NOT EXISTS executor_role_alias_immutable_update
         BEFORE UPDATE ON executor_role_endpoint_aliases
         BEGIN SELECT RAISE(ABORT, 'EXECUTOR_ALIAS_IMMUTABLE'); END;
@@ -764,6 +866,7 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
           OR NEW.token_sha256 IS NOT OLD.token_sha256
           OR NEW.target_kind IS NOT OLD.target_kind
           OR NEW.target_key IS NOT OLD.target_key
+          OR NEW.repository_scope IS NOT OLD.repository_scope
           OR NEW.lineage_repository IS NOT OLD.lineage_repository
           OR NEW.lineage_issue_number IS NOT OLD.lineage_issue_number
           OR NEW.lineage_generation IS NOT OLD.lineage_generation
@@ -783,6 +886,18 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'EXECUTOR_ATTEMPT_EVENT_IMMUTABLE'); END;
         """
     )
+    existing_pointer = connection.execute(
+        "SELECT updated_at FROM executor_role_endpoint_current ORDER BY role LIMIT 1"
+    ).fetchone()
+    if existing_pointer is not None:
+        connection.execute(
+            """
+            UPDATE executor_registry_state
+            SET cutover_state='CUTOVER_COMPLETE', version=version+1, completed_at=?
+            WHERE singleton=1 AND cutover_state='PRE_CUTOVER'
+            """,
+            (str(existing_pointer[0]),),
+        )
     if not attempts_existed:
         connection.execute(
             """CREATE UNIQUE INDEX executor_one_active_attempt_per_target
@@ -793,6 +908,12 @@ def ensure_executor_registry_schema(connection: sqlite3.Connection) -> None:
             """CREATE UNIQUE INDEX executor_one_active_attempt_per_lineage
             ON executor_attempts(lineage_sha256)
             WHERE lineage_sha256 IS NOT NULL
+              AND state IN ('RESERVED','LAUNCHING','RUNNING')"""
+        )
+        connection.execute(
+            """CREATE UNIQUE INDEX executor_one_active_planner_per_repository
+            ON executor_attempts(repository_scope)
+            WHERE role='planner' AND repository_scope IS NOT NULL
               AND state IN ('RESERVED','LAUNCHING','RUNNING')"""
         )
 
@@ -840,6 +961,7 @@ def attempt_active_uniqueness(connection: sqlite3.Connection) -> str:
             "role", "target_kind", "target_key"
         ),
         "executor_one_active_attempt_per_lineage": ("lineage_sha256",),
+        "executor_one_active_planner_per_repository": ("repository_scope",),
     }:
         return "ROLE_TARGET"
     if any(columns == ("role",) for _name, columns in active_indexes):
@@ -861,6 +983,7 @@ def attempt_schema_is_current(connection: sqlite3.Connection) -> bool:
         "systemd_unit",
         "systemd_invocation_id",
         "systemd_control_group",
+        "repository_scope",
         "lineage_repository",
         "lineage_issue_number",
         "lineage_generation",
@@ -913,6 +1036,9 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
     control_group = (
         "systemd_control_group" if "systemd_control_group" in old_columns else "NULL"
     )
+    repository_scope = (
+        "lower(repository_scope)" if "repository_scope" in old_columns else "NULL"
+    )
     lineage_repository = (
         "lineage_repository" if "lineage_repository" in old_columns else "NULL"
     )
@@ -937,6 +1063,7 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
         "DROP INDEX IF EXISTS executor_one_active_attempt_per_role",
         "DROP INDEX IF EXISTS executor_one_active_attempt_per_target",
         "DROP INDEX IF EXISTS executor_one_active_attempt_per_lineage",
+        "DROP INDEX IF EXISTS executor_one_active_planner_per_repository",
         "ALTER TABLE executor_attempts RENAME TO executor_attempts_legacy_schema",
         """CREATE TABLE executor_attempts (
             attempt_id TEXT PRIMARY KEY,
@@ -946,6 +1073,7 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
             token_sha256 TEXT NOT NULL,
             target_kind TEXT NOT NULL CHECK(target_kind IN ('message','terminal_watch','hosted_operation')),
             target_key TEXT NOT NULL,
+            repository_scope TEXT,
             lineage_repository TEXT,
             lineage_issue_number INTEGER,
             lineage_generation INTEGER,
@@ -979,13 +1107,14 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
         )""",
         f"""INSERT INTO executor_attempts(
             attempt_id, role, endpoint_id, instance_id, token_sha256,
-            target_kind, target_key, lineage_repository, lineage_issue_number,
+            target_kind, target_key, repository_scope,
+            lineage_repository, lineage_issue_number,
             lineage_generation, lineage_lease_sha256, lineage_sha256,
             state, process_id, exit_code,
             systemd_unit, systemd_invocation_id, systemd_control_group,
             heartbeat_at, version, created_at, updated_at, last_error
         ) SELECT attempt_id, role, endpoint_id, instance_id, token_sha256,
-                 target_kind, target_key, {lineage_repository},
+                 target_kind, target_key, {repository_scope}, {lineage_repository},
                  {lineage_issue_number}, {lineage_generation},
                  {lineage_lease_sha256}, {lineage_sha256},
                  state, process_id, exit_code,
@@ -999,6 +1128,10 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
             ON executor_attempts(lineage_sha256)
             WHERE lineage_sha256 IS NOT NULL
               AND state IN ('RESERVED','LAUNCHING','RUNNING')""",
+        """CREATE UNIQUE INDEX executor_one_active_planner_per_repository
+            ON executor_attempts(repository_scope)
+            WHERE role='planner' AND repository_scope IS NOT NULL
+              AND state IN ('RESERVED','LAUNCHING','RUNNING')""",
         """CREATE TRIGGER executor_attempt_identity_immutable
         BEFORE UPDATE ON executor_attempts
         WHEN NEW.attempt_id IS NOT OLD.attempt_id
@@ -1008,6 +1141,7 @@ def upgrade_attempt_schema(connection: sqlite3.Connection) -> None:
           OR NEW.token_sha256 IS NOT OLD.token_sha256
           OR NEW.target_kind IS NOT OLD.target_kind
           OR NEW.target_key IS NOT OLD.target_key
+          OR NEW.repository_scope IS NOT OLD.repository_scope
           OR NEW.lineage_repository IS NOT OLD.lineage_repository
           OR NEW.lineage_issue_number IS NOT OLD.lineage_issue_number
           OR NEW.lineage_generation IS NOT OLD.lineage_generation
@@ -1061,54 +1195,58 @@ upgrade_attempt_target_schema = upgrade_attempt_schema
 
 
 def identity_role(connection: sqlite3.Connection, identity: str) -> str | None:
-    """Resolve an endpoint or reviewed legacy alias to its role.
-
-    The reviewed file is deliberately authoritative even before the additive
-    registry migration has installed database aliases.
-    """
+    """Resolve only an exact reviewed endpoint; syntax never grants a role."""
 
     if not isinstance(identity, str):
         return None
-    if ENDPOINT_ID.fullmatch(identity):
-        endpoint_role = identity.split(".")[1]
-    else:
-        endpoint_role = None
-    reviewed_role = load_legacy_aliases().aliases.get(identity)
-
-    tables = {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-            "('executor_role_endpoints','executor_role_endpoint_aliases')"
-        ).fetchall()
-    }
-    if "executor_role_endpoints" not in tables:
-        return reviewed_role or endpoint_role
-
+    configured_role = configured_identity_role(identity)
+    if configured_role is None:
+        return None
+    endpoint_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='executor_role_endpoints'"
+    ).fetchone()
+    if endpoint_table is None:
+        return configured_role
     endpoint = connection.execute(
         "SELECT role FROM executor_role_endpoints WHERE endpoint_id=?", (identity,)
     ).fetchone()
-    if endpoint is not None:
-        return str(endpoint[0])
-    if "executor_role_endpoint_aliases" not in tables:
-        return reviewed_role
+    if endpoint is None:
+        return None
+    if str(endpoint[0]) != configured_role:
+        raise RegistryError("EXECUTOR_ENDPOINT_CATALOG_DRIFT")
+    return configured_role
+
+
+def _historical_identity_role(
+    connection: sqlite3.Connection, identity: str
+) -> str | None:
+    """Resolve an exact endpoint or installed alias for readback/migration only."""
+
+    role = identity_role(connection, identity)
+    if role is not None:
+        return role
+    if not isinstance(identity, str):
+        return None
+    alias_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='executor_role_endpoint_aliases'"
+    ).fetchone()
+    if alias_table is None:
+        return None
     alias = connection.execute(
         "SELECT role FROM executor_role_endpoint_aliases WHERE alias=?", (identity,)
     ).fetchone()
-    database_role = None if alias is None else str(alias[0])
-    if database_role is not None and reviewed_role is not None and database_role != reviewed_role:
-        raise RegistryError("LEGACY_ALIAS_DATABASE_DRIFT")
-    return database_role or reviewed_role or endpoint_role
+    return None if alias is None else str(alias[0])
 
 
 def configured_identity_role(identity: str) -> str | None:
-    """Resolve syntax-level endpoints and reviewed aliases without a database."""
+    """Resolve only endpoint IDs present in the reviewed versioned catalog."""
 
     if not isinstance(identity, str):
         return None
-    if ENDPOINT_ID.fullmatch(identity):
-        return identity.split(".")[1]
-    return load_legacy_aliases().aliases.get(identity)
+    endpoint = load_registry_config().endpoints.get(identity)
+    return None if endpoint is None else endpoint.role
 
 
 def identities_role_equivalent(
@@ -1120,8 +1258,11 @@ def identities_role_equivalent(
     historical rows.  It must not be used to validate a new mutable route.
     """
 
-    left_role = identity_role(connection, left)
-    return left_role is not None and left_role == identity_role(connection, right)
+    left_role = _historical_identity_role(connection, left)
+    return (
+        left_role is not None
+        and left_role == _historical_identity_role(connection, right)
+    )
 
 
 def select_role_equivalent_identity(
@@ -1131,7 +1272,7 @@ def select_role_equivalent_identity(
 ) -> str:
     """Prefer the current endpoint, otherwise one immutable alias of its role."""
 
-    if identity_role(connection, requested_identity) is None:
+    if _historical_identity_role(connection, requested_identity) is None:
         raise RegistryError("REGISTRY_IDENTITY_ROLE_UNKNOWN")
     canonical = canonical_endpoint_id(connection, requested_identity) or requested_identity
     equivalent = sorted({
@@ -1142,9 +1283,62 @@ def select_role_equivalent_identity(
     return canonical if canonical in equivalent or not equivalent else equivalent[0]
 
 
+def registry_cutover_complete(connection: sqlite3.Connection) -> bool:
+    """Return the monotonic cutover mode, inferring old installed registries."""
+
+    state_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='executor_registry_state'"
+    ).fetchone()
+    if state_table is not None:
+        row = connection.execute(
+            "SELECT cutover_state FROM executor_registry_state WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise RegistryError("REGISTRY_CUTOVER_STATE_INVALID")
+        return str(row[0]) == "CUTOVER_COMPLETE"
+    pointer_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='executor_role_endpoint_current'"
+    ).fetchone()
+    if pointer_table is None:
+        return False
+    return bool(
+        connection.execute(
+            "SELECT 1 FROM executor_role_endpoint_current LIMIT 1"
+        ).fetchone()
+    )
+
+
+def _require_complete_current_pointer_set(connection: sqlite3.Connection) -> None:
+    if not registry_cutover_complete(connection):
+        return
+    rows = connection.execute(
+        """
+        SELECT current.role AS pointer_role, current.endpoint_id,
+               endpoint.role AS endpoint_role
+        FROM executor_role_endpoint_current current
+        LEFT JOIN executor_role_endpoints endpoint
+          ON endpoint.endpoint_id=current.endpoint_id
+        ORDER BY current.role
+        """
+    ).fetchall()
+    if (
+        len(rows) != len(ROLES)
+        or {str(row["pointer_role"]) for row in rows} != set(ROLES)
+        or any(
+            row["endpoint_role"] != row["pointer_role"]
+            or ENDPOINT_ID.fullmatch(str(row["endpoint_id"])) is None
+            for row in rows
+        )
+    ):
+        raise RegistryError("REGISTRY_CURRENT_POINTER_SET_INCOMPLETE")
+
+
 def current_endpoint(connection: sqlite3.Connection, role: str) -> sqlite3.Row | None:
     if role not in ROLES:
         raise RegistryError("REGISTRY_ROLE_INVALID")
+    _require_complete_current_pointer_set(connection)
     return connection.execute(
         """
         SELECT endpoint.*, current.pointer_version, current.updated_at AS pointer_updated_at
@@ -1162,14 +1356,7 @@ def require_current_endpoint_identity(
     *,
     expected_role: str | None = None,
 ) -> str:
-    """Require an exact registered current endpoint after registry cutover.
-
-    Before any current pointer exists, legacy pre-migration callers retain
-    their prior validation behavior so the reviewed migration can inspect and
-    rewrite mutable rows.  Once cutover has begun, no UUID alias, stale
-    endpoint, unregistered endpoint, or arbitrary session UUID is accepted as
-    a new mutable or claiming identity.
-    """
+    """Require one exact registered current endpoint and a complete pointer set."""
 
     if not isinstance(identity, str) or (
         ENDPOINT_ID.fullmatch(identity) is None and UUID.fullmatch(identity) is None
@@ -1178,21 +1365,7 @@ def require_current_endpoint_identity(
     if expected_role is not None and expected_role not in ROLES:
         raise RegistryError("REGISTRY_ROLE_INVALID")
 
-    pointer_table = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' "
-        "AND name='executor_role_endpoint_current'"
-    ).fetchone()
-    pointer_count = 0
-    if pointer_table is not None:
-        pointer_count = int(connection.execute(
-            "SELECT COUNT(*) FROM executor_role_endpoint_current"
-        ).fetchone()[0])
-
     role = identity_role(connection, identity)
-    if pointer_count == 0:
-        if expected_role is not None and role != expected_role:
-            raise RegistryError("REGISTRY_IDENTITY_ROLE_MISMATCH")
-        return identity
     if role is None:
         raise RegistryError("CURRENT_ROLE_ENDPOINT_REQUIRED")
     if expected_role is not None and role != expected_role:
@@ -1204,7 +1377,7 @@ def require_current_endpoint_identity(
 
 
 def canonical_endpoint_id(connection: sqlite3.Connection, identity: str) -> str | None:
-    role = identity_role(connection, identity)
+    role = _historical_identity_role(connection, identity)
     if role is None:
         return None
     endpoint = current_endpoint(connection, role)
@@ -1324,6 +1497,78 @@ def attempt_lineage_for_target(
     raise RegistryError("EXECUTOR_LINEAGE_INVALID")
 
 
+def repository_scope_for_target(
+    connection: sqlite3.Connection, target_kind: str, target_key: str
+) -> str | None:
+    """Resolve a target's canonical immutable repository scope without writes."""
+
+    if target_kind == "message":
+        try:
+            message_id = int(target_key)
+        except (TypeError, ValueError):
+            return None
+        row = connection.execute(
+            "SELECT payload_json FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RegistryError("EXECUTOR_REPOSITORY_SCOPE_INVALID") from exc
+        source = payload.get("source") if isinstance(payload, dict) else None
+        repository = source.get("repository") if isinstance(source, dict) else None
+        return canonical_repository_scope(repository)
+    if target_kind == "terminal_watch":
+        row = connection.execute(
+            "SELECT repository FROM coordination_terminal_watches WHERE watch_key=?",
+            (target_key,),
+        ).fetchone()
+        return None if row is None else canonical_repository_scope(row["repository"])
+    if target_kind == "hosted_operation":
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hosted_operations'"
+        ).fetchone()
+        if table is None:
+            return None
+        hosted_columns = {
+            str(column[1])
+            for column in connection.execute("PRAGMA table_info(hosted_operations)")
+        }
+        if "repository" not in hosted_columns:
+            return None
+        try:
+            operation_id = int(target_key)
+        except (TypeError, ValueError):
+            return None
+        row = connection.execute(
+            "SELECT repository FROM hosted_operations WHERE id=?", (operation_id,)
+        ).fetchone()
+        return None if row is None else canonical_repository_scope(row["repository"])
+    raise RegistryError("EXECUTOR_REPOSITORY_SCOPE_INVALID")
+
+
+def planner_repository_for_target(
+    connection: sqlite3.Connection, target_kind: str, target_key: str
+) -> str | None:
+    """Resolve the canonical repository scope for one Planner target."""
+
+    if target_kind != "message":
+        return None
+    try:
+        message_id = int(target_key)
+    except (TypeError, ValueError) as exc:
+        raise RegistryError("EXECUTOR_REPOSITORY_SCOPE_INVALID") from exc
+    row = connection.execute(
+        "SELECT recipient_session_id FROM coordination_messages WHERE id=?",
+        (message_id,),
+    ).fetchone()
+    if row is None or identity_role(connection, row["recipient_session_id"]) != "planner":
+        return None
+    return repository_scope_for_target(connection, target_kind, target_key)
+
+
 def reserve_attempt(
     connection: sqlite3.Connection,
     *,
@@ -1356,6 +1601,11 @@ def reserve_attempt(
         lineage = precondition(connection)
         if lineage is not None and not isinstance(lineage, AttemptLineage):
             raise RegistryError("EXECUTOR_LINEAGE_INVALID")
+        repository_scope = repository_scope_for_target(
+            connection, target_kind, target_key
+        )
+        if role == "planner" and repository_scope is None:
+            raise RegistryError("EXECUTOR_REPOSITORY_SCOPE_INVALID")
         endpoint = current_endpoint(connection, role)
         if endpoint is None or endpoint["endpoint_id"] != endpoint_id:
             raise RegistryError("EXECUTOR_ENDPOINT_NOT_CURRENT")
@@ -1374,15 +1624,25 @@ def reserve_attempt(
             ).fetchone()
             if active_lineage is not None:
                 raise RegistryError("EXECUTOR_LINEAGE_BUSY")
+        if role == "planner" and connection.execute(
+            """
+            SELECT 1 FROM executor_attempts
+            WHERE role='planner' AND repository_scope=?
+              AND state IN ('RESERVED','LAUNCHING','RUNNING')
+            """,
+            (repository_scope,),
+        ).fetchone() is not None:
+            raise RegistryError("EXECUTOR_REPOSITORY_BUSY")
         connection.execute(
             """
             INSERT INTO executor_attempts(
                 attempt_id, role, endpoint_id, instance_id, token_sha256,
-                target_kind, target_key, lineage_repository, lineage_issue_number,
+                target_kind, target_key, repository_scope,
+                lineage_repository, lineage_issue_number,
                 lineage_generation, lineage_lease_sha256, lineage_sha256,
                 state, process_id, exit_code,
                 heartbeat_at, version, created_at, updated_at, last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                       'RESERVED', NULL, NULL, ?, 1, ?, ?, NULL)
             """,
             (
@@ -1393,6 +1653,7 @@ def reserve_attempt(
                 token_sha256,
                 target_kind,
                 target_key,
+                repository_scope,
                 None if lineage is None else lineage.repository,
                 None if lineage is None else lineage.issue_number,
                 None if lineage is None else lineage.generation,
