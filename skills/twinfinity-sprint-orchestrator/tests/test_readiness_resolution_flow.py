@@ -96,7 +96,7 @@ class ResolutionHarness:
             fetched_at=NOW,
         )
         self.source_sha256 = snapshot.payload_sha256
-        self.item = self.store._set_issue_status_for_test_fixture(
+        self.item = self.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=ISSUE,
             status="PREPARED",

@@ -70,7 +70,7 @@ class KanbanPullBufferTests(unittest.TestCase):
         self.sources[number] = snapshot.payload_sha256
 
     def _item(self, number: int, status: str) -> None:
-        self.store._set_issue_status_for_test_fixture(
+        self.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=number,
             status=status,
@@ -239,25 +239,6 @@ class KanbanPullBufferTests(unittest.TestCase):
         self.assertEqual(set(), triggers)
 
     def test_ready_registration_fails_closed_on_incomplete_admission(self) -> None:
-        current = self.store.connection.execute(
-            "SELECT version FROM coordination_items WHERE repository=? AND issue_number=251",
-            (REPOSITORY,),
-        ).fetchone()
-        self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
-            issue_number=251,
-            status="READY",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=None,
-            lease_manifest_sha256=None,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=self.sources[251],
-            expected_version=int(current["version"]),
-            now="2026-08-24T02:00:02Z",
-        )
         packet = self._packet(
             251,
             "END_TO_END",

@@ -22,6 +22,7 @@ from coordination_store import (  # noqa: E402
     digest_json,
 )
 from prepush_control import PrePushControl  # noqa: E402
+from portfolio_graph import replace_graph  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
@@ -30,6 +31,9 @@ from reconcile_routing_artifacts import (  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
     reviewed_planner_rotation_catalog,
+)
+from tests.canonical_ready_fixture import (  # noqa: E402
+    finalize_canonical_ready_item,
 )
 
 
@@ -90,6 +94,78 @@ class CoordinationStoreTests(unittest.TestCase):
             "routine_chain": ["Run the issue-owned delivery chain."],
             "hard_stops": ["Stop on any binding drift."],
         }
+
+    def canonical_ready_item(
+        self,
+        source,
+        *,
+        issue_number: int = 92,
+        generation: int = 1,
+        development_units: int = 1,
+        shared_units: int = 0,
+        sre_units: int = 0,
+        suffix: str,
+    ) -> dict:
+        endpoint = SRE_SESSION if sre_units else SESSION
+        self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=issue_number,
+            status="PREPARED",
+            allocation_class="NONE",
+            generation=generation,
+            accountable_session_id=None,
+            lease_manifest_sha256=None,
+            development_units=development_units,
+            shared_units=shared_units,
+            sre_units=sre_units,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-22T10:00:02Z",
+        )
+        replace_graph(
+            self.store.connection,
+            {
+                "repository": REPOSITORY,
+                "accepted_main_sha": "a" * 40,
+                "expected_current_version": 0,
+                "scope_milestones": [{"title": "Fixture", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [
+                    {
+                        "node_key": f"issue:{issue_number}",
+                        "issue_number": issue_number,
+                        "role": "DELIVERY",
+                        "root_kind": "STANDALONE",
+                        "root_reason": "Independent canonical fixture outcome",
+                        "lane_key": f"lane-{issue_number}",
+                        "lane_order": 0,
+                        "dispatchable": True,
+                        "priority_rank": 1,
+                        "estimate_units": 1,
+                        "development_units": development_units,
+                        "shared_units": shared_units,
+                        "sre_units": sre_units,
+                        "source_payload_sha256": source.payload_sha256,
+                        "ready_at": "2026-08-22T10:00:00Z",
+                    }
+                ],
+                "relations": [],
+            },
+            now="2026-08-22T10:00:03Z",
+        )
+        return finalize_canonical_ready_item(
+            self.store,
+            database=self.database,
+            artifact_root=self.database.parent,
+            repository=REPOSITORY,
+            issue_number=issue_number,
+            source_payload_sha256=source.payload_sha256,
+            accepted_main_sha="a" * 40,
+            worker_role="sre" if sre_units else "development",
+            worker_endpoint_id=endpoint,
+            now="2026-08-22T10:00:04Z",
+            suffix=suffix,
+        )["item"]
 
     def bind_admission_lease(
         self,
@@ -154,20 +230,11 @@ class CoordinationStoreTests(unittest.TestCase):
         self, slug: str
     ) -> tuple[dict, dict, list[dict], dict]:
         source = self.snapshot()
-        ready = self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="READY",
-            allocation_class="NONE",
+        ready = self.canonical_ready_item(
+            source,
             generation=3,
-            accountable_session_id=SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
             shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+            suffix=f"{slug}-ready",
         )
         item = {
             "repository": REPOSITORY,
@@ -245,6 +312,94 @@ class CoordinationStoreTests(unittest.TestCase):
             "role, target_kind, target_key", target_index[0]
         )
         self.assertIsNone(role_index)
+
+    def test_test_fixture_ready_gateway_rejects_copied_live_database_without_writes(self) -> None:
+        source = self.snapshot()
+        seeded = self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="PREPARED",
+            allocation_class="NONE",
+            generation=1,
+            accountable_session_id=None,
+            lease_manifest_sha256=None,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-22T10:00:02Z",
+        )
+        copied_path = self.database.parent / "live-shaped-copy.sqlite3"
+        copied = CoordinationStore(copied_path)
+        try:
+            self.store.connection.backup(copied.connection)
+            before_changes = copied.connection.total_changes
+            before_item = tuple(
+                copied.connection.execute(
+                    "SELECT status, generation, version, source_payload_sha256 "
+                    "FROM coordination_items WHERE repository=? AND issue_number=92",
+                    (REPOSITORY,),
+                ).fetchone()
+            )
+            before_coordination = tuple(
+                copied.connection.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM coordination_items),"
+                    "(SELECT COUNT(*) FROM coordination_messages),"
+                    "(SELECT COUNT(*) FROM github_outbox),"
+                    "(SELECT COUNT(*) FROM coordination_artifacts),"
+                    "(SELECT COUNT(*) FROM coordination_events)"
+                ).fetchone()
+            )
+            for forbidden in ("READY", "READY_ELIGIBLE", "FINALIZED"):
+                with self.subTest(forbidden=forbidden):
+                    with self.assertRaisesRegex(
+                        CoordinationError, "READY_FINALIZATION_REQUIRED"
+                    ):
+                        copied._set_issue_status_for_test_fixture(
+                            repository=REPOSITORY,
+                            issue_number=92,
+                            status=forbidden,
+                            allocation_class="NONE",
+                            generation=1,
+                            accountable_session_id=None,
+                            lease_manifest_sha256=None,
+                            development_units=1,
+                            shared_units=0,
+                            sre_units=0,
+                            expected_source_sha256=source.payload_sha256,
+                            expected_version=int(seeded["version"]),
+                            now="2026-08-22T10:00:03Z",
+                        )
+                    self.assertFalse(copied.connection.in_transaction)
+                    self.assertEqual(before_changes, copied.connection.total_changes)
+                    self.assertEqual(
+                        before_item,
+                        tuple(
+                            copied.connection.execute(
+                                "SELECT status, generation, version, source_payload_sha256 "
+                                "FROM coordination_items "
+                                "WHERE repository=? AND issue_number=92",
+                                (REPOSITORY,),
+                            ).fetchone()
+                        ),
+                    )
+                    self.assertEqual(
+                        before_coordination,
+                        tuple(
+                            copied.connection.execute(
+                                "SELECT "
+                                "(SELECT COUNT(*) FROM coordination_items),"
+                                "(SELECT COUNT(*) FROM coordination_messages),"
+                                "(SELECT COUNT(*) FROM github_outbox),"
+                                "(SELECT COUNT(*) FROM coordination_artifacts),"
+                                "(SELECT COUNT(*) FROM coordination_events)"
+                            ).fetchone()
+                        ),
+                    )
+        finally:
+            copied.close()
 
     def test_capacity_policy_is_persisted_versioned_and_drives_enforcement(self) -> None:
         source = self.snapshot()
@@ -421,19 +576,11 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_activation_and_admission_commit_atomically(self) -> None:
         source = self.snapshot()
-        ready = self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="READY",
-            allocation_class="NONE",
+        ready = self.canonical_ready_item(
+            source,
             generation=3,
-            accountable_session_id=SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
             shared_units=1,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+            suffix="atomic-admission-ready",
         )
         item = {
             "repository": REPOSITORY,
@@ -483,6 +630,12 @@ class CoordinationStoreTests(unittest.TestCase):
             item, message, "atomic-issue-92-admission-lease"
         )
         payload = message["payload"]
+        before_messages = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_messages"
+        ).fetchone()[0]
+        before_watches = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_terminal_watches"
+        ).fetchone()[0]
         with self.assertRaisesRegex(
             CoordinationError, "ADMISSION_ITEM_BINDING_MISMATCH"
         ):
@@ -496,15 +649,15 @@ class CoordinationStoreTests(unittest.TestCase):
             "SELECT status, version FROM coordination_items WHERE repository=? AND issue_number=?",
             (REPOSITORY, 92),
         ).fetchone()
-        self.assertEqual(("READY", 1), tuple(rolled_back))
+        self.assertEqual(("READY", ready["version"]), tuple(rolled_back))
         self.assertEqual(
-            0,
+            before_messages,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_messages"
             ).fetchone()[0],
         )
         self.assertEqual(
-            0,
+            before_watches,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_terminal_watches"
             ).fetchone()[0],
@@ -515,7 +668,10 @@ class CoordinationStoreTests(unittest.TestCase):
             artifacts=artifacts,
             now="2026-08-22T10:00:04Z",
         )
-        self.assertEqual(("ACTIVE", 2), (activated["status"], activated["version"]))
+        self.assertEqual(
+            ("ACTIVE", ready["version"] + 1),
+            (activated["status"], activated["version"]),
+        )
         observed = self.store.connection.execute(
             "SELECT state, recipient_session_id FROM coordination_messages WHERE id=?",
             (message_id,),
@@ -581,6 +737,16 @@ class CoordinationStoreTests(unittest.TestCase):
         before_events = self.store.connection.execute(
             "SELECT COUNT(*) FROM coordination_events"
         ).fetchone()[0]
+        before_tables = {
+            table: self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in (
+                "coordination_messages",
+                "coordination_terminal_watches",
+                "coordination_artifacts",
+            )
+        }
 
         for category, invalid_values in (
             ("wrong_type", wrong_types),
@@ -615,7 +781,7 @@ class CoordinationStoreTests(unittest.TestCase):
             "coordination_artifacts",
         ):
             self.assertEqual(
-                0,
+                before_tables[table],
                 self.store.connection.execute(
                     f"SELECT COUNT(*) FROM {table}"
                 ).fetchone()[0],
@@ -682,6 +848,12 @@ class CoordinationStoreTests(unittest.TestCase):
             before_events = self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_events"
             ).fetchone()[0]
+            before_messages = self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages"
+            ).fetchone()[0]
+            before_watches = self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_terminal_watches"
+            ).fetchone()[0]
             for field, value in substitutions.items():
                 with self.subTest(field=field):
                     observation["entry"] = {
@@ -708,13 +880,13 @@ class CoordinationStoreTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(("READY", "NONE", ready["version"]), tuple(observed_item))
         self.assertEqual(
-            0,
+            before_messages,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_messages"
             ).fetchone()[0],
         )
         self.assertEqual(
-            0,
+            before_watches,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_terminal_watches"
             ).fetchone()[0],
@@ -936,20 +1108,11 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_ready_first_admission_requires_a_complete_lease_artifact(self) -> None:
         source = self.snapshot()
-        ready = self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="READY",
-            allocation_class="NONE",
+        ready = self.canonical_ready_item(
+            source,
             generation=3,
-            accountable_session_id=SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
             shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+            suffix="ready-first-admission",
         )
         item = {
             "repository": REPOSITORY,
@@ -1053,20 +1216,12 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_sre_activation_and_admission_are_atomic_and_capacity_typed(self) -> None:
         source = self.issue_snapshot(314)
-        ready = self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
+        ready = self.canonical_ready_item(
+            source,
             issue_number=314,
-            status="READY",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=SRE_SESSION,
-            lease_manifest_sha256=LEASE,
             development_units=0,
-            shared_units=0,
             sre_units=1,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+            suffix="sre-atomic-admission",
         )
         item = {
             "repository": REPOSITORY,
@@ -1116,6 +1271,9 @@ class CoordinationStoreTests(unittest.TestCase):
             item, message, "atomic-issue-314-sre-admission-lease"
         )
         payload = message["payload"]
+        before_messages = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_messages"
+        ).fetchone()[0]
 
         for wrong_recipient in (SESSION, PLANNER_SESSION):
             wrong_role_item = {
@@ -1170,9 +1328,11 @@ class CoordinationStoreTests(unittest.TestCase):
             "SELECT status, allocation_class, version FROM coordination_items WHERE repository=? AND issue_number=?",
             (REPOSITORY, 314),
         ).fetchone()
-        self.assertEqual(("READY", "NONE", 1), tuple(rolled_back))
         self.assertEqual(
-            0,
+            ("READY", "NONE", ready["version"]), tuple(rolled_back)
+        )
+        self.assertEqual(
+            before_messages,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_messages"
             ).fetchone()[0],
@@ -1185,7 +1345,7 @@ class CoordinationStoreTests(unittest.TestCase):
             now="2026-08-22T10:00:04Z",
         )
         self.assertEqual(
-            ("ACTIVE", "ACTIVE", 2),
+            ("ACTIVE", "ACTIVE", ready["version"] + 1),
             (activated["status"], activated["allocation_class"], activated["version"]),
         )
         observed = self.store.connection.execute(
@@ -1207,20 +1367,10 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_terminal_closeout_binds_done_item_watch_lineage_and_outbox(self) -> None:
         source = self.snapshot()
-        ready = self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="READY",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
+        ready = self.canonical_ready_item(
+            source,
             shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
+            suffix="terminal-closeout-ready",
         )
         admission_payload = {
             "source": {

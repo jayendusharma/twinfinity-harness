@@ -8,6 +8,7 @@ and atomic finalizer APIs used by the owner control plane.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -268,3 +269,173 @@ def finalize_canonical_ready_candidate(
         "finalized": finalized,
         "item": current_item,
     }
+
+
+def finalize_canonical_ready_item(
+    store: CoordinationStore,
+    *,
+    database: Path,
+    artifact_root: Path,
+    repository: str,
+    issue_number: int,
+    source_payload_sha256: str,
+    accepted_main_sha: str,
+    worker_role: str,
+    worker_endpoint_id: str,
+    now: str,
+    suffix: str,
+) -> dict[str, Any]:
+    """Finalize one existing PREPARED/QUEUED item through the canonical path."""
+
+    item_row = store.connection.execute(
+        "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+        (repository, issue_number),
+    ).fetchone()
+    graph = store.connection.execute(
+        "SELECT * FROM portfolio_graph_current WHERE repository=?",
+        (repository,),
+    ).fetchone()
+    if item_row is None or item_row["status"] not in {"PREPARED", "QUEUED"}:
+        raise AssertionError("canonical READY fixture requires PREPARED or QUEUED item")
+    if graph is None or graph["health"] != "CURRENT":
+        raise AssertionError("canonical READY fixture requires current portfolio graph")
+    item = dict(item_row)
+    policy = store.capacity_policy(repository, now=now)
+    units = {
+        "development_units": int(item["development_units"]),
+        "shared_units": int(item["shared_units"]),
+        "sre_units": int(item["sre_units"]),
+    }
+    topic = "sre.admission" if worker_role == "sre" else "development.admission"
+    plans = artifact_root / "plans"
+    plans.mkdir(exist_ok=True)
+    branch = f"codex/{issue_number}-{suffix}"
+    worktree = f"/home/ubuntu/code/twinfinityapp-issue-{issue_number}-{suffix}"
+    lease_path = plans / f"issue-{issue_number}-{suffix}-lease.json"
+    lease_payload = {
+        "repository": repository,
+        "issue_number": issue_number,
+        "generation": int(item["generation"]),
+        "base_sha": accepted_main_sha,
+        "branch": branch,
+        "worktree_path": worktree,
+        "no_additional_paths": True,
+        "paths": [
+            {
+                "path": f"canonical-ready/issue-{issue_number}-{suffix}.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": hashlib.sha1(
+                    f"{repository}:{issue_number}:{suffix}".encode()
+                ).hexdigest(),
+            }
+        ],
+    }
+    lease_path.write_text(
+        json.dumps(lease_payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    lease_sha = hashlib.sha256(lease_path.read_bytes()).hexdigest()
+    admission_payload = {
+        "source": {
+            "repository": repository,
+            "object_kind": "issue",
+            "object_number": issue_number,
+            "payload_sha256": source_payload_sha256,
+        },
+        "issue_number": issue_number,
+        "generation": int(item["generation"]),
+        "item_version": int(item["version"]) + 2,
+        "base_sha": accepted_main_sha,
+        "branch": branch,
+        "worktree_path": worktree,
+        "opaque_worktree_id": f"canonical-ready-{issue_number}-{suffix}",
+        "accountable_session_id": worker_endpoint_id,
+        "lease_manifest_sha256": lease_sha,
+        "authority_sha256": hashlib.sha256(
+            f"authority:{repository}:{issue_number}:{suffix}".encode()
+        ).hexdigest(),
+        "capacity": units,
+        "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+    }
+    if topic == "development.admission":
+        admission_payload.update(
+            {
+                "writer": f"issue-{issue_number}-canonical-ready-writer",
+                "reviewer_plan": ["Independent exact-head review."],
+                "collision_proof": ["The canonical fixture lease is disjoint."],
+                "environment_rule": "Use only the issue-owned environment.",
+                "routine_chain": ["Run bounded gates and routine closeout."],
+                "hard_stops": ["Stop on source, lease, or capacity drift."],
+            }
+        )
+    prepared_packet = {
+        "schema": "twinfinity-kanban-pull-buffer/v2",
+        "repository": repository,
+        "issue_number": issue_number,
+        "generation": int(item["generation"]),
+        "item_version_at_preparation": int(item["version"]),
+        "source_payload_sha256": source_payload_sha256,
+        "accepted_main_at_preparation": accepted_main_sha,
+        "portfolio_graph_version": int(graph["version"]),
+        "state": "PREPARED_NOT_READY",
+        "verticality": "END_TO_END",
+        "owner_visible_outcome": f"Deliver canonical fixture issue {issue_number}.",
+        "capacity_policy": {
+            "version": int(policy["version"]),
+            "development_limit": int(policy["development_limit"]),
+            "shared_limit": int(policy["shared_limit"]),
+            "sre_limit": int(policy["sre_limit"]),
+        },
+        "capacity_on_activation": units,
+        "precomputed_collision_matrix": [
+            {
+                "other_issue": 999999,
+                "disposition": "DISJOINT",
+                "reason": "Canonical fixture paths are issue-specific.",
+            }
+        ],
+        "preparation_complete": ["The canonical admission envelope is complete."],
+        "promotion_checks_after_predecessor": ["Revalidate every local guard."],
+        "hard_stops": ["Stop on any controlling-state drift."],
+        "promotion_trigger": "All canonical readiness gates pass.",
+    }
+    admission_transaction = {
+        "item": {
+            "repository": repository,
+            "issue_number": issue_number,
+            "status": "ACTIVE",
+            "allocation_class": "ACTIVE",
+            "generation": int(item["generation"]),
+            "accountable_session_id": worker_endpoint_id,
+            "lease_manifest_sha256": lease_sha,
+            **units,
+            "expected_source_sha256": source_payload_sha256,
+            "expected_version": int(item["version"]) + 1,
+        },
+        "message": {
+            "idempotency_key": f"canonical-ready-{issue_number}-{suffix}",
+            "recipient_session_id": worker_endpoint_id,
+            "topic": topic,
+            "payload": admission_payload,
+        },
+        "artifacts": [
+            {
+                "repository": repository,
+                "issue_number": issue_number,
+                "generation": int(item["generation"]),
+                "path": str(lease_path),
+                "retention_class": "CLOSEOUT_EVIDENCE",
+            }
+        ],
+    }
+    return finalize_canonical_ready_candidate(
+        store,
+        database=database,
+        artifact_root=artifact_root,
+        prepared_packet=prepared_packet,
+        admission_transaction=admission_transaction,
+        worker_role=worker_role,
+        worker_endpoint_id=worker_endpoint_id,
+        now=now,
+        suffix=suffix,
+    )

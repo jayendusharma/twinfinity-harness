@@ -89,7 +89,7 @@ class Harness:
             fetched_at=NOW,
         )
         self.sources[issue] = snapshot.payload_sha256
-        self.items[issue] = self.store._set_issue_status_for_test_fixture(
+        self.items[issue] = self.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=issue,
             status="PREPARED",
@@ -348,7 +348,7 @@ class KanbanReadinessTests(unittest.TestCase):
     def test_discovery_does_not_promote_queued_work(self) -> None:
         self.h.seed([1])
         item = self.h.items[1]
-        self.h.store._set_issue_status_for_test_fixture(
+        self.h.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=1,
             status="QUEUED",

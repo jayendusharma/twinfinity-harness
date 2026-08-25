@@ -14,6 +14,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import CoordinationError, CoordinationStore  # noqa: E402
+from kanban_readiness import ReadinessError  # noqa: E402
 import portfolio_graph  # noqa: E402
 from portfolio_graph import (  # noqa: E402
     PortfolioGraphError,
@@ -25,11 +26,15 @@ from portfolio_graph import (  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
+from tests.canonical_ready_fixture import (  # noqa: E402
+    finalize_canonical_ready_item,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 MAIN = "1" * 40
 SESSION = "role.development.v4"
+SRE_SESSION = "role.sre.v4"
 
 
 class PortfolioGraphTests(unittest.TestCase):
@@ -178,31 +183,54 @@ class PortfolioGraphTests(unittest.TestCase):
         generation: int = 1,
         development: int = 1,
         shared: int = 0,
+        sre: int = 0,
     ) -> dict:
-        setter = (
-            self.store._set_issue_status_for_test_fixture
-            if status == "READY"
-            else self.store.set_issue_status
-        )
-        return setter(
+        requested_status = status
+        current = self.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, number),
+        ).fetchone()
+        if requested_status == "READY" and current is not None:
+            seeded = dict(current)
+        else:
+            seeded = self.store.set_issue_status(
+                repository=REPOSITORY,
+                issue_number=number,
+                status=(
+                    "PREPARED" if requested_status == "READY" else requested_status
+                ),
+                allocation_class=allocation,
+                generation=generation,
+                accountable_session_id=SESSION if allocation != "NONE" else None,
+                lease_manifest_sha256=(
+                    hashlib.sha256(
+                        f"lease:{number}:{generation}".encode()
+                    ).hexdigest()
+                    if allocation != "NONE"
+                    else None
+                ),
+                development_units=development,
+                shared_units=shared,
+                sre_units=sre,
+                expected_source_sha256=self.sources[number],
+                expected_version=version,
+                now="2026-08-22T10:01:00Z",
+            )
+        if requested_status != "READY":
+            return seeded
+        return finalize_canonical_ready_item(
+            self.store,
+            database=self.database,
+            artifact_root=Path(self.temp.name) / "coordinator",
             repository=REPOSITORY,
             issue_number=number,
-            status=status,
-            allocation_class=allocation,
-            generation=generation,
-            accountable_session_id=SESSION if allocation != "NONE" else None,
-            lease_manifest_sha256=(
-                hashlib.sha256(f"lease:{number}:{generation}".encode()).hexdigest()
-                if allocation != "NONE"
-                else None
-            ),
-            development_units=development,
-            shared_units=shared,
-            sre_units=0,
-            expected_source_sha256=self.sources[number],
-            expected_version=version,
-            now="2026-08-22T10:01:00Z",
-        )
+            source_payload_sha256=self.sources[number],
+            accepted_main_sha=MAIN,
+            worker_role="sre" if sre else "development",
+            worker_endpoint_id=SRE_SESSION if sre else SESSION,
+            now="2026-08-22T10:01:01Z",
+            suffix=f"portfolio-graph-{number}-{version}",
+        )["item"]
 
     def test_replace_is_atomic_versioned_and_reports_cross_milestone_edges(self) -> None:
         result = replace_graph(
@@ -288,13 +316,14 @@ class PortfolioGraphTests(unittest.TestCase):
         )
         self.assertEqual(4, result["node_count"])
 
-    def test_dependency_aware_fifo_skips_collision_without_head_of_line_blocking(self) -> None:
+    def test_dependency_aware_fifo_keeps_colliding_prepared_work_out_of_ready_selection(self) -> None:
+        self._status(58, "PREPARED", shared=1)
+        self._status(115, "QUEUED", shared=1)
+        self._status(320, "PREPARED")
         replace_graph(
             self.store.connection, self._plan(), now="2026-08-22T10:02:00Z"
         )
         self._status(58, "READY", shared=1)
-        self._status(115, "QUEUED", shared=1)
-        self._status(320, "READY")
         decision = schedule(
             self.store.connection,
             REPOSITORY,
@@ -303,16 +332,22 @@ class PortfolioGraphTests(unittest.TestCase):
             now="2026-08-22T10:03:00Z",
         )
         self.assertEqual(["issue:58"], decision["selected"])
+        self.assertEqual([], decision["skipped"])
         self.assertEqual(
-            [{"node_key": "issue:320", "reason": "COLLISION"}],
-            decision["skipped"],
+            "PREPARED",
+            self.store.connection.execute(
+                "SELECT status FROM coordination_items "
+                "WHERE repository=? AND issue_number=320",
+                (REPOSITORY,),
+            ).fetchone()[0],
         )
         events = self.store.connection.execute(
             "SELECT COUNT(*) FROM portfolio_scheduler_events"
         ).fetchone()[0]
-        self.assertGreaterEqual(events, 3)
+        self.assertGreaterEqual(events, 2)
 
     def test_recorded_schedule_reads_and_writes_under_one_immediate_transaction(self) -> None:
+        self._status(58, "PREPARED", shared=1)
         replace_graph(
             self.store.connection, self._plan(), now="2026-08-22T10:02:00Z"
         )
@@ -334,7 +369,7 @@ class PortfolioGraphTests(unittest.TestCase):
         self.assertEqual(["issue:58"], decision["selected"])
         self.assertFalse(self.store.connection.in_transaction)
 
-    def test_scheduler_reselects_against_revised_capacity_policy(self) -> None:
+    def test_scheduler_reselects_against_reduced_capacity_policy(self) -> None:
         plan = self._plan()
         plan["relations"] = [
             relation
@@ -345,65 +380,63 @@ class PortfolioGraphTests(unittest.TestCase):
         plan["nodes"][0]["shared_units"] = 2
         plan["nodes"][2]["development_units"] = 3
         plan["nodes"][2]["shared_units"] = 1
+        self._status(58, "PREPARED", development=3, shared=2)
+        self._status(320, "PREPARED", development=3, shared=1)
         replace_graph(self.store.connection, plan, now="2026-08-22T10:02:00Z")
-        self._status(58, "READY", development=3, shared=2)
-        self._status(320, "READY", development=3, shared=1)
-        default = schedule(
-            self.store.connection,
-            REPOSITORY,
-            current_main=MAIN,
-            record=False,
-            now="2026-08-22T10:03:00Z",
-        )
-        self.assertEqual(["issue:58"], default["selected"])
-        self.assertEqual(1, default["capacity_policy_version"])
-
-        revised = self.store.set_capacity_policy(
+        expanded_policy = self.store.set_capacity_policy(
             repository=REPOSITORY,
             development_limit=6,
             shared_limit=3,
             sre_limit=5,
             authority_sha256="d" * 64,
             expected_version=1,
+            now="2026-08-22T10:02:01Z",
+        )
+        self.assertEqual(2, expanded_policy["version"])
+        self._status(58, "READY", development=3, shared=2)
+        self._status(320, "READY", development=3, shared=1)
+        expanded = schedule(
+            self.store.connection,
+            REPOSITORY,
+            current_main=MAIN,
+            record=False,
+            now="2026-08-22T10:03:00Z",
+        )
+        self.assertEqual(["issue:58", "issue:320"], expanded["selected"])
+        self.assertEqual(2, expanded["capacity_policy_version"])
+
+        reduced = self.store.set_capacity_policy(
+            repository=REPOSITORY,
+            development_limit=5,
+            shared_limit=2,
+            sre_limit=5,
+            authority_sha256="e" * 64,
+            expected_version=2,
             now="2026-08-22T10:04:00Z",
         )
-        self.assertEqual(2, revised["version"])
-        expanded = schedule(
+        self.assertEqual(3, reduced["version"])
+        constrained = schedule(
             self.store.connection,
             REPOSITORY,
             current_main=MAIN,
             record=False,
             now="2026-08-22T10:05:00Z",
         )
-        self.assertEqual(["issue:58", "issue:320"], expanded["selected"])
-        self.assertEqual(2, expanded["capacity_policy_version"])
+        self.assertEqual(["issue:58"], constrained["selected"])
+        self.assertEqual(3, constrained["capacity_policy_version"])
 
     def test_scheduler_counts_hosted_sre_reservations(self) -> None:
         plan = self._plan()
         plan["nodes"][2]["development_units"] = 0
         plan["nodes"][2]["sre_units"] = 1
         replace_graph(self.store.connection, plan, now="2026-08-22T10:02:00Z")
+        self._status(320, "READY", development=0, sre=1)
         self.store.connection.execute(
             "CREATE TABLE hosted_operations (repository TEXT, state TEXT, sre_units INTEGER)"
         )
         self.store.connection.execute(
             "INSERT INTO hosted_operations(repository, state, sre_units) VALUES (?, 'CLAIMED', 5)",
             (REPOSITORY,),
-        )
-        self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
-            issue_number=320,
-            status="READY",
-            allocation_class="NONE",
-            generation=1,
-            accountable_session_id=None,
-            lease_manifest_sha256=None,
-            development_units=0,
-            shared_units=0,
-            sre_units=1,
-            expected_source_sha256=self.sources[320],
-            expected_version=0,
-            now="2026-08-22T10:02:30Z",
         )
         decision = schedule(
             self.store.connection,
@@ -427,6 +460,7 @@ class PortfolioGraphTests(unittest.TestCase):
             self._status(58, "QUEUED")
 
     def test_hard_successor_cannot_be_ready_before_gate_is_done(self) -> None:
+        self._status(115, "PREPARED", shared=1)
         replace_graph(
             self.store.connection, self._plan(), now="2026-08-22T10:02:00Z"
         )
@@ -435,9 +469,7 @@ class PortfolioGraphTests(unittest.TestCase):
             self.store.connection, REPOSITORY, current_main=MAIN
         )
         self.assertEqual(["issue:58"], evaluated["critical_path_holds"])
-        with self.assertRaisesRegex(
-            CoordinationError, "GRAPH_HARD_PREDECESSOR_UNSATISFIED"
-        ):
+        with self.assertRaisesRegex(ReadinessError, "DEPENDENCY_NOT_READY"):
             self._status(115, "READY", shared=1)
 
     def test_active_collision_is_rejected_by_transition_guard(self) -> None:

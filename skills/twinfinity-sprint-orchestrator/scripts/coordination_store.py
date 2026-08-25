@@ -125,7 +125,11 @@ ACTIVE_EXECUTION_STATUSES = {"ACTIVE", "ACTIVE_FENCED", "MONITOR"}
 _READY_FINALIZATION_GATEWAY = object()
 _READINESS_DECISION_GATEWAY = object()
 _READINESS_RESOLUTION_GATEWAY = object()
-_TEST_FIXTURE_GATEWAY = object()
+_TEST_FIXTURE_FORBIDDEN_ITEM_STATES = {
+    "READY",
+    "READY_ELIGIBLE",
+    "FINALIZED",
+}
 MESSAGE_TOPICS = {
     "coordination.notice",
     "development.admission",
@@ -3017,10 +3021,7 @@ class CoordinationStore:
             creating_ready = status == "READY" and (
                 current is None or current["status"] != "READY"
             )
-            if creating_ready and _gateway not in {
-                _READY_FINALIZATION_GATEWAY,
-                _TEST_FIXTURE_GATEWAY,
-            }:
+            if creating_ready and _gateway is not _READY_FINALIZATION_GATEWAY:
                 raise CoordinationError("READY_FINALIZATION_REQUIRED")
             reserved = self.connection.execute(
                 """
@@ -3247,10 +3248,16 @@ class CoordinationStore:
     def _set_issue_status_for_test_fixture(
         self, **item: Any
     ) -> dict[str, Any]:
-        """Seed synthetic item states; never accepts a production database."""
+        """Seed non-readiness item states only on a temporary database."""
 
+        status = item.get("status")
+        if (
+            isinstance(status, str)
+            and status.upper() in _TEST_FIXTURE_FORBIDDEN_ITEM_STATES
+        ):
+            raise CoordinationError("READY_FINALIZATION_REQUIRED")
         self._require_temporary_test_database()
-        return self.set_issue_status(**item, _gateway=_TEST_FIXTURE_GATEWAY)
+        return self.set_issue_status(**item)
 
     def apply_issue_plan(
         self, entries: list[dict[str, Any]], *, now: str
