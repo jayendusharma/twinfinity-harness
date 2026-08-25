@@ -298,7 +298,7 @@ class Harness:
             "resolution": {
                 "role": None,
                 "actions": [],
-                "approval_proposal_sha256": None,
+                "approval": None,
             },
             "summary": "The complete candidate-level phase passed.",
             "observed_at": NOW,
@@ -937,8 +937,20 @@ class KanbanReadinessTests(unittest.TestCase):
             ],
             "resolution": {
                 "role": "planner",
-                "actions": ["Reconcile the bounded control and rebind the campaign."],
-                "approval_proposal_sha256": None,
+                "actions": [
+                    {
+                        "kind": "REBUILD_PREPARED_CANDIDATE",
+                        "target": f"{REPOSITORY}:issue:1",
+                        "expected_digest": self.h.candidates[1],
+                        "desired_digest": "d" * 64,
+                        "authority_class": "PLANNER_OWNER_API",
+                        "evidence_required": [
+                            "portfolio_pull_buffer_current.candidate_id",
+                            "portfolio_pull_buffer_candidates.candidate_sha256",
+                        ],
+                    }
+                ],
+                "approval": None,
             },
             "summary": "One bounded Planner-owned resolution cycle is sufficient.",
             "observed_at": NOW,
@@ -973,14 +985,18 @@ class KanbanReadinessTests(unittest.TestCase):
             "parent_campaign_id": int(current["campaign_id"]),
             "expected_parent_version": int(current["version"]),
             "changed_evidence_sha256": "0" * 64,
+            "resolution_action_set_sha256": hashlib.sha256(
+                canonical_json(receipt["resolution"]["actions"]).encode("utf-8")
+            ).hexdigest(),
             "approval": None,
         }
         successor["transition"]["changed_evidence_sha256"] = (
             transition_evidence_sha256(plan, successor)
         )
-        resumed = register(self.h.store.connection, successor, now=NOW)
-        self.assertEqual("PENDING", resumed["state"])
-        self.assertEqual(1, resumed["resolution_ordinal"])
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_RESOLUTION_HANDLER_REQUIRED"
+        ):
+            register(self.h.store.connection, successor, now=NOW)
 
     def test_source_drift_invalidates_phase(self) -> None:
         self.h.seed([1])
@@ -1065,7 +1081,7 @@ class KanbanReadinessTests(unittest.TestCase):
                 "resolution": {
                     "role": None,
                     "actions": [],
-                    "approval_proposal_sha256": None,
+                    "approval": None,
                 },
                 "summary": "The complete candidate-level phase passed.",
                 "observed_at": NOW,
@@ -1097,6 +1113,7 @@ class KanbanReadinessTests(unittest.TestCase):
                     "parent_campaign_id": int(current["campaign_id"]),
                     "expected_parent_version": int(current["version"]),
                     "changed_evidence_sha256": "f" * 64,
+                    "resolution_action_set_sha256": None,
                     "approval": None,
                 }
                 with self.assertRaisesRegex(

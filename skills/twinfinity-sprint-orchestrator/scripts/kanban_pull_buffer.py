@@ -2521,6 +2521,15 @@ def main() -> int:
     readiness_decision.add_argument("--message-id", type=int, required=True)
     readiness_decision.add_argument("--planner-session-id", required=True)
     readiness_decision.add_argument("--source", type=Path, required=True)
+    readiness_context = subparsers.add_parser("readiness-resolution-context")
+    readiness_context.add_argument("--message-id", type=int, required=True)
+    readiness_context.add_argument("--planner-session-id", required=True)
+    readiness_resolution = subparsers.add_parser("readiness-apply-resolution")
+    readiness_resolution.add_argument("--message-id", type=int, required=True)
+    readiness_resolution.add_argument("--planner-session-id", required=True)
+    readiness_resolution.add_argument(
+        "--expected-context-sha256", required=True
+    )
     readiness_evaluate = subparsers.add_parser("readiness-evaluate")
     readiness_evaluate.add_argument("--repository", required=True)
     readiness_evaluate.add_argument("--issue", type=int, required=True)
@@ -2550,6 +2559,8 @@ def main() -> int:
             from kanban_readiness import (
                 attach as attach_readiness,
                 apply_readiness_decision,
+                apply_readiness_resolution,
+                claim_readiness_resolution_context,
                 discover as discover_readiness,
                 dispatch as dispatch_readiness,
                 evaluate as evaluate_readiness,
@@ -2566,8 +2577,6 @@ def main() -> int:
                     connection, read_readiness_json(args.plan), now=utc_now()
                 )
             elif args.command == "readiness-dispatch":
-                from coordination_store import CoordinationStore
-
                 dispatch_store = CoordinationStore(DEFAULT_DATABASE)
                 try:
                     result = dispatch_readiness(
@@ -2606,6 +2615,29 @@ def main() -> int:
                     )
                 finally:
                     decision_store.close()
+            elif args.command == "readiness-resolution-context":
+                resolution_store = CoordinationStore(DEFAULT_DATABASE)
+                try:
+                    result = claim_readiness_resolution_context(
+                        resolution_store,
+                        message_id=args.message_id,
+                        planner_session_id=args.planner_session_id,
+                        now=utc_now(),
+                    )
+                finally:
+                    resolution_store.close()
+            elif args.command == "readiness-apply-resolution":
+                resolution_store = CoordinationStore(DEFAULT_DATABASE)
+                try:
+                    result = apply_readiness_resolution(
+                        resolution_store,
+                        message_id=args.message_id,
+                        planner_session_id=args.planner_session_id,
+                        expected_context_sha256=args.expected_context_sha256,
+                        now=utc_now(),
+                    )
+                finally:
+                    resolution_store.close()
             elif args.command == "readiness-evaluate":
                 result = evaluate_readiness(
                     connection, args.repository, args.issue,

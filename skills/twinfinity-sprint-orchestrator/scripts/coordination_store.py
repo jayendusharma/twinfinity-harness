@@ -124,6 +124,7 @@ PREPARED_MESSAGE_HOLD_REASONS = {
 ACTIVE_EXECUTION_STATUSES = {"ACTIVE", "ACTIVE_FENCED", "MONITOR"}
 _READY_FINALIZATION_GATEWAY = object()
 _READINESS_DECISION_GATEWAY = object()
+_READINESS_RESOLUTION_GATEWAY = object()
 _TEST_FIXTURE_GATEWAY = object()
 MESSAGE_TOPICS = {
     "coordination.notice",
@@ -4591,6 +4592,20 @@ class CoordinationStore:
             ).fetchone()
         )
 
+    def _readiness_resolution_notice_bound(self, message_id: int) -> bool:
+        table = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='portfolio_readiness_resolution_notices'"
+        ).fetchone()
+        return bool(
+            table
+            and self.connection.execute(
+                "SELECT 1 FROM portfolio_readiness_resolution_notices "
+                "WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+        )
+
     def _claim_message_in_transaction(
         self,
         message_id: int,
@@ -4611,8 +4626,11 @@ class CoordinationStore:
         if row is None:
             raise CoordinationError("MESSAGE_NOT_FOUND")
         readiness_bound = self._readiness_decision_notice_bound(message_id)
+        resolution_bound = self._readiness_resolution_notice_bound(message_id)
         if readiness_bound and gateway is not _READINESS_DECISION_GATEWAY:
             raise CoordinationError("READINESS_DECISION_HANDLER_REQUIRED")
+        if resolution_bound and gateway is not _READINESS_RESOLUTION_GATEWAY:
+            raise CoordinationError("READINESS_RESOLUTION_HANDLER_REQUIRED")
         if not identities_role_equivalent(
             self.connection, row["recipient_session_id"], session_id
         ):
@@ -4625,7 +4643,7 @@ class CoordinationStore:
         ):
             raise CoordinationError("MESSAGE_STATE_CONFLICT")
         payload = json.loads(row["payload_json"])
-        if not readiness_bound:
+        if not readiness_bound and not resolution_bound:
             self._validate_message_source(payload)
         self._validate_message_contract(
             topic=row["topic"],
@@ -4661,6 +4679,18 @@ class CoordinationStore:
             session_id,
             now,
             gateway=_READINESS_DECISION_GATEWAY,
+        )
+
+    def claim_readiness_resolution_message_in_transaction(
+        self, message_id: int, session_id: str, now: str
+    ) -> dict[str, Any]:
+        """Claim one bound consolidated resolution through its exact handler."""
+
+        return self._claim_message_in_transaction(
+            message_id,
+            session_id,
+            now,
+            gateway=_READINESS_RESOLUTION_GATEWAY,
         )
 
     def claim_message(
@@ -4717,6 +4747,7 @@ class CoordinationStore:
         ):
             raise CoordinationError("MESSAGE_STATE_CONFLICT")
         readiness_bound = self._readiness_decision_notice_bound(message_id)
+        resolution_bound = self._readiness_resolution_notice_bound(message_id)
         if readiness_bound:
             if gateway is not _READINESS_DECISION_GATEWAY:
                 raise CoordinationError("READINESS_DECISION_CONSUMPTION_REQUIRED")
@@ -4730,6 +4761,19 @@ class CoordinationStore:
                 (message_id,),
             ).fetchone() is None:
                 raise CoordinationError("READINESS_DECISION_CONSUMPTION_REQUIRED")
+        if resolution_bound:
+            if gateway is not _READINESS_RESOLUTION_GATEWAY:
+                raise CoordinationError("READINESS_RESOLUTION_CONSUMPTION_REQUIRED")
+            cycle_table = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='portfolio_readiness_resolution_cycles'"
+            ).fetchone()
+            if not cycle_table or self.connection.execute(
+                "SELECT 1 FROM portfolio_readiness_resolution_cycles "
+                "WHERE notice_message_id=?",
+                (message_id,),
+            ).fetchone() is None:
+                raise CoordinationError("READINESS_RESOLUTION_CONSUMPTION_REQUIRED")
         payload = json.loads(row["payload_json"])
         if row["topic"] == "development.terminal_closeout":
             outbox = self.connection.execute(
@@ -4742,7 +4786,7 @@ class CoordinationStore:
                 or not outbox["remote_receipt"]
             ):
                 raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
-        if not readiness_bound:
+        if not readiness_bound and not resolution_bound:
             self._validate_message_source(payload)
         self._validate_message_contract(
             topic=row["topic"],
@@ -4773,6 +4817,18 @@ class CoordinationStore:
             session_id,
             now,
             gateway=_READINESS_DECISION_GATEWAY,
+        )
+
+    def complete_readiness_resolution_message_in_transaction(
+        self, message_id: int, session_id: str, now: str
+    ) -> None:
+        """Complete one resolution notice after its immutable cycle receipt."""
+
+        self._complete_message_in_transaction(
+            message_id,
+            session_id,
+            now,
+            gateway=_READINESS_RESOLUTION_GATEWAY,
         )
 
     def complete_message(self, message_id: int, session_id: str, now: str) -> None:

@@ -44,6 +44,15 @@ TRANSITION_EVIDENCE_SCHEMA = "twinfinity-kanban-readiness-transition-evidence/v1
 RECEIPT_SCHEMA = "twinfinity-kanban-readiness-receipt/v1"
 RECEIPT_LOCATOR_SCHEMA = "twinfinity-kanban-readiness-receipt-locator/v1"
 READINESS_APPROVAL_INPUT_SCHEMA = "twinfinity-kanban-readiness-approval-input/v1"
+READINESS_RESOLUTION_CONTEXT_SCHEMA = (
+    "twinfinity-kanban-readiness-resolution-context/v1"
+)
+READINESS_RESOLUTION_RESULT_SCHEMA = (
+    "twinfinity-kanban-readiness-resolution-result/v1"
+)
+READINESS_RESOLUTION_FAILURE_SCHEMA = (
+    "twinfinity-kanban-readiness-resolution-failure/v1"
+)
 READINESS_DECISION_MAPPING = {
     "APPROVE": "APPROVAL_RESUME",
     "REJECT": "HOLD",
@@ -56,6 +65,50 @@ MAX_RECEIPT_PICKUP_ATTEMPTS = 3
 RECEIPT_PICKUP_RETRY_SECONDS = 60
 MAX_RECEIPT_PICKUPS_PER_SCAN = 8
 WORKER_ROLES = {"development", "sre"}
+RESOLUTION_ACTION_KEYS = {
+    "kind",
+    "target",
+    "expected_digest",
+    "desired_digest",
+    "authority_class",
+    "evidence_required",
+}
+PLANNER_ACTION_AUTHORITY = "PLANNER_OWNER_API"
+MATERIAL_ACTION_AUTHORITY = "HUMAN_APPROVAL"
+RESOLUTION_ACTION_REGISTRY = {
+    "REFRESH_SOURCE_SNAPSHOT": {
+        "owner_api": "CoordinationStore.ingest_snapshot/set_issue_status",
+        "target_kind": "ISSUE",
+        "evidence_required": [
+            "github_current.payload_sha256",
+            "coordination_items.source_payload_sha256",
+        ],
+        "order": 10,
+    },
+    "RECOMPUTE_DEPENDENCY_GRAPH": {
+        "owner_api": "portfolio_graph.replace_graph",
+        "target_kind": "REPOSITORY",
+        "evidence_required": [
+            "portfolio_graph_revisions.graph_sha256",
+            "portfolio_graph_current.health",
+        ],
+        "order": 20,
+    },
+    "REBUILD_PREPARED_CANDIDATE": {
+        "owner_api": "kanban_pull_buffer.register_candidate",
+        "target_kind": "ISSUE",
+        "evidence_required": [
+            "portfolio_pull_buffer_current.candidate_id",
+            "portfolio_pull_buffer_candidates.candidate_sha256",
+        ],
+        "order": 30,
+    },
+}
+MATERIAL_ACTION_REGISTRY = {
+    "REQUEST_MATERIAL_APPROVAL": {
+        "evidence_required": ["approval_ledger.published_decision"],
+    }
+}
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 GATE_KEY = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -416,6 +469,7 @@ def ensure_schema(
                 transition_kind TEXT,
                 resolution_ordinal INTEGER NOT NULL DEFAULT 0,
                 changed_evidence_sha256 TEXT,
+                resolution_action_set_sha256 TEXT,
                 approval_proposal_sha256 TEXT,
                 approval_decision_sha256 TEXT,
                 approval_recipient_session_id TEXT,
@@ -451,6 +505,7 @@ def ensure_schema(
                 message_id INTEGER NOT NULL,
                 attempt_id TEXT NOT NULL,
                 resolution_role TEXT,
+                resolution_action_set_sha256 TEXT NOT NULL,
                 approval_proposal_sha256 TEXT,
                 receipt_sha256 TEXT NOT NULL UNIQUE,
                 receipt_json TEXT NOT NULL,
@@ -501,6 +556,65 @@ def ensure_schema(
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(campaign_id) REFERENCES portfolio_readiness_campaigns(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio_readiness_resolution_notices (
+                campaign_id INTEGER PRIMARY KEY,
+                receipt_id INTEGER NOT NULL UNIQUE,
+                action_set_sha256 TEXT NOT NULL,
+                message_id INTEGER NOT NULL UNIQUE,
+                routed_endpoint_id TEXT NOT NULL,
+                expected_readiness_version INTEGER NOT NULL
+                    CHECK(expected_readiness_version > 0),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(campaign_id) REFERENCES portfolio_readiness_campaigns(id),
+                FOREIGN KEY(receipt_id) REFERENCES portfolio_readiness_receipts(id),
+                FOREIGN KEY(message_id) REFERENCES coordination_messages(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio_readiness_resolution_contexts (
+                notice_message_id INTEGER PRIMARY KEY,
+                campaign_id INTEGER NOT NULL UNIQUE,
+                receipt_id INTEGER NOT NULL UNIQUE,
+                action_set_sha256 TEXT NOT NULL,
+                context_sha256 TEXT NOT NULL UNIQUE,
+                context_json TEXT NOT NULL,
+                acting_planner_session_id TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                FOREIGN KEY(notice_message_id) REFERENCES coordination_messages(id),
+                FOREIGN KEY(campaign_id) REFERENCES portfolio_readiness_campaigns(id),
+                FOREIGN KEY(receipt_id) REFERENCES portfolio_readiness_receipts(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio_readiness_resolution_cycles (
+                parent_campaign_id INTEGER PRIMARY KEY,
+                receipt_id INTEGER NOT NULL UNIQUE,
+                notice_message_id INTEGER NOT NULL UNIQUE,
+                action_set_sha256 TEXT NOT NULL,
+                context_sha256 TEXT NOT NULL,
+                changed_evidence_sha256 TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('SUCCESSOR','HOLD')),
+                successor_campaign_id INTEGER UNIQUE,
+                disposition_reason TEXT,
+                acting_planner_session_id TEXT NOT NULL,
+                result_sha256 TEXT NOT NULL UNIQUE,
+                result_json TEXT NOT NULL,
+                consumed_at TEXT NOT NULL,
+                FOREIGN KEY(parent_campaign_id)
+                    REFERENCES portfolio_readiness_campaigns(id),
+                FOREIGN KEY(receipt_id) REFERENCES portfolio_readiness_receipts(id),
+                FOREIGN KEY(notice_message_id) REFERENCES coordination_messages(id),
+                FOREIGN KEY(successor_campaign_id)
+                    REFERENCES portfolio_readiness_campaigns(id)
             )
             """
         )
@@ -612,6 +726,7 @@ def ensure_schema(
             "transition_kind": "TEXT",
             "resolution_ordinal": "INTEGER NOT NULL DEFAULT 0",
             "changed_evidence_sha256": "TEXT",
+            "resolution_action_set_sha256": "TEXT",
             "approval_proposal_sha256": "TEXT",
             "approval_decision_sha256": "TEXT",
             "approval_recipient_session_id": "TEXT",
@@ -627,11 +742,15 @@ def ensure_schema(
             str(row[1])
             for row in connection.execute("PRAGMA table_info(portfolio_readiness_receipts)")
         }
-        if "approval_proposal_sha256" not in receipt_columns:
-            connection.execute(
-                "ALTER TABLE portfolio_readiness_receipts "
-                "ADD COLUMN approval_proposal_sha256 TEXT"
-            )
+        for column, declaration in {
+            "resolution_action_set_sha256": "TEXT",
+            "approval_proposal_sha256": "TEXT",
+        }.items():
+            if column not in receipt_columns:
+                connection.execute(
+                    f"ALTER TABLE portfolio_readiness_receipts "
+                    f"ADD COLUMN {column} {declaration}"
+                )
         _migration_step(failpoint, "after_receipt_columns")
         current_columns = {
             str(row[1])
@@ -794,6 +913,24 @@ def ensure_schema(
             """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_events_immutable_delete
                BEFORE DELETE ON portfolio_readiness_events
                BEGIN SELECT RAISE(ABORT, 'READINESS_EVENT_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_notices_immutable_update
+               BEFORE UPDATE ON portfolio_readiness_resolution_notices
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_NOTICE_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_notices_immutable_delete
+               BEFORE DELETE ON portfolio_readiness_resolution_notices
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_NOTICE_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_contexts_immutable_update
+               BEFORE UPDATE ON portfolio_readiness_resolution_contexts
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_CONTEXT_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_contexts_immutable_delete
+               BEFORE DELETE ON portfolio_readiness_resolution_contexts
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_CONTEXT_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_cycles_immutable_update
+               BEFORE UPDATE ON portfolio_readiness_resolution_cycles
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_CYCLE_IMMUTABLE'); END""",
+            """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_resolution_cycles_immutable_delete
+               BEFORE DELETE ON portfolio_readiness_resolution_cycles
+               BEGIN SELECT RAISE(ABORT, 'READINESS_RESOLUTION_CYCLE_IMMUTABLE'); END""",
             """CREATE TRIGGER IF NOT EXISTS portfolio_readiness_approval_requests_immutable_update
                BEFORE UPDATE ON portfolio_readiness_approval_requests
                BEGIN SELECT RAISE(ABORT, 'READINESS_APPROVAL_REQUEST_IMMUTABLE'); END""",
@@ -923,6 +1060,9 @@ def require_schema(connection: sqlite3.Connection) -> None:
         "portfolio_readiness_campaigns", "portfolio_readiness_gates",
         "portfolio_readiness_receipts", "portfolio_readiness_current",
         "portfolio_readiness_events", "portfolio_readiness_receipt_pickups",
+        "portfolio_readiness_resolution_notices",
+        "portfolio_readiness_resolution_contexts",
+        "portfolio_readiness_resolution_cycles",
     }
     present = {
         str(row[0])
@@ -1004,7 +1144,8 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         transition = plan.get("transition")
         if not isinstance(transition, dict) or set(transition) != {
             "kind", "parent_campaign_id", "expected_parent_version",
-            "changed_evidence_sha256", "approval",
+            "changed_evidence_sha256", "resolution_action_set_sha256",
+            "approval",
         }:
             raise ReadinessError("READINESS_TRANSITION_INVALID")
         if transition.get("kind") not in {
@@ -1017,8 +1158,19 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         changed = transition.get("changed_evidence_sha256")
         if not isinstance(changed, str) or not SHA256.fullmatch(changed):
             raise ReadinessError("READINESS_TRANSITION_INVALID")
+        action_set_sha256 = transition.get("resolution_action_set_sha256")
+        if transition["kind"] == "RESOLUTION":
+            if (
+                not isinstance(action_set_sha256, str)
+                or SHA256.fullmatch(action_set_sha256) is None
+            ):
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_BINDING_INVALID")
+        elif action_set_sha256 is not None:
+            raise ReadinessError("READINESS_TRANSITION_INVALID")
         approval = transition.get("approval")
-        if transition["kind"] == "APPROVAL_RESUME":
+        if transition["kind"] in {"APPROVAL_RESUME", "RESOLUTION"} and (
+            transition["kind"] == "APPROVAL_RESUME" or approval is not None
+        ):
             if not isinstance(approval, dict) or set(approval) != {
                 "proposal_sha256", "decision_sha256", "recipient_session_id",
                 "execution_scope_sha256",
@@ -1075,6 +1227,9 @@ def transition_evidence_payload(
             None
             if transition.get("approval") is None
             else digest_json(transition["approval"])
+        ),
+        "resolution_action_set_sha256": transition.get(
+            "resolution_action_set_sha256"
         ),
     }
 
@@ -1375,13 +1530,12 @@ def _binding_reasons(connection: sqlite3.Connection, campaign: Any) -> list[str]
     approval: dict[str, Any] | None = None
     if isinstance(campaign, dict):
         transition = campaign.get("transition")
-        if isinstance(transition, dict) and transition.get("kind") == "APPROVAL_RESUME":
+        if isinstance(transition, dict):
             candidate_approval = transition.get("approval")
             if isinstance(candidate_approval, dict):
                 approval = candidate_approval
     elif (
         "transition_kind" in campaign.keys()
-        and campaign["transition_kind"] == "APPROVAL_RESUME"
         and campaign["approval_proposal_sha256"] is not None
     ):
         approval = {
@@ -1549,6 +1703,7 @@ def _register_locked(
     *,
     now: str,
     approval_verified: bool,
+    resolution_verified: bool = False,
 ) -> dict[str, Any]:
     """Register one initial or explicitly fenced successor while holding BEGIN IMMEDIATE."""
 
@@ -1587,6 +1742,7 @@ def _register_locked(
     transition_kind = "INITIAL"
     resolution_ordinal = 0
     changed_evidence_sha256: str | None = None
+    resolution_action_set_sha256: str | None = None
     approval: dict[str, Any] | None = None
     if prior is None:
         if plan["schema"] != PLAN_SCHEMA:
@@ -1597,6 +1753,9 @@ def _register_locked(
         parent_campaign_id = int(transition["parent_campaign_id"])
         transition_kind = str(transition["kind"])
         changed_evidence_sha256 = str(transition["changed_evidence_sha256"])
+        resolution_action_set_sha256 = transition.get(
+            "resolution_action_set_sha256"
+        )
         approval = transition.get("approval")
         if (
             parent_campaign_id != int(prior["campaign_id"])
@@ -1610,10 +1769,26 @@ def _register_locked(
         }[transition_kind]
         if prior["state"] != expected_state:
             raise ReadinessError("READINESS_SUCCESSOR_STATE_CONFLICT")
-        if transition_kind == "APPROVAL_RESUME" and not approval_verified:
+        if approval is not None and not approval_verified:
             raise ReadinessError("READINESS_EFFECTIVE_APPROVAL_REQUIRED")
-        if transition_kind != "APPROVAL_RESUME" and approval_verified:
+        if approval is None and approval_verified:
             raise ReadinessError("READINESS_TRANSITION_INVALID")
+        if transition_kind == "RESOLUTION" and not resolution_verified:
+            raise ReadinessError("READINESS_RESOLUTION_HANDLER_REQUIRED")
+        if transition_kind != "RESOLUTION" and resolution_verified:
+            raise ReadinessError("READINESS_TRANSITION_INVALID")
+        if transition_kind == "RESOLUTION":
+            receipt_binding = connection.execute(
+                "SELECT resolution_action_set_sha256 "
+                "FROM portfolio_readiness_receipts WHERE id=? AND campaign_id=?",
+                (prior["receipt_id"], parent_campaign_id),
+            ).fetchone()
+            if (
+                receipt_binding is None
+                or receipt_binding["resolution_action_set_sha256"]
+                != resolution_action_set_sha256
+            ):
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_BINDING_INVALID")
         try:
             parent_plan = json.loads(
                 connection.execute(
@@ -1662,10 +1837,11 @@ def _register_locked(
             capacity_policy_version, candidate_sha256, worker_role,
             phase_summary, plan_sha256, plan_json, parent_campaign_id,
             transition_kind, resolution_ordinal, changed_evidence_sha256,
+            resolution_action_set_sha256,
             approval_proposal_sha256, approval_decision_sha256,
             approval_recipient_session_id, approval_execution_scope_sha256,
             created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan["repository"], plan["issue_number"], plan["generation"],
@@ -1675,6 +1851,7 @@ def _register_locked(
             plan["worker_role"], plan["phase_summary"], plan_sha,
             canonical_json(plan), parent_campaign_id, transition_kind,
             resolution_ordinal, changed_evidence_sha256,
+            resolution_action_set_sha256,
             None if approval is None else approval["proposal_sha256"],
             None if approval is None else approval["decision_sha256"],
             None if approval is None else approval["recipient_session_id"],
@@ -1725,6 +1902,7 @@ def _register_locked(
             "parent_campaign_id": parent_campaign_id,
             "transition_kind": transition_kind,
             "resolution_ordinal": resolution_ordinal,
+            "resolution_action_set_sha256": resolution_action_set_sha256,
         },
         now,
     )
@@ -1743,8 +1921,11 @@ def register(
     connection: sqlite3.Connection, plan: dict[str, Any], *, now: str
 ) -> dict[str, Any]:
     _validate_plan(plan)
-    if plan.get("transition", {}).get("kind") == "APPROVAL_RESUME":
+    transition_kind = plan.get("transition", {}).get("kind")
+    if transition_kind == "APPROVAL_RESUME":
         raise ReadinessError("READINESS_EFFECTIVE_APPROVAL_REQUIRED")
+    if transition_kind == "RESOLUTION":
+        raise ReadinessError("READINESS_RESOLUTION_HANDLER_REQUIRED")
     ensure_schema(connection)
     _require_pull_buffer_schema(connection)
     connection.execute("BEGIN IMMEDIATE")
@@ -1766,6 +1947,829 @@ def resume_after_approval(
     """Reject caller-authored resumes; the exact decision notice owns this edge."""
 
     raise ReadinessError("READINESS_DECISION_HANDLER_REQUIRED")
+
+
+def _parse_bound_json(raw: Any, error: str) -> dict[str, Any]:
+    try:
+        value = json.loads(str(raw), object_pairs_hook=_strict_object)
+    except (TypeError, json.JSONDecodeError, ReadinessError) as exc:
+        raise ReadinessError(error) from exc
+    if not isinstance(value, dict) or canonical_json(value) != str(raw):
+        raise ReadinessError(error)
+    return value
+
+
+def _resolution_notice_row(
+    connection: sqlite3.Connection, message_id: int
+) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT notice.campaign_id AS resolution_campaign_id,
+               notice.receipt_id AS resolution_receipt_id,
+               notice.action_set_sha256 AS notice_action_set_sha256,
+               notice.message_id, notice.routed_endpoint_id,
+               notice.expected_readiness_version,
+               message.state AS message_state,
+               message.recipient_session_id AS message_recipient_session_id,
+               message.claimed_by AS message_claimed_by,
+               message.payload_sha256 AS message_payload_sha256,
+               message.payload_json AS message_payload_json,
+               current.state AS readiness_state,
+               current.version AS readiness_version,
+               current.campaign_id AS current_campaign_id,
+               current.receipt_id AS current_receipt_id,
+               current.resolution_cycles,
+               campaign.repository, campaign.issue_number, campaign.generation,
+               campaign.item_version, campaign.source_payload_sha256,
+               campaign.accepted_main_sha, campaign.graph_version,
+               campaign.capacity_policy_version, campaign.candidate_sha256,
+               campaign.worker_role, campaign.plan_sha256, campaign.plan_json,
+               campaign.resolution_ordinal,
+               campaign.approval_proposal_sha256,
+               campaign.approval_decision_sha256,
+               campaign.approval_recipient_session_id,
+               campaign.approval_execution_scope_sha256,
+               receipt.verdict, receipt.message_id AS worker_message_id,
+               receipt.receipt_sha256, receipt.receipt_json,
+               receipt.resolution_action_set_sha256 AS receipt_action_set_sha256,
+               context.context_sha256, context.context_json,
+               context.acting_planner_session_id AS context_planner_session_id,
+               context.claimed_at AS context_claimed_at,
+               cycle.outcome AS cycle_outcome,
+               cycle.successor_campaign_id AS cycle_successor_campaign_id,
+               cycle.result_sha256 AS cycle_result_sha256,
+               cycle.result_json AS cycle_result_json
+        FROM portfolio_readiness_resolution_notices notice
+        JOIN coordination_messages message ON message.id=notice.message_id
+        JOIN portfolio_readiness_campaigns campaign
+          ON campaign.id=notice.campaign_id
+        JOIN portfolio_readiness_current current
+          ON current.repository=campaign.repository
+         AND current.issue_number=campaign.issue_number
+        JOIN portfolio_readiness_receipts receipt
+          ON receipt.id=notice.receipt_id
+         AND receipt.campaign_id=notice.campaign_id
+        LEFT JOIN portfolio_readiness_resolution_contexts context
+          ON context.notice_message_id=notice.message_id
+         AND context.campaign_id=notice.campaign_id
+         AND context.receipt_id=notice.receipt_id
+        LEFT JOIN portfolio_readiness_resolution_cycles cycle
+          ON cycle.notice_message_id=notice.message_id
+         AND cycle.parent_campaign_id=notice.campaign_id
+         AND cycle.receipt_id=notice.receipt_id
+        WHERE notice.message_id=?
+        """,
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        raise ReadinessError("READINESS_RESOLUTION_NOTICE_NOT_FOUND")
+    return row
+
+
+def _validate_resolution_notice_binding(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    planner_session_id: str,
+    require_pending: bool,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    planner = current_endpoint(connection, "planner")
+    if planner is None or planner["endpoint_id"] != planner_session_id:
+        raise ReadinessError("CURRENT_PLANNER_ENDPOINT_REQUIRED")
+    if (
+        not identities_role_equivalent(
+            connection, str(row["routed_endpoint_id"]), planner_session_id
+        )
+        or not identities_role_equivalent(
+            connection, str(row["message_recipient_session_id"]), planner_session_id
+        )
+        or row["verdict"] != "ACTIONABLE_HOLD"
+        or row["notice_action_set_sha256"] != row["receipt_action_set_sha256"]
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_BINDING_DRIFT")
+    if require_pending:
+        if (
+            int(row["current_campaign_id"])
+            != int(row["resolution_campaign_id"])
+            or row["current_receipt_id"] is None
+            or int(row["current_receipt_id"])
+            != int(row["resolution_receipt_id"])
+            or int(row["readiness_version"])
+            != int(row["expected_readiness_version"])
+        ):
+            raise ReadinessError("READINESS_RESOLUTION_BINDING_DRIFT")
+        if row["readiness_state"] != "RESOLUTION_PENDING":
+            raise ReadinessError("READINESS_RESOLUTION_STATE_CONFLICT")
+        if int(row["resolution_cycles"]) >= MAX_RESOLUTION_CYCLES:
+            raise ReadinessError("READINESS_RESOLUTION_CYCLE_LIMIT")
+    parent_plan = _parse_bound_json(
+        row["plan_json"], "READINESS_PARENT_PLAN_INVALID"
+    )
+    receipt = _parse_bound_json(
+        row["receipt_json"], "READINESS_RECEIPT_INVALID"
+    )
+    if (
+        digest_json(parent_plan) != row["plan_sha256"]
+        or digest_json(receipt) != row["receipt_sha256"]
+        or receipt.get("readiness_plan_sha256") != row["plan_sha256"]
+        or int(receipt.get("message_id", -1)) != int(row["worker_message_id"])
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_BINDING_DRIFT")
+    actions = _validate_resolution_actions(
+        receipt.get("resolution", {}).get("actions"), "ACTIONABLE_HOLD"
+    )
+    if digest_json(actions) != row["notice_action_set_sha256"]:
+        raise ReadinessError("READINESS_RESOLUTION_ACTION_BINDING_INVALID")
+    message_payload = _parse_bound_json(
+        row["message_payload_json"], "READINESS_RESOLUTION_NOTICE_INVALID"
+    )
+    evidence = message_payload.get("evidence")
+    source = message_payload.get("source")
+    if (
+        digest_json(message_payload) != row["message_payload_sha256"]
+        or not isinstance(evidence, dict)
+        or not isinstance(source, dict)
+        or source.get("repository") != row["repository"]
+        or source.get("object_kind") != "issue"
+        or source.get("object_number") != int(row["issue_number"])
+        or source.get("payload_sha256") != row["source_payload_sha256"]
+        or evidence.get("readiness_plan_sha256") != row["plan_sha256"]
+        or evidence.get("readiness_receipt_sha256") != row["receipt_sha256"]
+        or evidence.get("resolution_action_set_sha256")
+        != row["notice_action_set_sha256"]
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_NOTICE_INVALID")
+    return parent_plan, receipt, actions
+
+
+def _current_resolution_bindings(
+    connection: sqlite3.Connection, row: sqlite3.Row
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    repository = str(row["repository"])
+    issue_number = int(row["issue_number"])
+    source = connection.execute(
+        "SELECT payload_sha256, source_updated_at, fetched_at FROM github_current "
+        "WHERE repository=? AND object_kind='issue' AND object_number=?",
+        (repository, issue_number),
+    ).fetchone()
+    item = connection.execute(
+        "SELECT generation, version, source_payload_sha256, status, "
+        "allocation_class, development_units, shared_units, sre_units "
+        "FROM coordination_items WHERE repository=? AND issue_number=?",
+        (repository, issue_number),
+    ).fetchone()
+    graph = connection.execute(
+        """
+        SELECT current.version, current.observed_main_sha, current.health,
+               current.updated_at, current.last_error, revision.graph_sha256
+        FROM portfolio_graph_current current
+        LEFT JOIN portfolio_graph_revisions revision
+          ON revision.repository=current.repository
+         AND revision.version=current.version
+        WHERE current.repository=?
+        """,
+        (repository,),
+    ).fetchone()
+    policy = connection.execute(
+        "SELECT version FROM coordination_capacity_current WHERE repository=?",
+        (repository,),
+    ).fetchone()
+    candidate = connection.execute(
+        """
+        SELECT candidate.* FROM portfolio_pull_buffer_current pointer
+        JOIN portfolio_pull_buffer_candidates candidate
+          ON candidate.id=pointer.candidate_id
+        LEFT JOIN portfolio_pull_buffer_retirements retirement
+          ON retirement.candidate_id=candidate.id
+        WHERE pointer.repository=? AND pointer.issue_number=?
+          AND retirement.candidate_id IS NULL
+        """,
+        (repository, issue_number),
+    ).fetchone()
+    if source is None or item is None or graph is None or policy is None or candidate is None:
+        raise ReadinessError("READINESS_RESOLUTION_CONTEXT_BINDING_MISSING")
+    prepared_candidate = {
+        key: candidate[key]
+        for key in (
+            "id", "repository", "issue_number", "generation", "item_version",
+            "source_payload_sha256", "accepted_main_sha", "graph_version",
+            "capacity_policy_version", "lane_key", "state", "verticality",
+            "development_units", "shared_units", "sre_units", "promotion_trigger",
+            "artifact_relative_path", "artifact_content_sha256",
+            "candidate_sha256", "registered_at",
+        )
+    }
+    bindings = {
+        "source": {
+            "payload_sha256": source["payload_sha256"],
+            "source_updated_at": source["source_updated_at"],
+            "fetched_at": source["fetched_at"],
+        },
+        "item": {
+            key: item[key]
+            for key in (
+                "generation", "version", "source_payload_sha256", "status",
+                "allocation_class", "development_units", "shared_units",
+                "sre_units",
+            )
+        },
+        "graph": {
+            "version": int(graph["version"]),
+            "observed_main_sha": graph["observed_main_sha"],
+            "health": graph["health"],
+            "graph_sha256": graph["graph_sha256"],
+            "updated_at": graph["updated_at"],
+            "last_error": graph["last_error"],
+        },
+        "capacity_policy": {"version": int(policy["version"])},
+        "candidate": {
+            "id": int(candidate["id"]),
+            "candidate_sha256": candidate["candidate_sha256"],
+            "state": candidate["state"],
+        },
+    }
+    return prepared_candidate, bindings
+
+
+def _resolution_context_payload(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    parent_plan: dict[str, Any],
+    actions: list[dict[str, Any]],
+    *,
+    planner_session_id: str,
+    claimed_at: str,
+) -> dict[str, Any]:
+    prepared_candidate, bindings = _current_resolution_bindings(connection, row)
+    approval_values = {
+        "proposal_sha256": row["approval_proposal_sha256"],
+        "decision_sha256": row["approval_decision_sha256"],
+        "recipient_session_id": row["approval_recipient_session_id"],
+        "execution_scope_sha256": row["approval_execution_scope_sha256"],
+    }
+    frozen_approval = (
+        None if all(value is None for value in approval_values.values()) else approval_values
+    )
+    return {
+        "schema": READINESS_RESOLUTION_CONTEXT_SCHEMA,
+        "repository": row["repository"],
+        "issue_number": int(row["issue_number"]),
+        "campaign": {
+            "campaign_id": int(row["resolution_campaign_id"]),
+            "current_version": int(row["readiness_version"]),
+            "generation": int(row["generation"]),
+            "item_version": int(row["item_version"]),
+            "resolution_ordinal": int(row["resolution_ordinal"]),
+            "resolution_cycles": int(row["resolution_cycles"]),
+            "state": row["readiness_state"],
+            "plan_sha256": row["plan_sha256"],
+        },
+        "parent_plan": parent_plan,
+        "parent_plan_json": canonical_json(parent_plan),
+        "prepared_candidate": prepared_candidate,
+        "receipt": {
+            "receipt_id": int(row["resolution_receipt_id"]),
+            "receipt_sha256": row["receipt_sha256"],
+        },
+        "action_set": {
+            "actions": actions,
+            "actions_json": canonical_json(actions),
+            "action_set_sha256": row["notice_action_set_sha256"],
+        },
+        "current_bindings": bindings,
+        "frozen_approval_reference": frozen_approval,
+        "planner_notice": {
+            "message_id": int(row["message_id"]),
+            "payload_sha256": row["message_payload_sha256"],
+            "routed_endpoint_id": row["routed_endpoint_id"],
+            "expected_readiness_version": int(
+                row["expected_readiness_version"]
+            ),
+        },
+        "execution": {
+            "mode": "BROKER_MEDIATED_PREREQUISITE",
+            "direct_database_authority": False,
+            "handlers": [
+                {
+                    "kind": action["kind"],
+                    "owner_api": RESOLUTION_ACTION_REGISTRY[action["kind"]][
+                        "owner_api"
+                    ],
+                }
+                for action in actions
+            ],
+        },
+        "planner_claim": {
+            "acting_planner_session_id": planner_session_id,
+            "claimed_at": claimed_at,
+        },
+    }
+
+
+def claim_readiness_resolution_context(
+    store: CoordinationStore,
+    *,
+    message_id: int,
+    planner_session_id: str,
+    now: str,
+) -> dict[str, Any]:
+    """Claim one exact Planner notice and return its complete cold context."""
+
+    if type(message_id) is not int or message_id <= 0:
+        raise ReadinessError("READINESS_RESOLUTION_NOTICE_INVALID")
+    ensure_schema(store.connection)
+    _require_pull_buffer_schema(store.connection)
+    with store.transaction():
+        row = _resolution_notice_row(store.connection, message_id)
+        parent_plan, _receipt, actions = _validate_resolution_notice_binding(
+            store.connection,
+            row,
+            planner_session_id=planner_session_id,
+            require_pending=row["cycle_result_json"] is None,
+        )
+        if row["context_json"] is not None:
+            context = _parse_bound_json(
+                row["context_json"], "READINESS_RESOLUTION_CONTEXT_INVALID"
+            )
+            if digest_json(context) != row["context_sha256"]:
+                raise ReadinessError("READINESS_RESOLUTION_CONTEXT_INVALID")
+            if row["message_state"] not in {"CLAIMED", "COMPLETE"} or (
+                row["message_claimed_by"] is None
+                or not identities_role_equivalent(
+                    store.connection,
+                    str(row["message_claimed_by"]),
+                    planner_session_id,
+                )
+            ):
+                raise ReadinessError("READINESS_RESOLUTION_CONTEXT_CLAIM_INVALID")
+            return {
+                **context,
+                "context_sha256": row["context_sha256"],
+                "replay": True,
+            }
+        claimed = store.claim_readiness_resolution_message_in_transaction(
+            message_id, planner_session_id, now
+        )
+        if claimed["state"] != "CLAIMED":
+            raise ReadinessError("READINESS_RESOLUTION_MESSAGE_CLAIM_FAILED")
+        context = _resolution_context_payload(
+            store.connection,
+            row,
+            parent_plan,
+            actions,
+            planner_session_id=planner_session_id,
+            claimed_at=now,
+        )
+        context_sha256 = digest_json(context)
+        store.connection.execute(
+            """
+            INSERT INTO portfolio_readiness_resolution_contexts(
+                notice_message_id, campaign_id, receipt_id,
+                action_set_sha256, context_sha256, context_json,
+                acting_planner_session_id, claimed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id, int(row["resolution_campaign_id"]),
+                int(row["resolution_receipt_id"]),
+                row["notice_action_set_sha256"], context_sha256,
+                canonical_json(context), planner_session_id, now,
+            ),
+        )
+        _event(
+            store.connection,
+            int(row["resolution_campaign_id"]),
+            "READINESS_RESOLUTION_CONTEXT_CLAIMED",
+            {
+                "message_id": message_id,
+                "context_sha256": context_sha256,
+                "action_set_sha256": row["notice_action_set_sha256"],
+            },
+            now,
+        )
+    return {**context, "context_sha256": context_sha256, "replay": False}
+
+
+def _resolution_observations_and_successor(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    parent_plan: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    successor = {
+        key: value
+        for key, value in parent_plan.items()
+        if key not in {"schema", "transition"}
+    }
+    observations: list[dict[str, Any]] = []
+    repository = str(row["repository"])
+    issue_number = int(row["issue_number"])
+    for action in actions:
+        kind = str(action["kind"])
+        binding: dict[str, Any]
+        observed_digest: str | None
+        if kind == "REFRESH_SOURCE_SNAPSHOT":
+            source = connection.execute(
+                "SELECT payload_sha256 FROM github_current WHERE repository=? "
+                "AND object_kind='issue' AND object_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            item = connection.execute(
+                "SELECT generation, version, source_payload_sha256, status, "
+                "allocation_class FROM coordination_items "
+                "WHERE repository=? AND issue_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            observed_digest = None if source is None else source["payload_sha256"]
+            binding = {
+                "source_payload_sha256": observed_digest,
+                "item_source_payload_sha256": (
+                    None if item is None else item["source_payload_sha256"]
+                ),
+                "item_generation": None if item is None else int(item["generation"]),
+                "item_version": None if item is None else int(item["version"]),
+                "item_status": None if item is None else item["status"],
+                "item_allocation_class": (
+                    None if item is None else item["allocation_class"]
+                ),
+            }
+            if (
+                item is None
+                or observed_digest != action["desired_digest"]
+                or item["source_payload_sha256"] != action["desired_digest"]
+                or item["status"] != "PREPARED"
+                or item["allocation_class"] != "NONE"
+            ):
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_EVIDENCE_DRIFT:REFRESH_SOURCE_SNAPSHOT"
+                )
+            successor["source_payload_sha256"] = observed_digest
+            successor["generation"] = int(item["generation"])
+            successor["item_version"] = int(item["version"])
+        elif kind == "RECOMPUTE_DEPENDENCY_GRAPH":
+            graph = connection.execute(
+                """
+                SELECT current.version, current.observed_main_sha, current.health,
+                       revision.graph_sha256
+                FROM portfolio_graph_current current
+                LEFT JOIN portfolio_graph_revisions revision
+                  ON revision.repository=current.repository
+                 AND revision.version=current.version
+                WHERE current.repository=?
+                """,
+                (repository,),
+            ).fetchone()
+            observed_digest = None if graph is None else graph["graph_sha256"]
+            binding = {
+                "graph_sha256": observed_digest,
+                "graph_version": None if graph is None else int(graph["version"]),
+                "accepted_main_sha": (
+                    None if graph is None else graph["observed_main_sha"]
+                ),
+                "health": None if graph is None else graph["health"],
+            }
+            if (
+                graph is None
+                or observed_digest != action["desired_digest"]
+                or graph["health"] != "CURRENT"
+            ):
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_EVIDENCE_DRIFT:"
+                    "RECOMPUTE_DEPENDENCY_GRAPH"
+                )
+            successor["accepted_main_sha"] = graph["observed_main_sha"]
+            successor["graph_version"] = int(graph["version"])
+        elif kind == "REBUILD_PREPARED_CANDIDATE":
+            candidate = connection.execute(
+                """
+                SELECT candidate.* FROM portfolio_pull_buffer_current pointer
+                JOIN portfolio_pull_buffer_candidates candidate
+                  ON candidate.id=pointer.candidate_id
+                LEFT JOIN portfolio_pull_buffer_retirements retirement
+                  ON retirement.candidate_id=candidate.id
+                WHERE pointer.repository=? AND pointer.issue_number=?
+                  AND retirement.candidate_id IS NULL
+                """,
+                (repository, issue_number),
+            ).fetchone()
+            observed_digest = (
+                None if candidate is None else candidate["candidate_sha256"]
+            )
+            binding = {
+                "candidate_id": None if candidate is None else int(candidate["id"]),
+                "candidate_sha256": observed_digest,
+                "state": None if candidate is None else candidate["state"],
+                "generation": (
+                    None if candidate is None else int(candidate["generation"])
+                ),
+                "item_version": (
+                    None if candidate is None else int(candidate["item_version"])
+                ),
+                "source_payload_sha256": (
+                    None if candidate is None else candidate["source_payload_sha256"]
+                ),
+                "accepted_main_sha": (
+                    None if candidate is None else candidate["accepted_main_sha"]
+                ),
+                "graph_version": (
+                    None if candidate is None else int(candidate["graph_version"])
+                ),
+                "capacity_policy_version": (
+                    None
+                    if candidate is None
+                    else int(candidate["capacity_policy_version"])
+                ),
+            }
+            if (
+                candidate is None
+                or observed_digest != action["desired_digest"]
+                or candidate["state"] != "PREPARED_NOT_READY"
+            ):
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_EVIDENCE_DRIFT:"
+                    "REBUILD_PREPARED_CANDIDATE"
+                )
+            successor.update(
+                {
+                    "generation": int(candidate["generation"]),
+                    "item_version": int(candidate["item_version"]),
+                    "source_payload_sha256": candidate["source_payload_sha256"],
+                    "accepted_main_sha": candidate["accepted_main_sha"],
+                    "graph_version": int(candidate["graph_version"]),
+                    "capacity_policy_version": int(
+                        candidate["capacity_policy_version"]
+                    ),
+                    "candidate_sha256": observed_digest,
+                }
+            )
+        else:
+            raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+        observations.append(
+            {
+                "kind": kind,
+                "target": action["target"],
+                "expected_digest": action["expected_digest"],
+                "desired_digest": action["desired_digest"],
+                "observed_digest": observed_digest,
+                "binding": binding,
+                "binding_sha256": digest_json(binding),
+            }
+        )
+    frozen_approval_values = {
+        "proposal_sha256": row["approval_proposal_sha256"],
+        "decision_sha256": row["approval_decision_sha256"],
+        "recipient_session_id": row["approval_recipient_session_id"],
+        "execution_scope_sha256": row["approval_execution_scope_sha256"],
+    }
+    frozen_approval = (
+        None
+        if all(value is None for value in frozen_approval_values.values())
+        else frozen_approval_values
+    )
+    if frozen_approval is not None and any(
+        value is None for value in frozen_approval.values()
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_EVIDENCE_APPROVAL_BINDING_DRIFT")
+    successor.update(
+        {
+            "schema": SUCCESSOR_PLAN_SCHEMA,
+            "transition": {
+                "kind": "RESOLUTION",
+                "parent_campaign_id": int(row["resolution_campaign_id"]),
+                "expected_parent_version": int(row["expected_readiness_version"]),
+                "changed_evidence_sha256": "0" * 64,
+                "resolution_action_set_sha256": row[
+                    "notice_action_set_sha256"
+                ],
+                "approval": frozen_approval,
+            },
+        }
+    )
+    successor["transition"]["changed_evidence_sha256"] = (
+        transition_evidence_sha256(parent_plan, successor)
+    )
+    _validate_plan(successor)
+    return observations, successor
+
+
+def _insert_resolution_cycle(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    context_sha256: str,
+    changed_evidence_sha256: str,
+    outcome: str,
+    successor_campaign_id: int | None,
+    disposition_reason: str | None,
+    acting_planner_session_id: str,
+    result: dict[str, Any],
+    now: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO portfolio_readiness_resolution_cycles(
+            parent_campaign_id, receipt_id, notice_message_id,
+            action_set_sha256, context_sha256, changed_evidence_sha256,
+            outcome, successor_campaign_id, disposition_reason,
+            acting_planner_session_id, result_sha256, result_json, consumed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(row["resolution_campaign_id"]),
+            int(row["resolution_receipt_id"]), int(row["message_id"]),
+            row["notice_action_set_sha256"], context_sha256,
+            changed_evidence_sha256, outcome, successor_campaign_id,
+            disposition_reason, acting_planner_session_id, digest_json(result),
+            canonical_json(result), now,
+        ),
+    )
+
+
+def apply_readiness_resolution(
+    store: CoordinationStore,
+    *,
+    message_id: int,
+    planner_session_id: str,
+    expected_context_sha256: str,
+    now: str,
+    failpoint: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Consume one claimed context after all broker-owned prerequisites read back."""
+
+    if (
+        type(message_id) is not int
+        or message_id <= 0
+        or not isinstance(expected_context_sha256, str)
+        or SHA256.fullmatch(expected_context_sha256) is None
+    ):
+        raise ReadinessError("READINESS_RESOLUTION_CONTEXT_INVALID")
+    ensure_schema(store.connection)
+    _require_pull_buffer_schema(store.connection)
+    with store.transaction():
+        row = _resolution_notice_row(store.connection, message_id)
+        if row["cycle_result_json"] is not None:
+            if row["message_state"] != "COMPLETE":
+                raise ReadinessError("READINESS_RESOLUTION_REPLAY_INCOMPLETE")
+            result = _parse_bound_json(
+                row["cycle_result_json"], "READINESS_RESOLUTION_RESULT_INVALID"
+            )
+            if digest_json(result) != row["cycle_result_sha256"]:
+                raise ReadinessError("READINESS_RESOLUTION_RESULT_INVALID")
+            return {**result, "replay": True}
+        parent_plan, _receipt, actions = _validate_resolution_notice_binding(
+            store.connection,
+            row,
+            planner_session_id=planner_session_id,
+            require_pending=True,
+        )
+        if (
+            row["context_json"] is None
+            or row["context_sha256"] != expected_context_sha256
+            or row["message_state"] != "CLAIMED"
+            or row["message_claimed_by"] is None
+            or not identities_role_equivalent(
+                store.connection,
+                str(row["message_claimed_by"]),
+                planner_session_id,
+            )
+        ):
+            raise ReadinessError("READINESS_RESOLUTION_CONTEXT_CLAIM_INVALID")
+        context = _parse_bound_json(
+            row["context_json"], "READINESS_RESOLUTION_CONTEXT_INVALID"
+        )
+        if (
+            digest_json(context) != expected_context_sha256
+            or context.get("action_set", {}).get("action_set_sha256")
+            != row["notice_action_set_sha256"]
+        ):
+            raise ReadinessError("READINESS_RESOLUTION_CONTEXT_INVALID")
+        try:
+            observations, successor = _resolution_observations_and_successor(
+                store.connection, row, parent_plan, actions
+            )
+            reasons = _binding_reasons(
+                store.connection, {**successor, "id": -1, "endpoint_id": None}
+            )
+            if reasons:
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_EVIDENCE_DRIFT:" + ",".join(reasons)
+                )
+        except ReadinessError as exc:
+            reason = str(exc)
+            if not reason.startswith("READINESS_RESOLUTION_EVIDENCE_"):
+                raise
+            failure = {
+                "schema": READINESS_RESOLUTION_FAILURE_SCHEMA,
+                "parent_campaign_id": int(row["resolution_campaign_id"]),
+                "notice_message_id": message_id,
+                "action_set_sha256": row["notice_action_set_sha256"],
+                "context_sha256": expected_context_sha256,
+                "reason": reason,
+            }
+            changed_evidence_sha256 = digest_json(failure)
+            changed = store.connection.execute(
+                "UPDATE portfolio_readiness_current SET state='HOLD', "
+                "version=version+1, updated_at=?, last_error=? "
+                "WHERE campaign_id=? AND receipt_id=? "
+                "AND state='RESOLUTION_PENDING' AND version=?",
+                (
+                    now, reason, int(row["resolution_campaign_id"]),
+                    int(row["resolution_receipt_id"]),
+                    int(row["expected_readiness_version"]),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ReadinessError("READINESS_RESOLUTION_FENCE_LOST")
+            result = {
+                "schema": READINESS_RESOLUTION_RESULT_SCHEMA,
+                "repository": row["repository"],
+                "issue_number": int(row["issue_number"]),
+                "parent_campaign_id": int(row["resolution_campaign_id"]),
+                "successor_campaign_id": None,
+                "outcome": "HOLD",
+                "disposition": "TERMINAL_HOLD",
+                "reason": reason,
+                "action_set_sha256": row["notice_action_set_sha256"],
+                "changed_evidence_sha256": changed_evidence_sha256,
+                "context_sha256": expected_context_sha256,
+            }
+            _decision_failpoint(failpoint, "after_disposition")
+            _insert_resolution_cycle(
+                store.connection,
+                row,
+                context_sha256=expected_context_sha256,
+                changed_evidence_sha256=changed_evidence_sha256,
+                outcome="HOLD",
+                successor_campaign_id=None,
+                disposition_reason=reason,
+                acting_planner_session_id=planner_session_id,
+                result=result,
+                now=now,
+            )
+            _decision_failpoint(failpoint, "after_consumption")
+            store.complete_readiness_resolution_message_in_transaction(
+                message_id, planner_session_id, now
+            )
+            _event(
+                store.connection,
+                int(row["resolution_campaign_id"]),
+                "READINESS_RESOLUTION_HELD",
+                result,
+                now,
+            )
+            return {**result, "replay": False}
+        _decision_failpoint(failpoint, "after_evidence_readback")
+        registered = _register_locked(
+            store.connection,
+            successor,
+            now=now,
+            approval_verified=(
+                successor["transition"].get("approval") is not None
+            ),
+            resolution_verified=True,
+        )
+        _decision_failpoint(failpoint, "after_successor_registered")
+        changed_evidence_sha256 = successor["transition"][
+            "changed_evidence_sha256"
+        ]
+        result = {
+            "schema": READINESS_RESOLUTION_RESULT_SCHEMA,
+            "repository": row["repository"],
+            "issue_number": int(row["issue_number"]),
+            "parent_campaign_id": int(row["resolution_campaign_id"]),
+            "successor_campaign_id": int(registered["campaign_id"]),
+            "outcome": "SUCCESSOR",
+            "disposition": "RESUMED",
+            "reason": None,
+            "action_set_sha256": row["notice_action_set_sha256"],
+            "changed_evidence_sha256": changed_evidence_sha256,
+            "context_sha256": expected_context_sha256,
+            "observation_set_sha256": digest_json(observations),
+        }
+        _insert_resolution_cycle(
+            store.connection,
+            row,
+            context_sha256=expected_context_sha256,
+            changed_evidence_sha256=changed_evidence_sha256,
+            outcome="SUCCESSOR",
+            successor_campaign_id=int(registered["campaign_id"]),
+            disposition_reason=None,
+            acting_planner_session_id=planner_session_id,
+            result=result,
+            now=now,
+        )
+        _decision_failpoint(failpoint, "after_consumption")
+        store.complete_readiness_resolution_message_in_transaction(
+            message_id, planner_session_id, now
+        )
+        _event(
+            store.connection,
+            int(row["resolution_campaign_id"]),
+            "READINESS_RESOLUTION_COMPLETED",
+            {**result, "observations": observations},
+            now,
+        )
+    return {**result, "replay": False}
 
 
 def _decision_failpoint(
@@ -1827,6 +2831,7 @@ def _deterministic_approval_successor(
             "parent_campaign_id": int(row["readiness_campaign_id"]),
             "expected_parent_version": int(row["expected_readiness_version"]),
             "changed_evidence_sha256": "0" * 64,
+            "resolution_action_set_sha256": None,
             "approval": {
                 "proposal_sha256": row["proposal_sha256"],
                 "decision_sha256": row["decision_sha256"],
@@ -3131,6 +4136,124 @@ def stage_receipt(
         _close_artifact(artifact)
 
 
+def _issue_action_target(repository: str, issue_number: int) -> str:
+    return f"{repository}:issue:{issue_number}"
+
+
+def _validate_resolution_actions(actions: Any, verdict: str) -> list[dict[str, Any]]:
+    if not isinstance(actions, list) or len(actions) > 8:
+        raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
+    if verdict in {"PASS", "TERMINAL_HOLD"}:
+        if actions:
+            raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
+        return []
+    if not actions:
+        raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
+    normalized: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    last_order = -1
+    for action in actions:
+        if not isinstance(action, dict) or set(action) != RESOLUTION_ACTION_KEYS:
+            raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+        kind = action.get("kind")
+        target = action.get("target")
+        expected_digest = action.get("expected_digest")
+        desired_digest = action.get("desired_digest")
+        authority_class = action.get("authority_class")
+        evidence_required = action.get("evidence_required")
+        if (
+            not isinstance(kind, str)
+            or not isinstance(target, str)
+            or not target.strip()
+            or not isinstance(expected_digest, str)
+            or SHA256.fullmatch(expected_digest) is None
+            or not isinstance(desired_digest, str)
+            or SHA256.fullmatch(desired_digest) is None
+            or expected_digest == desired_digest
+        ):
+            raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+        identity = (kind, target)
+        if identity in identities:
+            raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+        identities.add(identity)
+        if kind in RESOLUTION_ACTION_REGISTRY:
+            registry = RESOLUTION_ACTION_REGISTRY[kind]
+            if verdict != "ACTIONABLE_HOLD":
+                raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+            if authority_class != PLANNER_ACTION_AUTHORITY:
+                raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+            if evidence_required != registry["evidence_required"]:
+                raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+            order = int(registry["order"])
+            if order <= last_order:
+                raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+            last_order = order
+        elif kind in MATERIAL_ACTION_REGISTRY:
+            registry = MATERIAL_ACTION_REGISTRY[kind]
+            if authority_class != MATERIAL_ACTION_AUTHORITY:
+                raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+            if verdict != "APPROVAL_REQUIRED":
+                raise ReadinessError("READINESS_ACTION_APPROVAL_REQUIRED")
+            if evidence_required != registry["evidence_required"]:
+                raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+        else:
+            raise ReadinessError("READINESS_ACTION_TERMINAL_HOLD")
+        normalized.append(action)
+    return normalized
+
+
+def _parent_graph_digest(
+    connection: sqlite3.Connection, repository: str, graph_version: int
+) -> str:
+    row = connection.execute(
+        "SELECT graph_sha256 FROM portfolio_graph_revisions "
+        "WHERE repository=? AND version=?",
+        (repository, graph_version),
+    ).fetchone()
+    if row is None or not isinstance(row["graph_sha256"], str):
+        raise ReadinessError("READINESS_ACTION_BINDING_INVALID")
+    return str(row["graph_sha256"])
+
+
+def _validate_resolution_action_bindings(
+    connection: sqlite3.Connection,
+    campaign: sqlite3.Row,
+    actions: list[dict[str, Any]],
+    *,
+    approval_scope_sha256: str | None,
+) -> str:
+    repository = str(campaign["repository"])
+    issue_number = int(campaign["issue_number"])
+    issue_target = _issue_action_target(repository, issue_number)
+    expected_by_kind = {
+        "REFRESH_SOURCE_SNAPSHOT": str(campaign["source_payload_sha256"]),
+        "RECOMPUTE_DEPENDENCY_GRAPH": _parent_graph_digest(
+            connection, repository, int(campaign["graph_version"])
+        ),
+        "REBUILD_PREPARED_CANDIDATE": str(campaign["candidate_sha256"]),
+        "REQUEST_MATERIAL_APPROVAL": str(campaign["plan_sha256"]),
+    }
+    target_by_kind = {
+        "REFRESH_SOURCE_SNAPSHOT": issue_target,
+        "RECOMPUTE_DEPENDENCY_GRAPH": repository,
+        "REBUILD_PREPARED_CANDIDATE": issue_target,
+        "REQUEST_MATERIAL_APPROVAL": issue_target,
+    }
+    for action in actions:
+        kind = str(action["kind"])
+        if (
+            action["target"] != target_by_kind[kind]
+            or action["expected_digest"] != expected_by_kind[kind]
+        ):
+            raise ReadinessError("READINESS_ACTION_BINDING_INVALID")
+        if kind == "REQUEST_MATERIAL_APPROVAL" and (
+            approval_scope_sha256 is None
+            or action["desired_digest"] != approval_scope_sha256
+        ):
+            raise ReadinessError("READINESS_ACTION_APPROVAL_BINDING_INVALID")
+    return digest_json(actions)
+
+
 def _validate_receipt(receipt: dict[str, Any]) -> None:
     expected = {
         "schema", "repository", "issue_number", "readiness_plan_sha256",
@@ -3185,35 +4308,27 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
     resolution = receipt.get("resolution")
     if not isinstance(resolution, dict):
         raise ReadinessError("READINESS_RECEIPT_INVALID")
-    legacy_resolution = set(resolution) == {
-        "role", "actions", "approval_proposal_sha256"
-    }
-    current_resolution = set(resolution) == {"role", "actions", "approval"}
-    if not legacy_resolution and not current_resolution:
+    if set(resolution) != {"role", "actions", "approval"}:
         raise ReadinessError("READINESS_RECEIPT_INVALID")
     role = resolution.get("role")
     actions = resolution.get("actions")
-    approval = resolution.get("approval") if current_resolution else None
-    legacy_proposal = (
-        resolution.get("approval_proposal_sha256") if legacy_resolution else None
-    )
+    approval = resolution.get("approval")
     if verdict == "PASS":
         if (
             role is not None
             or actions != []
             or approval is not None
-            or legacy_proposal is not None
         ):
             raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
     elif verdict == "ACTIONABLE_HOLD":
         if role != "planner" or not isinstance(actions, list) or not actions:
             raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
-        if approval is not None or legacy_proposal is not None:
+        if approval is not None:
             raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
     elif verdict == "APPROVAL_REQUIRED":
         if role != "planner" or not isinstance(actions, list) or not actions:
             raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
-        if legacy_resolution or not isinstance(approval, dict) or set(approval) != {
+        if not isinstance(approval, dict) or set(approval) != {
             "schema", "packet", "material_boundary", "decision_mapping"
         }:
             raise ReadinessError("READINESS_APPROVAL_INPUT_REQUIRED")
@@ -3239,13 +4354,9 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
         role is not None
         or actions != []
         or approval is not None
-        or legacy_proposal is not None
     ):
         raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
-    if not isinstance(actions, list) or any(
-        not isinstance(action, str) or not action.strip() for action in actions
-    ):
-        raise ReadinessError("READINESS_RECEIPT_RESOLUTION_INVALID")
+    _validate_resolution_actions(actions, str(verdict))
 
 
 def _approval_input_for_campaign(
@@ -3321,16 +4432,15 @@ def _planner_notice(
     if planner is None:
         raise ReadinessError("CURRENT_PLANNER_ENDPOINT_REQUIRED")
     verdict = str(receipt["verdict"])
+    action_set_sha256 = digest_json(receipt["resolution"]["actions"])
     evidence = {
         "readiness_plan_sha256": campaign["plan_sha256"],
         "readiness_receipt_sha256": receipt_sha,
         "verdict": verdict,
         "resolution_role": receipt["resolution"]["role"],
         "resolution_item_count": len(receipt["resolution"]["actions"]),
+        "resolution_action_set_sha256": action_set_sha256,
     }
-    legacy_proposal = receipt["resolution"].get("approval_proposal_sha256")
-    if legacy_proposal is not None:
-        evidence["proposal_sha256"] = legacy_proposal
     payload = {
         "source": {
             "repository": campaign["repository"],
@@ -3508,18 +4618,26 @@ def _record_staged_receipt(
             if submission.get("planner_message_id") is None:
                 raise ReadinessError("READINESS_APPROVAL_NOTICE_MISSING")
             planner_message_id = int(submission["planner_message_id"])
+        action_set_sha256 = _validate_resolution_action_bindings(
+            connection,
+            campaign,
+            receipt["resolution"]["actions"],
+            approval_scope_sha256=approval_scope,
+        )
         connection.execute(
             """
             INSERT OR IGNORE INTO portfolio_readiness_receipts(
                 campaign_id, verdict, worker_role, message_id, attempt_id,
-                resolution_role, approval_proposal_sha256, receipt_sha256,
+                resolution_role, resolution_action_set_sha256,
+                approval_proposal_sha256, receipt_sha256,
                 receipt_json, observed_at, recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(campaign["id"]), receipt["verdict"], receipt["worker_role"],
                 receipt["message_id"], receipt["attempt_id"],
-                receipt["resolution"]["role"], proposal, receipt_sha,
+                receipt["resolution"]["role"], action_set_sha256,
+                proposal, receipt_sha,
                 canonical_json(receipt), receipt["observed_at"], now,
             ),
         )
@@ -3601,6 +4719,24 @@ def _record_staged_receipt(
         if planner_message_id is None:
             planner_message_id = _planner_notice(
                 store, campaign, receipt, receipt_sha, now=now
+            )
+        if receipt["verdict"] == "ACTIONABLE_HOLD" and state == "RESOLUTION_PENDING":
+            planner = current_endpoint(connection, "planner")
+            if planner is None:
+                raise ReadinessError("CURRENT_PLANNER_ENDPOINT_REQUIRED")
+            connection.execute(
+                """
+                INSERT INTO portfolio_readiness_resolution_notices(
+                    campaign_id, receipt_id, action_set_sha256, message_id,
+                    routed_endpoint_id, expected_readiness_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(campaign["id"]), int(receipt_row["id"]),
+                    action_set_sha256, planner_message_id,
+                    str(planner["endpoint_id"]),
+                    int(campaign["current_version"]) + 1, now,
+                ),
             )
         _event(
             connection,

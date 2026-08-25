@@ -340,7 +340,7 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                 "resolution": {
                     "role": None,
                     "actions": [],
-                    "approval_proposal_sha256": None,
+                    "approval": None,
                 },
                 "summary": "The candidate is ready for atomic finalization.",
                 "observed_at": "2026-08-24T10:00:02Z",

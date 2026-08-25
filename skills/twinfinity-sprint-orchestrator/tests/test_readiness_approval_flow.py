@@ -35,6 +35,7 @@ from kanban_readiness import (  # noqa: E402
     RECEIPT_SCHEMA,
     apply_readiness_decision,
     attach,
+    claim_readiness_resolution_context,
     dispatch,
     enqueue_due_readiness_revisits,
     ensure_schema as ensure_readiness_schema,
@@ -302,12 +303,13 @@ class ApprovalFlowHarness:
                     attempt_id, role, endpoint_id, instance_id, token_sha256,
                     target_kind, target_key, state, process_id, exit_code,
                     heartbeat_at, version, created_at, updated_at
-                ) VALUES (?, 'sre', ?, 'approval-readiness-worker', ?,
+                ) VALUES (?, 'sre', ?, ?, ?,
                           'message', ?, 'RUNNING', 9001, NULL, ?, 1, ?, ?)
                 """,
                 (
                     self.worker_attempt_id,
                     SRE,
+                    f"approval-readiness-worker:{self.worker_attempt_id}",
                     token_sha256,
                     str(self.worker_message_id),
                     NOW,
@@ -428,7 +430,18 @@ class ApprovalFlowHarness:
             "resolution": {
                 "role": "planner",
                 "actions": [
-                    "Consume one exact published approval-ledger disposition."
+                    {
+                        "kind": "REQUEST_MATERIAL_APPROVAL",
+                        "target": f"{REPOSITORY}:issue:{ISSUE}",
+                        "expected_digest": self.registered["plan_sha256"],
+                        "desired_digest": self.approval_packet[
+                            "execution_scope_sha256"
+                        ],
+                        "authority_class": "HUMAN_APPROVAL",
+                        "evidence_required": [
+                            "approval_ledger.published_decision"
+                        ],
+                    }
                 ],
                 "approval": {
                     "schema": READINESS_APPROVAL_INPUT_SCHEMA,
@@ -624,6 +637,114 @@ class ReadinessApprovalFlowTests(unittest.TestCase):
                     "SELECT state FROM coordination_messages WHERE id=?", (message_id,)
                 ).fetchone()[0],
             )
+        self.assert_zero_writer_wip()
+
+    def test_approved_successor_freezes_approval_in_cold_resolution_context(self) -> None:
+        decision = self.h.decide("APPROVE")
+        self.h.publish(decision)
+        approval_message_id = self.h.enqueue_decision_notice()
+        resumed = self.h.apply(approval_message_id)
+
+        dispatched = dispatch(
+            self.h.store, REPOSITORY, max_parallel=1, now=CONSUMED_AT
+        )["dispatched"][0]
+        self.h.worker_message_id = int(dispatched["message_id"])
+        self.h.worker_attempt_id = "22222222-2222-4222-8222-222222222222"
+        self.h.worker_token = f"executor-token:{self.h.worker_attempt_id}"
+        self.h._start_worker_attempt()
+
+        campaign = self.h.store.connection.execute(
+            "SELECT * FROM portfolio_readiness_campaigns WHERE id=?",
+            (int(resumed["successor_campaign_id"]),),
+        ).fetchone()
+        receipt = {
+            "schema": RECEIPT_SCHEMA,
+            "repository": REPOSITORY,
+            "issue_number": ISSUE,
+            "readiness_plan_sha256": campaign["plan_sha256"],
+            "verdict": "ACTIONABLE_HOLD",
+            "worker_role": "sre",
+            "message_id": self.h.worker_message_id,
+            "attempt_id": self.h.worker_attempt_id,
+            "gate_results": [
+                {
+                    "gate_key": "material-decision",
+                    "verdict": "HOLD",
+                    "evidence_sha256": "f" * 64,
+                    "summary": "One exact prepared-candidate rebuild is needed.",
+                }
+            ],
+            "resolution": {
+                "role": "planner",
+                "actions": [
+                    {
+                        "kind": "REBUILD_PREPARED_CANDIDATE",
+                        "target": f"{REPOSITORY}:issue:{ISSUE}",
+                        "expected_digest": campaign["candidate_sha256"],
+                        "desired_digest": "d" * 64,
+                        "authority_class": "PLANNER_OWNER_API",
+                        "evidence_required": [
+                            "portfolio_pull_buffer_current.candidate_id",
+                            "portfolio_pull_buffer_candidates.candidate_sha256",
+                        ],
+                    }
+                ],
+                "approval": None,
+            },
+            "summary": "One consolidated Planner-owned rebuild is sufficient.",
+            "observed_at": CONSUMED_AT,
+        }
+        draft = self.h.root / "approved-actionable-receipt.json"
+        draft.write_text(canonical_json(receipt), encoding="utf-8")
+        draft.chmod(0o600)
+        with patch.dict(
+            os.environ, {"TWINFINITY_EXECUTOR_TOKEN": self.h.worker_token}
+        ):
+            stage_receipt(
+                self.h.store.connection,
+                self.h.database,
+                draft,
+                message_id=self.h.worker_message_id,
+                attempt_id=self.h.worker_attempt_id,
+                now=CONSUMED_AT,
+            )
+        self.h.store.complete_message(self.h.worker_message_id, SRE, CONSUMED_AT)
+        with self.h.store.transaction():
+            changed = self.h.store.connection.execute(
+                "UPDATE executor_attempts SET state='COMPLETE', exit_code=0, "
+                "version=version+1, updated_at=? WHERE attempt_id=? "
+                "AND state='RUNNING'",
+                (CONSUMED_AT, self.h.worker_attempt_id),
+            ).rowcount
+            self.assertEqual(1, changed)
+        pickup = pickup_receipt(
+            self.h.store, int(resumed["successor_campaign_id"]), now=CONSUMED_AT
+        )
+        self.assertEqual("RESOLUTION_PENDING", pickup["state"])
+        resolution_message_id = int(
+            self.h.store.connection.execute(
+                "SELECT message_id FROM portfolio_readiness_resolution_notices "
+                "WHERE campaign_id=?",
+                (int(resumed["successor_campaign_id"]),),
+            ).fetchone()[0]
+        )
+        context = claim_readiness_resolution_context(
+            self.h.store,
+            message_id=resolution_message_id,
+            planner_session_id=PLANNER_V1,
+            now=CONSUMED_AT,
+        )
+        self.assertEqual(
+            {
+                "proposal_sha256": decision["proposal_sha256"],
+                "decision_sha256": decision["decision_sha256"],
+                "recipient_session_id": PLANNER_V1,
+                "execution_scope_sha256": self.h.approval_packet[
+                    "execution_scope_sha256"
+                ],
+            },
+            context["frozen_approval_reference"],
+        )
         self.assert_zero_writer_wip()
 
     def test_defer_holds_and_arms_one_typed_revisit(self) -> None:
@@ -938,6 +1059,7 @@ class ReadinessApprovalFlowTests(unittest.TestCase):
                 "parent_campaign_id": int(current["campaign_id"]),
                 "expected_parent_version": int(current["version"]),
                 "changed_evidence_sha256": "0" * 64,
+                "resolution_action_set_sha256": "f" * 64,
                 "approval": None,
             },
         }
@@ -945,7 +1067,7 @@ class ReadinessApprovalFlowTests(unittest.TestCase):
             transition_evidence_sha256(parent, successor)
         )
         with self.assertRaisesRegex(
-            Exception, "READINESS_SUCCESSOR_STATE_CONFLICT"
+            Exception, "READINESS_RESOLUTION_HANDLER_REQUIRED"
         ):
             register(self.h.store.connection, successor, now=CONSUMED_AT)
         self.assert_zero_writer_wip()
