@@ -42,8 +42,8 @@ from role_executor_transport import launch_role_executor  # noqa: E402
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 MAIN = "a" * 40
-DEVELOPMENT_ENDPOINT = "role.development.v3"
-SRE_ENDPOINT = "role.sre.v3"
+DEVELOPMENT_ENDPOINT = "role.development.v4"
+SRE_ENDPOINT = "role.sre.v4"
 AUTHORITY_BODY = "Exact bounded throughput simulation authority"
 AUTHORITY_SHA256 = hashlib.sha256(AUTHORITY_BODY.encode()).hexdigest()
 
@@ -559,8 +559,8 @@ class CapacityDispatchFlowTests(unittest.TestCase):
         self.assertTrue(all(command[0:3] == ["/usr/bin/systemd-run", "--user", "--quiet"] for command in commands))
         expected_working_directory = f"--working-directory={Path.cwd().resolve()}"
         self.assertTrue(all(expected_working_directory in command for command in commands))
-        self.assertEqual(6, sum("role.development.v3" in command for command in commands))
-        self.assertEqual(3, sum("role.sre.v3" in command for command in commands))
+        self.assertEqual(6, sum(DEVELOPMENT_ENDPOINT in command for command in commands))
+        self.assertEqual(3, sum(SRE_ENDPOINT in command for command in commands))
 
     def test_real_transport_rejects_a_missing_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

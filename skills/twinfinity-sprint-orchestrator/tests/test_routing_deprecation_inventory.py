@@ -284,6 +284,27 @@ class RoutingInventoryScanTests(unittest.TestCase):
 class RoutingInventoryStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        fixture_root = Path(self.temp.name) / "canonical-operational-inputs"
+        fixture_root.mkdir()
+        planner_goal = fixture_root / "product-planner-goal.md"
+        planner_goal.write_text(
+            "Use only current role endpoints.\n",
+            encoding="utf-8",
+        )
+        agents = fixture_root / "AGENTS.md"
+        agents.write_text(
+            "Current role endpoints are the only executable routing inputs.\n",
+            encoding="utf-8",
+        )
+        self.enterContext(
+            patch(
+                "archive_readiness_audit.CANONICAL_PLANNER_GOAL",
+                planner_goal,
+            )
+        )
+        self.enterContext(
+            patch("archive_readiness_audit.CANONICAL_AGENTS", agents)
+        )
         directory = Path(self.temp.name) / "coordination"
         directory.mkdir(mode=0o700)
         self.store = CoordinationStore(directory / "state.sqlite3")

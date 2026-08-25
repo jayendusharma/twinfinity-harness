@@ -9,12 +9,9 @@ import unittest
 
 
 STAGED = Path(__file__).resolve().parents[1] / "scripts"
-INSTALLED = Path("/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/scripts")
-sys.path.insert(0, str(INSTALLED))
 sys.path.insert(0, str(STAGED))
 
 from coordination_store import CoordinationStore  # noqa: E402
-from executor_registry import ensure_executor_registry_schema  # noqa: E402
 from kanban_pull_buffer import ensure_pull_buffer_schema  # noqa: E402
 from kanban_readiness import (  # noqa: E402
     PLAN_SCHEMA,
@@ -28,6 +25,9 @@ from kanban_readiness import (  # noqa: E402
     register,
 )
 from portfolio_graph import replace_graph  # noqa: E402
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
@@ -41,38 +41,23 @@ class Harness:
         root = Path(self.temporary.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
-        ensure_executor_registry_schema(self.store.connection)
+        config = apply_reviewed_current_endpoint_catalog(
+            self.store.connection,
+            Path(__file__).resolve().parents[1],
+            operation_key="kanban-readiness-tests",
+            now=NOW,
+        )
+        self.endpoints = {
+            role: endpoint.endpoint_id for role, endpoint in config.roles.items()
+        }
         ensure_pull_buffer_schema(self.store.connection)
         self.sources: dict[int, str] = {}
         self.items: dict[int, dict] = {}
         self.candidates: dict[int, str] = {}
-        self._install_endpoints()
 
     def close(self) -> None:
         self.store.close()
         self.temporary.cleanup()
-
-    def _install_endpoints(self) -> None:
-        with self.store.transaction():
-            for role in ("planner", "development", "sre"):
-                endpoint = f"role.{role}.v1"
-                self.store.connection.execute(
-                    """
-                    INSERT INTO executor_role_endpoints(
-                        endpoint_id, role, version, executor_profile, codex_profile,
-                        config_sha256, config_json, command_json, created_at
-                    ) VALUES (?, ?, 1, ?, ?, ?, '{}', '[]', ?)
-                    """,
-                    (endpoint, role, role, f"twinfinity-{role}", "b" * 64, NOW),
-                )
-                self.store.connection.execute(
-                    """
-                    INSERT INTO executor_role_endpoint_current(
-                        role, endpoint_id, pointer_version, updated_at
-                    ) VALUES (?, ?, 1, ?)
-                    """,
-                    (role, endpoint, NOW),
-                )
 
     def add_issue(self, issue: int) -> None:
         snapshot = self.store.ingest_snapshot(
@@ -211,7 +196,7 @@ class Harness:
             self.add_candidate(issue)
 
     def complete_attempt(self, issue: int, message_id: int, attempt_id: str) -> None:
-        endpoint = "role.sre.v1"
+        endpoint = self.endpoints["sre"]
         with self.store.transaction():
             self.store.connection.execute(
                 """
@@ -343,8 +328,9 @@ class KanbanReadinessTests(unittest.TestCase):
         planner_notices = self.h.store.connection.execute(
             """
             SELECT COUNT(*) FROM coordination_messages
-            WHERE recipient_session_id='role.planner.v1' AND state='PREPARED'
-            """
+            WHERE recipient_session_id=? AND state='PREPARED'
+            """,
+            (self.h.endpoints["planner"],),
         ).fetchone()[0]
         self.assertEqual(1, planner_notices)
         with self.assertRaisesRegex(ReadinessError, "READINESS_RESOLUTION_NO_CHANGE"):

@@ -33,8 +33,8 @@ from reconcile_routing_artifacts import (  # noqa: E402
 CONFIG = ROOT / "references" / "twinfinity-executor-registry.toml"
 ALIASES = ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
 REPOSITORY = "twinfinityai/twinfinityapp"
-DEVELOPMENT_ENDPOINT = "role.development.v3"
-SRE_ENDPOINT = "role.sre.v3"
+DEVELOPMENT_ENDPOINT = "role.development.v4"
+SRE_ENDPOINT = "role.sre.v4"
 LEASE = "7" * 64
 
 

@@ -5,11 +5,22 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
+import sqlite3
 from typing import Iterator
 from unittest.mock import patch
 
 import executor_registry
-from executor_registry import RegistryConfig, load_registry_config
+from executor_registry import (
+    RegistryConfig,
+    immediate_transaction,
+    load_registry_config,
+)
+from reconcile_routing_artifacts import (
+    _verify_or_insert_endpoint,
+    apply_plan,
+    build_plan,
+    load_legacy_alias_fixture,
+)
 
 
 _PLANNER_V2 = """[roles.planner]
@@ -70,6 +81,55 @@ command_prefix = [
 ]
 allowed_topics = ["coordination.notice"]
 """
+
+
+def apply_reviewed_current_endpoint_catalog(
+    connection: sqlite3.Connection,
+    skill_root: Path,
+    *,
+    operation_key: str,
+    now: str = "2026-08-24T09:59:59Z",
+) -> RegistryConfig:
+    """Apply and verify the complete production-current pointer set in a test DB."""
+
+    config = load_registry_config(
+        skill_root / "references" / "twinfinity-executor-registry.toml"
+    )
+    aliases, alias_sha256 = load_legacy_alias_fixture(
+        skill_root / "tests" / "fixtures" / "legacy-role-aliases.json"
+    )
+    plan = build_plan(
+        connection,
+        config,
+        aliases,
+        alias_fixture_sha256=alias_sha256,
+    )
+    apply_plan(
+        connection,
+        plan=plan,
+        operation_key=operation_key,
+        expected_plan_sha256=plan["plan_sha256"],
+        now=now,
+    )
+    with immediate_transaction(connection):
+        for endpoint_id in sorted(config.endpoints):
+            _verify_or_insert_endpoint(
+                connection,
+                config.endpoints[endpoint_id].payload,
+                now,
+            )
+    expected = {
+        role: endpoint.endpoint_id for role, endpoint in config.roles.items()
+    }
+    current = {
+        str(row["role"]): str(row["endpoint_id"])
+        for row in connection.execute(
+            "SELECT role, endpoint_id FROM executor_role_endpoint_current ORDER BY role"
+        ).fetchall()
+    }
+    if current != expected:
+        raise AssertionError("temporary reviewed endpoint current set drifted")
+    return config
 
 
 @contextmanager

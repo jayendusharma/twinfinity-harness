@@ -6,7 +6,8 @@ import unittest
 
 import sys
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from approval_guard import (  # noqa: E402
@@ -24,11 +25,14 @@ from coordination_store import (  # noqa: E402
     CoordinationError,
     CoordinationStore,
 )
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
-PLANNER_SESSION = "role.planner.v1"
-SRE_SESSION = "role.sre.v2"
+PLANNER_SESSION = "role.planner.v2"
+SRE_SESSION = "role.sre.v4"
 
 
 class ApprovalGuardTests(unittest.TestCase):
@@ -37,6 +41,11 @@ class ApprovalGuardTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
+        apply_reviewed_current_endpoint_catalog(
+            self.store.connection,
+            ROOT,
+            operation_key="approval-guard-tests",
+        )
         self.source = self.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",

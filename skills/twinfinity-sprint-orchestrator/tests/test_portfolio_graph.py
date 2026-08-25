@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import CoordinationError, CoordinationStore  # noqa: E402
@@ -21,11 +22,14 @@ from portfolio_graph import (  # noqa: E402
     schedule,
     sync_head,
 )
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 MAIN = "1" * 40
-SESSION = "role.development.v2"
+SESSION = "role.development.v4"
 
 
 class PortfolioGraphTests(unittest.TestCase):
@@ -35,6 +39,11 @@ class PortfolioGraphTests(unittest.TestCase):
         directory.mkdir(mode=0o700)
         self.database = directory / "state.sqlite3"
         self.store = CoordinationStore(self.database)
+        apply_reviewed_current_endpoint_catalog(
+            self.store.connection,
+            ROOT,
+            operation_key="portfolio-graph-tests",
+        )
         self.sources: dict[int, str] = {}
         self._issue(58, "Sprint 1")
         self._issue(115, "Sprint 2")

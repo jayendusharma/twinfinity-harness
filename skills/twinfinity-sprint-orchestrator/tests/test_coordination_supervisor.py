@@ -38,9 +38,9 @@ from reconcile_routing_artifacts import (  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEVELOPMENT_SESSION = "role.development.v3"
-PLANNER_SESSION = "role.planner.v1"
-SRE_SESSION = "role.sre.v3"
+DEVELOPMENT_SESSION = "role.development.v4"
+PLANNER_SESSION = "role.planner.v2"
+SRE_SESSION = "role.sre.v4"
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
@@ -1019,7 +1019,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
         sre_command = run.call_args_list[1].args[0]
         self.assertEqual("planner", planner_command[planner_command.index("--role") + 1])
         self.assertEqual(
-            "role.planner.v1",
+            PLANNER_SESSION,
             planner_command[planner_command.index("--endpoint-id") + 1],
         )
         self.assertEqual(

@@ -12,7 +12,8 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import digest_json  # noqa: E402
@@ -25,11 +26,14 @@ from prepush_control import (  # noqa: E402
     PrePushError,
     build_parser,
 )
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    apply_reviewed_current_endpoint_catalog,
+)
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 ISSUE = 314
-SESSION = "role.sre.v2"
+SESSION = "role.sre.v4"
 LEASE = "5" * 64
 HEAD = "b" * 40
 
@@ -40,6 +44,11 @@ class PrePushControlTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.control = PrePushControl(root / "state.sqlite3")
+        apply_reviewed_current_endpoint_catalog(
+            self.control.connection,
+            ROOT,
+            operation_key="prepush-control-tests",
+        )
         source = self.control.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
@@ -145,7 +154,7 @@ class PrePushControlTests(unittest.TestCase):
 
         self.control.connection.execute(
             "UPDATE coordination_messages SET claimed_by=? WHERE id=?",
-            ("role.development.v2", self.message),
+            ("role.development.v4", self.message),
         )
         with self.assertRaisesRegex(
             PrePushError, "PREPUSH_COMPLETED_ADMISSION_ABSENT"
@@ -713,7 +722,32 @@ class PrePushControlTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="beta==2\nalpha==1\n", stderr=""
         )
+        uv = Path("/home/ubuntu/.local/bin/uv")
+        verifier_metadata = (root / "bin" / "ruff").lstat()
+        path_lstat = Path.lstat
+        path_is_symlink = Path.is_symlink
+
+        def fixture_lstat(path: Path):
+            if path == uv:
+                return verifier_metadata
+            return path_lstat(path)
+
+        def fixture_is_symlink(path: Path) -> bool:
+            if path == uv:
+                return False
+            return path_is_symlink(path)
+
         with (
+            patch(
+                "prepush_control.Path.lstat",
+                autospec=True,
+                side_effect=fixture_lstat,
+            ),
+            patch(
+                "prepush_control.Path.is_symlink",
+                autospec=True,
+                side_effect=fixture_is_symlink,
+            ),
             patch("prepush_control.subprocess.run", return_value=completed),
             patch.object(
                 self.control,
@@ -731,6 +765,16 @@ class PrePushControlTests(unittest.TestCase):
             args=[], returncode=0, stdout="alpha==9\nbeta==2\n", stderr=""
         )
         with (
+            patch(
+                "prepush_control.Path.lstat",
+                autospec=True,
+                side_effect=fixture_lstat,
+            ),
+            patch(
+                "prepush_control.Path.is_symlink",
+                autospec=True,
+                side_effect=fixture_is_symlink,
+            ),
             patch("prepush_control.subprocess.run", return_value=drifted),
             patch.object(
                 self.control,
