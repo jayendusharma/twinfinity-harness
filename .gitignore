@@ -1,0 +1,33 @@
+# Python and test output
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Machine-local coordination state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pid
+*.sock
+live/
+receipts/
+spool/
+
+# Credentials and local environment
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor and OS output
+.DS_Store
+*~
+*.swp
+

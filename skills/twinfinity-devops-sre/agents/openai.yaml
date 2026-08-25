@@ -1,0 +1,4 @@
+interface:
+  display_name: "Twinfinity DevOps and SRE"
+  short_description: "Operate safe releases and production reliability"
+  default_prompt: "Use $twinfinity-devops-sre to assess or operate a Twinfinity release, environment, incident, or production-support concern using live evidence and safety gates."

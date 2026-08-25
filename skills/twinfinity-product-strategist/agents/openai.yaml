@@ -1,0 +1,4 @@
+interface:
+  display_name: "Twinfinity Product Strategist"
+  short_description: "Shape parallel Twinfinity product delivery lanes"
+  default_prompt: "Use $twinfinity-product-strategist to define the roadmap and maintain parallel, isolated vertical delivery lanes from live GitHub evidence."

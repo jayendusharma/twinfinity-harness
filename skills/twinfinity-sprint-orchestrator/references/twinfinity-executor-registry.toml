@@ -1,0 +1,55 @@
+schema_version = 1
+
+[roles.planner]
+endpoint_id = "role.planner.v2"
+version = 2
+executor_profile = "planner"
+codex_profile = "twinfinity-planner"
+profile_sha256 = "38d39166c7573d676206a0f70efd4ebbc68c2d74cd743bab85f48de56b5128cf"
+command_prefix = [
+  "/home/ubuntu/.local/bin/codex",
+  "exec",
+  "--profile",
+  "twinfinity-planner",
+  "--strict-config",
+  "--json",
+]
+allowed_topics = ["coordination.notice"]
+
+[roles.development]
+endpoint_id = "role.development.v3"
+version = 3
+executor_profile = "development"
+codex_profile = "twinfinity-development"
+profile_sha256 = "e75697c80eb2107dbd338ba1d49e9ac47364bb36aa414d99a8aa28145dafc247"
+command_prefix = [
+  "/home/ubuntu/.local/bin/codex",
+  "exec",
+  "--profile",
+  "twinfinity-development",
+  "--strict-config",
+  "--json",
+]
+allowed_topics = [
+  "coordination.notice",
+  "development.admission",
+  "development.recovery_prepare",
+  "development.recovery_commit",
+  "development.terminal_closeout",
+]
+
+[roles.sre]
+endpoint_id = "role.sre.v3"
+version = 3
+executor_profile = "sre"
+codex_profile = "twinfinity-sre"
+profile_sha256 = "918c0564b39d28d7776a9b3e4fb7b040b0de2935ad5e8a98099650e6c5ced7f0"
+command_prefix = [
+  "/home/ubuntu/.local/bin/codex",
+  "exec",
+  "--profile",
+  "twinfinity-sre",
+  "--strict-config",
+  "--json",
+]
+allowed_topics = ["coordination.notice", "sre.admission"]

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Twinfinity Sprint Orchestrator"
+  short_description: "Run parallel Twinfinity sprint delivery lanes"
+  default_prompt: "Use $twinfinity-sprint-orchestrator to reconcile live sprint state and proactively queue and dispatch safe, isolated vertical lanes."
+
+policy:
+  allow_implicit_invocation: true

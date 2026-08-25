@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "aliases": [
+    {
+      "alias": "01a017f9-4ce5-7110-9a1f-73b1c10f5625",
+      "role": "planner"
+    },
+    {
+      "alias": "01a017fc-69ea-76d3-beed-3693127ddafe",
+      "role": "development"
+    },
+    {
+      "alias": "01a017fa-81c0-7d51-b515-732204bc6f52",
+      "role": "sre"
+    }
+  ]
+}
