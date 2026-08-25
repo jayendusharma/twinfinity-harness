@@ -16,7 +16,7 @@ Generated caches, bytecode, databases, credentials, live receipts, spools, and o
 - `integration/*` branches combine compatible changes and resolve shared state-machine surfaces.
 - `audit/*` branches contain audit-driven documentation or remediation prepared from a fixed integration head.
 
-Changes that share SQLite transitions or supervisor behavior may be developed separately, but they are installed only from a validated integration head. Live endpoint cutover, service activation, and migration remain explicit Planner-controlled operations; a pushed branch is not an installation or deployment.
+Changes that share SQLite transitions or supervisor behavior may be developed separately, but they are installed only from a validated integration head. Live endpoint installation, service activation, and database replacement remain explicit Planner-controlled operations; a pushed branch is not an installation or deployment. The production source catalog is Planner v2 / Development v3 / SRE v3. V4/v5 artifacts are staged only, and v5 is dormant experimental hardening rather than a delivery prerequisite.
 
 Reviewed and merged source is not installed or live state. Source maintenance reaches `SOURCE_COMPLETE` only under [the shared harness contract](skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md); installation, registration, cutover, and runtime attestation remain separate explicitly authorized operations.
 
@@ -38,3 +38,12 @@ python3 skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py
 The runner uses a private temporary `CODEX_HOME` populated only with the exact
 versioned profiles declared by the checked-in schema-v2 registry; it never
 depends on or mutates installed profiles.
+
+Audit the catalog directly from source bytes with:
+
+```bash
+python3 skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py \
+  --config skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml \
+  --profile-root skills/twinfinity-sprint-orchestrator/references \
+  audit-config
+```

@@ -1215,6 +1215,71 @@ class CoordinationStore:
         _validate_repository(repository)
         return dict(self._ensure_capacity_policy(repository, now or utc_now()))
 
+    def bootstrap_capacity_policy(
+        self,
+        *,
+        repository: str,
+        development_limit: int,
+        shared_limit: int,
+        sre_limit: int,
+        authority_sha256: str,
+        now: str,
+        _transaction: bool = True,
+    ) -> dict[str, Any]:
+        """Install the first reviewed policy in an otherwise empty store."""
+
+        _validate_repository(repository)
+        _validate_sha256(authority_sha256)
+        if development_limit <= 0 or shared_limit < 0 or sre_limit < 0:
+            raise CoordinationError("CAPACITY_POLICY_INVALID")
+        transaction = self.transaction() if _transaction else nullcontext()
+        with transaction:
+            if self.connection.execute(
+                "SELECT 1 FROM coordination_capacity_current LIMIT 1"
+            ).fetchone() is not None or self.connection.execute(
+                "SELECT 1 FROM coordination_capacity_policies LIMIT 1"
+            ).fetchone() is not None:
+                raise CoordinationError("CAPACITY_POLICY_BOOTSTRAP_CONFLICT")
+            if self.connection.execute(
+                "SELECT 1 FROM coordination_items LIMIT 1"
+            ).fetchone() is not None:
+                raise CoordinationError("CAPACITY_POLICY_BOOTSTRAP_CONFLICT")
+            self.connection.execute(
+                """
+                INSERT INTO coordination_capacity_policies(
+                    repository, version, development_limit, shared_limit,
+                    sre_limit, authority_sha256, created_at
+                ) VALUES (?, 1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repository,
+                    development_limit,
+                    shared_limit,
+                    sre_limit,
+                    authority_sha256,
+                    now,
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO coordination_capacity_current(repository, version, updated_at)
+                VALUES (?, 1, ?)
+                """,
+                (repository, now),
+            )
+            self._event(
+                "CAPACITY_POLICY_BOOTSTRAPPED",
+                f"{repository}:capacity-policy:1",
+                {
+                    "authority_sha256": authority_sha256,
+                    "development_limit": development_limit,
+                    "shared_limit": shared_limit,
+                    "sre_limit": sre_limit,
+                },
+                now,
+            )
+        return self.capacity_policy(repository, now=now)
+
     def _set_capacity_policy_for_test_fixture(
         self,
         *,
@@ -2146,6 +2211,103 @@ class CoordinationStore:
             self._ensure_capacity_policy(repository, utc_now())
         ensure_portfolio_graph_schema(self.connection)
         ensure_executor_registry_schema(self.connection)
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS coordination_bootstrap_provenance (
+                bootstrap_id TEXT PRIMARY KEY,
+                manifest_sha256 TEXT NOT NULL UNIQUE,
+                manifest_json TEXT NOT NULL,
+                source_harness_repository TEXT NOT NULL,
+                source_harness_main_sha TEXT NOT NULL,
+                source_registry_sha256 TEXT NOT NULL,
+                approved_goal_sha256 TEXT NOT NULL,
+                application_repository TEXT NOT NULL,
+                application_main_sha TEXT NOT NULL,
+                archived_database_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_bootstrap_provenance_immutable_update
+            BEFORE UPDATE ON coordination_bootstrap_provenance
+            BEGIN
+                SELECT RAISE(ABORT, 'BOOTSTRAP_PROVENANCE_IMMUTABLE');
+            END;
+            CREATE TRIGGER IF NOT EXISTS coordination_bootstrap_provenance_immutable_delete
+            BEFORE DELETE ON coordination_bootstrap_provenance
+            BEGIN
+                SELECT RAISE(ABORT, 'BOOTSTRAP_PROVENANCE_IMMUTABLE');
+            END;
+            """
+        )
+
+    def record_bootstrap_provenance(
+        self,
+        *,
+        bootstrap_id: str,
+        manifest_sha256: str,
+        manifest: dict[str, Any],
+        source_harness_repository: str,
+        source_harness_main_sha: str,
+        source_registry_sha256: str,
+        approved_goal_sha256: str,
+        application_repository: str,
+        application_main_sha: str,
+        archived_database_sha256: str,
+        now: str,
+    ) -> None:
+        """Persist one immutable exact clean-control-plane source binding."""
+
+        if not self.connection.in_transaction:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+        if not bootstrap_id or not isinstance(manifest, dict):
+            raise CoordinationError("BOOTSTRAP_PROVENANCE_INVALID")
+        for digest in (
+            manifest_sha256,
+            source_registry_sha256,
+            approved_goal_sha256,
+            archived_database_sha256,
+        ):
+            _validate_sha256(digest)
+        _validate_repository(source_harness_repository)
+        _validate_repository(application_repository)
+        if not re.fullmatch(r"[0-9a-f]{40}", source_harness_main_sha) or not re.fullmatch(
+            r"[0-9a-f]{40}", application_main_sha
+        ):
+            raise CoordinationError("BOOTSTRAP_PROVENANCE_INVALID")
+        if self.connection.execute(
+            "SELECT 1 FROM coordination_bootstrap_provenance LIMIT 1"
+        ).fetchone() is not None:
+            raise CoordinationError("BOOTSTRAP_PROVENANCE_CONFLICT")
+        canonical = canonical_json(manifest)
+        self.connection.execute(
+            """
+            INSERT INTO coordination_bootstrap_provenance(
+                bootstrap_id, manifest_sha256, manifest_json,
+                source_harness_repository, source_harness_main_sha,
+                source_registry_sha256, approved_goal_sha256,
+                application_repository, application_main_sha,
+                archived_database_sha256, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                bootstrap_id,
+                manifest_sha256,
+                canonical,
+                source_harness_repository,
+                source_harness_main_sha,
+                source_registry_sha256,
+                approved_goal_sha256,
+                application_repository,
+                application_main_sha,
+                archived_database_sha256,
+                now,
+            ),
+        )
+        self._event(
+            "CLEAN_CONTROL_PLANE_BOOTSTRAPPED",
+            bootstrap_id,
+            {"manifest_sha256": manifest_sha256},
+            now,
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[None]:

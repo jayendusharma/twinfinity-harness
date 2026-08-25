@@ -1,4 +1,5 @@
 schema_version = 2
+historical_endpoints = []
 
 [roles.planner]
 endpoint_id = "role.planner.v2"
@@ -17,12 +18,11 @@ command_prefix = [
 allowed_topics = ["coordination.notice"]
 
 [roles.development]
-endpoint_id = "role.development.v5"
-version = 5
+endpoint_id = "role.development.v3"
+version = 3
 executor_profile = "development"
 codex_profile = "twinfinity-development"
-profile_sha256 = "d82fafe8e269b63aa95ec125afc9b151373f2a321fbffd1f90a9af1d59c0500b"
-execution_protocol = "readiness/v1"
+profile_sha256 = "e75697c80eb2107dbd338ba1d49e9ac47364bb36aa414d99a8aa28145dafc247"
 command_prefix = [
   "/home/ubuntu/.local/bin/codex",
   "exec",
@@ -31,15 +31,20 @@ command_prefix = [
   "--strict-config",
   "--json",
 ]
-allowed_topics = ["coordination.notice"]
+allowed_topics = [
+  "coordination.notice",
+  "development.admission",
+  "development.recovery_prepare",
+  "development.recovery_commit",
+  "development.terminal_closeout",
+]
 
 [roles.sre]
-endpoint_id = "role.sre.v5"
-version = 5
+endpoint_id = "role.sre.v3"
+version = 3
 executor_profile = "sre"
 codex_profile = "twinfinity-sre"
-profile_sha256 = "010e8df7de6a99bf13f455cb915dec88f30100f221ff3f957f7a574edf8b0b17"
-execution_protocol = "readiness/v1"
+profile_sha256 = "918c0564b39d28d7776a9b3e4fb7b040b0de2935ad5e8a98099650e6c5ced7f0"
 command_prefix = [
   "/home/ubuntu/.local/bin/codex",
   "exec",
@@ -48,9 +53,9 @@ command_prefix = [
   "--strict-config",
   "--json",
 ]
-allowed_topics = ["coordination.notice"]
+allowed_topics = ["coordination.notice", "sre.admission"]
 
-[[historical_endpoints]]
+[[staged_endpoints]]
 role = "development"
 endpoint_id = "role.development.v4"
 version = 4
@@ -73,7 +78,7 @@ allowed_topics = [
   "development.terminal_closeout",
 ]
 
-[[historical_endpoints]]
+[[staged_endpoints]]
 role = "sre"
 endpoint_id = "role.sre.v4"
 version = 4
@@ -90,13 +95,14 @@ command_prefix = [
 ]
 allowed_topics = ["coordination.notice", "sre.admission"]
 
-[[historical_endpoints]]
+[[staged_endpoints]]
 role = "development"
-endpoint_id = "role.development.v3"
-version = 3
+endpoint_id = "role.development.v5"
+version = 5
 executor_profile = "development"
 codex_profile = "twinfinity-development"
-profile_sha256 = "e75697c80eb2107dbd338ba1d49e9ac47364bb36aa414d99a8aa28145dafc247"
+profile_sha256 = "d82fafe8e269b63aa95ec125afc9b151373f2a321fbffd1f90a9af1d59c0500b"
+execution_protocol = "readiness/v1"
 command_prefix = [
   "/home/ubuntu/.local/bin/codex",
   "exec",
@@ -105,21 +111,16 @@ command_prefix = [
   "--strict-config",
   "--json",
 ]
-allowed_topics = [
-  "coordination.notice",
-  "development.admission",
-  "development.recovery_prepare",
-  "development.recovery_commit",
-  "development.terminal_closeout",
-]
+allowed_topics = ["coordination.notice"]
 
-[[historical_endpoints]]
+[[staged_endpoints]]
 role = "sre"
-endpoint_id = "role.sre.v3"
-version = 3
+endpoint_id = "role.sre.v5"
+version = 5
 executor_profile = "sre"
 codex_profile = "twinfinity-sre"
-profile_sha256 = "918c0564b39d28d7776a9b3e4fb7b040b0de2935ad5e8a98099650e6c5ced7f0"
+profile_sha256 = "010e8df7de6a99bf13f455cb915dec88f30100f221ff3f957f7a574edf8b0b17"
+execution_protocol = "readiness/v1"
 command_prefix = [
   "/home/ubuntu/.local/bin/codex",
   "exec",
@@ -128,4 +129,4 @@ command_prefix = [
   "--strict-config",
   "--json",
 ]
-allowed_topics = ["coordination.notice", "sre.admission"]
+allowed_topics = ["coordination.notice"]

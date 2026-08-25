@@ -35,9 +35,14 @@ def _catalog_endpoints(parsed: dict[str, Any]) -> list[dict[str, Any]]:
         raise HermeticTestError("HERMETIC_REGISTRY_SCHEMA_INVALID")
     roles = parsed.get("roles")
     history = parsed.get("historical_endpoints")
-    if not isinstance(roles, dict) or not isinstance(history, list):
+    staged = parsed.get("staged_endpoints")
+    if (
+        not isinstance(roles, dict)
+        or not isinstance(history, list)
+        or not isinstance(staged, list)
+    ):
         raise HermeticTestError("HERMETIC_REGISTRY_CATALOG_INVALID")
-    endpoints = list(roles.values()) + history
+    endpoints = list(roles.values()) + history + staged
     if not endpoints or any(not isinstance(item, dict) for item in endpoints):
         raise HermeticTestError("HERMETIC_REGISTRY_CATALOG_INVALID")
     return endpoints
