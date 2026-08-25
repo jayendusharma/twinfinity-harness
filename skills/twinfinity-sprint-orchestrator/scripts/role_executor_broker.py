@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
 from pathlib import Path
 import pwd
+import re
 import resource
 import secrets
 import sqlite3
@@ -46,8 +48,15 @@ from kanban_readiness import (
     _event as readiness_event,
     _validate_attempt,
     _validate_receipt,
+    _mark_stale,
     ensure_schema as ensure_readiness_schema,
     record as record_readiness,
+)
+from role_executor_transport import (
+    BROKER_SYSTEMD_CPU_QUOTA_PERCENT,
+    BROKER_SYSTEMD_MEMORY_MAX_BYTES,
+    BROKER_SYSTEMD_RUNTIME_MAX_SECONDS,
+    BROKER_SYSTEMD_TASKS_MAX,
 )
 
 
@@ -65,8 +74,19 @@ BROKER_WALL_SECONDS = 600
 BROKER_CPU_SECONDS = 300
 BROKER_NOFILE_LIMIT = 64
 BROKER_LOG_BYTES = 0
+BROKER_TERMINATION_GRACE_SECONDS = 5
 BROKER_STATES = {"PREPARING", "LAUNCHING", "RUNNING", "COMPLETE", "HOLD"}
 BROKER_ACTIVE_STATES = {"PREPARING", "LAUNCHING", "RUNNING"}
+BROKER_TERMINAL_SYSTEMD_RESULTS = {
+    "success",
+    "exit-code",
+    "signal",
+    "core-dump",
+    "watchdog",
+    "timeout",
+    "resources",
+    "protocol",
+}
 BROKER_PROTOCOL = BROKERED_READINESS_PROTOCOL
 REFERENCE_ROOT = Path(__file__).resolve().parents[1] / "references"
 
@@ -97,6 +117,29 @@ class BrokerSpool:
     runtime_profile_path: Path
     receipt_path: Path
     masked_coordination_root: Path
+
+
+@dataclass(frozen=True)
+class BrokerEvaluatorInactivity:
+    """Positive proof that the isolated evaluator can no longer mutate output."""
+
+    kind: str
+    process_id: int | None = None
+    exit_code: int | None = None
+    systemd_evidence: SystemdUnitEvidence | None = None
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "process_id": self.process_id,
+            "exit_code": self.exit_code,
+            "systemd_evidence": (
+                None
+                if self.systemd_evidence is None
+                else self.systemd_evidence.payload
+            ),
+        }
 
 
 def default_runtime_paths() -> BrokerRuntimePaths:
@@ -338,6 +381,12 @@ def isolation_manifest(configured: EndpointConfig) -> dict[str, Any]:
             "file_bytes": RESULT_MAX_BYTES,
             "open_files": BROKER_NOFILE_LIMIT,
             "captured_log_bytes": BROKER_LOG_BYTES,
+            "attempt_cgroup": {
+                "MemoryMax": BROKER_SYSTEMD_MEMORY_MAX_BYTES,
+                "TasksMax": BROKER_SYSTEMD_TASKS_MAX,
+                "RuntimeMaxSec": BROKER_SYSTEMD_RUNTIME_MAX_SECONDS,
+                "CPUQuotaPercent": BROKER_SYSTEMD_CPU_QUOTA_PERCENT,
+            },
         },
         "profile_sha256": configured.profile_sha256,
     }
@@ -1277,8 +1326,85 @@ def attest_bwrap_command(command: list[str]) -> dict[str, Any]:
             "file_bytes": RESULT_MAX_BYTES,
             "open_files": BROKER_NOFILE_LIMIT,
             "captured_log_bytes": BROKER_LOG_BYTES,
+            "attempt_cgroup": {
+                "MemoryMax": BROKER_SYSTEMD_MEMORY_MAX_BYTES,
+                "TasksMax": BROKER_SYSTEMD_TASKS_MAX,
+                "RuntimeMaxSec": BROKER_SYSTEMD_RUNTIME_MAX_SECONDS,
+                "CPUQuotaPercent": BROKER_SYSTEMD_CPU_QUOTA_PERCENT,
+            },
         },
     }
+
+
+_SYSTEMD_TIMESPAN_PART = re.compile(
+    r"\s*(?P<value>[0-9]+(?:\.[0-9]+)?)\s*"
+    r"(?P<unit>us|ms|s|min|h|d)"
+)
+_SYSTEMD_TIMESPAN_MULTIPLIERS = {
+    "us": Decimal(1),
+    "ms": Decimal(1_000),
+    "s": Decimal(1_000_000),
+    "min": Decimal(60_000_000),
+    "h": Decimal(3_600_000_000),
+    "d": Decimal(86_400_000_000),
+}
+
+
+def _systemd_usec(value: str) -> int:
+    """Parse the stable `systemctl show` finite-timespan representation."""
+
+    if not isinstance(value, str) or not value or value == "infinity":
+        raise BrokerError("BROKER_SYSTEMD_LIMITS_INVALID")
+    if value.isdecimal():
+        return int(value)
+    position = 0
+    total = Decimal(0)
+    try:
+        while position < len(value):
+            match = _SYSTEMD_TIMESPAN_PART.match(value, position)
+            if match is None:
+                raise BrokerError("BROKER_SYSTEMD_LIMITS_INVALID")
+            total += (
+                Decimal(match.group("value"))
+                * _SYSTEMD_TIMESPAN_MULTIPLIERS[match.group("unit")]
+            )
+            position = match.end()
+    except (InvalidOperation, KeyError) as exc:
+        raise BrokerError("BROKER_SYSTEMD_LIMITS_INVALID") from exc
+    if total != total.to_integral_value():
+        raise BrokerError("BROKER_SYSTEMD_LIMITS_INVALID")
+    return int(total)
+
+
+def attest_broker_systemd_limits(evidence: SystemdUnitEvidence) -> dict[str, int]:
+    """Require the outer attempt cgroup to attest every aggregate limit exactly."""
+
+    try:
+        memory_max = int(evidence.memory_max)
+        tasks_max = int(evidence.tasks_max)
+        runtime_max_usec = _systemd_usec(evidence.runtime_max_usec)
+        cpu_quota_per_sec_usec = _systemd_usec(
+            evidence.cpu_quota_per_sec_usec
+        )
+    except (TypeError, ValueError) as exc:
+        raise BrokerError("BROKER_SYSTEMD_LIMITS_INVALID") from exc
+    expected = {
+        "MemoryMax": BROKER_SYSTEMD_MEMORY_MAX_BYTES,
+        "TasksMax": BROKER_SYSTEMD_TASKS_MAX,
+        "RuntimeMaxUSec": BROKER_SYSTEMD_RUNTIME_MAX_SECONDS * 1_000_000,
+        "CPUQuotaPerSecUSec": (
+            BROKER_SYSTEMD_CPU_QUOTA_PERCENT * 10_000
+        ),
+    }
+    observed = {
+        "MemoryMax": memory_max,
+        "TasksMax": tasks_max,
+        "RuntimeMaxUSec": runtime_max_usec,
+        "CPUQuotaPerSecUSec": cpu_quota_per_sec_usec,
+    }
+    if observed != expected:
+        raise BrokerError("BROKER_SYSTEMD_LIMITS_INVALID")
+    return observed
 
 
 def _attempt_transition(
@@ -1393,6 +1519,7 @@ def mark_broker_launching(
     """Atomically bind systemd identity and enter broker LAUNCHING."""
 
     ensure_broker_schema(connection)
+    systemd_limits = attest_broker_systemd_limits(evidence)
     connection.execute("BEGIN IMMEDIATE")
     try:
         run = connection.execute(
@@ -1406,7 +1533,10 @@ def mark_broker_launching(
             raise BrokerError("BROKER_RUN_STATE_CONFLICT")
         _require_attempt_token(attempt, token)
         if (
-            command_attestation.get("schema")
+            evidence.load_state != "loaded"
+            or evidence.active_state not in {"active", "activating"}
+            or evidence.sub_state not in {"running", "start"}
+            or command_attestation.get("schema")
             != "twinfinity-role-broker-command-attestation/v1"
             or not SHA256.fullmatch(str(command_attestation.get("command_sha256", "")))
             or command_attestation.get("credential_mount") is not None
@@ -1439,7 +1569,10 @@ def mark_broker_launching(
             from_version=int(run["version"]),
             to_version=new_version,
             reason="BROKER_CHILD_GATED",
-            payload=command_attestation,
+            payload={
+                **command_attestation,
+                "observed_attempt_cgroup": systemd_limits,
+            },
             now=now,
         )
         updated = connection.execute(
@@ -1679,6 +1812,104 @@ def heartbeat_broker_run(
         raise
 
 
+def _not_started_inactivity() -> BrokerEvaluatorInactivity:
+    return BrokerEvaluatorInactivity(kind="NOT_STARTED")
+
+
+def _process_exit_inactivity(
+    process_id: int, exit_code: int
+) -> BrokerEvaluatorInactivity:
+    if type(process_id) is not int or process_id <= 0 or type(exit_code) is not int:
+        raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID")
+    return BrokerEvaluatorInactivity(
+        kind="PROCESS_EXIT", process_id=process_id, exit_code=exit_code
+    )
+
+
+def _systemd_inactivity(
+    evidence: SystemdUnitEvidence,
+) -> BrokerEvaluatorInactivity:
+    return BrokerEvaluatorInactivity(
+        kind="SYSTEMD_INACTIVE", systemd_evidence=evidence
+    )
+
+
+def _validate_inactive_systemd_snapshot(
+    attempt: sqlite3.Row, evidence: SystemdUnitEvidence
+) -> None:
+    unit = str(attempt["systemd_unit"] or "")
+    invocation_id = str(attempt["systemd_invocation_id"] or "")
+    control_group = str(attempt["systemd_control_group"] or "")
+    expected_unit = stable_systemd_unit(
+        str(attempt["role"]), str(attempt["target_kind"]), str(attempt["target_key"])
+    )
+    if (
+        unit != expected_unit
+        or SYSTEMD_INVOCATION_ID.fullmatch(invocation_id) is None
+        or not control_group.startswith("/")
+        or not control_group.endswith(f"/{unit}")
+        or evidence.unit != unit
+        or evidence.invocation_id != invocation_id
+        or evidence.control_group != control_group
+        or evidence.load_state != "loaded"
+        or evidence.active_state != "inactive"
+        or evidence.sub_state != "dead"
+        or evidence.result not in BROKER_TERMINAL_SYSTEMD_RESULTS
+    ):
+        raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID")
+    try:
+        attest_broker_systemd_limits(evidence)
+    except BrokerError as exc:
+        raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID") from exc
+
+
+def _require_evaluator_inactive(
+    attempt: sqlite3.Row,
+    run: sqlite3.Row,
+    observation: BrokerEvaluatorInactivity | None,
+) -> dict[str, Any]:
+    """Validate positive inactivity proof against the exact immutable attempt."""
+
+    if observation is None:
+        raise BrokerError("BROKER_EVALUATOR_INACTIVITY_REQUIRED")
+    if observation.kind == "NOT_STARTED":
+        if (
+            observation.process_id is not None
+            or observation.exit_code is not None
+            or observation.systemd_evidence is not None
+            or attempt["process_id"] is not None
+            or run["process_id"] is not None
+            or run["state"] not in {"PREPARING", "LAUNCHING"}
+        ):
+            raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID")
+    elif observation.kind == "PROCESS_EXIT":
+        if (
+            type(observation.process_id) is not int
+            or observation.process_id <= 0
+            or type(observation.exit_code) is not int
+            or observation.systemd_evidence is not None
+        ):
+            raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID")
+        stored_process_ids = {
+            int(value)
+            for value in (attempt["process_id"], run["process_id"])
+            if value is not None
+        }
+        if stored_process_ids and stored_process_ids != {observation.process_id}:
+            raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID")
+    elif observation.kind == "SYSTEMD_INACTIVE":
+        if (
+            observation.process_id is not None
+            or observation.exit_code is not None
+            or observation.systemd_evidence is None
+        ):
+            raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID")
+        _validate_inactive_systemd_snapshot(attempt, observation.systemd_evidence)
+    else:
+        raise BrokerError("BROKER_EVALUATOR_INACTIVITY_INVALID")
+    return observation.payload
+
+
 def hold_broker_run(
     connection: sqlite3.Connection,
     *,
@@ -1686,6 +1917,7 @@ def hold_broker_run(
     error: str,
     now: str,
     exit_code: int | None,
+    evaluator_inactivity: BrokerEvaluatorInactivity,
 ) -> dict[str, Any]:
     """Apply the exact before-claim or after-attach terminal HOLD transaction."""
 
@@ -1709,6 +1941,9 @@ def hold_broker_run(
             return dict(run)
         if run["state"] == "COMPLETE":
             raise BrokerError("BROKER_RUN_STATE_CONFLICT")
+        inactivity_payload = _require_evaluator_inactive(
+            attempt, run, evaluator_inactivity
+        )
         message = connection.execute(
             "SELECT * FROM coordination_messages WHERE id=?",
             (int(run["message_id"]),),
@@ -1805,6 +2040,7 @@ def hold_broker_run(
                     None if message is None else message["claimed_by"]
                 ),
                 "observed_readiness_attempt_id": campaign["attempt_id"],
+                "evaluator_inactivity": inactivity_payload,
             },
             now=now,
         )
@@ -1916,6 +2152,7 @@ def complete_broker_receipt(
     receipt_json: str,
     observation: dict[str, Any],
     now: str,
+    evaluator_inactivity: BrokerEvaluatorInactivity | None = None,
 ) -> dict[str, Any]:
     """Atomically stage the receipt and terminalize message, attempt, and run."""
 
@@ -1984,6 +2221,9 @@ def complete_broker_receipt(
             or campaign["attempt_id"] != attempt_id
         ):
             raise BrokerError("BROKER_TERMINAL_BINDING_INVALID")
+        inactivity_payload = _require_evaluator_inactive(
+            attempt, run, evaluator_inactivity
+        )
         try:
             message_payload = json.loads(str(message["payload_json"]))
             if (
@@ -2105,7 +2345,11 @@ def complete_broker_receipt(
             from_version=old_version,
             to_version=new_version,
             reason="BROKER_RECEIPT_STAGED",
-            payload={"receipt_sha256": receipt_sha256, "pickup_state": "STAGED"},
+            payload={
+                "receipt_sha256": receipt_sha256,
+                "pickup_state": "STAGED",
+                "evaluator_inactivity": inactivity_payload,
+            },
             now=now,
         )
         connection.execute("COMMIT")
@@ -2127,6 +2371,7 @@ def replay_broker_receipt(
     attempt_id: str,
     runtime: BrokerRuntimePaths | None = None,
     now: str,
+    evaluator_inactivity: BrokerEvaluatorInactivity | None = None,
 ) -> dict[str, Any]:
     """Recover a crashed broker from the isolated output or exact staged pickup."""
 
@@ -2153,6 +2398,7 @@ def replay_broker_receipt(
             receipt_json=str(pickup["receipt_json"]),
             observation=json.loads(str(pickup["observation_json"])),
             now=now,
+            evaluator_inactivity=evaluator_inactivity,
         )
     runtime = runtime or default_runtime_paths()
     receipt_path = runtime.spool_root / attempt_id / "out" / "receipt.json"
@@ -2164,7 +2410,142 @@ def replay_broker_receipt(
         receipt_json=receipt_json,
         observation=observation,
         now=now,
+        evaluator_inactivity=evaluator_inactivity,
     )
+
+
+def _persist_pickup_disposition(
+    connection: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    error: str,
+    now: str,
+    verdict: str | None,
+) -> dict[str, Any]:
+    """Durably retire one poison pickup without blocking later supervisor work."""
+
+    safe_error = _error_code(BrokerError(error), "BROKER_PICKUP_CONSUMPTION_FAILED")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        existing = connection.execute(
+            "SELECT * FROM role_executor_broker_pickup_consumptions WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            outcome = _parse_canonical_json(
+                str(existing["outcome_json"]),
+                str(existing["outcome_sha256"]),
+                "BROKER_CONSUMPTION_INVALID",
+            )
+            connection.execute("COMMIT")
+            return outcome
+        pickup = connection.execute(
+            """
+            SELECT pickup.*, run.repository, run.issue_number,
+                   run.campaign_id AS run_campaign_id,
+                   run.receipt_sha256 AS run_receipt_sha256
+            FROM role_executor_broker_receipt_pickups pickup
+            JOIN role_executor_broker_runs run ON run.attempt_id=pickup.attempt_id
+            WHERE pickup.attempt_id=?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if pickup is None:
+            raise BrokerError("BROKER_PICKUP_MISSING")
+        current = connection.execute(
+            """
+            SELECT * FROM portfolio_readiness_current WHERE campaign_id=?
+            """,
+            (int(pickup["campaign_id"]),),
+        ).fetchone()
+        readiness_state = None if current is None else str(current["state"])
+        disposition = "ERROR"
+        reasons: list[str] = []
+        if current is not None:
+            try:
+                campaign = _campaign(
+                    connection,
+                    str(pickup["repository"]),
+                    int(pickup["issue_number"]),
+                )
+            except ReadinessError:
+                campaign = None
+            if campaign is not None and int(campaign["id"]) == int(
+                pickup["campaign_id"]
+            ):
+                reasons = _binding_reasons(connection, campaign)
+                if readiness_state == "RUNNING" and reasons:
+                    _mark_stale(connection, campaign, reasons, now)
+                    readiness_state = "STALE"
+                if readiness_state == "STALE":
+                    disposition = "STALE"
+                    safe_error = (
+                        "READINESS_BINDING_DRIFT:" + ",".join(reasons)
+                        if reasons
+                        else str(current["last_error"] or safe_error)
+                    )
+                elif readiness_state == "RUNNING":
+                    updated = connection.execute(
+                        """
+                        UPDATE portfolio_readiness_current
+                        SET state='HOLD', version=version+1, updated_at=?,
+                            last_error=?
+                        WHERE campaign_id=? AND state='RUNNING' AND version=?
+                        """,
+                        (
+                            now,
+                            safe_error,
+                            int(campaign["id"]),
+                            int(campaign["current_version"]),
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise BrokerError("BROKER_PICKUP_DISPOSITION_RACE")
+                    readiness_event(
+                        connection,
+                        int(campaign["id"]),
+                        "READINESS_BROKER_PICKUP_HELD",
+                        {"attempt_id": attempt_id, "error": safe_error},
+                        now,
+                    )
+                    readiness_state = "HOLD"
+                    disposition = "HOLD"
+                elif readiness_state == "HOLD":
+                    disposition = "HOLD"
+        outcome = {
+            "schema": PICKUP_CONSUMPTION_SCHEMA,
+            "attempt_id": attempt_id,
+            "campaign_id": int(pickup["campaign_id"]),
+            "receipt_sha256": str(pickup["receipt_sha256"]),
+            "readiness_state": readiness_state,
+            "verdict": verdict,
+            "disposition": disposition,
+            "error": safe_error,
+        }
+        outcome_json = canonical_json(outcome)
+        outcome_sha256 = hashlib.sha256(outcome_json.encode("utf-8")).hexdigest()
+        connection.execute(
+            """
+            INSERT INTO role_executor_broker_pickup_consumptions(
+                attempt_id, campaign_id, receipt_sha256, outcome_sha256,
+                outcome_json, consumed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_id,
+                int(pickup["campaign_id"]),
+                str(pickup["receipt_sha256"]),
+                outcome_sha256,
+                outcome_json,
+                now,
+            ),
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    return outcome
 
 
 def consume_broker_pickup(
@@ -2197,24 +2578,40 @@ def consume_broker_pickup(
         """,
         (attempt_id,),
     ).fetchone()
-    if (
-        pickup is None
-        or pickup["run_state"] != "COMPLETE"
-        or pickup["state"] != "STAGED"
-        or pickup["receipt_sha256"] != pickup["run_receipt_sha256"]
-    ):
-        raise BrokerError("BROKER_PICKUP_BINDING_INVALID")
-    receipt = _parse_canonical_json(
-        str(pickup["receipt_json"]),
-        str(pickup["receipt_sha256"]),
-        "BROKER_PICKUP_BINDING_INVALID",
-    )
-    if not isinstance(receipt, dict) or receipt.get("attempt_id") != attempt_id:
-        raise BrokerError("BROKER_PICKUP_BINDING_INVALID")
+    if pickup is None:
+        raise BrokerError("BROKER_PICKUP_MISSING")
+    try:
+        if (
+            pickup["run_state"] != "COMPLETE"
+            or pickup["state"] != "STAGED"
+            or pickup["receipt_sha256"] != pickup["run_receipt_sha256"]
+        ):
+            raise BrokerError("BROKER_PICKUP_BINDING_INVALID")
+        receipt = _parse_canonical_json(
+            str(pickup["receipt_json"]),
+            str(pickup["receipt_sha256"]),
+            "BROKER_PICKUP_BINDING_INVALID",
+        )
+        if not isinstance(receipt, dict) or receipt.get("attempt_id") != attempt_id:
+            raise BrokerError("BROKER_PICKUP_BINDING_INVALID")
+    except BrokerError as exc:
+        return _persist_pickup_disposition(
+            connection,
+            attempt_id=attempt_id,
+            error=str(exc),
+            now=now,
+            verdict=None,
+        )
     try:
         recorded = record_readiness(_store_for_connection(connection), receipt, now=now)
     except ReadinessError as exc:
-        raise BrokerError(str(exc)) from exc
+        return _persist_pickup_disposition(
+            connection,
+            attempt_id=attempt_id,
+            error=str(exc),
+            now=now,
+            verdict=str(receipt.get("verdict")),
+        )
     outcome = {
         "schema": PICKUP_CONSUMPTION_SCHEMA,
         "attempt_id": attempt_id,
@@ -2296,21 +2693,76 @@ def consume_staged_broker_pickups(
             """
         )
     ]
-    return [
-        consume_broker_pickup(connection, attempt_id=attempt_id, now=now)
-        for attempt_id in attempt_ids
-    ]
+    results: list[dict[str, Any]] = []
+    for attempt_id in attempt_ids:
+        try:
+            results.append(
+                consume_broker_pickup(
+                    connection, attempt_id=attempt_id, now=now
+                )
+            )
+        except BrokerError as exc:
+            # One malformed pickup cannot serialize later pickups or ordinary
+            # supervisor work. Known binding/readiness failures are durably
+            # consumed above; this reports only a storage-level residual.
+            results.append(
+                {
+                    "schema": PICKUP_CONSUMPTION_SCHEMA,
+                    "attempt_id": attempt_id,
+                    "disposition": "ERROR",
+                    "error": _error_code(
+                        exc, "BROKER_PICKUP_CONSUMPTION_FAILED"
+                    ),
+                }
+            )
+    return results
 
 
-def _terminate_child(process: subprocess.Popen[Any]) -> None:
+def _observed_process_exit(
+    process: subprocess.Popen[Any], *, timeout: float | None
+) -> int | None:
+    try:
+        if timeout is None:
+            value = process.poll()
+        else:
+            value = process.wait(timeout=timeout)
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        return None
+    if type(value) is int:
+        return value
+    return None
+
+
+def _terminate_child(
+    process: subprocess.Popen[Any],
+) -> BrokerEvaluatorInactivity:
+    """Stop one child and return only after positive process-exit observation."""
+
+    process_id = int(process.pid)
+    observed = _observed_process_exit(process, timeout=None)
+    if observed is not None:
+        return _process_exit_inactivity(process_id, observed)
     try:
         process.terminate()
-        process.wait(timeout=5)
-    except Exception:
-        try:
-            process.kill()
-        except Exception:
-            pass
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        pass
+    observed = _observed_process_exit(
+        process, timeout=BROKER_TERMINATION_GRACE_SECONDS
+    )
+    if observed is not None:
+        return _process_exit_inactivity(process_id, observed)
+    try:
+        process.kill()
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        pass
+    observed = _observed_process_exit(
+        process, timeout=BROKER_TERMINATION_GRACE_SECONDS
+    )
+    if observed is None:
+        observed = _observed_process_exit(process, timeout=None)
+    if observed is None:
+        raise BrokerError("BROKER_CHILD_TERMINATION_UNCONFIRMED")
+    return _process_exit_inactivity(process_id, observed)
 
 
 def _apply_child_resource_limits() -> None:
@@ -2410,22 +2862,9 @@ def _inactive_systemd_evidence(
         or evidence.control_group != control_group
     ):
         return None, "BROKER_RECOVERY_SYSTEMD_IDENTITY_MISMATCH"
-    if (
-        evidence.load_state != "loaded"
-        or evidence.active_state != "inactive"
-        or evidence.sub_state != "dead"
-        or evidence.result
-        not in {
-            "success",
-            "exit-code",
-            "signal",
-            "core-dump",
-            "watchdog",
-            "timeout",
-            "resources",
-            "protocol",
-        }
-    ):
+    try:
+        _validate_inactive_systemd_snapshot(attempt, evidence)
+    except BrokerError:
         return None, "BROKER_RECOVERY_SYSTEMD_NOT_PROVEN_INACTIVE"
     return evidence, None
 
@@ -2457,8 +2896,9 @@ def recover_stale_broker_runs(
     for candidate in candidates:
         attempt_id = str(candidate["attempt_id"])
         broker_state = str(candidate["broker_state"])
+        evaluator_inactivity = _not_started_inactivity()
         if broker_state != "PREPARING":
-            _evidence, evidence_error = _inactive_systemd_evidence(
+            evidence, evidence_error = _inactive_systemd_evidence(
                 candidate, evidence_reader
             )
             if evidence_error is not None:
@@ -2471,6 +2911,9 @@ def recover_stale_broker_runs(
                     }
                 )
                 continue
+            if evidence is None:
+                raise BrokerError("BROKER_RECOVERY_SYSTEMD_EVIDENCE_FAILED")
+            evaluator_inactivity = _systemd_inactivity(evidence)
         if broker_state == "RUNNING":
             try:
                 replayed = replay_broker_receipt(
@@ -2478,6 +2921,7 @@ def recover_stale_broker_runs(
                     attempt_id=attempt_id,
                     runtime=runtime,
                     now=now,
+                    evaluator_inactivity=evaluator_inactivity,
                 )
                 consumed = consume_broker_pickup(
                     connection, attempt_id=attempt_id, now=now
@@ -2505,6 +2949,7 @@ def recover_stale_broker_runs(
                 error=recovery_error,
                 now=now,
                 exit_code=None,
+                evaluator_inactivity=evaluator_inactivity,
             )
             readback = broker_terminal_readback(connection, attempt_id=attempt_id)
             results.append(
@@ -2560,6 +3005,7 @@ def execute_brokered_readiness(
         raise BrokerError("BROKER_PROTOCOL_INVALID")
     if heartbeat_seconds <= 0:
         raise BrokerError("BROKER_HEARTBEAT_INVALID")
+    attest_broker_systemd_limits(systemd_evidence)
     # Prove this is the implemented readiness RPC before consuming an attempt.
     try:
         _build_input_projection(
@@ -2592,6 +3038,7 @@ def _execute_brokered_readiness_mechanics(
     runtime: BrokerRuntimePaths,
     popen: Callable[..., subprocess.Popen[Any]],
     heartbeat_seconds: int,
+    evidence_reader: Callable[[str], SystemdUnitEvidence] = probe_systemd_unit,
 ) -> dict[str, Any]:
     """Latent owner mechanics; production dispatch is fenced by preflight."""
 
@@ -2605,6 +3052,7 @@ def _execute_brokered_readiness_mechanics(
         )
         return target_precondition(candidate)
 
+    attest_broker_systemd_limits(systemd_evidence)
     reserved, token = reserve_attempt(
         connection,
         role=configured.role,
@@ -2619,6 +3067,7 @@ def _execute_brokered_readiness_mechanics(
     gate_read = -1
     gate_write = -1
     run_created = False
+    evaluator_inactivity: BrokerEvaluatorInactivity | None = None
     try:
         run = prepare_broker_run(
             connection,
@@ -2669,12 +3118,21 @@ def _execute_brokered_readiness_mechanics(
         gate_write = -1
         deadline = time.monotonic() + BROKER_WALL_SECONDS
         while True:
-            exit_code = process.poll()
-            if exit_code is not None:
-                break
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise BrokerError("BROKER_CHILD_DEADLINE_EXCEEDED")
-            time.sleep(heartbeat_seconds)
+            try:
+                exit_code = process.wait(
+                    timeout=min(float(heartbeat_seconds), remaining)
+                )
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise BrokerError("BROKER_CHILD_DEADLINE_EXCEEDED")
+            else:
+                evaluator_inactivity = _process_exit_inactivity(
+                    int(process.pid), int(exit_code)
+                )
+                break
             heartbeat_broker_run(
                 connection,
                 attempt_id=attempt_id,
@@ -2690,6 +3148,7 @@ def _execute_brokered_readiness_mechanics(
                 error=error,
                 now=utc_now(),
                 exit_code=int(exit_code),
+                evaluator_inactivity=evaluator_inactivity,
             )
             return {
                 "phase": "HOLD",
@@ -2707,6 +3166,7 @@ def _execute_brokered_readiness_mechanics(
             receipt_json=receipt_json,
             observation=observation,
             now=utc_now(),
+            evaluator_inactivity=evaluator_inactivity,
         )
         consumed = consume_broker_pickup(
             connection, attempt_id=attempt_id, now=utc_now()
@@ -2729,7 +3189,35 @@ def _execute_brokered_readiness_mechanics(
     except Exception as exc:
         error = _error_code(exc, "BROKER_BOUNDARY_FAILED")
         if process is not None:
-            _terminate_child(process)
+            try:
+                evaluator_inactivity = _terminate_child(process)
+            except BrokerError:
+                attempt = connection.execute(
+                    "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()
+                evidence = None
+                evidence_error = "BROKER_CHILD_TERMINATION_UNCONFIRMED"
+                if attempt is not None and attempt["systemd_unit"] is not None:
+                    evidence, evidence_error = _inactive_systemd_evidence(
+                        attempt, evidence_reader
+                    )
+                if evidence is not None and evidence_error is None:
+                    evaluator_inactivity = _systemd_inactivity(evidence)
+                else:
+                    readback = broker_terminal_readback(
+                        connection, attempt_id=attempt_id
+                    )
+                    return {
+                        "phase": "RECOVERY_REQUIRED",
+                        "attempt_id": attempt_id,
+                        "error": "BROKER_CHILD_TERMINATION_UNCONFIRMED",
+                        "boundary_error": error,
+                        "cleanup_error": evidence_error,
+                        **readback,
+                    }
+        elif run_created:
+            evaluator_inactivity = _not_started_inactivity()
         cleanup_error: str | None = None
         try:
             if run_created:
@@ -2739,6 +3227,7 @@ def _execute_brokered_readiness_mechanics(
                     error=error,
                     now=utc_now(),
                     exit_code=None,
+                    evaluator_inactivity=evaluator_inactivity,
                 )
             else:
                 transition_attempt(

@@ -43,9 +43,11 @@ from role_executor_broker import (  # noqa: E402
     RESULT_MAX_BYTES,
     RESULT_PATH,
     BrokerError,
+    BrokerEvaluatorInactivity,
     BrokerRuntimePaths,
     _build_input_projection,
     _execute_brokered_readiness_mechanics,
+    attest_broker_systemd_limits,
     attest_bwrap_command,
     broker_terminal_readback,
     build_bwrap_command,
@@ -59,6 +61,13 @@ from role_executor_broker import (  # noqa: E402
     read_receipt_file,
     replay_broker_receipt,
     recover_stale_broker_runs,
+)
+from role_executor_transport import (  # noqa: E402
+    BROKER_SYSTEMD_CPU_QUOTA_PERCENT,
+    BROKER_SYSTEMD_MEMORY_MAX_BYTES,
+    BROKER_SYSTEMD_RUNTIME_MAX_SECONDS,
+    BROKER_SYSTEMD_TASKS_MAX,
+    launch_role_executor,
 )
 from run_role_executor import execute_role  # noqa: E402
 
@@ -85,6 +94,20 @@ def systemd_evidence(
             "/user.slice/user-1000.slice/user@1000.service/app.slice/" + unit
         ),
         result="success",
+        memory_max=str(BROKER_SYSTEMD_MEMORY_MAX_BYTES),
+        tasks_max=str(BROKER_SYSTEMD_TASKS_MAX),
+        runtime_max_usec=f"{BROKER_SYSTEMD_RUNTIME_MAX_SECONDS}s",
+        cpu_quota_per_sec_usec=(
+            f"{BROKER_SYSTEMD_CPU_QUOTA_PERCENT / 100:g}s"
+        ),
+    )
+
+
+def process_exit(
+    process_id: int = 9001, exit_code: int = 0
+) -> BrokerEvaluatorInactivity:
+    return BrokerEvaluatorInactivity(
+        kind="PROCESS_EXIT", process_id=process_id, exit_code=exit_code
     )
 
 
@@ -96,6 +119,7 @@ class _ReceiptProcess:
         self._on_poll = on_poll
         self._finished = False
         self.terminated = False
+        self.wait_timeouts = []
 
     def poll(self):
         if not self._finished:
@@ -112,7 +136,8 @@ class _ReceiptProcess:
             self._gate_fd = -1
 
     def wait(self, timeout=None):
-        return -15
+        self.wait_timeouts.append(timeout)
+        return self.poll()
 
     def kill(self):
         self.terminate()
@@ -135,10 +160,43 @@ class _NeverProcess:
             self._gate_fd = -1
 
     def wait(self, timeout=None):
-        return -15
+        if self.terminated:
+            return -15
+        raise subprocess.TimeoutExpired("synthetic", timeout)
 
     def kill(self):
         self.terminate()
+
+
+class _DelayedKillProcess:
+    pid = 43212
+
+    def __init__(self, gate_fd: int, *, never_exit: bool):
+        self._gate_fd = os.dup(gate_fd)
+        self.never_exit = never_exit
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.killed = False
+
+    def poll(self):
+        return -9 if self.killed and not self.never_exit else None
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def wait(self, timeout=None):
+        result = self.poll()
+        if result is None:
+            raise subprocess.TimeoutExpired("synthetic-stubborn", timeout)
+        return result
+
+    def kill(self):
+        self.kill_calls += 1
+        if self._gate_fd >= 0:
+            os.close(self._gate_fd)
+            self._gate_fd = -1
+        if not self.never_exit:
+            self.killed = True
 
 
 class BrokerHarness:
@@ -165,6 +223,8 @@ class BrokerHarness:
         self.item: dict = {}
         self.candidate_sha256 = ""
         self.message_id = 0
+        self.issue_number = 88
+        self.seeded_candidates: list[dict[str, object]] = []
 
     def close(self) -> None:
         self.store.close()
@@ -203,15 +263,21 @@ class BrokerHarness:
             codex_binary_path=files["codex"],
         )
 
-    def seed(self, *, role: str = "development") -> int:
+    def seed(self, *, role: str = "development", issue_number: int = 88) -> int:
+        if any(
+            int(candidate["issue_number"]) == issue_number
+            for candidate in self.seeded_candidates
+        ):
+            raise AssertionError("candidate already seeded")
+        self.issue_number = issue_number
         snapshot = self.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
-            object_number=88,
+            object_number=issue_number,
             payload={
                 "_projection_version": 3,
-                "number": 88,
-                "title": "Brokered readiness",
+                "number": issue_number,
+                "title": f"Brokered readiness {issue_number}",
                 "state": "open",
                 "updated_at": NOW,
                 "milestone": {"number": 1, "title": "Sprint", "state": "open"},
@@ -222,7 +288,7 @@ class BrokerHarness:
         self.source_sha256 = snapshot.payload_sha256
         self.item = self.store.set_issue_status(
             repository=REPOSITORY,
-            issue_number=88,
+            issue_number=issue_number,
             status="PREPARED",
             allocation_class="NONE",
             generation=1,
@@ -235,36 +301,58 @@ class BrokerHarness:
             expected_version=0,
             now=NOW,
         )
+        self.seeded_candidates.append(
+            {
+                "issue_number": issue_number,
+                "role": role,
+                "source_payload_sha256": snapshot.payload_sha256,
+            }
+        )
+        graph = self.store.connection.execute(
+            "SELECT version FROM portfolio_graph_current WHERE repository=?",
+            (REPOSITORY,),
+        ).fetchone()
         replace_graph(
             self.store.connection,
             {
                 "repository": REPOSITORY,
                 "accepted_main_sha": MAIN,
-                "expected_current_version": 0,
+                "expected_current_version": 0 if graph is None else int(graph["version"]),
                 "scope_milestones": [{"title": "Sprint", "rank": 1}],
                 "excluded_issues": [],
                 "nodes": [
                     {
-                        "node_key": "issue:88",
-                        "issue_number": 88,
+                        "node_key": f"issue:{int(candidate['issue_number'])}",
+                        "issue_number": int(candidate["issue_number"]),
                         "role": "DELIVERY",
                         "root_kind": "STANDALONE",
                         "root_reason": "Independent outcome",
-                        "lane_key": "lane-88",
+                        "lane_key": f"lane-{int(candidate['issue_number'])}",
                         "lane_order": 0,
                         "dispatchable": True,
-                        "priority_rank": 1,
+                        "priority_rank": index,
                         "estimate_units": 1,
-                        "development_units": 1 if role == "development" else 0,
+                        "development_units": (
+                            1 if candidate["role"] == "development" else 0
+                        ),
                         "shared_units": 0,
-                        "sre_units": 1 if role == "sre" else 0,
-                        "source_payload_sha256": snapshot.payload_sha256,
+                        "sre_units": 1 if candidate["role"] == "sre" else 0,
+                        "source_payload_sha256": candidate["source_payload_sha256"],
                         "ready_at": NOW,
                     }
+                    for index, candidate in enumerate(
+                        self.seeded_candidates, start=1
+                    )
                 ],
                 "relations": [],
             },
             now=NOW,
+        )
+        graph_version = int(
+            self.store.connection.execute(
+                "SELECT version FROM portfolio_graph_current WHERE repository=?",
+                (REPOSITORY,),
+            ).fetchone()[0]
         )
         policy_version = int(
             self.store.connection.execute(
@@ -275,7 +363,9 @@ class BrokerHarness:
                 (REPOSITORY,),
             ).fetchone()[0]
         )
-        self.candidate_sha256 = hashlib.sha256(b"candidate:88").hexdigest()
+        self.candidate_sha256 = hashlib.sha256(
+            f"candidate:{issue_number}".encode()
+        ).hexdigest()
         with self.store.transaction():
             cursor = self.store.connection.execute(
                 """
@@ -286,19 +376,23 @@ class BrokerHarness:
                     development_units, shared_units, sre_units, promotion_trigger,
                     artifact_relative_path, artifact_content_sha256,
                     candidate_sha256, registered_at
-                ) VALUES (?, 88, 1, ?, ?, ?, 1, ?, 'lane-88',
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?,
                           'PREPARED_NOT_READY', 'END_TO_END', ?, 0, ?,
-                          'Close readiness phase', 'plans/issue-88.json', ?,
+                          'Close readiness phase', ?, ?,
                           ?, ?)
                 """,
                 (
                     REPOSITORY,
+                    issue_number,
                     int(self.item["version"]),
                     snapshot.payload_sha256,
                     MAIN,
+                    graph_version,
                     policy_version,
+                    f"lane-{issue_number}",
                     1 if role == "development" else 0,
                     1 if role == "sre" else 0,
+                    f"plans/issue-{issue_number}.json",
                     "c" * 64,
                     self.candidate_sha256,
                     NOW,
@@ -308,19 +402,19 @@ class BrokerHarness:
                 """
                 INSERT INTO portfolio_pull_buffer_current(
                     repository, issue_number, candidate_id, updated_at
-                ) VALUES (?, 88, ?, ?)
+                ) VALUES (?, ?, ?, ?)
                 """,
-                (REPOSITORY, int(cursor.lastrowid), NOW),
+                (REPOSITORY, issue_number, int(cursor.lastrowid), NOW),
             )
         plan = {
             "schema": PLAN_SCHEMA,
             "repository": REPOSITORY,
-            "issue_number": 88,
+            "issue_number": issue_number,
             "generation": 1,
             "item_version": int(self.item["version"]),
             "source_payload_sha256": snapshot.payload_sha256,
             "accepted_main_sha": MAIN,
-            "graph_version": 1,
+            "graph_version": graph_version,
             "capacity_policy_version": policy_version,
             "candidate_sha256": self.candidate_sha256,
             "worker_role": role,
@@ -335,23 +429,28 @@ class BrokerHarness:
         }
         register(self.store.connection, plan, now=NOW)
         result = dispatch(self.store, REPOSITORY, max_parallel=1, now=NOW)
-        self.message_id = int(result["dispatched"][0]["message_id"])
+        dispatched = next(
+            candidate
+            for candidate in result["dispatched"]
+            if int(candidate["issue_number"]) == issue_number
+        )
+        self.message_id = int(dispatched["message_id"])
         return self.message_id
 
     def receipt(self, attempt_id: str, *, verdict: str = "PASS") -> dict:
         return {
             "schema": RECEIPT_SCHEMA,
             "repository": REPOSITORY,
-            "issue_number": 88,
+            "issue_number": self.issue_number,
             "readiness_plan_sha256": self.store.connection.execute(
                 """
                 SELECT campaign.plan_sha256
                 FROM portfolio_readiness_current current
                 JOIN portfolio_readiness_campaigns campaign
                   ON campaign.id=current.campaign_id
-                WHERE current.repository=? AND current.issue_number=88
+                WHERE current.repository=? AND current.issue_number=?
                 """,
-                (REPOSITORY,),
+                (REPOSITORY, self.issue_number),
             ).fetchone()[0],
             "verdict": verdict,
             "worker_role": self.store.connection.execute(
@@ -360,9 +459,9 @@ class BrokerHarness:
                 FROM portfolio_readiness_current current
                 JOIN portfolio_readiness_campaigns campaign
                   ON campaign.id=current.campaign_id
-                WHERE current.repository=? AND current.issue_number=88
+                WHERE current.repository=? AND current.issue_number=?
                 """,
-                (REPOSITORY,),
+                (REPOSITORY, self.issue_number),
             ).fetchone()[0],
             "message_id": self.message_id,
             "attempt_id": attempt_id,
@@ -1222,6 +1321,99 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         self.assertIsNone(nofile_result.stdout)
         self.assertIsNone(nofile_result.stderr)
 
+    def test_outer_systemd_cgroup_limits_are_built_and_exactly_attested(self) -> None:
+        endpoint = self.h.config.roles["development"]
+        captured: dict[str, list[str]] = {}
+
+        def runner(command, **_kwargs):
+            captured["command"] = command
+            return type("Completed", (), {"returncode": 0})()
+
+        self.assertEqual(
+            0,
+            launch_role_executor(
+                role="development",
+                endpoint_id=endpoint.endpoint_id,
+                target_kind="message",
+                target_key="88",
+                prompt="credential transport remains disabled",
+                working_directory=self.h.root,
+                runner=runner,
+            ),
+        )
+        command = captured["command"]
+        self.assertIn(
+            f"--property=MemoryMax={BROKER_SYSTEMD_MEMORY_MAX_BYTES}", command
+        )
+        self.assertIn(f"--property=TasksMax={BROKER_SYSTEMD_TASKS_MAX}", command)
+        self.assertIn(
+            f"--property=RuntimeMaxSec={BROKER_SYSTEMD_RUNTIME_MAX_SECONDS}s",
+            command,
+        )
+        self.assertIn(
+            f"--property=CPUQuota={BROKER_SYSTEMD_CPU_QUOTA_PERCENT}%", command
+        )
+        evidence = systemd_evidence("development", "message", "88")
+        self.assertEqual(
+            {
+                "MemoryMax": BROKER_SYSTEMD_MEMORY_MAX_BYTES,
+                "TasksMax": BROKER_SYSTEMD_TASKS_MAX,
+                "RuntimeMaxUSec": BROKER_SYSTEMD_RUNTIME_MAX_SECONDS * 1_000_000,
+                "CPUQuotaPerSecUSec": BROKER_SYSTEMD_CPU_QUOTA_PERCENT * 10_000,
+            },
+            attest_broker_systemd_limits(evidence),
+        )
+        for field in (
+            "memory_max",
+            "tasks_max",
+            "runtime_max_usec",
+            "cpu_quota_per_sec_usec",
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                BrokerError, "BROKER_SYSTEMD_LIMITS_INVALID"
+            ):
+                attest_broker_systemd_limits(replace(evidence, **{field: "infinity"}))
+
+    def test_heartbeat_wait_is_capped_by_remaining_wall_deadline(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        observed: dict[str, _ReceiptProcess] = {}
+
+        def launch(_command, **kwargs):
+            def write_receipt():
+                attempt_id = self.h.store.connection.execute(
+                    "SELECT attempt_id FROM role_executor_broker_runs"
+                ).fetchone()[0]
+                path = self.h.runtime.spool_root / attempt_id / "out" / "receipt.json"
+                path.write_text(
+                    canonical_json(self.h.receipt(str(attempt_id))),
+                    encoding="utf-8",
+                )
+
+            process = _ReceiptProcess(kwargs["pass_fds"][0], write_receipt)
+            observed["process"] = process
+            return process
+
+        with patch.object(broker, "BROKER_WALL_SECONDS", 7):
+            result = _execute_brokered_readiness_mechanics(
+                self.h.store.connection,
+                configured=endpoint,
+                profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
+                target_kind="message",
+                target_key=str(self.h.message_id),
+                systemd_evidence=systemd_evidence(
+                    "development", "message", str(self.h.message_id)
+                ),
+                target_precondition=lambda _connection: None,
+                popen=launch,
+                runtime=self.h.runtime,
+                heartbeat_seconds=30,
+            )
+        self.assertEqual("PASS", result["phase"])
+        self.assertEqual(1, len(observed["process"].wait_timeouts))
+        self.assertGreater(observed["process"].wait_timeouts[0], 0)
+        self.assertLessEqual(observed["process"].wait_timeouts[0], 7)
+
     def test_wall_deadline_terminates_child_and_holds_attached_truth(self) -> None:
         self.h.seed()
         endpoint = self.h.config.roles["development"]
@@ -1257,6 +1449,87 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         self.assertIs(subprocess.DEVNULL, observed["stdout"])
         self.assertIs(subprocess.DEVNULL, observed["stderr"])
         self.assertIs(broker._apply_child_resource_limits, observed["preexec_fn"])
+
+    def test_delayed_kill_must_observe_exit_before_terminal_hold(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        observed: dict[str, _DelayedKillProcess] = {}
+
+        def launch(_command, **kwargs):
+            process = _DelayedKillProcess(kwargs["pass_fds"][0], never_exit=False)
+            observed["process"] = process
+            return process
+
+        with patch.object(broker, "BROKER_WALL_SECONDS", 0):
+            result = _execute_brokered_readiness_mechanics(
+                self.h.store.connection,
+                configured=endpoint,
+                profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
+                target_kind="message",
+                target_key=str(self.h.message_id),
+                systemd_evidence=systemd_evidence(
+                    "development", "message", str(self.h.message_id)
+                ),
+                target_precondition=lambda _connection: None,
+                popen=launch,
+                runtime=self.h.runtime,
+                heartbeat_seconds=30,
+            )
+        self.assertEqual(("HOLD", "HOLD", "HOLD"), (
+            result["phase"], result["state"], result["broker_state"]
+        ))
+        self.assertEqual((1, 1), (
+            observed["process"].terminate_calls, observed["process"].kill_calls
+        ))
+
+    def test_stubborn_child_preserves_active_truth_until_recovery_proves_exit(self) -> None:
+        self.h.seed()
+        endpoint = self.h.config.roles["development"]
+        observed: dict[str, _DelayedKillProcess] = {}
+
+        def launch(_command, **kwargs):
+            process = _DelayedKillProcess(kwargs["pass_fds"][0], never_exit=True)
+            observed["process"] = process
+            return process
+
+        with patch.object(broker, "BROKER_WALL_SECONDS", 0):
+            result = _execute_brokered_readiness_mechanics(
+                self.h.store.connection,
+                configured=endpoint,
+                profile_path=ROOT / "references" / "twinfinity-development-v5.config.toml",
+                target_kind="message",
+                target_key=str(self.h.message_id),
+                systemd_evidence=systemd_evidence(
+                    "development", "message", str(self.h.message_id)
+                ),
+                target_precondition=lambda _connection: None,
+                popen=launch,
+                runtime=self.h.runtime,
+                heartbeat_seconds=30,
+                evidence_reader=lambda _unit: systemd_evidence(
+                    "development", "message", str(self.h.message_id)
+                ),
+            )
+        self.assertEqual(
+            (
+                "RECOVERY_REQUIRED",
+                "RUNNING",
+                "RUNNING",
+                "CLAIMED",
+                "RUNNING",
+            ),
+            (
+                result["phase"],
+                result["state"],
+                result["broker_state"],
+                result["message_state"],
+                result["readiness_state"],
+            ),
+        )
+        self.assertEqual("BROKER_CHILD_TERMINATION_UNCONFIRMED", result["error"])
+        self.assertEqual((1, 1), (
+            observed["process"].terminate_calls, observed["process"].kill_calls
+        ))
 
     def test_claim_attach_is_atomic_and_replayable(self) -> None:
         self.h.seed()
@@ -1340,6 +1613,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
                 receipt_json=receipt_json,
                 observation=observation,
                 now=NOW,
+                evaluator_inactivity=process_exit(),
             )
         self.assertEqual(
             ("CLAIMED", "RUNNING", "RUNNING", 0),
@@ -1367,6 +1641,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             attempt_id=attempt_id,
             runtime=self.h.runtime,
             now=NOW,
+            evaluator_inactivity=process_exit(),
         )
         self.assertEqual(("COMPLETE", "STAGED"), (
             replayed["state"], replayed["pickup_state"]
@@ -1401,6 +1676,54 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             self.h.store.connection.execute(
                 "SELECT receipt_json FROM portfolio_readiness_receipts"
             ).fetchone()[0],
+        )
+
+    def test_terminal_staging_requires_positive_evaluator_inactivity(self) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        receipt = self.h.receipt(attempt_id)
+        spool.receipt_path.write_text(canonical_json(receipt), encoding="utf-8")
+        parsed, receipt_json, observation = read_receipt_file(
+            spool.receipt_path, observed_at=NOW
+        )
+        with self.assertRaisesRegex(
+            BrokerError, "BROKER_EVALUATOR_INACTIVITY_REQUIRED"
+        ):
+            complete_broker_receipt(
+                self.h.store.connection,
+                attempt_id=attempt_id,
+                receipt=parsed,
+                receipt_json=receipt_json,
+                observation=observation,
+                now=NOW,
+            )
+        self.assertEqual(
+            ("RUNNING", "RUNNING", "CLAIMED", "RUNNING"),
+            (
+                self.h.store.connection.execute(
+                    "SELECT state FROM executor_attempts WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT state FROM role_executor_broker_runs WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (self.h.message_id,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT state FROM portfolio_readiness_current"
+                ).fetchone()[0],
+            ),
         )
 
     def test_generic_recovery_skips_broker_and_broker_recovers_preparing(self) -> None:
@@ -1467,6 +1790,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             attempt_id=attempt_id,
             runtime=self.h.runtime,
             now=NOW,
+            evaluator_inactivity=process_exit(),
         )
         supervisor = CoordinationSupervisor(
             self.h.store,
@@ -1489,6 +1813,148 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             ),
         )
 
+    def test_poison_pickup_is_terminal_then_later_good_pickup_and_wake_continue(self) -> None:
+        self.h.seed(issue_number=88)
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        poison_attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=poison_attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        spool.receipt_path.write_text(
+            canonical_json(self.h.receipt(poison_attempt_id)), encoding="utf-8"
+        )
+        replay_broker_receipt(
+            self.h.store.connection,
+            attempt_id=poison_attempt_id,
+            runtime=self.h.runtime,
+            now=NOW,
+            evaluator_inactivity=process_exit(),
+        )
+        with self.h.store.transaction():
+            self.h.store.connection.execute(
+                """
+                UPDATE portfolio_graph_current
+                SET health='STALE', last_error='synthetic poison drift'
+                WHERE repository=?
+                """,
+                (REPOSITORY,),
+            )
+        launches: list[tuple[str, int]] = []
+        supervisor = CoordinationSupervisor(
+            self.h.store,
+            launcher=lambda identity, message_id: (
+                launches.append((identity, message_id)) or 8000 + len(launches)
+            ),
+            terminal_watch_launcher=lambda _identity, _watch_key: 1,
+            process_checker=lambda _identity, _kind, _key: False,
+        )
+        first = supervisor.run_once("2026-08-25T05:00:30Z")
+        self.assertEqual(
+            (1, "STALE", "STALE", 1, []),
+            (
+                len(first["broker_pickups"]),
+                first["broker_pickups"][0]["disposition"],
+                self.h.store.connection.execute(
+                    """
+                    SELECT state FROM portfolio_readiness_current
+                    WHERE repository=? AND issue_number=88
+                    """,
+                    (REPOSITORY,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+                ).fetchone()[0],
+                launches,
+            ),
+        )
+
+        self.h.seed(issue_number=89)
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        good_attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=good_attempt_id,
+            token=token,
+            process_id=9002,
+            now="2026-08-25T05:00:31Z",
+        )
+        spool.receipt_path.write_text(
+            canonical_json(self.h.receipt(good_attempt_id)), encoding="utf-8"
+        )
+        replay_broker_receipt(
+            self.h.store.connection,
+            attempt_id=good_attempt_id,
+            runtime=self.h.runtime,
+            now="2026-08-25T05:00:31Z",
+            evaluator_inactivity=process_exit(9002),
+        )
+        second = supervisor.run_once("2026-08-25T05:00:32Z")
+        self.assertEqual(1, len(second["broker_pickups"]))
+        self.assertEqual(
+            (good_attempt_id, "READY_ELIGIBLE"),
+            (
+                second["broker_pickups"][0]["attempt_id"],
+                second["broker_pickups"][0]["readiness_state"],
+            ),
+        )
+        self.assertEqual(2, self.h.store.connection.execute(
+            "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+        ).fetchone()[0])
+        self.assertTrue(second["launched"])
+        self.assertTrue(any(identity == self.h.config.roles["planner"].endpoint_id for identity, _ in launches))
+
+    def test_endpoint_drift_pickup_is_durably_retired_as_stale(self) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        spool.receipt_path.write_text(
+            canonical_json(self.h.receipt(attempt_id)), encoding="utf-8"
+        )
+        replay_broker_receipt(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            runtime=self.h.runtime,
+            now=NOW,
+            evaluator_inactivity=process_exit(),
+        )
+        with self.h.store.transaction():
+            self.h.store.connection.execute(
+                """
+                UPDATE executor_role_endpoint_current
+                SET endpoint_id='role.development.v4', pointer_version=pointer_version+1,
+                    updated_at=? WHERE role='development'
+                """,
+                (NOW,),
+            )
+        outcome = consume_broker_pickup(
+            self.h.store.connection, attempt_id=attempt_id, now=NOW
+        )
+        self.assertEqual(
+            ("STALE", "STALE", "READINESS_BINDING_DRIFT:ENDPOINT_DRIFT"),
+            (
+                outcome["disposition"],
+                outcome["readiness_state"],
+                outcome["error"],
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+            ).fetchone()[0],
+        )
+
     def test_pickup_consumption_crash_replays_without_duplicate_planner_notice(self) -> None:
         self.h.seed()
         _endpoint, reserved, token, spool = self.h.reserve_and_launch()
@@ -1508,6 +1974,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             attempt_id=attempt_id,
             runtime=self.h.runtime,
             now=NOW,
+            evaluator_inactivity=process_exit(),
         )
         self.h.store.connection.execute(
             """
@@ -1582,6 +2049,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
                     attempt_id=attempt_id,
                     runtime=self.h.runtime,
                     now="2026-08-25T05:02:00Z",
+                    evaluator_inactivity=process_exit(),
                 )
                 consume_broker_pickup(
                     self.h.store.connection,
@@ -1600,6 +2068,10 @@ class RoleExecutorBrokerTests(unittest.TestCase):
                 invocation_id=active.invocation_id,
                 control_group=active.control_group,
                 result="success",
+                memory_max=active.memory_max,
+                tasks_max=active.tasks_max,
+                runtime_max_usec=active.runtime_max_usec,
+                cpu_quota_per_sec_usec=active.cpu_quota_per_sec_usec,
             )
 
         recovered = recover_stale_broker_runs(
@@ -1656,6 +2128,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
                 attempt_id=attempt_id,
                 runtime=self.h.runtime,
                 now=NOW,
+                evaluator_inactivity=process_exit(),
             )
         hold_broker_run(
             self.h.store.connection,
@@ -1663,6 +2136,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             error="BROKER_READINESS_BINDING_DRIFT:GRAPH_STALE",
             now=NOW,
             exit_code=None,
+            evaluator_inactivity=process_exit(),
         )
         self.assertEqual(
             ("HOLD", "HOLD", 0),

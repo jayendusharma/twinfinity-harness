@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -38,6 +39,7 @@ from executor_registry import (  # noqa: E402
     load_legacy_aliases,
     load_registry_config,
     open_registry_database,
+    probe_systemd_unit,
     reserve_attempt,
     recover_stale_active_attempts,
     require_current_endpoint_identity,
@@ -178,6 +180,50 @@ class ExecutorRegistryTests(unittest.TestCase):
         self.environment.stop()
         self.store.close()
         self.temp.cleanup()
+
+    def test_systemd_probe_reads_exact_attempt_cgroup_limits(self) -> None:
+        fields = {
+            "Id": UNIT,
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "InvocationID": INVOCATION_ID,
+            "ControlGroup": CONTROL_GROUP,
+            "Result": "success",
+            "MemoryMax": "2147483648",
+            "TasksMax": "64",
+            "RuntimeMaxUSec": "11min",
+            "CPUQuotaPerSecUSec": "1s",
+        }
+
+        def runner(_command, **_kwargs):
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="".join(f"{key}={value}\n" for key, value in fields.items()),
+            )
+
+        evidence = probe_systemd_unit(UNIT, runner=runner)
+        self.assertEqual(
+            ("2147483648", "64", "11min", "1s"),
+            (
+                evidence.memory_max,
+                evidence.tasks_max,
+                evidence.runtime_max_usec,
+                evidence.cpu_quota_per_sec_usec,
+            ),
+        )
+        missing = dict(fields)
+        missing.pop("MemoryMax")
+        with self.assertRaisesRegex(RegistryError, "SYSTEMD_EVIDENCE_AMBIGUOUS"):
+            probe_systemd_unit(
+                UNIT,
+                runner=lambda _command, **_kwargs: types.SimpleNamespace(
+                    returncode=0,
+                    stdout="".join(
+                        f"{key}={value}\n" for key, value in missing.items()
+                    ),
+                ),
+            )
 
     @staticmethod
     def no_lineage(_connection: sqlite3.Connection) -> None:

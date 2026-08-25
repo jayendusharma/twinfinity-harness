@@ -226,9 +226,13 @@ class SystemdUnitEvidence:
     invocation_id: str
     control_group: str
     result: str
+    memory_max: str = ""
+    tasks_max: str = ""
+    runtime_max_usec: str = ""
+    cpu_quota_per_sec_usec: str = ""
 
     @property
-    def payload(self) -> dict[str, str]:
+    def payload(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -275,6 +279,10 @@ def probe_systemd_unit(
                 "--property=InvocationID",
                 "--property=ControlGroup",
                 "--property=Result",
+                "--property=MemoryMax",
+                "--property=TasksMax",
+                "--property=RuntimeMaxUSec",
+                "--property=CPUQuotaPerSecUSec",
             ],
             check=False,
             capture_output=True,
@@ -301,6 +309,10 @@ def probe_systemd_unit(
         "InvocationID",
         "ControlGroup",
         "Result",
+        "MemoryMax",
+        "TasksMax",
+        "RuntimeMaxUSec",
+        "CPUQuotaPerSecUSec",
     }
     if set(fields) != expected:
         raise RegistryError("SYSTEMD_EVIDENCE_AMBIGUOUS")
@@ -312,6 +324,10 @@ def probe_systemd_unit(
         invocation_id=fields["InvocationID"],
         control_group=fields["ControlGroup"],
         result=fields["Result"],
+        memory_max=fields["MemoryMax"],
+        tasks_max=fields["TasksMax"],
+        runtime_max_usec=fields["RuntimeMaxUSec"],
+        cpu_quota_per_sec_usec=fields["CPUQuotaPerSecUSec"],
     )
 
 
