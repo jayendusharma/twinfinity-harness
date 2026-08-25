@@ -278,6 +278,7 @@ Archive readiness never authorizes deletion. Deleting archives or other data req
 | Module | Responsibility |
 | --- | --- |
 | `owner_safe_sqlite.py` | Owner/type/mode/link safety and shared SQLite open primitives. |
+| `attempt_responses_proxy.py` | Dormant credential-free attempt proxy contract, hashed owner ledger, framed relay, Responses request limits, and fail-closed replay states. |
 | `executor_registry.py` | Endpoint config, pointers, aliases, attempts, migration ledger, and recovery. |
 | `coordination_store.py` | Shared source, item, allocation, lease, inbox, outbox, watch, event, admission, closeout, and artifact transactions. |
 | `portfolio_graph.py` / `portfolio_graph_supervisor.py` | Dependency graph, coverage, collisions, scheduling decisions, refresh, and recovery. |
