@@ -145,9 +145,11 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
         shutil.copy2(CONFIG, config_path)
         shutil.copy2(ALIASES, alias_path)
         for profile in (
-            "twinfinity-planner",
-            "twinfinity-development",
-            "twinfinity-sre",
+            "twinfinity-planner-v2",
+            "twinfinity-development-v3",
+            "twinfinity-development-v4",
+            "twinfinity-sre-v3",
+            "twinfinity-sre-v4",
         ):
             source = ROOT / "references" / f"{profile}.config.toml"
             shutil.copy2(source, template_root / source.name)
@@ -290,7 +292,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 before = self._routing_state_bytes()
                 root = template_root if source_kind == "template" else codex_home
                 self._replace_with_same_bytes(
-                    root / "twinfinity-development.config.toml"
+                    root / "twinfinity-development-v4.config.toml"
                 )
 
                 with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_DRIFT"):
@@ -306,7 +308,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
 
                 self.assertEqual(before, self._routing_state_bytes())
 
-    def test_apply_is_one_immediate_transaction_and_replay_rollback_survive(self) -> None:
+    def test_apply_is_atomic_and_first_cutover_rollback_is_forbidden(self) -> None:
         self._insert_legacy_item_and_watch("103")
         reviewed = self._dry_run_plan()
         statements: list[str] = []
@@ -325,23 +327,25 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
         replayed = self._migrate(reviewed, "atomic-apply-replay-rollback")
         self.assertEqual(applied["change_id"], replayed["change_id"])
 
-        rolled_back = rollback_change(
-            self.connection,
-            change_id=applied["change_id"],
-            expected_version=1,
-            now="2026-08-24T10:00:01Z",
-        )
-        self.assertEqual("ROLLED_BACK", rolled_back["state"])
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "REGISTRY_ROLLBACK_PRECUTOVER_FORBIDDEN"
+        ):
+            rollback_change(
+                self.connection,
+                change_id=applied["change_id"],
+                expected_version=1,
+                now="2026-08-24T10:00:01Z",
+            )
         item = self.connection.execute(
             "SELECT accountable_session_id, version FROM coordination_items"
         ).fetchone()
         watch = self.connection.execute(
             "SELECT accountable_session_id FROM coordination_terminal_watches"
         ).fetchone()
-        self.assertEqual((self.alias_by_role["development"], 3), tuple(item))
-        self.assertEqual(self.alias_by_role["development"], watch[0])
+        self.assertEqual((self.config.roles["development"].endpoint_id, 2), tuple(item))
+        self.assertEqual(self.config.roles["development"].endpoint_id, watch[0])
         self.assertEqual(
-            0,
+            3,
             self.connection.execute(
                 "SELECT COUNT(*) FROM executor_role_endpoint_current"
             ).fetchone()[0],
@@ -356,8 +360,8 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
             )
 
         prior_endpoints = {
-            "development": "role.development.v2",
-            "sre": "role.sre.v2",
+            "development": "role.development.v3",
+            "sre": "role.sre.v3",
         }
         for role, endpoint_id in prior_endpoints.items():
             self.connection.execute(
@@ -365,7 +369,7 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
                 INSERT INTO executor_role_endpoints(
                     endpoint_id, role, version, executor_profile, codex_profile,
                     config_sha256, config_json, command_json, created_at
-                ) VALUES (?, ?, 2, ?, ?, ?, '{}', '[]', ?)
+                ) VALUES (?, ?, 3, ?, ?, ?, '{}', '[]', ?)
                 """,
                 (
                     endpoint_id,
@@ -416,6 +420,24 @@ class RoutingMigrationAtomicityTests(unittest.TestCase):
         )
         self.assertEqual(
             (self.config.roles["sre"].endpoint_id, 2), pointers["sre"]
+        )
+        self.assertEqual(
+            (self.config.roles["planner"].endpoint_id, 1), pointers["planner"]
+        )
+        preserved = {
+            row["endpoint_id"]: (row["role"], row["version"])
+            for row in self.connection.execute(
+                "SELECT endpoint_id, role, version FROM executor_role_endpoints "
+                "WHERE endpoint_id IN (?, ?)",
+                (prior_endpoints["development"], prior_endpoints["sre"]),
+            )
+        }
+        self.assertEqual(
+            {
+                "role.development.v3": ("development", 3),
+                "role.sre.v3": ("sre", 3),
+            },
+            preserved,
         )
         for entry in self.aliases:
             stored = self.connection.execute(

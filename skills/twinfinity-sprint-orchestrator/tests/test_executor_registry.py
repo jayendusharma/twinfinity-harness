@@ -23,16 +23,20 @@ from executor_registry import (  # noqa: E402
     attempt_schema_is_current,
     attempts_support_hosted_operation,
     current_endpoint,
+    ensure_executor_registry_schema,
+    identity_role,
     load_legacy_aliases,
     load_registry_config,
     open_registry_database,
     reserve_attempt,
     recover_stale_active_attempts,
+    require_current_endpoint_identity,
     stable_systemd_unit,
     transition_attempt,
 )
 from reconcile_routing_artifacts import (  # noqa: E402
     _legacy_occurrences,
+    _verify_or_insert_endpoint,
     apply_plan,
     build_plan,
     load_legacy_alias_fixture,
@@ -40,6 +44,10 @@ from reconcile_routing_artifacts import (  # noqa: E402
     rollback_change,
 )
 from run_role_executor import build_fresh_command, execute_role  # noqa: E402
+from reviewed_endpoint_catalog_fixture import (  # noqa: E402
+    reviewed_current_endpoint_catalog,
+    reviewed_planner_rotation_catalog,
+)
 
 
 CONFIG = ROOT / "references" / "twinfinity-executor-registry.toml"
@@ -47,8 +55,9 @@ ALIASES = ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
 REPOSITORY = "twinfinityai/twinfinityapp"
 DEVELOPMENT_UUID = "22222222-2222-4222-8222-222222222222"
 SRE_UUID = "33333333-3333-4333-8333-333333333333"
-DEVELOPMENT_ENDPOINT = "role.development.v3"
-SRE_ENDPOINT = "role.sre.v3"
+DEVELOPMENT_ENDPOINT = "role.development.v4"
+SRE_ENDPOINT = "role.sre.v4"
+PLANNER_ENDPOINT = "role.planner.v2"
 LEASE = "5" * 64
 INVOCATION_ID = "a" * 32
 UNIT = stable_systemd_unit("development", "message", "11")
@@ -211,9 +220,11 @@ class ExecutorRegistryTests(unittest.TestCase):
     def _install_role_profiles(self, codex_home: Path) -> None:
         codex_home.mkdir()
         for profile in (
-            "twinfinity-planner",
-            "twinfinity-development",
-            "twinfinity-sre",
+            "twinfinity-planner-v2",
+            "twinfinity-development-v3",
+            "twinfinity-development-v4",
+            "twinfinity-sre-v3",
+            "twinfinity-sre-v4",
         ):
             source = ROOT / "references" / f"{profile}.config.toml"
             (codex_home / f"{profile}.config.toml").write_bytes(source.read_bytes())
@@ -226,7 +237,7 @@ class ExecutorRegistryTests(unittest.TestCase):
 
         mismatched_home = Path(self.temp.name) / "mismatched-codex-home"
         self._install_role_profiles(mismatched_home)
-        development = mismatched_home / "twinfinity-development.config.toml"
+        development = mismatched_home / "twinfinity-development-v4.config.toml"
         development.write_bytes(development.read_bytes() + b"\n")
         with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_DIGEST_MISMATCH"):
             load_registry_config(CONFIG, codex_home=mismatched_home)
@@ -307,6 +318,125 @@ class ExecutorRegistryTests(unittest.TestCase):
         self.assertEqual(set(), tables)
         self.assertEqual(3, len(plan["pointer_changes"]))
 
+    def test_endpoint_identity_never_fails_open_or_accepts_syntax_only_ids(self) -> None:
+        ensure_executor_registry_schema(self.store.connection)
+        self.assertIsNone(
+            identity_role(self.store.connection, "role.development.v999")
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO executor_role_endpoints(
+                endpoint_id, role, version, executor_profile, codex_profile,
+                config_sha256, config_json, command_json, created_at
+            ) VALUES (
+                'role.development.v999', 'development', 999, 'development',
+                'twinfinity-development', ?, '{}', '[]',
+                '2026-08-24T08:59:59Z'
+            )
+            """,
+            ("f" * 64,),
+        )
+        self.assertIsNone(
+            identity_role(self.store.connection, "role.development.v999")
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "CURRENT_ROLE_ENDPOINT_REQUIRED"
+        ):
+            require_current_endpoint_identity(
+                self.store.connection,
+                DEVELOPMENT_ENDPOINT,
+                expected_role="development",
+            )
+
+        endpoint = self.config.roles["development"]
+        _verify_or_insert_endpoint(
+            self.store.connection, endpoint.payload, "2026-08-24T09:00:00Z"
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO executor_role_endpoint_current(
+                role, endpoint_id, pointer_version, updated_at
+            ) VALUES ('development', ?, 1, '2026-08-24T09:00:01Z')
+            """,
+            (DEVELOPMENT_ENDPOINT,),
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_CURRENT_POINTER_SET_INCOMPLETE"
+        ):
+            current_endpoint(self.store.connection, "development")
+
+    def test_temporary_reviewed_planner_rotation_catalog_is_complete(self) -> None:
+        self.migrate("planner-rotation-fixture-base")
+        root = Path(__file__).resolve().parents[1]
+        with reviewed_planner_rotation_catalog(
+            root, Path(self.temp.name)
+        ) as rotated_config:
+            self.assertEqual(
+                "role.planner.v3", rotated_config.roles["planner"].endpoint_id
+            )
+            self.assertEqual(
+                {
+                    "role.planner.v1",
+                    "role.planner.v2",
+                    "role.planner.v3",
+                    "role.development.v3",
+                    "role.development.v4",
+                    "role.sre.v3",
+                    "role.sre.v4",
+                },
+                set(rotated_config.endpoints),
+            )
+            plan = build_plan(
+                self.store.connection,
+                rotated_config,
+                self.aliases,
+                alias_fixture_sha256=self.alias_sha,
+            )
+            apply_plan(
+                self.store.connection,
+                plan=plan,
+                operation_key="planner-rotation-fixture-v3",
+                expected_plan_sha256=plan["plan_sha256"],
+                now="2026-08-24T09:00:02Z",
+            )
+            self.assertEqual(
+                "role.planner.v3",
+                current_endpoint(self.store.connection, "planner")["endpoint_id"],
+            )
+            self.assertEqual(
+                "planner", identity_role(self.store.connection, "role.planner.v2")
+            )
+            self.assertIsNone(
+                identity_role(self.store.connection, "role.planner.v999")
+            )
+
+    def test_temporary_reviewed_current_catalog_is_complete(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with reviewed_current_endpoint_catalog(
+            root, Path(self.temp.name)
+        ) as current_config:
+            self.assertEqual(
+                {
+                    "planner": "role.planner.v2",
+                    "development": "role.development.v4",
+                    "sre": "role.sre.v4",
+                },
+                {
+                    role: endpoint.endpoint_id
+                    for role, endpoint in current_config.roles.items()
+                },
+            )
+            self.assertEqual(
+                {
+                    "role.planner.v2",
+                    "role.development.v3",
+                    "role.development.v4",
+                    "role.sre.v3",
+                    "role.sre.v4",
+                },
+                set(current_config.endpoints),
+            )
+
     def test_read_only_registry_open_cannot_write(self) -> None:
         connection = open_registry_database(self.store.path, read_only=True)
         try:
@@ -316,23 +446,27 @@ class ExecutorRegistryTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_migration_is_cas_idempotent_and_rollback_preserves_versions(self) -> None:
+    def test_first_cutover_is_monotonic_and_cannot_restore_legacy_routing(self) -> None:
         source = self.snapshot()
-        active = self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_UUID,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-24T09:00:02Z",
-        )
+        with patch(
+            "coordination_store.require_current_endpoint_identity",
+            return_value=DEVELOPMENT_UUID,
+        ):
+            active = self.store.set_issue_status(
+                repository=REPOSITORY,
+                issue_number=92,
+                status="ACTIVE",
+                allocation_class="ACTIVE",
+                generation=1,
+                accountable_session_id=DEVELOPMENT_UUID,
+                lease_manifest_sha256=LEASE,
+                development_units=1,
+                shared_units=1,
+                sre_units=0,
+                expected_source_sha256=source.payload_sha256,
+                expected_version=0,
+                now="2026-08-24T09:00:02Z",
+            )
         plan = build_plan(
             self.store.connection,
             self.config,
@@ -373,18 +507,23 @@ class ExecutorRegistryTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(DEVELOPMENT_ENDPOINT, watch["accountable_session_id"])
 
-        rolled = rollback_change(
-            self.store.connection,
-            change_id=applied["change_id"],
-            expected_version=1,
-            now="2026-08-24T10:00:02Z",
-        )
-        self.assertEqual("ROLLED_BACK", rolled["state"])
-        restored = self.store.connection.execute(
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "REGISTRY_ROLLBACK_PRECUTOVER_FORBIDDEN"
+        ):
+            rollback_change(
+                self.store.connection,
+                change_id=applied["change_id"],
+                expected_version=1,
+                now="2026-08-24T10:00:02Z",
+            )
+        retained = self.store.connection.execute(
             "SELECT accountable_session_id, version FROM coordination_items WHERE issue_number=92"
         ).fetchone()
-        self.assertEqual((DEVELOPMENT_UUID, active["version"] + 2), tuple(restored))
-        self.assertIsNone(current_endpoint(self.store.connection, "development"))
+        self.assertEqual((DEVELOPMENT_ENDPOINT, active["version"] + 1), tuple(retained))
+        self.assertEqual(
+            DEVELOPMENT_ENDPOINT,
+            current_endpoint(self.store.connection, "development")["endpoint_id"],
+        )
         endpoint_count = self.store.connection.execute(
             "SELECT COUNT(*) FROM executor_role_endpoints"
         ).fetchone()[0]
@@ -392,21 +531,25 @@ class ExecutorRegistryTests(unittest.TestCase):
 
     def test_rollback_rejects_terminal_watch_timestamp_drift(self) -> None:
         source = self.snapshot()
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_UUID,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-24T09:00:02Z",
-        )
+        with patch(
+            "coordination_store.require_current_endpoint_identity",
+            return_value=DEVELOPMENT_UUID,
+        ):
+            self.store.set_issue_status(
+                repository=REPOSITORY,
+                issue_number=92,
+                status="ACTIVE",
+                allocation_class="ACTIVE",
+                generation=1,
+                accountable_session_id=DEVELOPMENT_UUID,
+                lease_manifest_sha256=LEASE,
+                development_units=1,
+                shared_units=1,
+                sre_units=0,
+                expected_source_sha256=source.payload_sha256,
+                expected_version=0,
+                now="2026-08-24T09:00:02Z",
+            )
         applied = self.migrate("watch-cas")
         self.store.connection.execute(
             "UPDATE coordination_terminal_watches SET updated_at=?",
@@ -472,25 +615,29 @@ class ExecutorRegistryTests(unittest.TestCase):
 
     def test_current_claim_rejects_alias_but_consumes_historical_alias_row(self) -> None:
         source = self.snapshot()
-        message_id = self.store.enqueue_message(
-            idempotency_key="historical-alias-notice",
-            recipient_session_id=DEVELOPMENT_UUID,
-            topic="coordination.notice",
-            payload={
-                "source": {
-                    "repository": REPOSITORY,
-                    "object_kind": "issue",
-                    "object_number": 92,
-                    "payload_sha256": source.payload_sha256,
+        with patch(
+            "coordination_store.require_current_endpoint_identity",
+            return_value=DEVELOPMENT_UUID,
+        ):
+            message_id = self.store.enqueue_message(
+                idempotency_key="historical-alias-notice",
+                recipient_session_id=DEVELOPMENT_UUID,
+                topic="coordination.notice",
+                payload={
+                    "source": {
+                        "repository": REPOSITORY,
+                        "object_kind": "issue",
+                        "object_number": 92,
+                        "payload_sha256": source.payload_sha256,
+                    },
+                    "notice_kind": "status",
+                    "mutation_authority": False,
+                    "subject": "Historical route",
+                    "summary": "This immutable row predates endpoint cutover.",
+                    "evidence": {},
                 },
-                "notice_kind": "status",
-                "mutation_authority": False,
-                "subject": "Historical route",
-                "summary": "This immutable row predates endpoint cutover.",
-                "evidence": {},
-            },
-            now="2026-08-24T09:00:01Z",
-        )
+                now="2026-08-24T09:00:01Z",
+            )
         before = self.store.connection.execute(
             "SELECT recipient_session_id,payload_json FROM coordination_messages WHERE id=?",
             (message_id,),
@@ -845,6 +992,99 @@ class ExecutorRegistryTests(unittest.TestCase):
         self.assertEqual("COMPLETE", complete["state"])
         self.assertTrue(environments[0]["TWINFINITY_EXECUTOR_TOKEN"])
         self.assertFalse(complete["token_persisted"])
+
+    def test_v3_launch_v4_cutover_launch_rollback_and_v3_launch(self) -> None:
+        source = self.snapshot()
+        now = "2026-08-24T09:00:00Z"
+        for endpoint in self.config.endpoints.values():
+            _verify_or_insert_endpoint(self.store.connection, endpoint.payload, now)
+        initial = {
+            "planner": PLANNER_ENDPOINT,
+            "development": "role.development.v3",
+            "sre": "role.sre.v3",
+        }
+        for role, endpoint_id in initial.items():
+            self.store.connection.execute(
+                """
+                INSERT INTO executor_role_endpoint_current(
+                    role, endpoint_id, pointer_version, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (role, endpoint_id, now),
+            )
+
+        observed_profiles: list[str] = []
+
+        def launch(endpoint_id: str, suffix: str) -> None:
+            message_id = self.store.enqueue_message(
+                idempotency_key=f"endpoint-rollback-{suffix}",
+                recipient_session_id=endpoint_id,
+                topic="coordination.notice",
+                payload={
+                    "source": {
+                        "repository": REPOSITORY,
+                        "object_kind": "issue",
+                        "object_number": 92,
+                        "payload_sha256": source.payload_sha256,
+                    },
+                    "notice_kind": "status",
+                    "mutation_authority": False,
+                    "subject": "Endpoint rollback probe",
+                    "summary": "Validate an immutable endpoint runtime profile.",
+                    "evidence": {},
+                },
+                now=f"2026-08-24T10:00:0{suffix}Z",
+            )
+
+            def succeed(command, **_kwargs):
+                observed_profiles.append(command[command.index("--profile") + 1])
+                return _ImmediateProcess()
+
+            result = execute_role(
+                self.store.connection,
+                config_path=CONFIG,
+                role="development",
+                endpoint_id=endpoint_id,
+                target_kind="message",
+                target_key=str(message_id),
+                prompt="Inspect the exact endpoint rollback probe.",
+                systemd_invocation_id=INVOCATION_ID,
+                systemd_evidence=systemd_evidence(target_key=str(message_id)),
+                popen=succeed,
+            )
+            self.assertEqual("COMPLETE", result["state"])
+
+        launch("role.development.v3", "1")
+        plan = build_plan(
+            self.store.connection,
+            self.config,
+            self.aliases,
+            alias_fixture_sha256=self.alias_sha,
+        )
+        applied = apply_plan(
+            self.store.connection,
+            plan=plan,
+            operation_key="versioned-runtime-cutover",
+            expected_plan_sha256=plan["plan_sha256"],
+            now="2026-08-24T10:00:02Z",
+        )
+        launch(DEVELOPMENT_ENDPOINT, "3")
+        rolled_back = rollback_change(
+            self.store.connection,
+            change_id=applied["change_id"],
+            expected_version=1,
+            now="2026-08-24T10:00:04Z",
+        )
+        self.assertEqual("ROLLED_BACK", rolled_back["state"])
+        launch("role.development.v3", "5")
+        self.assertEqual(
+            [
+                "twinfinity-development-v3",
+                "twinfinity-development-v4",
+                "twinfinity-development-v3",
+            ],
+            observed_profiles,
+        )
 
     def test_launching_transition_failure_never_creates_child(self) -> None:
         source = self.snapshot()
@@ -1532,21 +1772,25 @@ class ExecutorRegistryTests(unittest.TestCase):
 
     def test_archive_readiness_fails_closed_before_migration_and_finds_item(self) -> None:
         source = self.snapshot()
-        self.store.set_issue_status(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE",
-            allocation_class="RETAINED",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_UUID,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-24T09:00:02Z",
-        )
+        with patch(
+            "coordination_store.require_current_endpoint_identity",
+            return_value=DEVELOPMENT_UUID,
+        ):
+            self.store.set_issue_status(
+                repository=REPOSITORY,
+                issue_number=92,
+                status="ACTIVE",
+                allocation_class="RETAINED",
+                generation=1,
+                accountable_session_id=DEVELOPMENT_UUID,
+                lease_manifest_sha256=LEASE,
+                development_units=1,
+                shared_units=1,
+                sre_units=0,
+                expected_source_sha256=source.payload_sha256,
+                expected_version=0,
+                now="2026-08-24T09:00:02Z",
+            )
         self.store.connection.executescript(
             """
             CREATE TABLE hosted_operations(

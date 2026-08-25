@@ -6,6 +6,8 @@ Use this protocol for Twinfinity endpoint configuration, dispatch, attempt recov
 
 Address work to `planner`, `development`, or `sre`, never to a long-lived model thread. Each role has additive immutable endpoint versions and one compare-and-swap current pointer. Endpoint IDs follow `role.<role>.v<version>`.
 
+The endpoint-ID grammar is not identity authority. Public routing resolves only an endpoint in the reviewed current-and-rollback catalog and, once tables exist, its exact immutable SQLite row. Reviewed UUID aliases are accepted only by the private migration/readback path. Public claim and mutation paths require an exact current endpoint and never fail open when pointers are absent.
+
 The current pointer is routing, not authority. It does not change an owning issue, Product Manager decision, approval, capacity, lease, source, branch, worktree, review, release, or provider guard.
 
 Historical endpoint identities and aliases are immutable provenance only. Do not place them in new commands, current pointers, mutable items, active watches, attempts, or current GitHub routing claims. Preserve immutable historical events, messages, decisions, receipts, and comments.
@@ -22,9 +24,23 @@ The installed role contracts are:
 | Development | `development` | `development.*` only | `twinfinity-development-executor` |
 | SRE | `sre` | `sre.*` only | `twinfinity-devops-sre` |
 
-Planner, Development, and SRE use distinct strict Codex profiles. Development and SRE may share only the focused `delivery_guard.py` hook; Planner has no delivery hook and receives only non-authorizing `coordination.notice` work. Their portable templates live beside the registry config and must match the installed `$CODEX_HOME/profile-name.config.toml` copies byte-for-byte. Each endpoint payload binds that exact SHA-256. A profile or endpoint cannot grant mutation authority outside the role contract, current user authority, and exact control-plane row.
+Planner, Development, and SRE use distinct strict Codex profiles. Development and SRE may share only the focused `delivery_guard.py` hook; Planner has no delivery hook and receives only non-authorizing `coordination.notice` work. Every reviewed endpoint, including an executable rollback target, has a versioned portable template named `$CODEX_HOME/<logical-profile>-v<version>.config.toml`. The registry catalog and immutable SQLite endpoint row bind its exact SHA-256 and command manifest. The runner selects that versioned profile from the exact current pointer; it never reloads only the newest singleton role definition. A profile or endpoint cannot grant mutation authority outside the role contract, current user authority, and exact control-plane row.
 
 Changing a role creates a new immutable endpoint version. Advance only that role's current pointer by compare-and-swap. Never edit a persisted endpoint or alias in place.
+
+### Staged strict-profile cutover
+
+The checked-in registry and portable templates are staged cutover inputs, not evidence that live profiles or pointers have moved:
+
+| Role | Staged endpoint | Portable profile SHA-256 | Pointer intent |
+| --- | --- | --- | --- |
+| Planner | `role.planner.v2` | `38d39166c7573d676206a0f70efd4ebbc68c2d74cd743bab85f48de56b5128cf` | unchanged |
+| Development | `role.development.v4` | `96542613dab00abca2a3bcc7e6975025f7b8ed01f610b54ecf23ea6b470c3f18` | additive `role.development.v3` to `role.development.v4` CAS |
+| SRE | `role.sre.v4` | `2257302ec8dafb3ad7f45018b28b98e6a120344f0fab1cc9ae81037639edd5e7` | additive `role.sre.v3` to `role.sre.v4` CAS |
+
+The Development and SRE v4 profiles accept exactly two entry classes. The first is an exact current-endpoint, non-authorizing `coordination.notice` for one read-only Kanban-readiness phase with zero writer WIP for that role. The second is the role's exact Planner admission, recovery, terminal-watch wake, or, for SRE, an authorized read-only operational audit. A readiness notice grants no repository, GitHub, provider, admission, tracker, lease, allocation, application, operational-target, or hosted mutation authority. Every mutation still requires its exact role admission and all ordinary authority and safety gates. Legacy aliases, prior endpoints, and resumed Codex threads are not execution routes.
+
+Do not install the staged templates or run migration merely because these artifacts validate. A later authorized cutover must install all five reviewed versioned profile files (`planner-v2`, Development v3/v4, and SRE v3/v4), re-read their digests, build a fresh plan against live SQLite, and compare-and-swap only the Development and SRE pointers from their exact observed v3 rendezvous. Planner stays at v2 unless its bytes or contract change. The v3 files are executable rollback inputs, not new-work routes while v4 is current.
 
 ## Dispatch and attempt lifecycle
 
@@ -106,11 +122,11 @@ python3 scripts/reconcile_routing_artifacts.py \
   --expected-plan-sha256 '<reviewed-plan-sha256>'
 ```
 
-The transaction inserts immutable endpoints and aliases, advances current pointers by compare-and-swap, and rewrites only the planned mutable current routing fields. If the attempt schema needs expansion, migration refuses active attempts, preserves attempt/event history, and installs target-unique active fencing. Exact operation-key/digest repetition is idempotent; changed bytes or state is conflict.
+The transaction inserts immutable endpoints and aliases, advances current pointers by compare-and-swap, and rewrites only the planned mutable current routing fields. The first pointer ever committed moves the registry monotonically to `CUTOVER_COMPLETE`; the transaction must finish with exactly one role-matched pointer for each role. Thereafter a zero or incomplete pointer set is `HOLD`. If the attempt schema needs expansion, migration refuses active attempts, preserves attempt/event history, and installs target-unique active fencing. Exact operation-key/digest repetition is idempotent; changed bytes or state is conflict.
 
 ## Rollback
 
-Rollback restores only current pointers and mutable local routing fields captured by one applied change. It preserves endpoints, aliases, attempts, messages, events, change history, and the compatible attempt schema.
+Rollback restores only the previous complete current-pointer set and mutable local routing fields captured by one applied version cutover. It preserves endpoints, versioned profile bindings, aliases, attempts, messages, events, change history, and the compatible attempt schema. The initial reviewed cutover cannot roll back to zero pointers or legacy UUID routing.
 
 ```bash
 python3 scripts/reconcile_routing_artifacts.py \
@@ -118,7 +134,7 @@ python3 scripts/reconcile_routing_artifacts.py \
   rollback --change-id '<change-id>' --expected-version '<version>'
 ```
 
-An exact repeat is idempotent. Pointer, item, watch, or change-version drift is `HOLD`; never force an older value over newer work. File-level SQLite restore is disaster recovery, not endpoint rollback.
+An exact repeat is idempotent. Pointer, item, watch, profile, endpoint-manifest, or change-version drift is `HOLD`; never force an older value over newer work. After a v4-to-v3 rollback, fresh attempts load the immutable `*-v3.config.toml` profile through a new attempt; no session resumes. File-level SQLite restore is disaster recovery, not endpoint rollback.
 
 ## GitHub body remediation
 

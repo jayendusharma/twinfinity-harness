@@ -52,6 +52,23 @@ def build_fresh_command(command_prefix: list[str], prompt: str) -> list[str]:
     return [*command_prefix, prompt]
 
 
+def build_endpoint_runtime_command(configured, prompt: str) -> list[str]:
+    """Launch through the endpoint's immutable versioned Codex profile."""
+
+    command = list(configured.command_prefix)
+    try:
+        profile_index = command.index("--profile") + 1
+    except ValueError as exc:
+        raise RegistryError("EXECUTOR_COMMAND_INVALID") from exc
+    if (
+        profile_index >= len(command)
+        or command[profile_index] != configured.codex_profile
+    ):
+        raise RegistryError("EXECUTOR_COMMAND_INVALID")
+    command[profile_index] = configured.runtime_codex_profile
+    return build_fresh_command(command, prompt)
+
+
 def build_child_environment(
     base: dict[str, str],
     *,
@@ -205,14 +222,15 @@ def execute_role(
         evidence=systemd_evidence,
     )
     config = load_registry_config(config_path)
-    configured = config.roles[role]
-    if configured.endpoint_id != endpoint_id:
+    configured = config.endpoints.get(endpoint_id)
+    if configured is None or configured.role != role:
         raise RegistryError("EXECUTOR_CONFIG_ENDPOINT_MISMATCH")
     endpoint = current_endpoint(connection, role)
     if (
         endpoint is None
         or endpoint["endpoint_id"] != endpoint_id
         or endpoint["config_sha256"] != configured.config_sha256
+        or endpoint["config_json"] != canonical_json(configured.payload)
         or json.loads(endpoint["command_json"]) != list(configured.command_prefix)
     ):
         raise RegistryError("EXECUTOR_CONFIG_ENDPOINT_MISMATCH")
@@ -233,7 +251,7 @@ def execute_role(
         now=utc_now(),
         precondition=target_validator,
     )
-    command = build_fresh_command(json.loads(endpoint["command_json"]), prompt)
+    command = build_endpoint_runtime_command(configured, prompt)
     environment = build_child_environment(
         os.environ.copy(),
         attempt_id=reserved["attempt_id"],
