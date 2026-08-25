@@ -682,19 +682,16 @@ def _fetch_terminal_live_observation(
             f"repos/{repository}/issues/{issue_number}/timeline?per_page=100",
         ]
     )
-    if not isinstance(raw_timeline, list):
+    if not isinstance(raw_timeline, list) or not raw_timeline:
         raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
-    timeline = (
-        [
-            event
-            for page in raw_timeline
-            if isinstance(page, list)
-            for event in page
-            if isinstance(event, dict)
-        ]
-        if raw_timeline and all(isinstance(page, list) for page in raw_timeline)
-        else [event for event in raw_timeline if isinstance(event, dict)]
-    )
+    timeline: list[dict[str, Any]] = []
+    for page in raw_timeline:
+        if not isinstance(page, list) or not page:
+            raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+        for event in page:
+            if not isinstance(event, dict):
+                raise CoordinationError("TERMINAL_LIVE_EVIDENCE_INVALID")
+            timeline.append(event)
     return issue_payload, main_ref, comment, timeline
 
 

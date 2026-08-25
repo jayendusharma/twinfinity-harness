@@ -255,7 +255,12 @@ class CoordinationStoreTests(unittest.TestCase):
             "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/92",
             "user": {"login": "twinfinity-bot"},
         }
-        timeline = [{**comment, "event": "commented"}]
+        historical_event = {
+            "id": 122,
+            "event": "labeled",
+            "created_at": "2026-08-22T09:59:00Z",
+        }
+        timeline = [historical_event, {**comment, "event": "commented"}]
         with (
             patch(
                 "sync_github_coordination.fetch_object",
@@ -263,7 +268,7 @@ class CoordinationStoreTests(unittest.TestCase):
             ) as fetch_issue,
             patch(
                 "sync_github_coordination._run_gh",
-                side_effect=[main_ref, comment, [timeline]],
+                side_effect=[main_ref, comment, [[historical_event], [timeline[1]]]],
             ) as run_gh,
         ):
             observed = self.fixed_live_observation(REPOSITORY, 92, "comment:123")
@@ -289,6 +294,58 @@ class CoordinationStoreTests(unittest.TestCase):
             ],
             run_gh.call_args_list,
         )
+
+    def test_terminal_live_observation_rejects_malformed_timeline_pages_without_writes(
+        self,
+    ) -> None:
+        issue_payload = {
+            "number": 92,
+            "updated_at": "2026-08-22T10:00:00Z",
+            "_projection_version": 3,
+        }
+        main_ref = {
+            "ref": "refs/heads/main",
+            "object": {"sha": "a" * 40},
+        }
+        comment = {
+            "id": 123,
+            "event": "commented",
+            "body": "receipt",
+            "created_at": "2026-08-22T10:00:02Z",
+            "updated_at": "2026-08-22T10:00:02Z",
+            "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/92",
+            "user": {"login": "twinfinity-bot"},
+        }
+        hidden_concurrent_event = {
+            "id": 124,
+            "event": "labeled",
+            "created_at": "2026-08-22T10:00:03Z",
+        }
+        malformed_timelines = (
+            [],
+            [[]],
+            [comment],
+            [[hidden_concurrent_event], comment],
+            [[comment, "invalid"]],
+        )
+        before_changes = self.store.connection.total_changes
+        for raw_timeline in malformed_timelines:
+            with (
+                self.subTest(raw_timeline=raw_timeline),
+                patch(
+                    "sync_github_coordination.fetch_object",
+                    return_value=issue_payload,
+                ),
+                patch(
+                    "sync_github_coordination._run_gh",
+                    side_effect=[main_ref, comment, raw_timeline],
+                ),
+                self.assertRaisesRegex(
+                    CoordinationError, "TERMINAL_LIVE_EVIDENCE_INVALID"
+                ),
+            ):
+                self.fixed_live_observation(REPOSITORY, 92, "comment:123")
+            self.assertEqual(before_changes, self.store.connection.total_changes)
 
     def install_all_current_endpoints(self) -> None:
         catalog = reviewed_current_endpoint_catalog(ROOT, Path(self.temp.name))
@@ -2465,6 +2522,81 @@ class CoordinationStoreTests(unittest.TestCase):
                 executor_token=token,
                 live_evidence=cached_forgery,
             )
+
+        def precommit_fingerprint() -> tuple:
+            return (
+                tuple(
+                    self.store.connection.execute(
+                        "SELECT status,allocation_class,version "
+                        "FROM coordination_items WHERE repository=? "
+                        "AND issue_number=92",
+                        (REPOSITORY,),
+                    ).fetchone()
+                ),
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (admission_id,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT state FROM coordination_terminal_watches "
+                    "WHERE watch_key=?",
+                    (watch_key,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_closeout_commits"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM portfolio_dirty_events"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_events"
+                ).fetchone()[0],
+            )
+
+        timeline_comment = {**copy.deepcopy(published_comment), "event": "commented"}
+        hidden_concurrent_event = {
+            "id": 124,
+            "event": "labeled",
+            "created_at": "2026-08-22T10:00:11Z",
+        }
+        malformed_pages = (
+            [[hidden_concurrent_event], timeline_comment],
+            [[timeline_comment, "invalid"]],
+        )
+        before_malformed_pages = precommit_fingerprint()
+        for raw_timeline in malformed_pages:
+            with (
+                self.subTest(raw_timeline=raw_timeline),
+                patch.object(
+                    coordination_store_module,
+                    "_fetch_terminal_live_observation",
+                    side_effect=self.fixed_live_observation,
+                ),
+                patch(
+                    "sync_github_coordination.fetch_object",
+                    return_value=copy.deepcopy(publication_only_payload),
+                ),
+                patch(
+                    "sync_github_coordination._run_gh",
+                    side_effect=[
+                        {
+                            "ref": "refs/heads/main",
+                            "object": {"sha": "a" * 40},
+                        },
+                        copy.deepcopy(published_comment),
+                        raw_timeline,
+                    ],
+                ),
+                self.assertRaisesRegex(
+                    CoordinationError, "TERMINAL_LIVE_EVIDENCE_INVALID"
+                ),
+            ):
+                self.store.commit_terminal_closeout(
+                    closeout_key=closeout_key,
+                    attempt_id=running["attempt_id"],
+                    executor_token=token,
+                )
+            self.assertEqual(before_malformed_pages, precommit_fingerprint())
 
         self.remote_issue_payloads[(REPOSITORY, 92)] = {
             "number": 92,
