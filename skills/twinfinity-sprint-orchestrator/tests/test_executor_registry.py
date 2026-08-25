@@ -17,11 +17,17 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from archive_readiness_audit import archive_readiness  # noqa: E402
-from coordination_store import CoordinationError, CoordinationStore  # noqa: E402
+import run_role_executor  # noqa: E402
+from coordination_store import (  # noqa: E402
+    CoordinationError,
+    CoordinationStore,
+    digest_json,
+)
 from executor_registry import (  # noqa: E402
     AttemptLineage,
     RegistryError,
     SystemdUnitEvidence,
+    attempt_lineage_for_target,
     attempt_schema_is_current,
     attempts_support_hosted_operation,
     current_endpoint,
@@ -144,7 +150,6 @@ class ExecutorRegistryTests(unittest.TestCase):
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
         self.store = CoordinationStore(root / "state.sqlite3")
-        self.config = load_registry_config(CONFIG)
         self.aliases, self.alias_sha = load_legacy_alias_fixture(ALIASES)
 
     def tearDown(self) -> None:
@@ -721,7 +726,7 @@ class ExecutorRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(
             CoordinationError, "CURRENT_ROLE_ENDPOINT_REQUIRED"
         ):
-            self.store.set_issue_status(
+            self.store._set_issue_status_for_test_fixture(
                 repository=REPOSITORY,
                 issue_number=92,
                 status="READY",
@@ -736,7 +741,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                 expected_version=0,
                 now="2026-08-24T10:00:04Z",
             )
-        active = self.store.set_issue_status(
+        active = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="ACTIVE",
@@ -1626,6 +1631,206 @@ class ExecutorRegistryTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(("HOLD", 2222), tuple(running_terminal))
 
+    def test_runner_terminal_watch_reservation_repeats_item_endpoint_and_lineage(self) -> None:
+        source = self.snapshot()
+        self.migrate("runner-terminal-watch-contract")
+        self.store._set_issue_status_for_test_fixture(
+            repository=REPOSITORY,
+            issue_number=92,
+            status="ACTIVE_FENCED",
+            allocation_class="ACTIVE",
+            generation=3,
+            accountable_session_id=DEVELOPMENT_ENDPOINT,
+            lease_manifest_sha256=LEASE,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-24T10:00:01Z",
+        )
+        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:3"
+        watch = self.store.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        self.assertEqual(
+            ("ACTIVE", DEVELOPMENT_ENDPOINT, LEASE),
+            (
+                watch["state"],
+                watch["accountable_session_id"],
+                watch["lease_manifest_sha256"],
+            ),
+        )
+
+        with self.assertRaisesRegex(RegistryError, "EXECUTOR_TARGET_INVALID"):
+            execute_role(
+                self.store.connection,
+                config_path=CONFIG,
+                role="development",
+                endpoint_id=DEVELOPMENT_ENDPOINT,
+                target_kind="terminal_watch",
+                target_key=watch_key,
+                prompt="Do not launch an unbound terminal watch.",
+                systemd_invocation_id=INVOCATION_ID,
+                systemd_evidence=systemd_evidence(
+                    role="development",
+                    target_kind="terminal_watch",
+                    target_key=watch_key,
+                ),
+                popen=lambda *_args, **_kwargs: self.fail("child must not launch"),
+            )
+        payload = {
+            "source": {
+                "repository": REPOSITORY,
+                "object_kind": "issue",
+                "object_number": 92,
+                "payload_sha256": source.payload_sha256,
+            },
+            "issue_number": 92,
+            "generation": 3,
+            "item_version": 1,
+            "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+            "base_sha": "a" * 40,
+            "branch": "codex/92-runner-terminal-binding",
+            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-92",
+            "opaque_worktree_id": "issue-92-runner-terminal-binding",
+            "accountable_session_id": DEVELOPMENT_ENDPOINT,
+            "lease_manifest_sha256": LEASE,
+            "authority_sha256": "7" * 64,
+            "capacity": {
+                "development_units": 1,
+                "shared_units": 0,
+                "sre_units": 0,
+            },
+            "writer": "accountable-writer",
+            "reviewer_plan": ["Different-session exact-head review."],
+            "collision_proof": ["Closed lease is collision-free."],
+            "environment_rule": "Use only an issue-owned environment.",
+            "routine_chain": ["Continue through routine closeout."],
+            "hard_stops": ["Stop on any binding drift."],
+        }
+        message_id = self.store.enqueue_message(
+            idempotency_key="runner-terminal-watch-binding",
+            recipient_session_id=DEVELOPMENT_ENDPOINT,
+            topic="development.admission",
+            payload=payload,
+            now="2026-08-24T10:00:02Z",
+        )
+        self.store.connection.execute(
+            """
+            UPDATE coordination_terminal_watches
+            SET state='PENDING_CLAIM', admission_message_id=?,
+                admission_payload_sha256=?
+            WHERE watch_key=?
+            """,
+            (message_id, digest_json(payload), watch_key),
+        )
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_ENDPOINT,
+            target_kind="message",
+            target_key=str(message_id),
+            now="2026-08-24T10:00:03Z",
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "message", str(message_id)
+            ),
+        )
+        message_unit = stable_systemd_unit(
+            "development", "message", str(message_id)
+        )
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=message_unit,
+            systemd_invocation_id="b" * 32,
+            systemd_control_group=f"/user.slice/{message_unit}",
+            now="2026-08-24T10:00:04Z",
+        )
+        running = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=9200,
+            now="2026-08-24T10:00:05Z",
+        )
+        self.store.claim_message(
+            message_id,
+            DEVELOPMENT_ENDPOINT,
+            "2026-08-24T10:00:06Z",
+            attempt_id=running["attempt_id"],
+            executor_token=token,
+        )
+        self.store.complete_message(
+            message_id, DEVELOPMENT_ENDPOINT, "2026-08-24T10:00:07Z"
+        )
+        transition_attempt(
+            self.store.connection,
+            attempt_id=running["attempt_id"],
+            token=token,
+            expected_version=running["version"],
+            new_state="COMPLETE",
+            exit_code=0,
+            now="2026-08-24T10:00:08Z",
+        )
+        launched = execute_role(
+            self.store.connection,
+            config_path=CONFIG,
+            role="development",
+            endpoint_id=DEVELOPMENT_ENDPOINT,
+            target_kind="terminal_watch",
+            target_key=watch_key,
+            prompt="Inspect the exact bound terminal watch.",
+            systemd_invocation_id=INVOCATION_ID,
+            systemd_evidence=systemd_evidence(
+                role="development",
+                target_kind="terminal_watch",
+                target_key=watch_key,
+            ),
+            popen=lambda *_args, **_kwargs: _ImmediateProcess(),
+        )
+        self.assertEqual("COMPLETE", launched["state"])
+        before_drift_attempts = self.store.connection.execute(
+            "SELECT COUNT(*) FROM executor_attempts"
+        ).fetchone()[0]
+
+        self.store.connection.execute(
+            "UPDATE coordination_items SET lease_manifest_sha256=? "
+            "WHERE repository=? AND issue_number=92",
+            ("6" * 64, REPOSITORY),
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "EXECUTOR_TERMINAL_WATCH_CONTRACT_INVALID"
+        ):
+            execute_role(
+                self.store.connection,
+                config_path=CONFIG,
+                role="development",
+                endpoint_id=DEVELOPMENT_ENDPOINT,
+                target_kind="terminal_watch",
+                target_key=watch_key,
+                prompt="Do not launch a drifted terminal watch.",
+                systemd_invocation_id=INVOCATION_ID,
+                systemd_evidence=systemd_evidence(
+                    role="development",
+                    target_kind="terminal_watch",
+                    target_key=watch_key,
+                ),
+                popen=lambda *_args, **_kwargs: self.fail("child must not launch"),
+            )
+        self.assertEqual(
+            before_drift_attempts,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM executor_attempts"
+            ).fetchone()[0],
+        )
+
     def test_hosted_executor_revalidates_exact_sre_row_before_reservation(self) -> None:
         self.migrate()
         self.store.connection.execute(
@@ -2299,7 +2504,7 @@ class ExecutorRegistryTests(unittest.TestCase):
     def test_archive_readiness_blocks_only_legacy_dependent_actionable_route(self) -> None:
         source = self.snapshot()
         self.migrate()
-        self.store.set_issue_status(
+        self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=92,
             status="ACTIVE",

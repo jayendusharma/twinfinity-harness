@@ -78,6 +78,7 @@ Classify delivery state truthfully:
 - `PREPARED`: reviewed zero-WIP candidate that still has a named activation blocker.
 - `READY`: every current-main admission guard passes and immediate atomic admission is possible.
 - `ACTIVE`: one admitted fresh executor attempt owns the exact mutable surface or operational target.
+- `PUBLICATION_PENDING`: the immutable accepted terminal packet exists, but exact owning-issue publication readback is not yet durable; the active allocation, lease, capacity, and terminal watch remain retained.
 - `HOLD`: the lineage is preserved under an exact blocker; retained resources consume capacity when policy says they do.
 - `MONITOR`: an external or review gate with no implementation mutation.
 - `DONE`: accepted outcome, required publication, cleanup, lease release, and capacity release are complete.
