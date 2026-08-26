@@ -42,7 +42,7 @@ Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` c
 
 ## Clean control-plane bootstrap
 
-`scripts/clean_control_plane.py` creates only an explicit nonexisting, noncanonical database. Its closed manifest binds the reviewed source main, registry and current-profile hashes, approved goal, application main and exact GitHub snapshots, capacity authority, v2/v3/v3 pointers, optional retained #320 evidence, and an immutable old-database archive digest. `validate` is read-only and manifest-authenticated. Neither command switches the canonical database or starts timers.
+`scripts/clean_control_plane.py` creates only an explicit nonexisting, noncanonical database. Its closed manifest binds the reviewed source main, registry and current-profile hashes, approved goal, application main and exact GitHub snapshots, capacity authority, v2/v6/v3 pointers, optional retained #320 evidence, and an immutable old-database archive digest. `validate` is read-only and manifest-authenticated. Neither command switches the canonical database or starts timers.
 
 Create the candidate in the private coordination root, validate it, then use SQLite backup to place a byte-equivalent candidate under `backups/` for the existing stopped-state `environment_restore_control.py` dry-run/apply seam. That restore keeps the former canonical database and sidecars queryable in its unique forensic directory and rolls filesystem placement back on failure. Do not drop tables or overwrite the old archive.
 

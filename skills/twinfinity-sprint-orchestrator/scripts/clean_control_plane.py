@@ -49,7 +49,7 @@ GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 EXPECTED_ENDPOINTS = {
     "planner": "role.planner.v2",
-    "development": "role.development.v3",
+    "development": "role.development.v6",
     "sre": "role.sre.v3",
 }
 SOURCE_HARNESS_REPOSITORY = "jayendusharma/twinfinity-harness"
@@ -1100,7 +1100,10 @@ def bootstrap_database(
                 now=manifest["created_at"],
                 _within_immediate_transaction=True,
             )
-            for endpoint_id in sorted(config.staged_endpoint_ids):
+            current_endpoint_ids = {
+                endpoint.endpoint_id for endpoint in config.roles.values()
+            }
+            for endpoint_id in sorted(set(config.endpoints) - current_endpoint_ids):
                 _verify_or_insert_endpoint(
                     store.connection,
                     config.endpoints[endpoint_id].payload,
