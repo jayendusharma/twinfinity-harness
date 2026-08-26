@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from coordination_store import digest_json  # noqa: E402
+from coordination_store import canonical_json, digest_json  # noqa: E402
 from coordination_transfer import activate_transfer  # noqa: E402
 from coordination_transfer_ledger import intent_sha256  # noqa: E402
 from prepush_control import (  # noqa: E402
@@ -125,10 +125,120 @@ class PrePushControlTests(unittest.TestCase):
             "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
             ("2026-08-23T00:00:05Z", self.message, SESSION),
         )
+        row = self.control.connection.execute(
+            "SELECT payload_json FROM coordination_messages WHERE id=?",
+            (self.message,),
+        ).fetchone()
+        self.admission_payload = json.loads(row["payload_json"])
 
     def tearDown(self) -> None:
         self.control.close()
         self.temp.cleanup()
+
+    def rewrite_admission_payload(self, **updates: object) -> None:
+        payload = json.loads(canonical_json(self.admission_payload))
+        payload.update(updates)
+        payload_sha256 = digest_json(payload)
+        self.control.connection.execute(
+            "DROP TRIGGER IF EXISTS coordination_message_envelope_immutable"
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_messages SET payload_json=?,payload_sha256=? "
+            "WHERE id=?",
+            (canonical_json(payload), payload_sha256, self.message),
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches "
+            "SET admission_payload_sha256=? WHERE admission_message_id=?",
+            (payload_sha256, self.message),
+        )
+
+    def seed_issue_328_versioned_lineage(self) -> int:
+        issue_number = 328
+        generation = 6
+        session_id = "role.development.v4"
+        lease_sha256 = "6" * 64
+        source = self.control.store.ingest_snapshot(
+            repository=REPOSITORY,
+            object_kind="issue",
+            object_number=issue_number,
+            payload={
+                "number": issue_number,
+                "updated_at": "2026-08-26T10:59:00Z",
+            },
+            source_updated_at="2026-08-26T10:59:00Z",
+            fetched_at="2026-08-26T10:59:01Z",
+        )
+        self.control.store._set_issue_status_for_test_fixture(
+            repository=REPOSITORY,
+            issue_number=issue_number,
+            status="ACTIVE",
+            allocation_class="ACTIVE",
+            generation=generation,
+            accountable_session_id=session_id,
+            lease_manifest_sha256=lease_sha256,
+            development_units=1,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-26T10:59:02Z",
+        )
+        message_id = self.control.store.enqueue_message(
+            idempotency_key="issue-328-generation-6-development-versioned",
+            recipient_session_id=session_id,
+            topic="development.admission",
+            payload={
+                "source": {
+                    "repository": REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": issue_number,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "issue_number": issue_number,
+                "generation": generation,
+                "item_version": 1,
+                "base_sha": "c" * 40,
+                "branch": "codex/328-evaluation-client-validation-v3",
+                "worktree_path": (
+                    "/home/ubuntu/code/twinfinityapp-issue-328-v3"
+                ),
+                "opaque_worktree_id": "issue-328-generation-6",
+                "accountable_session_id": session_id,
+                "lease_manifest_sha256": lease_sha256,
+                "authority_sha256": "8" * 64,
+                "capacity": {
+                    "development_units": 1,
+                    "shared_units": 0,
+                    "sre_units": 0,
+                },
+                "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+            },
+            now="2026-08-26T10:59:03Z",
+        )
+        message = self.control.connection.execute(
+            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches "
+            "SET admission_message_id=?,admission_payload_sha256=? "
+            "WHERE watch_key=?",
+            (
+                message_id,
+                message["payload_sha256"],
+                f"terminal:{REPOSITORY}:issue:{issue_number}:generation:{generation}",
+            ),
+        )
+        self.control.store.claim_message(
+            message_id, session_id, "2026-08-26T10:59:04Z"
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+            ("2026-08-26T10:59:05Z", message_id, session_id),
+        )
+        return message_id
 
     def record(self, *, state: str = "PASS") -> dict:
         lineage = self.control._lineage(REPOSITORY, ISSUE)
@@ -176,6 +286,168 @@ class PrePushControlTests(unittest.TestCase):
             PrePushError, "PREPUSH_COMPLETED_ADMISSION_ABSENT"
         ):
             self.control._lineage(REPOSITORY, ISSUE)
+
+    def test_exact_issue_328_versioned_identity_reaches_ordinary_lineage(self) -> None:
+        message_id = self.seed_issue_328_versioned_lineage()
+
+        lineage = self.control._lineage(REPOSITORY, 328)
+
+        self.assertEqual(message_id, lineage.admission_message_id)
+        self.assertEqual(328, lineage.issue_number)
+        self.assertEqual(328, lineage.surface_issue_number)
+        self.assertEqual(6, lineage.generation)
+        self.assertEqual(
+            "codex/328-evaluation-client-validation-v3", lineage.branch
+        )
+        self.assertEqual(
+            "/home/ubuntu/code/twinfinityapp-issue-328-v3",
+            lineage.worktree_path,
+        )
+
+    def test_non_transfer_worktree_identity_positive_and_negative_matrix(self) -> None:
+        accepted = (
+            (
+                "/home/ubuntu/code/twinfinityapp-issue-314",
+                "twinfinityapp-issue-314",
+            ),
+            (
+                "/home/ubuntu/code/twinfinityapp-issue-314-v7",
+                "issue-314-generation-2",
+            ),
+        )
+        for worktree_path, opaque_worktree_id in accepted:
+            with self.subTest(
+                accepted=True,
+                worktree_path=worktree_path,
+                opaque_worktree_id=opaque_worktree_id,
+            ):
+                self.rewrite_admission_payload(
+                    worktree_path=worktree_path,
+                    opaque_worktree_id=opaque_worktree_id,
+                )
+                lineage = self.control._lineage(REPOSITORY, ISSUE)
+                self.assertEqual(worktree_path, lineage.worktree_path)
+
+        rejected = (
+            (
+                "mixed-canonical-path",
+                "/home/ubuntu/code/twinfinityapp-issue-314",
+                "issue-314-generation-2",
+            ),
+            (
+                "mixed-versioned-path",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v3",
+                "twinfinityapp-issue-314",
+            ),
+            (
+                "wrong-path-issue",
+                "/home/ubuntu/code/twinfinityapp-issue-315-v3",
+                "issue-314-generation-2",
+            ),
+            (
+                "wrong-opaque-issue",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v3",
+                "issue-315-generation-2",
+            ),
+            (
+                "wrong-generation",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v3",
+                "issue-314-generation-3",
+            ),
+            (
+                "missing-version",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v",
+                "issue-314-generation-2",
+            ),
+            (
+                "zero-version",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v0",
+                "issue-314-generation-2",
+            ),
+            (
+                "negative-version",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v-1",
+                "issue-314-generation-2",
+            ),
+            (
+                "non-decimal-version",
+                "/home/ubuntu/code/twinfinityapp-issue-314-vthree",
+                "issue-314-generation-2",
+            ),
+            (
+                "leading-zero-version",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v03",
+                "issue-314-generation-2",
+            ),
+            (
+                "extra-suffix",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v3-extra",
+                "issue-314-generation-2",
+            ),
+            (
+                "opaque-extra-suffix",
+                "/home/ubuntu/code/twinfinityapp-issue-314-v3",
+                "issue-314-generation-2-extra",
+            ),
+            (
+                "wrong-parent",
+                "/home/ubuntu/twinfinityapp-issue-314-v3",
+                "issue-314-generation-2",
+            ),
+            (
+                "relative-path",
+                "twinfinityapp-issue-314-v3",
+                "issue-314-generation-2",
+            ),
+            (
+                "traversal",
+                "/home/ubuntu/code/../code/twinfinityapp-issue-314-v3",
+                "issue-314-generation-2",
+            ),
+            (
+                "arbitrary-basename",
+                "/home/ubuntu/code/planner-issued-v3",
+                "issue-314-generation-2",
+            ),
+        )
+        for name, worktree_path, opaque_worktree_id in rejected:
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    PrePushError, "PREPUSH_ADMISSION_INVALID"
+                ),
+            ):
+                self.rewrite_admission_payload(
+                    worktree_path=worktree_path,
+                    opaque_worktree_id=opaque_worktree_id,
+                )
+                self.control._lineage(REPOSITORY, ISSUE)
+
+    def test_versioned_identity_does_not_enable_transfer_fields(self) -> None:
+        transfer_fields = {
+            "parent_issue_number": ISSUE,
+            "transfer_key": "ordinary-lineage-must-not-carry-transfer",
+            "transfer_comment_ids": [1, 2],
+            "transfer_comment_body_sha256": ["1" * 64, "2" * 64],
+            "transfer_authority_sha256": "3" * 64,
+            "transfer_intent_sha256": "4" * 64,
+            "transfer_ledger_sha256": "5" * 64,
+        }
+        for field, value in transfer_fields.items():
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    PrePushError, "PREPUSH_ADMISSION_INVALID"
+                ),
+            ):
+                self.rewrite_admission_payload(
+                    worktree_path=(
+                        "/home/ubuntu/code/twinfinityapp-issue-314-v3"
+                    ),
+                    opaque_worktree_id="issue-314-generation-2",
+                    **{field: value},
+                )
+                self.control._lineage(REPOSITORY, ISSUE)
 
     def test_reviewed_transfer_preserves_parent_branch_and_environment_ownership(self) -> None:
         child_issue = 320
