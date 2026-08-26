@@ -43,6 +43,9 @@ GIT_CONFIG_PUSH_ALIAS = re.compile(r"(?i)\bGIT_CONFIG_(?:VALUE|KEY)_\d+\s*=\s*['
 GIT_METADATA_ENV = re.compile(
     r"(?i)(?:^|[;&|\s])GIT_(?:DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES)\s*="
 )
+GIT_EXTERNAL_HELPER_ENV = re.compile(
+    r"(?i)(?:^|[;&|\s'\"])GIT_(?:EXTERNAL_DIFF|ASKPASS|SSH|SSH_COMMAND|EDITOR|SEQUENCE_EDITOR|PAGER)\s*="
+)
 PASSIVE_POLL_LOOP = re.compile(r"(?is)\b(?:while|until)\b.*?\bdo\b.*?\b(?:sleep|usleep)\b.*?\bdone\b")
 SHELL_CONDITION_LOOP = re.compile(r"(?is)\b(?:while|until)\b.*?\bdo\b.*?\bdone\b")
 FINITE_WHILE_READ = re.compile(r"(?is)^\s*while\s+(?:IFS=\S*\s+)?read\b.*?\bdo\b.*?\bdone\b\s*(?:<\s*\S+)?\s*$")
@@ -821,7 +824,8 @@ def _enforce_exact_worktree_command(
 
     if subcommand in GIT_READ_ONLY_SUBCOMMANDS:
         if any(
-            argument == "--output" or argument.startswith("--output=")
+            argument in {"--ext-diff", "--textconv", "--output"}
+            or argument.startswith("--output=")
             for argument in arguments
         ):
             return _deny("DELIVERY_GIT_COMMAND_NOT_APPROVED")
@@ -950,15 +954,23 @@ def _enforce_exact_worktree_command(
     return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
 
 
-def _long_option_value(
-    arguments: tuple[str, ...], name: str
-) -> str | None:
-    for index, argument in enumerate(arguments):
-        if argument == name:
-            return arguments[index + 1] if index + 1 < len(arguments) else ""
-        if argument.startswith(f"{name}="):
-            return argument.split("=", 1)[1]
-    return None
+def _option_values(
+    arguments: tuple[str, ...], long_name: str, short_name: str
+) -> tuple[str, ...]:
+    values: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {long_name, short_name}:
+            values.append(arguments[index + 1] if index + 1 < len(arguments) else "")
+            index += 2
+            continue
+        if argument.startswith(f"{long_name}="):
+            values.append(argument.split("=", 1)[1])
+        elif argument.startswith(short_name) and argument != short_name:
+            values.append(argument[len(short_name):].removeprefix("="))
+        index += 1
+    return tuple(values)
 
 
 def _enforce_gh_command(
@@ -977,6 +989,12 @@ def _enforce_gh_command(
             continue
         if option.startswith("--repo="):
             selected_repository = option.split("=", 1)[1]
+            index += 1
+            continue
+        if option.startswith("-R") and option != "-R":
+            selected_repository = option[2:].removeprefix("=")
+            if not selected_repository:
+                return _deny("DELIVERY_GH_COMMAND_NOT_APPROVED")
             index += 1
             continue
         if option == "--":
@@ -1025,22 +1043,29 @@ def _enforce_gh_command(
         return {}
     if group == "pr" and action == "create":
         pr_arguments = arguments[1:]
-        head = _long_option_value(pr_arguments, "--head")
-        base = _long_option_value(pr_arguments, "--base")
-        repository = _long_option_value(pr_arguments, "--repo")
-        repository = selected_repository if repository is None else repository
+        heads = _option_values(pr_arguments, "--head", "-H")
+        bases = _option_values(pr_arguments, "--base", "-B")
+        repositories = _option_values(pr_arguments, "--repo", "-R")
+        if selected_repository is not None:
+            repositories = (*repositories, selected_repository)
         if (
             "--draft" not in pr_arguments
             or not context.repository_writes
             or context.worktree is None
             or context.branch is None
             or cwd != context.worktree
-            or (head is not None and head != context.branch)
-            or (base is not None and base != "main")
-            or (
-                repository is not None
-                and context.repository is not None
-                and repository != context.repository
+            or len(heads) > 1
+            or any(head != context.branch for head in heads)
+            or len(bases) > 1
+            or any(base != "main" for base in bases)
+            or len(repositories) > 1
+            or any(
+                not repository
+                or (
+                    context.repository is not None
+                    and repository != context.repository
+                )
+                for repository in repositories
             )
             or any(argument in {"--web", "--recover"} for argument in pr_arguments)
             or not _stable_descriptor_path(cwd, context.worktree, allow_missing_leaf=False)
@@ -1158,9 +1183,9 @@ def _enforce_outbound_command(
 
 
 def _shell_write(command: str) -> ShellWrite:
-    redirects = tuple(match.group(1) for match in REDIRECTION.finditer(command))
-    if redirects:
-        return ShellWrite(True, paths=redirects)
+    redirection = _redirection_write(command)
+    if redirection.writes:
+        return redirection
     tokens = _shell_tokens(command)
     if not tokens:
         return ShellWrite(True, ambiguous=True)
@@ -1211,6 +1236,11 @@ def _shell_write(command: str) -> ShellWrite:
     if executable in {"npm", "npx", "pnpm", "yarn", "pip", "pip3", "pytest", "ruff", "mypy", "tox", "make", "cargo", "go", "docker", "python", "python3"}:
         return ShellWrite(True, worktree_only=True)
     return ShellWrite()
+
+
+def _redirection_write(command: str) -> ShellWrite:
+    redirects = tuple(match.group(1) for match in REDIRECTION.finditer(command))
+    return ShellWrite(bool(redirects), paths=redirects)
 
 
 def _enforce_repository_write(assessment: ShellWrite, context: DeliveryContext, cwd: Path) -> dict[str, Any]:
@@ -1586,6 +1616,8 @@ def _python_interpreter_write(source: str) -> ShellWrite:
 def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[str, Any]:
     if GIT_METADATA_ENV.search(command):
         return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+    if GIT_EXTERNAL_HELPER_ENV.search(command):
+        return _deny("DELIVERY_GIT_EXTERNAL_HELPER_FORBIDDEN")
     if _contains_raw_push(command):
         return _deny("RAW_GIT_PUSH_FORBIDDEN_USE_SQLITE_EXACT_HEAD_GUARDED_PUSH")
     if _contains_open_ended_wait(command):
@@ -1595,10 +1627,17 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
     except GuardError:
         return _deny("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
     for leaf in leaves:
+        if GIT_EXTERNAL_HELPER_ENV.search(leaf.command):
+            return _deny("DELIVERY_GIT_EXTERNAL_HELPER_FORBIDDEN")
         if _contains_raw_push(leaf.command):
             return _deny("RAW_GIT_PUSH_FORBIDDEN_USE_SQLITE_EXACT_HEAD_GUARDED_PUSH")
         if _contains_open_ended_wait(leaf.command) and not leaf.bounded_wait:
             return _deny("OPEN_ENDED_WAIT_FORBIDDEN_USE_SESSION_WAIT_OR_MAX_60S_POLL")
+        redirection_decision = _enforce_repository_write(
+            _redirection_write(leaf.command), context, cwd
+        )
+        if redirection_decision:
+            return redirection_decision
         outbound_decision = _enforce_outbound_command(leaf.command, context, cwd)
         if outbound_decision is not None:
             if outbound_decision:

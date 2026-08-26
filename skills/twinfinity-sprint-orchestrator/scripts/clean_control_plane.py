@@ -580,20 +580,35 @@ def _validate_manifest_closed(
         raise CleanControlPlaneError("BOOTSTRAP_REGISTRY_DIGEST_MISMATCH")
 
     profiles = source["profiles"]
-    if not isinstance(profiles, list) or len(profiles) != 3:
+    if not isinstance(profiles, list) or not profiles:
         raise CleanControlPlaneError("BOOTSTRAP_PROFILE_SCHEMA_INVALID")
     profile_root: Path | None = None
-    seen_roles: set[str] = set()
+    declared_profiles: dict[str, tuple[str, str, str]] = {}
+    declared_profile_paths: set[str] = set()
     for profile in profiles:
         _require_keys(profile, {"role", "endpoint_id", "path", "sha256"}, "BOOTSTRAP_PROFILE_SCHEMA_INVALID")
         role = profile["role"]
-        if role not in EXPECTED_ENDPOINTS or role in seen_roles or profile["endpoint_id"] != EXPECTED_ENDPOINTS[role]:
+        endpoint_id = profile["endpoint_id"]
+        if (
+            role not in EXPECTED_ENDPOINTS
+            or not isinstance(endpoint_id, str)
+            or endpoint_id in declared_profiles
+            or profile["path"] in declared_profile_paths
+        ):
             raise CleanControlPlaneError("BOOTSTRAP_PROFILE_SCHEMA_INVALID")
-        seen_roles.add(role)
         path = _source_file(source_root, profile["path"])
         bound_source_paths.append(profile["path"])
-        if _file_sha256(path) != _require_sha(profile["sha256"], "BOOTSTRAP_PROFILE_DIGEST_INVALID"):
+        profile_sha256 = _require_sha(
+            profile["sha256"], "BOOTSTRAP_PROFILE_DIGEST_INVALID"
+        )
+        if _file_sha256(path) != profile_sha256:
             raise CleanControlPlaneError("BOOTSTRAP_PROFILE_DIGEST_MISMATCH")
+        declared_profiles[endpoint_id] = (
+            role,
+            profile_sha256,
+            path.name,
+        )
+        declared_profile_paths.add(profile["path"])
         if profile_root is None:
             profile_root = path.parent
         elif path.parent != profile_root:
@@ -605,14 +620,22 @@ def _validate_manifest_closed(
             registry_path,
             codex_home=profile_root,
             profile_template_root=profile_root,
+            profile_validation_scope="catalog",
         )
     except RegistryError as exc:
         raise CleanControlPlaneError(str(exc)) from exc
     current = {role: endpoint.endpoint_id for role, endpoint in config.roles.items()}
     if current != EXPECTED_ENDPOINTS or manifest["current_endpoints"] != EXPECTED_ENDPOINTS:
         raise CleanControlPlaneError("BOOTSTRAP_CURRENT_ENDPOINTS_INVALID")
-    declared_profiles = {entry["role"]: entry["sha256"] for entry in profiles}
-    if declared_profiles != {role: config.roles[role].profile_sha256 for role in EXPECTED_ENDPOINTS}:
+    expected_profiles = {
+        endpoint_id: (
+            endpoint.role,
+            endpoint.profile_sha256,
+            f"{endpoint.runtime_codex_profile}.config.toml",
+        )
+        for endpoint_id, endpoint in config.endpoints.items()
+    }
+    if declared_profiles != expected_profiles:
         raise CleanControlPlaneError("BOOTSTRAP_PROFILE_BINDING_MISMATCH")
 
     goal = _require_keys(manifest["approved_goal"], {"path", "sha256"}, "BOOTSTRAP_GOAL_SCHEMA_INVALID")

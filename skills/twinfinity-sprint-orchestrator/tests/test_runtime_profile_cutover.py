@@ -118,6 +118,41 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 {**direct_v6, "execution_protocol": "readiness/v1"},
             )
 
+    def test_runtime_selection_allows_v6_and_v3_but_rejects_v4_and_v5(self) -> None:
+        config_path = ROOT / "references" / "twinfinity-executor-registry.toml"
+        for endpoint_id, accepted in (
+            ("role.development.v6", True),
+            ("role.development.v3", True),
+            ("role.development.v4", False),
+            ("role.development.v5", False),
+        ):
+            version = endpoint_id.rsplit("v", 1)[1]
+            with self.subTest(endpoint_id=endpoint_id), tempfile.TemporaryDirectory() as temporary:
+                codex_home = Path(temporary) / "codex-home"
+                codex_home.mkdir(mode=0o700)
+                profile = f"twinfinity-development-v{version}.config.toml"
+                shutil.copy2(ROOT / "references" / profile, codex_home / profile)
+                if accepted:
+                    loaded = load_registry_config(
+                        config_path,
+                        codex_home=codex_home,
+                        profile_template_root=ROOT / "references",
+                        selected_current_endpoint_id=endpoint_id,
+                    )
+                    self.assertEqual(
+                        endpoint_id, loaded.roles["development"].endpoint_id
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        RegistryError, "REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT"
+                    ):
+                        load_registry_config(
+                            config_path,
+                            codex_home=codex_home,
+                            profile_template_root=ROOT / "references",
+                            selected_current_endpoint_id=endpoint_id,
+                        )
+
     def test_profile_root_rejects_symlink_and_world_writable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)

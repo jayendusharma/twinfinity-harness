@@ -83,6 +83,7 @@ COMMON_ROLE_KEYS = {
 PROFILED_ROLE_KEYS = COMMON_ROLE_KEYS | {"profile_sha256"}
 BROKERED_ROLE_KEYS = PROFILED_ROLE_KEYS | {"execution_protocol"}
 BROKERED_READINESS_PROTOCOL = "readiness/v1"
+RUNTIME_ROLLBACK_ENDPOINT_IDS = frozenset({"role.development.v3"})
 EXPECTED_CODEX_PROFILES = {
     "planner": "twinfinity-planner",
     "development": "twinfinity-development",
@@ -827,10 +828,19 @@ def load_registry_config(
     runtime_roles = roles
     if selected_current_endpoint_id is not None:
         selected = endpoints.get(selected_current_endpoint_id)
+        source_current = (
+            selected is not None
+            and roles[selected.role].endpoint_id == selected_current_endpoint_id
+        )
         if (
             profile_validation_scope != "current"
             or selected is None
             or selected_current_endpoint_id in staged_endpoint_ids
+            or (
+                not source_current
+                and selected_current_endpoint_id
+                not in RUNTIME_ROLLBACK_ENDPOINT_IDS
+            )
         ):
             raise RegistryError("REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT")
         runtime_roles = dict(roles)

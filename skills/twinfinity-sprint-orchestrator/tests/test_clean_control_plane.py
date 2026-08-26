@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -382,7 +383,19 @@ class CleanControlPlaneTests(unittest.TestCase):
                     },
                 ],
             }
-        profile_versions = {"planner": 2, "development": 6, "sre": 3}
+        registry = tomllib.loads(
+            (references / "twinfinity-executor-registry.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        catalog = [
+            *(
+                {"role": role, **endpoint}
+                for role, endpoint in registry["roles"].items()
+            ),
+            *registry["historical_endpoints"],
+            *registry["staged_endpoints"],
+        ]
         value: dict[str, object] = {
             "schema": clean.SCHEMA,
             "manifest_sha256": "0" * 64,
@@ -395,15 +408,15 @@ class CleanControlPlaneTests(unittest.TestCase):
                 "registry_sha256": sha(references / "twinfinity-executor-registry.toml"),
                 "profiles": [
                     {
-                        "role": role,
-                        "endpoint_id": endpoint,
-                        "path": f"skills/twinfinity-sprint-orchestrator/references/twinfinity-{role}-v{profile_versions[role]}.config.toml",
+                        "role": endpoint["role"],
+                        "endpoint_id": endpoint["endpoint_id"],
+                        "path": f"skills/twinfinity-sprint-orchestrator/references/{endpoint['codex_profile']}-v{endpoint['version']}.config.toml",
                         "sha256": sha(
                             references
-                            / f"twinfinity-{role}-v{profile_versions[role]}.config.toml"
+                            / f"{endpoint['codex_profile']}-v{endpoint['version']}.config.toml"
                         ),
                     }
-                    for role, endpoint in clean.EXPECTED_ENDPOINTS.items()
+                    for endpoint in catalog
                 ],
             },
             "approved_goal": {
@@ -455,8 +468,13 @@ class CleanControlPlaneTests(unittest.TestCase):
                 artifact["sha256"] = lease_sha
         manifest["manifest_sha256"] = clean.manifest_digest(manifest)
 
-    def source_fixture(self, manifest: dict[str, object]) -> tuple[Path, str]:
-        source_root = self.root / "source-fixture"
+    def source_fixture(
+        self,
+        manifest: dict[str, object],
+        *,
+        name: str = "source-fixture",
+    ) -> tuple[Path, str]:
+        source_root = self.root / name
         source_root.mkdir(mode=0o700)
         source = manifest["source_harness"]
         assert isinstance(source, dict)
@@ -535,6 +553,19 @@ class CleanControlPlaneTests(unittest.TestCase):
                 )
             }
             self.assertIn("role.development.v3", catalog)
+            self.assertEqual(
+                {
+                    "role.planner.v2",
+                    "role.development.v3",
+                    "role.development.v4",
+                    "role.development.v5",
+                    "role.development.v6",
+                    "role.sre.v3",
+                    "role.sre.v4",
+                    "role.sre.v5",
+                },
+                catalog,
+            )
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM portfolio_readiness_campaigns").fetchone()[0])
             stored = json.loads(connection.execute("SELECT manifest_json FROM coordination_bootstrap_provenance").fetchone()[0])
             self.assertEqual(
@@ -610,6 +641,78 @@ class CleanControlPlaneTests(unittest.TestCase):
                 source_root=SOURCE_ROOT,
                 database=self.root / "candidate.sqlite3",
                 harness_main_sha=HARNESS_MAIN,
+            )
+
+    def test_missing_and_tampered_rollback_profile_fail_closed(self) -> None:
+        manifest = self.manifest()
+        source = manifest["source_harness"]
+        assert isinstance(source, dict)
+        source["profiles"] = [
+            profile
+            for profile in source["profiles"]
+            if profile["endpoint_id"] != "role.development.v3"
+        ]
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_PROFILE_BINDING_MISMATCH"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=SOURCE_ROOT,
+                database=self.root / "candidate-unbound-v3.sqlite3",
+                harness_main_sha=HARNESS_MAIN,
+            )
+
+        manifest = self.manifest()
+        source_root, commit = self.source_fixture(
+            manifest, name="source-fixture-missing"
+        )
+        source = manifest["source_harness"]
+        assert isinstance(source, dict)
+        source["main_sha"] = commit
+        rollback_entry = next(
+            profile
+            for profile in source["profiles"]
+            if profile["endpoint_id"] == "role.development.v3"
+        )
+        rollback_path = source_root / str(rollback_entry["path"])
+        rollback_path.unlink()
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError, "BOOTSTRAP_SOURCE_PATH_UNSAFE"
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=source_root,
+                database=self.root / "candidate-missing-v3.sqlite3",
+                harness_main_sha=commit,
+            )
+
+        manifest = self.manifest()
+        source_root, commit = self.source_fixture(
+            manifest, name="source-fixture-tampered"
+        )
+        source = manifest["source_harness"]
+        assert isinstance(source, dict)
+        source["main_sha"] = commit
+        rollback_entry = next(
+            profile
+            for profile in source["profiles"]
+            if profile["endpoint_id"] == "role.development.v3"
+        )
+        rollback_path = source_root / str(rollback_entry["path"])
+        rollback_path.write_bytes(rollback_path.read_bytes() + b"\n")
+        rollback_entry["sha256"] = sha(rollback_path)
+        manifest["manifest_sha256"] = clean.manifest_digest(manifest)
+        with self.assertRaisesRegex(
+            clean.CleanControlPlaneError,
+            "REGISTRY_PROFILE_TEMPLATE_DIGEST_MISMATCH",
+        ):
+            clean._validate_manifest(
+                manifest,
+                source_root=source_root,
+                database=self.root / "candidate-tampered-v3.sqlite3",
+                harness_main_sha=commit,
             )
 
     def test_archive_must_contain_exact_authenticated_stranded_lineages(self) -> None:

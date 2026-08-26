@@ -327,12 +327,21 @@ class DeliveryGuardTests(unittest.TestCase):
                 f"GIT_DIR={unrelated}/.git git commit -m redirected",
                 f"git -C {unrelated} commit -m unrelated",
                 f"git -C {worktree} update-ref refs/heads/{branch} {base_sha}",
+                "GIT_EXTERNAL_DIFF=/tmp/mutator git diff --ext-diff",
+                "git diff --ext-diff",
+                "git log --textconv",
                 "gh api --method POST repos/twinfinityai/twinfinityapp/issues/328",
                 "gh api -XPOST repos/twinfinityai/twinfinityapp/issues/328",
                 "gh api repos/twinfinityai/twinfinityapp/issues/328 -f state=closed",
                 "gh api repos/twinfinityai/twinfinityapp/issues/328 -fstate=closed",
                 "gh issue edit 328 --title changed",
                 f"gh pr create --draft --head codex/328-wrong --base main --repo twinfinityai/twinfinityapp",
+                f"gh pr create --draft -H codex/328-wrong -B main -R twinfinityai/twinfinityapp",
+                f"gh pr create --draft -H {branch} -B wrong -R twinfinityai/twinfinityapp",
+                f"gh pr create --draft -H{branch} -Bmain -Runrelated/repository",
+                "git status --short > /tmp/delivery-guard-bypass",
+                f"gh pr create --draft --head {branch} --base main --repo twinfinityai/twinfinityapp > /tmp/delivery-guard-bypass",
+                "curl --head https://example.invalid > /tmp/delivery-guard-bypass",
                 "ssh github.com git-receive-pack twinfinityai/twinfinityapp.git",
                 "git-receive-pack twinfinityai/twinfinityapp.git",
                 "git-push origin HEAD",
@@ -361,6 +370,9 @@ class DeliveryGuardTests(unittest.TestCase):
                 "curl --head https://example.invalid",
                 f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 328",
                 f"gh pr create --draft --head {branch} --base main --repo twinfinityai/twinfinityapp",
+                f"gh pr create --draft -H {branch} -B main -R twinfinityai/twinfinityapp",
+                f"gh pr create --draft -H{branch} -Bmain -Rtwinfinityai/twinfinityapp",
+                "git status --short > docs/allowed.md",
             )
             for command in allowed:
                 with self.subTest(command=command):
@@ -420,7 +432,7 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "87794fd15c4cd836b196107c5a797cb116490a1ed23e7bc3705831458c2b2970",
+                "28006350055fdd44670d1f96334231eef240eb199e681f6107f65f745c2f579a",
         }
         for path, digest in expected.items():
             with self.subTest(path=path):
