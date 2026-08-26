@@ -730,12 +730,12 @@ class CoordinationStoreTests(unittest.TestCase):
         return bound_item, bound_message, artifacts
 
     def prepare_development_admission(
-        self, slug: str
+        self, slug: str, *, generation: int = 3
     ) -> tuple[dict, dict, list[dict], dict]:
         source = self.snapshot()
         ready = self.canonical_ready_item(
             source,
-            generation=3,
+            generation=generation,
             shared_units=1,
             suffix=f"{slug}-ready",
         )
@@ -744,7 +744,7 @@ class CoordinationStoreTests(unittest.TestCase):
             "issue_number": 92,
             "status": "ACTIVE",
             "allocation_class": "ACTIVE",
-            "generation": 3,
+            "generation": generation,
             "accountable_session_id": SESSION,
             "lease_manifest_sha256": LEASE,
             "development_units": 1,
@@ -765,7 +765,7 @@ class CoordinationStoreTests(unittest.TestCase):
                     "payload_sha256": source.payload_sha256,
                 },
                 "issue_number": 92,
-                "generation": 3,
+                "generation": generation,
                 "item_version": ready["version"] + 1,
                 "base_sha": "a" * 40,
                 "branch": "codex/92-transcript-review-editor",
@@ -2119,10 +2119,12 @@ class CoordinationStoreTests(unittest.TestCase):
             tuple(historical),
         )
 
-    def test_terminal_closeout_is_two_phase_attempt_fenced_and_atomic(self) -> None:
+    def test_generation_zero_terminal_closeout_is_two_phase_attempt_fenced_and_atomic(
+        self,
+    ) -> None:
         self.install_all_current_endpoints()
         item, message, artifacts, _ready = self.prepare_development_admission(
-            "issue-92-terminal-closeout"
+            "issue-92-terminal-closeout-generation-zero", generation=0
         )
         active, admission_id = self.store._activate_admission_for_test_fixture(
             item=item,
@@ -2131,13 +2133,14 @@ class CoordinationStoreTests(unittest.TestCase):
             now="2026-08-22T10:00:03Z",
         )
         self.remote_main_shas[REPOSITORY] = "a" * 40
-        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:3"
+        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:0"
         self.store.connection.execute(
             "UPDATE coordination_terminal_watches SET state='PENDING_CLAIM' "
             "WHERE watch_key=?",
             (watch_key,),
         )
         running, token = self.running_message_attempt(admission_id)
+        self.assertEqual(0, running["lineage_generation"])
         with self.assertRaisesRegex(
             CoordinationError, "TERMINAL_ATTEMPT_TOKEN_MISMATCH"
         ):
@@ -2222,7 +2225,7 @@ class CoordinationStoreTests(unittest.TestCase):
                 issue_number=92,
                 status="DONE",
                 allocation_class="NONE",
-                generation=3,
+                generation=0,
                 accountable_session_id=None,
                 lease_manifest_sha256=None,
                 development_units=0,
@@ -2237,7 +2240,7 @@ class CoordinationStoreTests(unittest.TestCase):
             "schema": "twinfinity-terminal-receipt/v1",
             "repository": REPOSITORY,
             "issue_number": 92,
-            "generation": 3,
+            "generation": 0,
             "source_payload_sha256": active["source_payload_sha256"],
             "lease_manifest_sha256": item["lease_manifest_sha256"],
             "outcome": "ACCEPTED",
@@ -2250,7 +2253,7 @@ class CoordinationStoreTests(unittest.TestCase):
             "schema": "twinfinity-terminal-cleanup/v1",
             "repository": REPOSITORY,
             "issue_number": 92,
-            "generation": 3,
+            "generation": 0,
             "lease_manifest_sha256": item["lease_manifest_sha256"],
             "owned_resources_absent": True,
             "temporary_resources_absent": True,
@@ -2259,12 +2262,12 @@ class CoordinationStoreTests(unittest.TestCase):
             "remote_branch_disposition": "ABSENT",
             "residuals": [],
         }
-        closeout_key = f"terminal-closeout:{REPOSITORY}:issue:92:generation:3"
+        closeout_key = f"terminal-closeout:{REPOSITORY}:issue:92:generation:0"
         packet = {
             "schema": "twinfinity-terminal-closeout-packet/v1",
             "repository": REPOSITORY,
             "issue_number": 92,
-            "generation": 3,
+            "generation": 0,
             "expected_item_version": active["version"],
             "source_payload_sha256": active["source_payload_sha256"],
             "lease_manifest_sha256": item["lease_manifest_sha256"],

@@ -5423,7 +5423,12 @@ class CoordinationStore:
             not in allowed_targets
             or attempt["lineage_repository"] != repository
             or int(attempt["lineage_issue_number"] or -1) != issue_number
-            or int(attempt["lineage_generation"] or -1) != generation
+            or int(
+                attempt["lineage_generation"]
+                if attempt["lineage_generation"] is not None
+                else -1
+            )
+            != generation
             or attempt["lineage_lease_sha256"] != lease_manifest_sha256
             or not isinstance(attempt["lineage_sha256"], str)
         ):
@@ -5466,7 +5471,12 @@ class CoordinationStore:
             not in allowed_targets
             or attempt["lineage_repository"] != repository
             or int(attempt["lineage_issue_number"] or -1) != issue_number
-            or int(attempt["lineage_generation"] or -1) != generation
+            or int(
+                attempt["lineage_generation"]
+                if attempt["lineage_generation"] is not None
+                else -1
+            )
+            != generation
             or attempt["lineage_lease_sha256"] != lease_manifest_sha256
             or not isinstance(attempt["lineage_sha256"], str)
         ):
@@ -5733,7 +5743,11 @@ class CoordinationStore:
             or attempt["target_key"] != str(message_id)
             or attempt["lineage_repository"] != repository
             or int(attempt["lineage_issue_number"] or -1) != issue_number
-            or int(attempt["lineage_generation"] or -1)
+            or int(
+                attempt["lineage_generation"]
+                if attempt["lineage_generation"] is not None
+                else -1
+            )
             != payload["generation"]
             or attempt["lineage_lease_sha256"]
             != payload["lease_manifest_sha256"]
@@ -6144,7 +6158,12 @@ class CoordinationStore:
                 or claim_binding["target_key"] != str(activation_message_id)
                 or claim_binding["lineage_repository"] != repository
                 or int(claim_binding["lineage_issue_number"] or -1) != issue_number
-                or int(claim_binding["lineage_generation"] or -1) != generation
+                or int(
+                    claim_binding["lineage_generation"]
+                    if claim_binding["lineage_generation"] is not None
+                    else -1
+                )
+                != generation
                 or claim_binding["lineage_lease_sha256"] != lease_manifest_sha256
                 or (
                     attempt["target_kind"] == "message"
@@ -7053,7 +7072,11 @@ class CoordinationStore:
                 or claim_binding["lineage_repository"] != packet["repository"]
                 or int(claim_binding["lineage_issue_number"] or -1)
                 != int(packet["issue_number"])
-                or int(claim_binding["lineage_generation"] or -1)
+                or int(
+                    claim_binding["lineage_generation"]
+                    if claim_binding["lineage_generation"] is not None
+                    else -1
+                )
                 != int(packet["generation"])
                 or claim_binding["lineage_lease_sha256"]
                 != packet["lease_manifest_sha256"]

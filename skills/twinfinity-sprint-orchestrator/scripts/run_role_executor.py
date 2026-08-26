@@ -269,7 +269,11 @@ def _validate_target(
             or claim_attempt["lineage_repository"] != row["repository"]
             or int(claim_attempt["lineage_issue_number"] or -1)
             != int(row["issue_number"])
-            or int(claim_attempt["lineage_generation"] or -1)
+            or int(
+                claim_attempt["lineage_generation"]
+                if claim_attempt["lineage_generation"] is not None
+                else -1
+            )
             != int(row["generation"])
             or claim_attempt["lineage_lease_sha256"]
             != row["lease_manifest_sha256"]
@@ -430,7 +434,11 @@ def _historical_rotated_admission_target_valid(
         or claim_attempt["target_key"] != str(message_id)
         or claim_attempt["lineage_repository"] != repository
         or int(claim_attempt["lineage_issue_number"] or -1) != issue_number
-        or int(claim_attempt["lineage_generation"] or -1)
+        or int(
+            claim_attempt["lineage_generation"]
+            if claim_attempt["lineage_generation"] is not None
+            else -1
+        )
         != payload["generation"]
         or claim_attempt["lineage_lease_sha256"]
         != payload.get("lease_manifest_sha256")
