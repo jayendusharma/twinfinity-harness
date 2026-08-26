@@ -45,6 +45,8 @@ EXECUTABLE_TOPICS = {
     "development.terminal_closeout",
     "sre.admission",
 }
+MUTABLE_ITEM_ALLOCATIONS = {"ACTIVE", "RETAINED"}
+MUTABLE_WATCH_STATES = {"ACTIVE", "HOLD"}
 
 
 class ReviewedAliases(list[dict[str, str]]):
@@ -328,18 +330,46 @@ def _build_plan_from_inputs(
                 row["endpoint_id"] != endpoint_by_role[role]
             ),
         })
+    endpoint_replacements = {
+        change["before_endpoint_id"]: change["after_endpoint_id"]
+        for change in pointer_changes
+        if change["before_endpoint_id"] is not None
+        and change["before_endpoint_id"] != change["after_endpoint_id"]
+    }
     item_changes: list[dict[str, Any]] = []
     if _table_exists(connection, "coordination_items"):
+        item_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(coordination_items)")
+        }
+        has_mutable_item_state = {
+            "status", "allocation_class"
+        }.issubset(item_columns)
+        item_projection = (
+            "repository, issue_number, accountable_session_id, version, "
+            "status, allocation_class"
+            if has_mutable_item_state
+            else "repository, issue_number, accountable_session_id, version"
+        )
         for row in connection.execute(
-            "SELECT repository, issue_number, accountable_session_id, version FROM coordination_items ORDER BY repository, issue_number"
+            f"SELECT {item_projection} FROM coordination_items "
+            "ORDER BY repository, issue_number"
         ).fetchall():
             identity = row["accountable_session_id"]
-            if identity in endpoint_by_alias:
+            if (
+                has_mutable_item_state
+                and row["allocation_class"] not in MUTABLE_ITEM_ALLOCATIONS
+            ):
+                continue
+            after_identity = endpoint_by_alias.get(identity)
+            if after_identity is None and has_mutable_item_state:
+                after_identity = endpoint_replacements.get(identity)
+            if after_identity is not None and after_identity != identity:
                 item_changes.append({
                     "repository": row["repository"],
                     "issue_number": int(row["issue_number"]),
                     "before_identity": identity,
-                    "after_identity": endpoint_by_alias[identity],
+                    "after_identity": after_identity,
                     "before_version": int(row["version"]),
                     "after_version": int(row["version"]) + 1,
                 })
@@ -349,15 +379,22 @@ def _build_plan_from_inputs(
             """
             SELECT watch_key, accountable_session_id, state, updated_at
             FROM coordination_terminal_watches
-            WHERE state='ACTIVE' ORDER BY watch_key
+            WHERE state IN ('ACTIVE','HOLD') ORDER BY watch_key
             """
         ).fetchall():
             identity = row["accountable_session_id"]
-            if identity in endpoint_by_alias:
+            after_identity = endpoint_by_alias.get(
+                identity, endpoint_replacements.get(identity)
+            )
+            if (
+                after_identity is not None
+                and after_identity != identity
+                and row["state"] in MUTABLE_WATCH_STATES
+            ):
                 watch_changes.append({
                     "watch_key": row["watch_key"],
                     "before_identity": identity,
-                    "after_identity": endpoint_by_alias[identity],
+                    "after_identity": after_identity,
                     "expected_state": row["state"],
                     "expected_updated_at": row["updated_at"],
                 })
@@ -620,7 +657,9 @@ def apply_plan(
             ] if _table_exists(connection, "coordination_items") else [],
             "watches": [
                 dict(row) for row in connection.execute(
-                    "SELECT watch_key, accountable_session_id, state, updated_at FROM coordination_terminal_watches WHERE state='ACTIVE' ORDER BY watch_key"
+                    "SELECT watch_key, accountable_session_id, state, updated_at "
+                    "FROM coordination_terminal_watches "
+                    "WHERE state IN ('ACTIVE','HOLD') ORDER BY watch_key"
                 ).fetchall()
             ] if _table_exists(connection, "coordination_terminal_watches") else [],
         }
@@ -828,12 +867,12 @@ def rollback_change(
             ):
                 raise RegistryError("REGISTRY_ROLLBACK_POINTER_CONFLICT")
             if pointer["before_endpoint_id"] is None:
-                connection.execute(
+                cursor = connection.execute(
                     "DELETE FROM executor_role_endpoint_current WHERE role=? AND pointer_version=?",
                     (pointer["role"], pointer["after_pointer_version"]),
                 )
             elif pointer["before_endpoint_id"] != pointer["after_endpoint_id"]:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE executor_role_endpoint_current
                     SET endpoint_id=?, pointer_version=pointer_version+1, updated_at=?
@@ -844,6 +883,10 @@ def rollback_change(
                         pointer["after_pointer_version"],
                     ),
                 )
+            else:
+                continue
+            if cursor.rowcount != 1:
+                raise RegistryError("REGISTRY_ROLLBACK_POINTER_CONFLICT")
         cursor = connection.execute(
             """
             UPDATE executor_registry_changes

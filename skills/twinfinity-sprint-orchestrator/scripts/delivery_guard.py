@@ -61,7 +61,7 @@ LONG_RUNNING_WAIT = re.compile(
 INTERPRETER_POLL_LOOP = re.compile(r"(?is)\bwhile\s+[^:\n]+:\s*.*?\b(?:time\.)?sleep\s*\(")
 SLEEP = re.compile(r"(?i)(?:^|[;&|\n]\s*)sleep\s+(\S+)")
 DURATION = re.compile(r"(?i)(\d+(?:\.\d+)?)([smhd]?)")
-REDIRECTION = re.compile(r"(?<!<)(?:\d*)>>?\s*([^\s;&|]+)")
+REDIRECTION = re.compile(r"(?<!<)(?:\d*)(?:>\||>>?)\s*([^\s;&|]+)")
 PATCH_PATH = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.MULTILINE)
 PATCH_MOVE_PATH = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
 FILESYSTEM_WRITE_TOOL = re.compile(r"(?i)(?:apply_patch|(?:write|edit|create|delete|remove|rename|move|copy)_file)")
@@ -192,7 +192,7 @@ def _commands(tool_input: dict[str, Any]) -> Iterable[str]:
 
 def _shell_tokens(command: str) -> tuple[str, ...] | None:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|>")
         lexer.whitespace_split = True
         lexer.commenters = ""
         return tuple(lexer)
@@ -211,7 +211,11 @@ def _command_segments(command: str) -> tuple[str, ...] | None:
             if current:
                 segments.append(
                     " ".join(
-                        item if item in {">", ">>", "1>", "1>>", "2>", "2>>"}
+                        item
+                        if item in {
+                            ">", ">>", ">|", "&>", "&>>",
+                            "1>", "1>>", "1>|", "2>", "2>>", "2>|",
+                        }
                         else shlex.quote(item)
                         for item in current
                     )
@@ -222,7 +226,11 @@ def _command_segments(command: str) -> tuple[str, ...] | None:
     if current:
         segments.append(
             " ".join(
-                item if item in {">", ">>", "1>", "1>>", "2>", "2>>"}
+                item
+                if item in {
+                    ">", ">>", ">|", "&>", "&>>",
+                    "1>", "1>>", "1>|", "2>", "2>>", "2>|",
+                }
                 else shlex.quote(item)
                 for item in current
             )

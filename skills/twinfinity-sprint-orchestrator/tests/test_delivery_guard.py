@@ -340,6 +340,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 f"gh pr create --draft -H {branch} -B wrong -R twinfinityai/twinfinityapp",
                 f"gh pr create --draft -H{branch} -Bmain -Runrelated/repository",
                 "git status --short > /tmp/delivery-guard-bypass",
+                "git status --short >| /tmp/delivery-guard-bypass",
                 f"gh pr create --draft --head {branch} --base main --repo twinfinityai/twinfinityapp > /tmp/delivery-guard-bypass",
                 "curl --head https://example.invalid > /tmp/delivery-guard-bypass",
                 "ssh github.com git-receive-pack twinfinityai/twinfinityapp.git",
@@ -432,7 +433,7 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "28006350055fdd44670d1f96334231eef240eb199e681f6107f65f745c2f579a",
+                "14106acf8c921b3e6e04ed9d4369549e41832090adefc51f521e8e1d73052d54",
         }
         for path, digest in expected.items():
             with self.subTest(path=path):
