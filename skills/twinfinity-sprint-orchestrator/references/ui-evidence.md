@@ -22,6 +22,12 @@ When this policy is introduced after work is already active, post the controllin
 
 The default viewports are desktop `1400x900` and mobile `430x900`. Add tablet `768x900` when navigation, responsive reflow, breakpoints, long-value handling, a shared shell, or a tablet reference is in scope. Capture the changed success state and each materially affected loading, empty, denied, partial, unsupported, error, focus, and persisted mutation state. A mutation form before submission is not proof; show the persisted/refetched result. For a visual bug, place a safe before image on the issue and the exact-head after image on the PR.
 
+## Separate local publication from PR evidence
+
+Before publication, the exact source, lease, worktree, branch, base, and head must pass the local lower gates, ordinary final-head browser Compose, and cleanup. The resulting exact-head `PASS` makes that head eligible only for the existing guarded-push path under the current admission; it is not standalone mutation authority. Local pre-push does not require a pull request, inject pull-request identity, request candidate output, or produce review evidence.
+
+After guarded publication, create or update the draft pull request. Natural exact-head pull-request CI is the sole producer of the durable PR-bound UI candidate. Missing, invalid, or stale candidate evidence blocks independent acceptance and merge, not the guarded publication needed to create or update the pull request for that head, including a repair head.
+
 ## Publish one exact-head PR gallery
 
 After the last UI-affecting change and before ready-for-review, add an `Exact-head UI evidence` PR comment that links the exact successful workflow run and candidate artifact. For each image record:

@@ -14,7 +14,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from typing import Any, Sequence
 
 from coordination_store import (
@@ -78,11 +77,6 @@ SHELL_INJECTION_ENVIRONMENT_KEYS = {
     "ENV",
     "SHELLOPTS",
 }
-UI_EVIDENCE_PATH_PREFIX = "frontend/e2e/ui-evidence/"
-UI_EVIDENCE_CANDIDATE_NAME = "twinfinity-ui-evidence-candidate-v1"
-GH_EXECUTABLE = "/usr/bin/gh"
-
-
 class PrePushError(RuntimeError):
     pass
 
@@ -256,7 +250,11 @@ class PrePushControl:
                 and claim_attempt["lineage_repository"] == repository
                 and int(claim_attempt["lineage_issue_number"] or -1)
                 == issue_number
-                and int(claim_attempt["lineage_generation"] or -1)
+                and int(
+                    claim_attempt["lineage_generation"]
+                    if claim_attempt["lineage_generation"] is not None
+                    else -1
+                )
                 == int(item["generation"])
                 and claim_attempt["lineage_lease_sha256"]
                 == item["lease_manifest_sha256"]
@@ -1402,59 +1400,12 @@ class PrePushControl:
             ).fetchone()
         )
 
-    @staticmethod
-    def _validate_candidate_pull_request(
-        lineage: Lineage,
-        pull_request: int | None,
-        environment: dict[str, str],
-    ) -> int:
-        if pull_request is None or pull_request < 1:
-            raise PrePushError("PREPUSH_UI_EVIDENCE_PR_REQUIRED")
-        try:
-            result = subprocess.run(
-                [
-                    GH_EXECUTABLE,
-                    "pr",
-                    "view",
-                    str(pull_request),
-                    "--repo",
-                    lineage.repository,
-                    "--json",
-                    "state,headRefName,baseRefName,baseRefOid,isCrossRepository",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=environment,
-            )
-        except OSError as exc:
-            raise PrePushError("PREPUSH_UI_EVIDENCE_PR_READ_FAILED") from exc
-        if result.returncode != 0:
-            raise PrePushError("PREPUSH_UI_EVIDENCE_PR_READ_FAILED")
-        try:
-            payload = json.loads(result.stdout)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise PrePushError("PREPUSH_UI_EVIDENCE_PR_READ_FAILED") from exc
-        if not isinstance(payload, dict):
-            raise PrePushError("PREPUSH_UI_EVIDENCE_PR_READ_FAILED")
-        if (
-            payload.get("state") != "OPEN"
-            or payload.get("headRefName") != lineage.branch
-            or payload.get("baseRefName") != "main"
-            or payload.get("baseRefOid") != lineage.base_sha
-            or payload.get("isCrossRepository") is not False
-        ):
-            raise PrePushError("PREPUSH_UI_EVIDENCE_PR_IDENTITY_DRIFT")
-        return pull_request
-
     def run(
         self,
         repository: str,
         issue_number: int,
         timeout_seconds: int,
         manifest_path: Path,
-        pull_request: int | None = None,
     ) -> dict[str, Any]:
         lineage = self._lineage(repository, issue_number)
         worktree, head_sha = self._validate_worktree(lineage)
@@ -1469,9 +1420,6 @@ class PrePushControl:
             ]
         )
         run_id = f"p{issue_number}-g{lineage.generation}-{head_sha[:12]}"
-        candidate_mode = any(
-            path.startswith(UI_EVIDENCE_PATH_PREFIX) for path in manifest.paths
-        )
         compose_gate = "python3 backend/scripts/browser_e2e.py"
         started_at = utc_now()
         lower_exit: int | None = None
@@ -1479,7 +1427,6 @@ class PrePushControl:
         error: str | None = None
         gate_environment: dict[str, str] = {}
         environment_provenance: dict[str, str] = {}
-        candidate_cleanup_proven = not candidate_mode
         try:
             gate_environment = self._prepared_gate_environment(
                 lineage, lower_commands
@@ -1496,13 +1443,6 @@ class PrePushControl:
                 ),
                 flush=True,
             )
-            candidate_pull_request = None
-            if candidate_mode:
-                candidate_pull_request = self._validate_candidate_pull_request(
-                    lineage,
-                    pull_request,
-                    gate_environment,
-                )
             lower_exit = 0
             for _name, cwd, argv in lower_commands:
                 lower = subprocess.run(
@@ -1522,102 +1462,14 @@ class PrePushControl:
                     "--run-id",
                     run_id,
                 ]
-                compose_environment = dict(gate_environment)
-                if candidate_mode:
-                    candidate_temp = tempfile.TemporaryDirectory(
-                        prefix=f"twinfinity-prepush-{run_id}-"
-                    )
-                    candidate_outer_root = Path(candidate_temp.name)
-                    candidate_root = candidate_outer_root / "candidate-root"
-                    candidate_root.mkdir(mode=0o700)
-                    root_before = candidate_root.lstat()
-                    root_identity = (
-                        root_before.st_dev,
-                        root_before.st_ino,
-                        root_before.st_uid,
-                        root_before.st_gid,
-                        stat.S_IMODE(root_before.st_mode),
-                    )
-                    candidate_identity_proven = False
-                    try:
-                        candidate_output = candidate_root / UI_EVIDENCE_CANDIDATE_NAME
-                        compose_argv.extend(
-                            ["--candidate-output", str(candidate_output)]
-                        )
-                        compose_environment.update(
-                            {
-                                "TWINFINITY_UI_EVIDENCE_REPOSITORY": repository,
-                                "TWINFINITY_UI_EVIDENCE_PULL_REQUEST": str(
-                                    candidate_pull_request
-                                ),
-                                "TWINFINITY_UI_EVIDENCE_LEAF_ISSUE": str(
-                                    lineage.surface_issue_number
-                                ),
-                                "TWINFINITY_UI_EVIDENCE_EVENT_BASE_SHA": lineage.base_sha,
-                                "TWINFINITY_UI_EVIDENCE_EVENT_HEAD_SHA": head_sha,
-                            }
-                        )
-                        compose_gate = (
-                            "python3 backend/scripts/browser_e2e.py "
-                            "--candidate-output <local-prepush-ephemeral>/"
-                            f"{UI_EVIDENCE_CANDIDATE_NAME}"
-                        )
-                        compose = subprocess.run(
-                            compose_argv,
-                            cwd=worktree,
-                            timeout=timeout_seconds,
-                            check=False,
-                            env=compose_environment,
-                        )
-                        compose_exit = compose.returncode
-                        if compose_exit == 0:
-                            try:
-                                output_status = candidate_output.lstat()
-                                root_status = candidate_root.lstat()
-                            except OSError:
-                                error = "PREPUSH_CANDIDATE_OUTPUT_ABSENT"
-                            else:
-                                root_after_identity = (
-                                    root_status.st_dev,
-                                    root_status.st_ino,
-                                    root_status.st_uid,
-                                    root_status.st_gid,
-                                    stat.S_IMODE(root_status.st_mode),
-                                )
-                                candidate_identity_proven = (
-                                    root_after_identity == root_identity
-                                    and stat.S_ISDIR(root_status.st_mode)
-                                    and not stat.S_ISLNK(root_status.st_mode)
-                                    and root_status.st_uid == os.getuid()
-                                    and root_status.st_gid == os.getgid()
-                                    and stat.S_IMODE(root_status.st_mode) == 0o700
-                                )
-                                if (
-                                    not candidate_identity_proven
-                                ):
-                                    error = "PREPUSH_CANDIDATE_ROOT_DRIFT"
-                                elif (
-                                    stat.S_ISLNK(output_status.st_mode)
-                                    or not stat.S_ISDIR(output_status.st_mode)
-                                    or candidate_output.parent.resolve(strict=True)
-                                    != candidate_root.resolve(strict=True)
-                                ):
-                                    error = "PREPUSH_CANDIDATE_OUTPUT_UNSAFE"
-                    finally:
-                        candidate_temp.cleanup()
-                        candidate_cleanup_proven = (
-                            candidate_identity_proven
-                            and not candidate_outer_root.exists()
-                        )
-                else:
-                    compose = subprocess.run(
-                        compose_argv,
-                        cwd=worktree,
-                        timeout=timeout_seconds,
-                        check=False,
-                        env=compose_environment,
-                    )
-                    compose_exit = compose.returncode
+                compose = subprocess.run(
+                    compose_argv,
+                    cwd=worktree,
+                    timeout=timeout_seconds,
+                    check=False,
+                    env=gate_environment,
+                )
+                compose_exit = compose.returncode
         except subprocess.TimeoutExpired:
             error = "PREPUSH_GATE_TIMEOUT"
         except OSError:
@@ -1633,7 +1485,7 @@ class PrePushControl:
             final_head = ""
             clean = False
         head_unchanged = final_head == head_sha and clean
-        cleanup_proven = compose_exit == 0 and candidate_cleanup_proven
+        cleanup_proven = compose_exit == 0
         if error is None and lower_exit != 0:
             error = "PREPUSH_LOWER_GATE_FAILED"
         if error is None and compose_exit != 0:
@@ -1999,7 +1851,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--repository", required=True)
     run.add_argument("--issue", type=int, required=True)
     run.add_argument("--lease-manifest", type=Path, required=True)
-    run.add_argument("--pull-request", type=int)
     run.add_argument("--timeout-seconds", type=int, default=3600)
     check = commands.add_parser("assert-push")
     check.add_argument("--repository", required=True)
@@ -2025,7 +1876,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.issue,
                 args.timeout_seconds,
                 args.lease_manifest,
-                args.pull_request,
             )
         elif args.command == "assert-push":
             result = control.assert_push_eligible(

@@ -44,7 +44,7 @@ from run_role_executor import _validate_target  # noqa: E402
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 ISSUE = 328
-GENERATION = 7
+GENERATION = 0
 LEASE = "5" * 64
 V3 = "role.development.v3"
 V6 = "role.development.v6"
@@ -150,7 +150,7 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             "hard_stops": ["Stop on binding drift."],
         }
         self.message_id = self.store.enqueue_message(
-            idempotency_key="issue-328-generation-7-admission",
+            idempotency_key=f"issue-328-generation-{GENERATION}-admission",
             recipient_session_id=V3,
             topic="development.admission",
             payload=self.payload,
@@ -755,6 +755,25 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
                     self.store._endpoint_rotation_rearm_preview_locked(**self.request)
                 self.store.connection.execute(f"ROLLBACK TO {name}")
                 self.store.connection.execute(f"RELEASE {name}")
+
+    def test_preview_rejects_legacy_null_claim_generation(self) -> None:
+        self.store.connection.execute("SAVEPOINT null_claim_generation")
+        try:
+            self.store.connection.execute(
+                "DROP TRIGGER executor_attempt_identity_immutable"
+            )
+            self.store.connection.execute(
+                "UPDATE executor_attempts SET lineage_generation=NULL "
+                "WHERE attempt_id=?",
+                (self.old_attempt_id,),
+            )
+            with self.assertRaisesRegex(
+                CoordinationError, "ENDPOINT_ROTATION_REARM_ATTEMPT_MISMATCH"
+            ):
+                self.store._endpoint_rotation_rearm_preview_locked(**self.request)
+        finally:
+            self.store.connection.execute("ROLLBACK TO null_claim_generation")
+            self.store.connection.execute("RELEASE null_claim_generation")
 
     def test_preview_rejects_active_attempt_wrong_errors_and_timestamp_fences(self) -> None:
         with self.assertRaisesRegex(

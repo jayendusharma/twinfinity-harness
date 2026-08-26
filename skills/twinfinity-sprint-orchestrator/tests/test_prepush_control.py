@@ -778,6 +778,20 @@ class PrePushControlTests(unittest.TestCase):
                     "elsewhere",
                 ]
             )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "run",
+                    "--repository",
+                    REPOSITORY,
+                    "--issue",
+                    str(ISSUE),
+                    "--lease-manifest",
+                    "/tmp/lease.json",
+                    "--pull-request",
+                    "322",
+                ]
+            )
 
     def test_remote_must_be_canonical_github_repository(self) -> None:
         accepted = (
@@ -1792,7 +1806,7 @@ class PrePushControlTests(unittest.TestCase):
             receipt["last_error"],
         )
 
-    def test_ui_evidence_lease_runs_local_compose_in_candidate_mode(self) -> None:
+    def test_ui_evidence_lease_runs_ordinary_compose_without_pull_request(self) -> None:
         lineage = self.control._lineage(REPOSITORY, ISSUE)
         worktree = Path(self.temp.name) / "worktree"
         (worktree / "backend" / "scripts").mkdir(parents=True)
@@ -1804,21 +1818,13 @@ class PrePushControlTests(unittest.TestCase):
             paths=("frontend/e2e/ui-evidence/example.spec.ts",),
         )
         passed = {"state": "PASS"}
+        compose_calls: list[tuple[list[str], dict[str, str]]] = []
 
         def git_after_gate(_worktree: Path, *args: str) -> str:
             return HEAD if args[-1] == "HEAD" else ""
 
         def run_gate(argv, **kwargs):
-            if "backend/scripts/browser_e2e.py" not in argv:
-                return subprocess.CompletedProcess(argv, 0)
-            candidate = Path(argv[argv.index("--candidate-output") + 1])
-            candidate.mkdir()
-            environment = kwargs["env"]
-            self.assertEqual(REPOSITORY, environment["TWINFINITY_UI_EVIDENCE_REPOSITORY"])
-            self.assertEqual("322", environment["TWINFINITY_UI_EVIDENCE_PULL_REQUEST"])
-            self.assertEqual(str(ISSUE), environment["TWINFINITY_UI_EVIDENCE_LEAF_ISSUE"])
-            self.assertEqual("a" * 40, environment["TWINFINITY_UI_EVIDENCE_EVENT_BASE_SHA"])
-            self.assertEqual(HEAD, environment["TWINFINITY_UI_EVIDENCE_EVENT_HEAD_SHA"])
+            compose_calls.append((list(argv), kwargs["env"]))
             return subprocess.CompletedProcess(argv, 0)
 
         with (
@@ -1827,11 +1833,6 @@ class PrePushControlTests(unittest.TestCase):
             patch.object(self.control, "_validate_manifest_file", return_value=manifest),
             patch.object(self.control, "_lower_gate_commands", return_value=()),
             patch.object(self.control, "_validate_gate_environment", return_value={}),
-            patch.object(
-                self.control,
-                "_validate_candidate_pull_request",
-                return_value=322,
-            ),
             patch.object(self.control, "_git", side_effect=git_after_gate),
             patch.object(self.control, "_record", return_value=passed) as record,
             patch("prepush_control.subprocess.run", side_effect=run_gate),
@@ -1841,116 +1842,39 @@ class PrePushControlTests(unittest.TestCase):
                 ISSUE,
                 30,
                 self.control.store.path.parent / "lease.json",
-                322,
             )
         self.assertEqual(passed, receipt)
+        self.assertEqual(1, len(compose_calls))
         self.assertEqual(
-            "python3 backend/scripts/browser_e2e.py --candidate-output "
-            "<local-prepush-ephemeral>/twinfinity-ui-evidence-candidate-v1",
+            [
+                sys.executable,
+                "backend/scripts/browser_e2e.py",
+                "--run-id",
+                f"p{ISSUE}-g{lineage.generation}-{HEAD[:12]}",
+            ],
+            compose_calls[0][0],
+        )
+        self.assertNotIn("--candidate-output", compose_calls[0][0])
+        self.assertFalse(
+            {
+                "TWINFINITY_UI_EVIDENCE_REPOSITORY",
+                "TWINFINITY_UI_EVIDENCE_PULL_REQUEST",
+                "TWINFINITY_UI_EVIDENCE_LEAF_ISSUE",
+                "TWINFINITY_UI_EVIDENCE_EVENT_BASE_SHA",
+                "TWINFINITY_UI_EVIDENCE_EVENT_HEAD_SHA",
+            }
+            & compose_calls[0][1].keys()
+        )
+        self.assertEqual(
+            "python3 backend/scripts/browser_e2e.py",
             record.call_args.kwargs["compose_gate"],
-        )
-
-    def test_ui_evidence_lease_without_real_pull_request_fails_closed(self) -> None:
-        lineage = self.control._lineage(REPOSITORY, ISSUE)
-        worktree = Path(self.temp.name) / "worktree"
-        worktree.mkdir()
-        manifest = LeaseManifest(
-            content_sha256=LEASE,
-            changed_paths_sha256=digest_json(
-                ["frontend/e2e/ui-evidence/example.spec.ts"]
-            ),
-            paths=("frontend/e2e/ui-evidence/example.spec.ts",),
-        )
-        held = {"state": "HOLD", "last_error": "PREPUSH_UI_EVIDENCE_PR_REQUIRED"}
-
-        def git_after_gate(_worktree: Path, *args: str) -> str:
-            return HEAD if args[-1] == "HEAD" else ""
-
-        with (
-            patch.object(self.control, "_lineage", return_value=lineage),
-            patch.object(self.control, "_validate_worktree", return_value=(worktree, HEAD)),
-            patch.object(self.control, "_validate_manifest_file", return_value=manifest),
-            patch.object(self.control, "_lower_gate_commands", return_value=()),
-            patch.object(self.control, "_validate_gate_environment", return_value={}),
-            patch.object(self.control, "_git", side_effect=git_after_gate),
-            patch.object(self.control, "_record", return_value=held) as record,
-            patch("prepush_control.subprocess.run") as subprocess_run,
-        ):
-            with self.assertRaisesRegex(
-                PrePushError, "PREPUSH_UI_EVIDENCE_PR_REQUIRED"
-            ):
-                self.control.run(
-                    REPOSITORY,
-                    ISSUE,
-                    30,
-                    self.control.store.path.parent / "lease.json",
-                )
-        subprocess_run.assert_not_called()
-        self.assertFalse(record.call_args.kwargs["cleanup_proven"])
-
-    def test_ui_evidence_symlink_candidate_holds_and_cleans_ephemeral_root(self) -> None:
-        lineage = self.control._lineage(REPOSITORY, ISSUE)
-        worktree = Path(self.temp.name) / "worktree"
-        worktree.mkdir()
-        outside = Path(self.temp.name) / "outside"
-        outside.mkdir()
-        observed_roots: list[Path] = []
-        manifest = LeaseManifest(
-            content_sha256=LEASE,
-            changed_paths_sha256=digest_json(
-                ["frontend/e2e/ui-evidence/example.spec.ts"]
-            ),
-            paths=("frontend/e2e/ui-evidence/example.spec.ts",),
-        )
-        held = {"state": "HOLD", "last_error": "PREPUSH_CANDIDATE_OUTPUT_UNSAFE"}
-
-        def git_after_gate(_worktree: Path, *args: str) -> str:
-            return HEAD if args[-1] == "HEAD" else ""
-
-        def run_gate(argv, **_kwargs):
-            candidate = Path(argv[argv.index("--candidate-output") + 1])
-            observed_roots.append(candidate.parent)
-            candidate.symlink_to(outside, target_is_directory=True)
-            return subprocess.CompletedProcess(argv, 0)
-
-        with (
-            patch.object(self.control, "_lineage", return_value=lineage),
-            patch.object(self.control, "_validate_worktree", return_value=(worktree, HEAD)),
-            patch.object(self.control, "_validate_manifest_file", return_value=manifest),
-            patch.object(self.control, "_lower_gate_commands", return_value=()),
-            patch.object(self.control, "_validate_gate_environment", return_value={}),
-            patch.object(
-                self.control,
-                "_validate_candidate_pull_request",
-                return_value=322,
-            ),
-            patch.object(self.control, "_git", side_effect=git_after_gate),
-            patch.object(self.control, "_record", return_value=held) as record,
-            patch("prepush_control.subprocess.run", side_effect=run_gate),
-        ):
-            with self.assertRaisesRegex(
-                PrePushError, "PREPUSH_CANDIDATE_OUTPUT_UNSAFE"
-            ):
-                self.control.run(
-                    REPOSITORY,
-                    ISSUE,
-                    30,
-                    self.control.store.path.parent / "lease.json",
-                    322,
-                )
-        self.assertTrue(observed_roots)
-        self.assertTrue(all(not root.exists() for root in observed_roots))
-        self.assertEqual(
-            "PREPUSH_CANDIDATE_OUTPUT_UNSAFE",
-            record.call_args.kwargs["error"],
         )
         self.assertTrue(record.call_args.kwargs["cleanup_proven"])
 
-    def test_ui_evidence_rebound_root_holds_and_cleans_outer_root(self) -> None:
+    def test_ui_evidence_lease_failed_ordinary_compose_holds(self) -> None:
         lineage = self.control._lineage(REPOSITORY, ISSUE)
         worktree = Path(self.temp.name) / "worktree"
         worktree.mkdir()
-        observed_outer_roots: list[Path] = []
         manifest = LeaseManifest(
             content_sha256=LEASE,
             changed_paths_sha256=digest_json(
@@ -1958,19 +1882,10 @@ class PrePushControlTests(unittest.TestCase):
             ),
             paths=("frontend/e2e/ui-evidence/example.spec.ts",),
         )
-        held = {"state": "HOLD", "last_error": "PREPUSH_CANDIDATE_ROOT_DRIFT"}
+        held = {"state": "HOLD", "last_error": "PREPUSH_COMPOSE_GATE_FAILED"}
 
         def git_after_gate(_worktree: Path, *args: str) -> str:
             return HEAD if args[-1] == "HEAD" else ""
-
-        def run_gate(argv, **_kwargs):
-            candidate = Path(argv[argv.index("--candidate-output") + 1])
-            root = candidate.parent
-            observed_outer_roots.append(root.parent)
-            root.rename(root.parent / "renamed-root")
-            root.mkdir(mode=0o700)
-            candidate.mkdir()
-            return subprocess.CompletedProcess(argv, 0)
 
         with (
             patch.object(self.control, "_lineage", return_value=lineage),
@@ -1978,60 +1893,27 @@ class PrePushControlTests(unittest.TestCase):
             patch.object(self.control, "_validate_manifest_file", return_value=manifest),
             patch.object(self.control, "_lower_gate_commands", return_value=()),
             patch.object(self.control, "_validate_gate_environment", return_value={}),
-            patch.object(
-                self.control,
-                "_validate_candidate_pull_request",
-                return_value=322,
-            ),
             patch.object(self.control, "_git", side_effect=git_after_gate),
             patch.object(self.control, "_record", return_value=held) as record,
-            patch("prepush_control.subprocess.run", side_effect=run_gate),
+            patch(
+                "prepush_control.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 1),
+            ) as subprocess_run,
         ):
             with self.assertRaisesRegex(
-                PrePushError, "PREPUSH_CANDIDATE_ROOT_DRIFT"
+                PrePushError, "PREPUSH_COMPOSE_GATE_FAILED"
             ):
                 self.control.run(
                     REPOSITORY,
                     ISSUE,
                     30,
                     self.control.store.path.parent / "lease.json",
-                    322,
                 )
-        self.assertTrue(observed_outer_roots)
-        self.assertTrue(all(not root.exists() for root in observed_outer_roots))
+        self.assertNotIn("--candidate-output", subprocess_run.call_args.args[0])
         self.assertEqual(
-            "PREPUSH_CANDIDATE_ROOT_DRIFT",
-            record.call_args.kwargs["error"],
+            "PREPUSH_COMPOSE_GATE_FAILED", record.call_args.kwargs["error"]
         )
         self.assertFalse(record.call_args.kwargs["cleanup_proven"])
-
-    def test_candidate_pull_request_rejects_cross_repository_and_malformed_json(self) -> None:
-        lineage = self.control._lineage(REPOSITORY, ISSUE)
-        valid = {
-            "state": "OPEN",
-            "headRefName": lineage.branch,
-            "baseRefName": "main",
-            "baseRefOid": lineage.base_sha,
-            "isCrossRepository": False,
-        }
-        with patch(
-            "prepush_control.subprocess.run",
-            return_value=subprocess.CompletedProcess(
-                [], 0, json.dumps({**valid, "isCrossRepository": True}), ""
-            ),
-        ):
-            with self.assertRaisesRegex(
-                PrePushError, "PREPUSH_UI_EVIDENCE_PR_IDENTITY_DRIFT"
-            ):
-                self.control._validate_candidate_pull_request(lineage, 322, {})
-        with patch(
-            "prepush_control.subprocess.run",
-            return_value=subprocess.CompletedProcess([], 0, "[]", ""),
-        ):
-            with self.assertRaisesRegex(
-                PrePushError, "PREPUSH_UI_EVIDENCE_PR_READ_FAILED"
-            ):
-                self.control._validate_candidate_pull_request(lineage, 322, {})
 
     def test_environment_discovery_error_records_hold_before_any_gate(self) -> None:
         lineage = self.control._lineage(REPOSITORY, ISSUE)
