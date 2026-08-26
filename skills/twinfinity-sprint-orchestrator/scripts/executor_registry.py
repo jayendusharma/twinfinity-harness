@@ -1492,6 +1492,276 @@ def identities_role_equivalent(
     )
 
 
+def applied_endpoint_rotation_chain(
+    connection: sqlite3.Connection,
+    *,
+    repository: str,
+    issue_number: int,
+    before_identity: str,
+    before_item_version: int,
+    after_identity: str,
+    after_item_version: int,
+    watch_key: str | None = None,
+    expected_watch_state: str | None = None,
+    not_before: str | None = None,
+    change_id: str | None = None,
+    change_version: int | None = None,
+) -> tuple[dict[str, Any], ...] | None:
+    """Prove one immutable admission survived exact applied endpoint rotation.
+
+    This is a consumption-only compatibility relation.  It never selects an
+    endpoint or makes a historical identity current.  Every accepted hop must
+    be an intact official migration-ledger row, an exact item transition, an
+    exact same-role pointer transition, and (when requested) the matching
+    terminal-watch transition from that same change.
+    """
+
+    if (
+        REPOSITORY.fullmatch(repository) is None
+        or type(issue_number) is not int
+        or issue_number <= 0
+        or type(before_item_version) is not int
+        or before_item_version <= 0
+        or type(after_item_version) is not int
+        or after_item_version <= before_item_version
+        or not isinstance(before_identity, str)
+        or not isinstance(after_identity, str)
+        or (watch_key is None) != (expected_watch_state is None)
+        or (change_id is None) != (change_version is None)
+        or (
+            change_version is not None
+            and (type(change_version) is not int or change_version <= 0)
+        )
+    ):
+        return None
+    role = identity_role(connection, before_identity)
+    if role is None or identity_role(connection, after_identity) != role:
+        return None
+    if not all(
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        for table in (
+            "executor_registry_changes",
+            "executor_role_endpoints",
+        )
+    ):
+        return None
+    parameters: tuple[Any, ...] = ()
+    predicate = "state='APPLIED'"
+    if change_id is not None:
+        predicate += " AND change_id=? AND version=?"
+        parameters = (change_id, change_version)
+    rows = connection.execute(
+        f"SELECT * FROM executor_registry_changes WHERE {predicate} "
+        "ORDER BY created_at, change_id",
+        parameters,
+    ).fetchall()
+    cursor_identity = before_identity
+    cursor_version = before_item_version
+    steps: list[dict[str, Any]] = []
+    for row in rows:
+        if not_before is not None:
+            try:
+                if datetime.fromisoformat(
+                    str(row["created_at"]).replace("Z", "+00:00")
+                ) < datetime.fromisoformat(not_before.replace("Z", "+00:00")):
+                    continue
+            except (TypeError, ValueError):
+                return None
+        try:
+            plan = json.loads(row["before_state_json"])
+            after_state = json.loads(row["after_state_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(plan, dict) or not isinstance(after_state, dict):
+            return None
+        if any(
+            not isinstance(container, list)
+            for container in (
+                plan.get("item_changes"),
+                plan.get("watch_changes"),
+                plan.get("pointer_changes"),
+                after_state.get("items"),
+                after_state.get("watches"),
+                after_state.get("pointers"),
+            )
+        ):
+            return None
+        plan_digest_input = dict(plan)
+        embedded_plan_sha256 = plan_digest_input.pop("plan_sha256", None)
+        if (
+            row["state"] != "APPLIED"
+            or type(row["version"]) is not int
+            or int(row["version"]) != 1
+            or row["created_at"] != row["updated_at"]
+            or not isinstance(row["operation_key"], str)
+            or not row["operation_key"]
+            or row["change_id"]
+            != hashlib.sha256(
+                f"{row['operation_key']}\0{row['before_state_sha256']}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            or canonical_json(plan) != row["before_state_json"]
+            or canonical_json(after_state) != row["after_state_json"]
+            or embedded_plan_sha256 != row["before_state_sha256"]
+            or digest_json(plan_digest_input) != row["before_state_sha256"]
+            or digest_json(after_state) != row["after_state_sha256"]
+            or plan.get("kind") != "TWINFINITY_ROLE_ENDPOINT_MIGRATION_V1"
+            or plan.get("config_sha256") != row["config_sha256"]
+        ):
+            return None
+        item_changes = plan.get("item_changes")
+        if not isinstance(item_changes, list):
+            return None
+        matching = [
+            candidate
+            for candidate in item_changes
+            if isinstance(candidate, dict)
+            and candidate.get("repository") == repository
+            and candidate.get("issue_number") == issue_number
+            and candidate.get("before_identity") == cursor_identity
+            and candidate.get("before_version") == cursor_version
+        ]
+        if not matching:
+            continue
+        if len(matching) != 1:
+            return None
+        candidate = matching[0]
+        if set(candidate) != {
+            "repository",
+            "issue_number",
+            "before_identity",
+            "after_identity",
+            "before_version",
+            "after_version",
+        }:
+            return None
+        next_identity = candidate.get("after_identity")
+        next_version = candidate.get("after_version")
+        if (
+            not isinstance(next_identity, str)
+            or identity_role(connection, next_identity) != role
+            or type(next_version) is not int
+            or next_version != cursor_version + 1
+        ):
+            return None
+        pointer_matches = [
+            pointer
+            for pointer in plan.get("pointer_changes", [])
+            if isinstance(pointer, dict)
+            and set(pointer)
+            == {
+                "role",
+                "before_endpoint_id",
+                "before_pointer_version",
+                "after_endpoint_id",
+                "after_pointer_version",
+            }
+            and pointer.get("role") == role
+            and pointer.get("before_endpoint_id") == cursor_identity
+            and pointer.get("after_endpoint_id") == next_identity
+        ]
+        after_item_matches = [
+            item
+            for item in after_state.get("items", [])
+            if isinstance(item, dict)
+            and set(item)
+            == {
+                "repository",
+                "issue_number",
+                "accountable_session_id",
+                "version",
+            }
+            and item.get("repository") == repository
+            and item.get("issue_number") == issue_number
+            and item.get("accountable_session_id") == next_identity
+            and item.get("version") == next_version
+        ]
+        after_pointer_matches = [
+            pointer
+            for pointer in after_state.get("pointers", [])
+            if isinstance(pointer, dict)
+            and set(pointer) == {"role", "endpoint_id", "pointer_version"}
+            and pointer.get("role") == role
+            and pointer.get("endpoint_id") == next_identity
+            and pointer.get("pointer_version")
+            == pointer_matches[0].get("after_pointer_version")
+        ] if len(pointer_matches) == 1 else []
+        if (
+            len(pointer_matches) != 1
+            or type(pointer_matches[0].get("before_pointer_version")) is not int
+            or type(pointer_matches[0].get("after_pointer_version")) is not int
+            or pointer_matches[0]["after_pointer_version"]
+            != pointer_matches[0]["before_pointer_version"] + 1
+            or len(after_pointer_matches) != 1
+            or len(after_item_matches) != 1
+        ):
+            return None
+        watch_transition: dict[str, Any] | None = None
+        if watch_key is not None:
+            watch_matches = [
+                watch
+                for watch in plan.get("watch_changes", [])
+                if isinstance(watch, dict)
+                and set(watch)
+                == {
+                    "watch_key",
+                    "before_identity",
+                    "after_identity",
+                    "expected_state",
+                    "expected_updated_at",
+                }
+                and watch.get("watch_key") == watch_key
+                and watch.get("before_identity") == cursor_identity
+                and watch.get("after_identity") == next_identity
+                and watch.get("expected_state") == expected_watch_state
+                and isinstance(watch.get("expected_updated_at"), str)
+            ]
+            after_watch_matches = [
+                watch
+                for watch in after_state.get("watches", [])
+                if isinstance(watch, dict)
+                and set(watch)
+                == {
+                    "watch_key",
+                    "accountable_session_id",
+                    "state",
+                    "updated_at",
+                }
+                and watch.get("watch_key") == watch_key
+                and watch.get("accountable_session_id") == next_identity
+                and watch.get("state") == expected_watch_state
+                and isinstance(watch.get("updated_at"), str)
+            ]
+            if len(watch_matches) != 1 or len(after_watch_matches) != 1:
+                return None
+            watch_transition = watch_matches[0]
+        steps.append(
+            {
+                "change_id": str(row["change_id"]),
+                "change_version": int(row["version"]),
+                "before_identity": cursor_identity,
+                "before_item_version": cursor_version,
+                "after_identity": next_identity,
+                "after_item_version": next_version,
+                "watch_transition": watch_transition,
+            }
+        )
+        cursor_identity = next_identity
+        cursor_version = next_version
+    if (
+        not steps
+        or cursor_identity != after_identity
+        or cursor_version != after_item_version
+        or (change_id is not None and len(steps) != 1)
+    ):
+        return None
+    return tuple(steps)
+
+
 def select_role_equivalent_identity(
     connection: sqlite3.Connection,
     requested_identity: str,

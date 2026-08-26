@@ -42,6 +42,7 @@ from executor_registry import (
     ENDPOINT_ID,
     ROLES,
     RegistryError,
+    applied_endpoint_rotation_chain,
     canonical_endpoint_id,
     current_endpoint,
     ensure_executor_registry_schema,
@@ -1568,6 +1569,28 @@ class CoordinationStore:
                 last_error TEXT,
                 UNIQUE(repository, issue_number, generation)
             );
+            CREATE TABLE IF NOT EXISTS coordination_endpoint_rotation_rearms (
+                rearm_key TEXT PRIMARY KEY,
+                preview_sha256 TEXT NOT NULL UNIQUE,
+                change_id TEXT NOT NULL,
+                change_version INTEGER NOT NULL CHECK(change_version > 0),
+                repository TEXT NOT NULL,
+                issue_number INTEGER NOT NULL CHECK(issue_number > 0),
+                generation INTEGER NOT NULL CHECK(generation >= 0),
+                message_id INTEGER NOT NULL,
+                watch_key TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL UNIQUE,
+                receipt_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(change_id, change_version, message_id, watch_key),
+                FOREIGN KEY(message_id) REFERENCES coordination_messages(id)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_endpoint_rotation_rearm_immutable_update
+            BEFORE UPDATE ON coordination_endpoint_rotation_rearms
+            BEGIN SELECT RAISE(ABORT, 'ENDPOINT_ROTATION_REARM_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_endpoint_rotation_rearm_immutable_delete
+            BEFORE DELETE ON coordination_endpoint_rotation_rearms
+            BEGIN SELECT RAISE(ABORT, 'ENDPOINT_ROTATION_REARM_IMMUTABLE'); END;
             CREATE TABLE IF NOT EXISTS coordination_terminal_closeout_packets (
                 closeout_key TEXT PRIMARY KEY,
                 packet_sha256 TEXT NOT NULL UNIQUE,
@@ -4014,6 +4037,7 @@ class CoordinationStore:
         payload: dict[str, Any],
         current_write: bool = False,
         projected_item: dict[str, Any] | None = None,
+        message_id: int | None = None,
     ) -> None:
         if topic not in MESSAGE_TOPICS:
             raise CoordinationError("MESSAGE_TOPIC_INVALID")
@@ -4354,11 +4378,25 @@ class CoordinationStore:
         terminal_packet = None
         recovery_watch = None
         if not current_write:
-            message_row = self.connection.execute(
-                "SELECT id FROM coordination_messages "
-                "WHERE payload_sha256=? AND topic=? ORDER BY id LIMIT 1",
-                (digest_json(payload), topic),
-            ).fetchone()
+            if message_id is not None:
+                message_row = self.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=?",
+                    (message_id,),
+                ).fetchone()
+                if (
+                    message_row is None
+                    or message_row["payload_sha256"] != digest_json(payload)
+                    or message_row["topic"] != topic
+                    or message_row["recipient_session_id"]
+                    != recipient_session_id
+                ):
+                    raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
+            else:
+                message_row = self.connection.execute(
+                    "SELECT * FROM coordination_messages "
+                    "WHERE payload_sha256=? AND topic=? ORDER BY id LIMIT 1",
+                    (digest_json(payload), topic),
+                ).fetchone()
             if message_row is not None:
                 terminal_packet = self.connection.execute(
                     "SELECT * FROM coordination_terminal_closeout_packets "
@@ -4407,6 +4445,62 @@ class CoordinationStore:
                 )
         else:
             allowed_statuses = {"HOLD"}
+        rotation_chain = None
+        if (
+            not current_write
+            and item is not None
+            and message_row is not None
+            and (
+                int(item["version"]) != item_version
+                or item["accountable_session_id"] != recipient_session_id
+            )
+            and topic in {
+                "development.admission",
+                "sre.admission",
+            }
+        ):
+            watch = self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches "
+                "WHERE repository=? AND issue_number=? AND generation=?",
+                (
+                    payload["source"]["repository"],
+                    issue_number,
+                    generation,
+                ),
+            ).fetchone()
+            if (
+                watch is not None
+                and watch["state"] == "ACTIVE"
+                and watch["accountable_session_id"]
+                == item["accountable_session_id"]
+                and watch["lease_manifest_sha256"]
+                == payload["lease_manifest_sha256"]
+                and int(watch["admission_message_id"] or 0)
+                == int(message_row["id"])
+                and watch["admission_payload_sha256"]
+                == message_row["payload_sha256"]
+            ):
+                rotation_claim_attempt = self.connection.execute(
+                    "SELECT created_at FROM executor_attempts WHERE attempt_id=?",
+                    (watch["claim_attempt_id"],),
+                ).fetchone()
+                rotation_chain = applied_endpoint_rotation_chain(
+                    self.connection,
+                    repository=payload["source"]["repository"],
+                    issue_number=issue_number,
+                    before_identity=recipient_session_id,
+                    before_item_version=item_version
+                    + (1 if topic == "development.recovery_commit" else 0),
+                    after_identity=str(item["accountable_session_id"]),
+                    after_item_version=int(item["version"]),
+                    watch_key=str(watch["watch_key"]),
+                    expected_watch_state="ACTIVE",
+                    not_before=(
+                        str(rotation_claim_attempt["created_at"])
+                        if rotation_claim_attempt is not None
+                        else str(message_row["created_at"])
+                    ),
+                )
         if (
             item is None
             or item["status"] not in allowed_statuses
@@ -4415,10 +4509,11 @@ class CoordinationStore:
             or (
                 item["accountable_session_id"] != recipient_session_id
                 if current_write
-                else not identities_role_equivalent(
-                    self.connection,
-                    item["accountable_session_id"],
-                    recipient_session_id,
+                else (
+                    item["accountable_session_id"] != recipient_session_id
+                    and rotation_chain is None
+                    and not terminal_pending
+                    and not recovery_activated
                 )
             )
             or item["lease_manifest_sha256"] != payload["lease_manifest_sha256"]
@@ -4427,6 +4522,7 @@ class CoordinationStore:
                 int(item["version"]) != item_version
                 and not terminal_pending
                 and not recovery_activated
+                and rotation_chain is None
             )
             or int(item["development_units"]) != development_units
             or int(item["shared_units"]) != shared_units
@@ -5162,6 +5258,7 @@ class CoordinationStore:
                 topic=message["topic"],
                 recipient_session_id=message["recipient_session_id"],
                 payload=payload,
+                message_id=message_id,
             )
             if item is None:
                 raise CoordinationError("MESSAGE_ITEM_STATE_MISMATCH")
@@ -5462,42 +5559,446 @@ class CoordinationStore:
             and cursor_identity == current_endpoint_id
         ):
             return True
-        for change in self.connection.execute(
-            """
-            SELECT before_state_json
-            FROM executor_registry_changes
-            WHERE state='APPLIED' AND created_at>=?
-            ORDER BY created_at, change_id
-            """,
-            (packet["created_at"],),
-        ).fetchall():
-            try:
-                plan = json.loads(change["before_state_json"])
-            except (TypeError, json.JSONDecodeError):
-                return False
-            candidates = [
-                candidate
-                for candidate in plan.get("item_changes", [])
-                if isinstance(candidate, dict)
-                and candidate.get("repository") == packet["repository"]
-                and candidate.get("issue_number") == int(packet["issue_number"])
-                and candidate.get("before_identity") == cursor_identity
-                and candidate.get("before_version") == cursor_version
-            ]
-            if not candidates:
-                continue
-            if len(candidates) != 1:
-                return False
-            candidate = candidates[0]
-            after_identity = candidate.get("after_identity")
-            if not isinstance(after_identity, str):
-                return False
-            cursor_identity = after_identity
-            cursor_version += 1
-        return (
-            cursor_version == int(item["version"])
-            and cursor_identity == current_endpoint_id
+        return applied_endpoint_rotation_chain(
+            self.connection,
+            repository=str(packet["repository"]),
+            issue_number=int(packet["issue_number"]),
+            before_identity=cursor_identity,
+            before_item_version=cursor_version,
+            after_identity=current_endpoint_id,
+            after_item_version=int(item["version"]),
+            watch_key=str(packet["terminal_watch_key"]),
+            expected_watch_state="ACTIVE",
+            not_before=str(packet["created_at"]),
+        ) is not None
+
+    @staticmethod
+    def _endpoint_rotation_rearm_key(
+        *,
+        change_id: str,
+        change_version: int,
+        repository: str,
+        issue_number: int,
+        message_id: int,
+        expected_message_updated_at: str,
+        watch_key: str,
+        expected_watch_updated_at: str,
+    ) -> str:
+        return digest_json(
+            {
+                "kind": "TWINFINITY_ENDPOINT_ROTATION_ADMISSION_REARM_REQUEST_V1",
+                "change_id": change_id,
+                "change_version": change_version,
+                "repository": repository,
+                "issue_number": issue_number,
+                "message_id": message_id,
+                "expected_message_updated_at": expected_message_updated_at,
+                "watch_key": watch_key,
+                "expected_watch_updated_at": expected_watch_updated_at,
+            }
         )
+
+    def _endpoint_rotation_rearm_preview_locked(
+        self,
+        *,
+        change_id: str,
+        change_version: int,
+        repository: str,
+        issue_number: int,
+        message_id: int,
+        expected_message_updated_at: str,
+        watch_key: str,
+        expected_watch_updated_at: str,
+    ) -> dict[str, Any]:
+        _validate_repository(repository)
+        if isinstance(change_id, str):
+            _validate_sha256(change_id)
+        if (
+            not isinstance(change_id, str)
+            or not change_id
+            or type(change_version) is not int
+            or change_version <= 0
+            or type(issue_number) is not int
+            or issue_number <= 0
+            or type(message_id) is not int
+            or message_id <= 0
+            or not isinstance(expected_message_updated_at, str)
+            or not expected_message_updated_at
+            or not isinstance(watch_key, str)
+            or not watch_key
+            or not isinstance(expected_watch_updated_at, str)
+            or not expected_watch_updated_at
+        ):
+            raise CoordinationError("ENDPOINT_ROTATION_REARM_INPUT_INVALID")
+        item = self.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        message = self.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        ).fetchone()
+        watch = self.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        try:
+            payload = (
+                None if message is None else json.loads(message["payload_json"])
+            )
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        source = payload.get("source") if isinstance(payload, dict) else None
+        capacity = payload.get("capacity") if isinstance(payload, dict) else None
+        role = (
+            None
+            if message is None
+            else identity_role(self.connection, str(message["recipient_session_id"]))
+        )
+        endpoint = (
+            current_endpoint(self.connection, role)
+            if role in {"development", "sre"}
+            else None
+        )
+        if (
+            item is None
+            or message is None
+            or watch is None
+            or not isinstance(payload, dict)
+            or not isinstance(source, dict)
+            or not isinstance(capacity, dict)
+            or role not in {"development", "sre"}
+            or endpoint is None
+            or message["topic"]
+            not in (
+                {"development.admission"}
+                if role == "development"
+                else {"sre.admission"}
+            )
+            or message["state"] != "HOLD"
+            or message["last_error"] != "MESSAGE_ITEM_STATE_MISMATCH"
+            or message["updated_at"] != expected_message_updated_at
+            or message["claimed_by"] != message["recipient_session_id"]
+            or digest_json(payload) != message["payload_sha256"]
+            or source.get("repository") != repository
+            or source.get("object_kind") != "issue"
+            or source.get("object_number") != issue_number
+            or payload.get("issue_number") != issue_number
+            or payload.get("accountable_session_id")
+            != message["recipient_session_id"]
+            or type(payload.get("generation")) is not int
+            or type(payload.get("item_version")) is not int
+            or item["status"] not in {"ACTIVE", "ACTIVE_FENCED"}
+            or item["allocation_class"] != "ACTIVE"
+            or int(item["generation"]) != payload.get("generation")
+            or item["accountable_session_id"] != endpoint["endpoint_id"]
+            or item["lease_manifest_sha256"]
+            != payload.get("lease_manifest_sha256")
+            or item["source_payload_sha256"] != source.get("payload_sha256")
+            or int(item["development_units"])
+            != capacity.get("development_units")
+            or int(item["shared_units"]) != capacity.get("shared_units")
+            or int(item["sre_units"]) != capacity.get("sre_units")
+            or watch["repository"] != repository
+            or int(watch["issue_number"]) != issue_number
+            or int(watch["generation"]) != payload.get("generation")
+            or watch["accountable_session_id"] != endpoint["endpoint_id"]
+            or watch["lease_manifest_sha256"]
+            != payload.get("lease_manifest_sha256")
+            or watch["state"] != "HOLD"
+            or watch["process_id"] is not None
+            or watch["last_error"]
+            != "TERMINAL_WATCH_ADMISSION_BINDING_DRIFT"
+            or watch["updated_at"] != expected_watch_updated_at
+            or int(watch["admission_message_id"] or 0) != message_id
+            or watch["admission_payload_sha256"] != message["payload_sha256"]
+            or not isinstance(watch["claim_attempt_id"], str)
+        ):
+            raise CoordinationError("ENDPOINT_ROTATION_REARM_STATE_MISMATCH")
+        current_source = self.current_snapshot(repository, "issue", issue_number)
+        if (
+            current_source is None
+            or current_source.payload_sha256 != source["payload_sha256"]
+        ):
+            raise CoordinationError("ENDPOINT_ROTATION_REARM_SOURCE_DRIFT")
+        attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?",
+            (watch["claim_attempt_id"],),
+        ).fetchone()
+        if (
+            attempt is None
+            or attempt["role"] != role
+            or attempt["endpoint_id"] != message["recipient_session_id"]
+            or attempt["state"] not in {"COMPLETE", "HOLD"}
+            or attempt["target_kind"] != "message"
+            or attempt["target_key"] != str(message_id)
+            or attempt["lineage_repository"] != repository
+            or int(attempt["lineage_issue_number"] or -1) != issue_number
+            or int(attempt["lineage_generation"] or -1)
+            != payload["generation"]
+            or attempt["lineage_lease_sha256"]
+            != payload["lease_manifest_sha256"]
+        ):
+            raise CoordinationError("ENDPOINT_ROTATION_REARM_ATTEMPT_MISMATCH")
+        if self.connection.execute(
+            "SELECT 1 FROM executor_attempts "
+            "WHERE state IN ('RESERVED','LAUNCHING','RUNNING') AND ("
+            "(target_kind='message' AND target_key=?) OR "
+            "(target_kind='terminal_watch' AND target_key=?) OR "
+            "(lineage_repository=? AND lineage_issue_number=? "
+            "AND lineage_generation=?)) LIMIT 1",
+            (
+                str(message_id),
+                watch_key,
+                repository,
+                issue_number,
+                payload["generation"],
+            ),
+        ).fetchone() is not None:
+            raise CoordinationError("ENDPOINT_ROTATION_REARM_ACTIVE_ATTEMPT")
+        if self.connection.execute(
+            "SELECT 1 FROM coordination_terminal_closeout_packets "
+            "WHERE activation_message_id=? OR terminal_watch_key=? LIMIT 1",
+            (message_id, watch_key),
+        ).fetchone() is not None:
+            raise CoordinationError("ENDPOINT_ROTATION_REARM_CLOSEOUT_CONFLICT")
+        chain = applied_endpoint_rotation_chain(
+            self.connection,
+            repository=repository,
+            issue_number=issue_number,
+            before_identity=str(message["recipient_session_id"]),
+            before_item_version=int(payload["item_version"])
+            + (1 if message["topic"] == "development.recovery_commit" else 0),
+            after_identity=str(item["accountable_session_id"]),
+            after_item_version=int(item["version"]),
+            watch_key=watch_key,
+            expected_watch_state="ACTIVE",
+            not_before=str(attempt["created_at"]),
+            change_id=change_id,
+            change_version=change_version,
+        )
+        if chain is None:
+            raise CoordinationError("ENDPOINT_ROTATION_REARM_LEDGER_MISMATCH")
+        preview = {
+            "kind": "TWINFINITY_ENDPOINT_ROTATION_ADMISSION_REARM_PREVIEW_V1",
+            "change_id": change_id,
+            "change_version": change_version,
+            "repository": repository,
+            "issue_number": issue_number,
+            "generation": int(item["generation"]),
+            "message_id": message_id,
+            "message_payload_sha256": str(message["payload_sha256"]),
+            "message_recipient": str(message["recipient_session_id"]),
+            "message_claimed_by": str(message["claimed_by"]),
+            "expected_message_updated_at": expected_message_updated_at,
+            "watch_key": watch_key,
+            "claim_attempt_id": str(watch["claim_attempt_id"]),
+            "expected_watch_updated_at": expected_watch_updated_at,
+            "current_endpoint_id": str(endpoint["endpoint_id"]),
+            "current_item_version": int(item["version"]),
+            "source_payload_sha256": str(item["source_payload_sha256"]),
+            "lease_manifest_sha256": str(item["lease_manifest_sha256"]),
+            "capacity": {
+                "development_units": int(item["development_units"]),
+                "shared_units": int(item["shared_units"]),
+                "sre_units": int(item["sre_units"]),
+            },
+            "rotation_step_sha256": digest_json(chain[0]),
+        }
+        preview["rearm_key"] = self._endpoint_rotation_rearm_key(
+            change_id=change_id,
+            change_version=change_version,
+            repository=repository,
+            issue_number=issue_number,
+            message_id=message_id,
+            expected_message_updated_at=expected_message_updated_at,
+            watch_key=watch_key,
+            expected_watch_updated_at=expected_watch_updated_at,
+        )
+        preview["preview_sha256"] = digest_json(preview)
+        return preview
+
+    def preview_endpoint_rotation_admission_rearm(self, **request: Any) -> dict[str, Any]:
+        """Validate and digest one exact known endpoint-rotation HOLD repair."""
+
+        with self.transaction():
+            return self._endpoint_rotation_rearm_preview_locked(**request)
+
+    def apply_endpoint_rotation_admission_rearm(
+        self,
+        *,
+        expected_preview_sha256: str,
+        now: str,
+        **request: Any,
+    ) -> dict[str, Any]:
+        """Atomically rearm only the exact ledger-proven historical admission."""
+
+        _validate_sha256(expected_preview_sha256)
+        _utc_timestamp(now, error="ENDPOINT_ROTATION_REARM_INPUT_INVALID")
+        rearm_key = self._endpoint_rotation_rearm_key(**request)
+        with self.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_endpoint_rotation_rearms "
+                "WHERE rearm_key=?",
+                (rearm_key,),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    receipt = json.loads(existing["receipt_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CoordinationError(
+                        "ENDPOINT_ROTATION_REARM_RECEIPT_DRIFT"
+                    ) from exc
+                expected_receipt_keys = {
+                    "kind",
+                    "change_id",
+                    "change_version",
+                    "repository",
+                    "issue_number",
+                    "generation",
+                    "message_id",
+                    "message_payload_sha256",
+                    "message_recipient",
+                    "message_claimed_by",
+                    "expected_message_updated_at",
+                    "watch_key",
+                    "claim_attempt_id",
+                    "expected_watch_updated_at",
+                    "current_endpoint_id",
+                    "current_item_version",
+                    "source_payload_sha256",
+                    "lease_manifest_sha256",
+                    "capacity",
+                    "rotation_step_sha256",
+                    "rearm_key",
+                    "preview_sha256",
+                    "rearmed_at",
+                }
+                embedded_preview = dict(receipt) if isinstance(receipt, dict) else {}
+                embedded_preview["kind"] = (
+                    "TWINFINITY_ENDPOINT_ROTATION_ADMISSION_REARM_PREVIEW_V1"
+                )
+                embedded_preview.pop("rearmed_at", None)
+                embedded_preview_sha256 = embedded_preview.pop(
+                    "preview_sha256", None
+                )
+                if (
+                    not isinstance(receipt, dict)
+                    or set(receipt) != expected_receipt_keys
+                    or
+                    canonical_json(receipt) != existing["receipt_json"]
+                    or digest_json(receipt) != existing["receipt_sha256"]
+                    or existing["preview_sha256"] != expected_preview_sha256
+                    or embedded_preview_sha256 != existing["preview_sha256"]
+                    or digest_json(embedded_preview)
+                    != embedded_preview_sha256
+                    or receipt.get("kind")
+                    != "TWINFINITY_ENDPOINT_ROTATION_ADMISSION_REARM_RECEIPT_V1"
+                    or receipt.get("rearm_key") != rearm_key
+                    or receipt.get("preview_sha256")
+                    != existing["preview_sha256"]
+                    or existing["change_id"] != request["change_id"]
+                    or receipt.get("change_id") != existing["change_id"]
+                    or int(existing["change_version"])
+                    != request["change_version"]
+                    or receipt.get("change_version")
+                    != int(existing["change_version"])
+                    or existing["repository"] != request["repository"]
+                    or receipt.get("repository") != existing["repository"]
+                    or int(existing["issue_number"]) != request["issue_number"]
+                    or receipt.get("issue_number")
+                    != int(existing["issue_number"])
+                    or receipt.get("generation") != int(existing["generation"])
+                    or int(existing["message_id"]) != request["message_id"]
+                    or receipt.get("message_id") != int(existing["message_id"])
+                    or existing["watch_key"] != request["watch_key"]
+                    or receipt.get("watch_key") != existing["watch_key"]
+                    or receipt.get("expected_message_updated_at")
+                    != request["expected_message_updated_at"]
+                    or receipt.get("expected_watch_updated_at")
+                    != request["expected_watch_updated_at"]
+                    or receipt.get("rearmed_at") != existing["created_at"]
+                ):
+                    raise CoordinationError("ENDPOINT_ROTATION_REARM_REPLAY_CONFLICT")
+                return {**receipt, "receipt_sha256": str(existing["receipt_sha256"])}
+            preview = self._endpoint_rotation_rearm_preview_locked(**request)
+            if preview["preview_sha256"] != expected_preview_sha256:
+                raise CoordinationError("ENDPOINT_ROTATION_REARM_PREVIEW_DRIFT")
+            message_updated = self.connection.execute(
+                """
+                UPDATE coordination_messages
+                SET state='CLAIMED', updated_at=?, last_error=NULL
+                WHERE id=? AND state='HOLD'
+                  AND last_error='MESSAGE_ITEM_STATE_MISMATCH'
+                  AND updated_at=?
+                """,
+                (
+                    now,
+                    request["message_id"],
+                    request["expected_message_updated_at"],
+                ),
+            )
+            watch_updated = self.connection.execute(
+                """
+                UPDATE coordination_terminal_watches
+                SET state='ACTIVE', attempts=0,
+                    target_progress_sha256=NULL, last_heartbeat_at=?,
+                    next_wake_at=?, updated_at=?, last_error=NULL
+                WHERE watch_key=? AND state='HOLD'
+                  AND process_id IS NULL
+                  AND last_error='TERMINAL_WATCH_ADMISSION_BINDING_DRIFT'
+                  AND updated_at=?
+                """,
+                (
+                    now,
+                    now,
+                    now,
+                    request["watch_key"],
+                    request["expected_watch_updated_at"],
+                ),
+            )
+            if message_updated.rowcount != 1 or watch_updated.rowcount != 1:
+                raise CoordinationError("ENDPOINT_ROTATION_REARM_CAS_CONFLICT")
+            receipt = {
+                **preview,
+                "kind": "TWINFINITY_ENDPOINT_ROTATION_ADMISSION_REARM_RECEIPT_V1",
+                "rearmed_at": now,
+            }
+            receipt_sha256 = digest_json(receipt)
+            self.connection.execute(
+                """
+                INSERT INTO coordination_endpoint_rotation_rearms(
+                    rearm_key, preview_sha256, change_id, change_version,
+                    repository, issue_number, generation, message_id, watch_key,
+                    receipt_sha256, receipt_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rearm_key,
+                    expected_preview_sha256,
+                    request["change_id"],
+                    request["change_version"],
+                    request["repository"],
+                    request["issue_number"],
+                    preview["generation"],
+                    request["message_id"],
+                    request["watch_key"],
+                    receipt_sha256,
+                    canonical_json(receipt),
+                    now,
+                ),
+            )
+            self._event(
+                "ENDPOINT_ROTATION_ADMISSION_REARMED",
+                f"message:{request['message_id']}",
+                {
+                    "change_id": request["change_id"],
+                    "change_version": request["change_version"],
+                    "receipt_sha256": receipt_sha256,
+                    "terminal_watch_key": request["watch_key"],
+                },
+                now,
+            )
+        return {**receipt, "receipt_sha256": receipt_sha256}
 
     def prepare_terminal_closeout(
         self,
@@ -6792,6 +7293,7 @@ class CoordinationStore:
             topic=row["topic"],
             recipient_session_id=row["recipient_session_id"],
             payload=payload,
+            message_id=message_id,
         )
         watch = None
         claim_attempt = None
@@ -6826,6 +7328,16 @@ class CoordinationStore:
                 != payload.get("lease_manifest_sha256")
             ):
                 raise CoordinationError("TERMINAL_WATCH_CLAIM_BINDING_MISMATCH")
+            if (
+                row["state"] == "CLAIMED"
+                and row["recipient_session_id"] != canonical_session_id
+                and watch["state"] == "ACTIVE"
+                and watch["claim_attempt_id"] is not None
+            ):
+                # The immutable historical admission is provenance only after
+                # endpoint rotation.  Its bound terminal watch is the sole
+                # current-endpoint continuation target.
+                raise CoordinationError("TERMINAL_WATCH_CONTINUATION_REQUIRED")
             if not fixture_preclaimed:
                 claim_attempt = self._require_running_lineage_attempt(
                     attempt_id=attempt_id,
@@ -7042,6 +7554,7 @@ class CoordinationStore:
             topic=row["topic"],
             recipient_session_id=row["recipient_session_id"],
             payload=payload,
+            message_id=message_id,
         )
         changed = self.connection.execute(
             "UPDATE coordination_messages SET state='COMPLETE', updated_at=? "
@@ -8197,6 +8710,17 @@ class CoordinationStore:
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_endpoint_rotation_rearm_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--change-id", required=True)
+        command.add_argument("--change-version", type=int, required=True)
+        command.add_argument("--repository", required=True)
+        command.add_argument("--issue-number", type=int, required=True)
+        command.add_argument("--message-id", type=int, required=True)
+        command.add_argument("--expected-message-updated-at", required=True)
+        command.add_argument("--watch-key", required=True)
+        command.add_argument("--expected-watch-updated-at", required=True)
+
     show = subparsers.add_parser("show")
     show.add_argument("--repository")
     enqueue = subparsers.add_parser("enqueue-message")
@@ -8257,6 +8781,15 @@ def main() -> int:
     heartbeat.add_argument("--session-id", required=True)
     heartbeat.add_argument("--generation", type=int, required=True)
     heartbeat.add_argument("--delay-seconds", type=int, default=300)
+    preview_rotation_rearm = subparsers.add_parser(
+        "preview-endpoint-rotation-admission-rearm"
+    )
+    add_endpoint_rotation_rearm_arguments(preview_rotation_rearm)
+    apply_rotation_rearm = subparsers.add_parser(
+        "apply-endpoint-rotation-admission-rearm"
+    )
+    add_endpoint_rotation_rearm_arguments(apply_rotation_rearm)
+    apply_rotation_rearm.add_argument("--expected-preview-sha256", required=True)
     register_artifacts = subparsers.add_parser("register-artifacts")
     register_artifacts.add_argument("--manifest-file", type=Path, required=True)
     hold_artifact = subparsers.add_parser("hold-drifted-artifact")
@@ -8434,6 +8967,30 @@ def main() -> int:
                 now=utc_now(),
             )
             print(canonical_json({"phase": "COMPLETE", "terminal_watch": watch}))
+        elif args.command in {
+            "preview-endpoint-rotation-admission-rearm",
+            "apply-endpoint-rotation-admission-rearm",
+        }:
+            request = {
+                "change_id": args.change_id,
+                "change_version": args.change_version,
+                "repository": args.repository,
+                "issue_number": args.issue_number,
+                "message_id": args.message_id,
+                "expected_message_updated_at": args.expected_message_updated_at,
+                "watch_key": args.watch_key,
+                "expected_watch_updated_at": args.expected_watch_updated_at,
+            }
+            if args.command == "preview-endpoint-rotation-admission-rearm":
+                result = store.preview_endpoint_rotation_admission_rearm(**request)
+                print(canonical_json({"phase": "PREVIEW", "rearm": result}))
+            else:
+                result = store.apply_endpoint_rotation_admission_rearm(
+                    **request,
+                    expected_preview_sha256=args.expected_preview_sha256,
+                    now=utc_now(),
+                )
+                print(canonical_json({"phase": "COMPLETE", "rearm": result}))
         elif args.command == "register-artifacts":
             payload = json.loads(args.manifest_file.read_text(encoding="utf-8"))
             if not isinstance(payload, dict) or set(payload) != {"artifacts"}:

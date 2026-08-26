@@ -2158,15 +2158,15 @@ class ExecutorRegistryTests(unittest.TestCase):
             "updated_at=? WHERE watch_key=?",
             (rotated_endpoint, "2026-08-24T10:00:20Z", watch_key),
         )
-        lineage = run_role_executor._validate_target(
-            self.store.connection,
-            role="development",
-            endpoint_id=rotated_endpoint,
-            target_kind="terminal_watch",
-            target_key=watch_key,
-            allowed_topics={"development.admission"},
-        )
-        self.assertEqual(REPOSITORY, lineage.repository)
+        with self.assertRaisesRegex(RegistryError, "EXECUTOR_TARGET_INVALID"):
+            run_role_executor._validate_target(
+                self.store.connection,
+                role="development",
+                endpoint_id=rotated_endpoint,
+                target_kind="terminal_watch",
+                target_key=watch_key,
+                allowed_topics={"development.admission"},
+            )
 
     def test_hosted_executor_revalidates_exact_sre_row_before_reservation(self) -> None:
         self.migrate()

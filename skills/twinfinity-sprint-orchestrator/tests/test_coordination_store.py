@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
+from dataclasses import replace
 import io
 import json
 import hashlib
@@ -351,6 +352,7 @@ class CoordinationStoreTests(unittest.TestCase):
     def install_all_current_endpoints(self) -> None:
         catalog = reviewed_current_endpoint_catalog(ROOT, Path(self.temp.name))
         config = catalog.__enter__()
+        self.reviewed_config = config
         self.addCleanup(catalog.__exit__, None, None, None)
         aliases, alias_sha = load_legacy_alias_fixture(
             ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
@@ -2781,62 +2783,43 @@ class CoordinationStoreTests(unittest.TestCase):
         self.assertEqual("COMMIT_READY", replayed_prepare["state"])
         self.assertEqual(prepared["packet_sha256"], replayed_prepare["packet_sha256"])
         self.assertEqual(prepared["outbox_id"], replayed_prepare["outbox_id"])
-        rotated_endpoint = self.store.connection.execute(
-            "SELECT * FROM executor_role_endpoints WHERE endpoint_id=?",
-            (DEVELOPMENT_ROTATED,),
-        ).fetchone()
-        endpoint_payload = json.loads(rotated_endpoint["config_json"])
         before_rotation = self.store.connection.execute(
             "SELECT version FROM coordination_items WHERE repository=? "
             "AND issue_number=92",
             (REPOSITORY,),
         ).fetchone()[0]
-        rotation_plan = {
-            "item_changes": [
-                {
-                    "repository": REPOSITORY,
-                    "issue_number": 92,
-                    "before_identity": SESSION,
-                    "after_identity": DEVELOPMENT_ROTATED,
-                    "before_version": before_rotation,
-                    "after_version": before_rotation + 1,
-                }
-            ]
-        }
-        self.store.connection.execute(
-            "UPDATE executor_role_endpoint_current SET endpoint_id=?,"
-            "pointer_version=pointer_version+1,updated_at=? WHERE role='development'",
-            (DEVELOPMENT_ROTATED, "2026-08-22T10:00:10Z"),
+        aliases, alias_sha = load_legacy_alias_fixture(
+            ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
         )
-        self.store.connection.execute(
-            "UPDATE coordination_items SET accountable_session_id=?,"
-            "version=version+1,updated_at=? WHERE repository=? AND issue_number=92",
-            (DEVELOPMENT_ROTATED, "2026-08-22T10:00:10Z", REPOSITORY),
+        rotation_config = replace(
+            self.reviewed_config,
+            roles={
+                **self.reviewed_config.roles,
+                "development": self.reviewed_config.endpoints[
+                    DEVELOPMENT_ROTATED
+                ],
+            },
         )
-        self.store.connection.execute(
-            "UPDATE coordination_terminal_watches SET accountable_session_id=?,"
-            "updated_at=? WHERE watch_key=?",
-            (DEVELOPMENT_ROTATED, "2026-08-22T10:00:10Z", watch_key),
+        rotation_plan = build_plan(
+            self.store.connection,
+            rotation_config,
+            aliases,
+            alias_fixture_sha256=alias_sha,
         )
-        self.store.connection.execute(
-            """
-            INSERT INTO executor_registry_changes(
-                change_id,operation_key,config_sha256,before_state_sha256,
-                before_state_json,after_state_sha256,after_state_json,state,
-                version,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,'APPLIED',1,?,?)
-            """,
-            (
-                "endpoint-rotation-terminal-closeout",
-                "endpoint-rotation-terminal-closeout",
-                digest_json(endpoint_payload),
-                digest_json(rotation_plan),
-                canonical_json(rotation_plan),
-                digest_json({"endpoint": DEVELOPMENT_ROTATED}),
-                canonical_json({"endpoint": DEVELOPMENT_ROTATED}),
-                "2026-08-22T10:00:10Z",
-                "2026-08-22T10:00:10Z",
-            ),
+        apply_plan(
+            self.store.connection,
+            plan=rotation_plan,
+            operation_key="endpoint-rotation-terminal-closeout",
+            expected_plan_sha256=rotation_plan["plan_sha256"],
+            now="2026-08-22T10:00:10Z",
+        )
+        self.assertEqual(
+            before_rotation + 1,
+            self.store.connection.execute(
+                "SELECT version FROM coordination_items WHERE repository=? "
+                "AND issue_number=92",
+                (REPOSITORY,),
+            ).fetchone()[0],
         )
 
         def terminal_fingerprint() -> tuple:

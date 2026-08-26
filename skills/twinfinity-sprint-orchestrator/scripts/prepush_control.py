@@ -32,6 +32,7 @@ from coordination_transfer_ledger import (
     validate_comments as validate_transfer_comments,
     validate_existing_state as validate_transfer_state,
 )
+from executor_registry import RegistryError, applied_endpoint_rotation_chain, identity_role
 
 
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -160,49 +161,139 @@ class PrePushControl:
         if current is None or current["payload_sha256"] != item["source_payload_sha256"]:
             raise PrePushError("PREPUSH_SOURCE_DRIFT")
 
-        admission = None
-        admission_payload: dict[str, Any] | None = None
-        for row in self.connection.execute(
-            """
-            SELECT * FROM coordination_messages
-            WHERE recipient_session_id=? AND state IN ('CLAIMED','COMPLETE')
-            ORDER BY id DESC
-            """,
-            (item["accountable_session_id"],),
-        ):
-            if row["topic"] not in ADMISSION_TOPICS:
-                continue
-            if row["state"] == "CLAIMED" and row["claimed_by"] != item[
-                "accountable_session_id"
-            ]:
-                continue
-            payload = json.loads(row["payload_json"])
-            capacity = payload.get("capacity")
-            payload_item_version = payload.get("item_version")
-            version_matches = (
-                isinstance(payload_item_version, int)
-                and (
-                    payload_item_version + 1 == int(item["version"])
-                    if row["topic"] == "development.recovery_commit"
-                    else payload_item_version == int(item["version"])
-                )
+        watch = self.connection.execute(
+            "SELECT * FROM coordination_terminal_watches "
+            "WHERE repository=? AND issue_number=? AND generation=?",
+            (repository, issue_number, item["generation"]),
+        ).fetchone()
+        admission = (
+            None
+            if watch is None
+            else self.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?",
+                (watch["admission_message_id"],),
+            ).fetchone()
+        )
+        try:
+            admission_payload = (
+                None
+                if admission is None
+                else json.loads(admission["payload_json"])
             )
+        except (TypeError, json.JSONDecodeError):
+            admission_payload = None
+        if admission is not None and isinstance(admission_payload, dict):
+            if digest_json(admission_payload) != admission["payload_sha256"]:
+                raise PrePushError("PREPUSH_ADMISSION_INVALID")
+            capacity = admission_payload.get("capacity")
+            payload_item_version = admission_payload.get("item_version")
+            historical_before_version = (
+                payload_item_version + 1
+                if isinstance(payload_item_version, int)
+                and admission["topic"] == "development.recovery_commit"
+                else payload_item_version
+            )
+            exact_version = historical_before_version == int(item["version"])
+            claim_attempt = (
+                None
+                if watch is None
+                else self.connection.execute(
+                    "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                    (watch["claim_attempt_id"],),
+                ).fetchone()
+            )
+            rotation_chain = None
             if (
-                payload.get("issue_number") == issue_number
-                and payload.get("generation") == int(item["generation"])
-                and payload.get("lease_manifest_sha256") == item["lease_manifest_sha256"]
-                and payload.get("source", {}).get("payload_sha256")
+                isinstance(historical_before_version, int)
+                and admission["topic"]
+                in {"development.admission", "sre.admission"}
+                and watch is not None
+            ):
+                try:
+                    rotation_chain = applied_endpoint_rotation_chain(
+                        self.connection,
+                        repository=repository,
+                        issue_number=issue_number,
+                        before_identity=str(admission["recipient_session_id"]),
+                        before_item_version=historical_before_version,
+                        after_identity=str(item["accountable_session_id"]),
+                        after_item_version=int(item["version"]),
+                        watch_key=str(watch["watch_key"]),
+                        expected_watch_state="ACTIVE",
+                        not_before=(
+                            str(claim_attempt["created_at"])
+                            if claim_attempt is not None
+                            else str(admission["created_at"])
+                        ),
+                    )
+                except RegistryError as exc:
+                    raise PrePushError("PREPUSH_ADMISSION_INVALID") from exc
+            rotated_version = rotation_chain is not None
+            exact_route = bool(
+                admission["recipient_session_id"]
+                == item["accountable_session_id"]
+                and exact_version
+            )
+            try:
+                admission_role = identity_role(
+                    self.connection, str(admission["recipient_session_id"])
+                )
+                item_role = identity_role(
+                    self.connection, str(item["accountable_session_id"])
+                )
+            except RegistryError as exc:
+                raise PrePushError("PREPUSH_ADMISSION_INVALID") from exc
+            rotated_route = bool(
+                rotated_version
+                and admission["state"] == "CLAIMED"
+                and claim_attempt is not None
+                and claim_attempt["role"] == admission_role
+                and claim_attempt["endpoint_id"]
+                == admission["recipient_session_id"]
+                and claim_attempt["state"] in {"COMPLETE", "HOLD"}
+                and claim_attempt["target_kind"] == "message"
+                and claim_attempt["target_key"] == str(admission["id"])
+                and claim_attempt["lineage_repository"] == repository
+                and int(claim_attempt["lineage_issue_number"] or -1)
+                == issue_number
+                and int(claim_attempt["lineage_generation"] or -1)
+                == int(item["generation"])
+                and claim_attempt["lineage_lease_sha256"]
+                == item["lease_manifest_sha256"]
+            )
+            valid = bool(
+                admission["topic"] in ADMISSION_TOPICS
+                and admission["state"] in {"CLAIMED", "COMPLETE"}
+                and admission["claimed_by"] == admission["recipient_session_id"]
+                and admission_role == item_role
+                and digest_json(admission_payload) == admission["payload_sha256"]
+                and admission_payload.get("issue_number") == issue_number
+                and admission_payload.get("generation") == int(item["generation"])
+                and admission_payload.get("accountable_session_id")
+                == admission["recipient_session_id"]
+                and admission_payload.get("lease_manifest_sha256")
+                == item["lease_manifest_sha256"]
+                and admission_payload.get("source", {}).get("payload_sha256")
                 == item["source_payload_sha256"]
-                and version_matches
+                and (exact_route or rotated_route)
                 and isinstance(capacity, dict)
                 and capacity.get("development_units")
                 == int(item["development_units"])
                 and capacity.get("shared_units") == int(item["shared_units"])
                 and capacity.get("sre_units") == int(item["sre_units"])
-            ):
-                admission = row
-                admission_payload = payload
-                break
+                and watch is not None
+                and watch["state"] == "ACTIVE"
+                and watch["accountable_session_id"]
+                == item["accountable_session_id"]
+                and watch["lease_manifest_sha256"]
+                == item["lease_manifest_sha256"]
+                and int(watch["admission_message_id"] or 0) == int(admission["id"])
+                and watch["admission_payload_sha256"]
+                == admission["payload_sha256"]
+            )
+            if not valid:
+                admission = None
+                admission_payload = None
         if admission is None or admission_payload is None:
             raise PrePushError("PREPUSH_COMPLETED_ADMISSION_ABSENT")
         branch = admission_payload.get("branch")

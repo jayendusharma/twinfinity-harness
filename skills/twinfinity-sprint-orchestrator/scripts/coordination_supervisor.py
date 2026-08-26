@@ -29,6 +29,7 @@ from executor_registry import (
     ENDPOINT_ID,
     RegistryError,
     SystemdUnitEvidence,
+    applied_endpoint_rotation_chain,
     active_attempt_for_lineage,
     active_attempt_for_target,
     active_planner_attempt_for_repository,
@@ -474,6 +475,11 @@ class CoordinationSupervisor:
                 "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
                 (watch["repository"], watch["issue_number"]),
             ).fetchone()
+            current_source = self.store.connection.execute(
+                "SELECT payload_sha256 FROM github_current "
+                "WHERE repository=? AND object_kind='issue' AND object_number=?",
+                (watch["repository"], watch["issue_number"]),
+            ).fetchone()
             if item is None or item["allocation_class"] != "ACTIVE" or item["status"] not in ACTIVE_EXECUTION_STATUSES:
                 terminal_commit = self.store.connection.execute(
                     """
@@ -545,6 +551,11 @@ class CoordinationSupervisor:
                 if isinstance(admission_payload, dict)
                 else None
             )
+            admission_capacity = (
+                admission_payload.get("capacity")
+                if isinstance(admission_payload, dict)
+                else None
+            )
             expected_admission_topics = (
                 {"development.admission", "development.recovery_commit"}
                 if role == "development"
@@ -562,18 +573,57 @@ class CoordinationSupervisor:
             original_endpoint = (
                 None if admission is None else admission["recipient_session_id"]
             )
+            historical_before_version = (
+                None
+                if not isinstance(admission_payload, dict)
+                or type(admission_payload.get("item_version")) is not int
+                else int(admission_payload["item_version"])
+                + (1 if admission["topic"] == "development.recovery_commit" else 0)
+            )
+            rotation_chain = None
+            if (
+                original_endpoint != watch["accountable_session_id"]
+                and admission is not None
+                and admission["topic"]
+                in {"development.admission", "sre.admission"}
+                and item is not None
+                and isinstance(historical_before_version, int)
+            ):
+                try:
+                    rotation_chain = applied_endpoint_rotation_chain(
+                        self.store.connection,
+                        repository=str(watch["repository"]),
+                        issue_number=int(watch["issue_number"]),
+                        before_identity=str(original_endpoint),
+                        before_item_version=historical_before_version,
+                        after_identity=str(watch["accountable_session_id"]),
+                        after_item_version=int(item["version"]),
+                        watch_key=watch_key,
+                        expected_watch_state="ACTIVE",
+                        not_before=str(claim_attempt["created_at"]),
+                    )
+                except RegistryError:
+                    rotation_chain = None
+            rotated_proven = rotation_chain is not None
+            rotation_valid = bool(
+                original_endpoint == watch["accountable_session_id"]
+                or rotated_proven
+            )
             if (
                 admission is None
                 or admission["topic"] not in expected_admission_topics
                 or not isinstance(admission_payload, dict)
                 or not isinstance(admission_source, dict)
+                or not isinstance(admission_capacity, dict)
                 or digest_json(admission_payload) != admission["payload_sha256"]
                 or admission["payload_sha256"] != watch["admission_payload_sha256"]
                 or admission["state"] not in {"CLAIMED", "COMPLETE"}
+                or (rotated_proven and admission["state"] != "CLAIMED")
                 or coordination_identity_role(
                     self.store.connection, str(original_endpoint)
                 ) != role
                 or admission["claimed_by"] != original_endpoint
+                or not rotation_valid
                 or admission_source.get("repository") != watch["repository"]
                 or admission_source.get("object_kind") != "issue"
                 or admission_source.get("object_number")
@@ -586,12 +636,23 @@ class CoordinationSupervisor:
                 != original_endpoint
                 or admission_payload.get("lease_manifest_sha256")
                 != watch["lease_manifest_sha256"]
+                or item["source_payload_sha256"]
+                != admission_source.get("payload_sha256")
+                or current_source is None
+                or current_source["payload_sha256"]
+                != item["source_payload_sha256"]
+                or int(item["development_units"])
+                != admission_capacity.get("development_units")
+                or int(item["shared_units"])
+                != admission_capacity.get("shared_units")
+                or int(item["sre_units"])
+                != admission_capacity.get("sre_units")
                 or claim_attempt is None
                 or claim_attempt["role"] != role
                 or claim_attempt["endpoint_id"] != original_endpoint
                 or claim_attempt["state"] not in (
                     {"RUNNING", "COMPLETE", "HOLD"}
-                    if packet is not None
+                    if packet is not None or rotated_proven
                     else {"RUNNING", "COMPLETE"}
                 )
                 or claim_attempt["target_kind"] != "message"
@@ -894,8 +955,35 @@ class CoordinationSupervisor:
                 topic=row["topic"],
                 recipient_session_id=row["recipient_session_id"],
                 payload=payload,
+                message_id=int(row["id"]),
             )
-        except (CoordinationError, json.JSONDecodeError) as exc:
+            if row["state"] == "CLAIMED" and row["topic"] in {
+                "development.admission",
+                "development.recovery_commit",
+                "sre.admission",
+            }:
+                source = payload.get("source") if isinstance(payload, dict) else None
+                watch = (
+                    None
+                    if not isinstance(source, dict)
+                    else self.store.connection.execute(
+                        "SELECT admission_message_id,admission_payload_sha256 "
+                        "FROM coordination_terminal_watches "
+                        "WHERE repository=? AND issue_number=? AND generation=?",
+                        (
+                            source.get("repository"),
+                            payload.get("issue_number"),
+                            payload.get("generation"),
+                        ),
+                    ).fetchone()
+                )
+                if (
+                    watch is not None
+                    and int(watch["admission_message_id"] or 0) == int(row["id"])
+                    and watch["admission_payload_sha256"] != row["payload_sha256"]
+                ):
+                    raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
+        except (CoordinationError, RegistryError, json.JSONDecodeError) as exc:
             return str(exc) if isinstance(exc, CoordinationError) else "INVALID_MESSAGE"
         return None
 
@@ -933,7 +1021,11 @@ class CoordinationSupervisor:
             # crashed original writer must not be relaunched against the
             # admission row and race a fresh terminal watcher.
             return False
-        if row["topic"] == "development.recovery_commit":
+        if row["topic"] in {
+            "development.admission",
+            "development.recovery_commit",
+            "sre.admission",
+        }:
             try:
                 payload = json.loads(row["payload_json"])
             except (TypeError, json.JSONDecodeError):
@@ -954,6 +1046,7 @@ class CoordinationSupervisor:
             )
             if (
                 watch is not None
+                and digest_json(payload) == row["payload_sha256"]
                 and watch["state"] == "ACTIVE"
                 and int(watch["admission_message_id"] or 0) == int(row["id"])
                 and watch["admission_payload_sha256"] == row["payload_sha256"]
