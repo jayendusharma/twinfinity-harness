@@ -40,6 +40,9 @@ MUTATING_NESTED_TOOL = re.compile(
 DOUBLE_LITERAL_CONCAT = re.compile(r'"([^"\\]*)"\s*\+\s*"([^"\\]*)"')
 SINGLE_LITERAL_CONCAT = re.compile(r"'([^'\\]*)'\s*\+\s*'([^'\\]*)'")
 GIT_CONFIG_PUSH_ALIAS = re.compile(r"(?i)\bGIT_CONFIG_(?:VALUE|KEY)_\d+\s*=\s*['\"]?[^\s;&|]*push")
+GIT_METADATA_ENV = re.compile(
+    r"(?i)(?:^|[;&|\s])GIT_(?:DIR|WORK_TREE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES)\s*="
+)
 PASSIVE_POLL_LOOP = re.compile(r"(?is)\b(?:while|until)\b.*?\bdo\b.*?\b(?:sleep|usleep)\b.*?\bdone\b")
 SHELL_CONDITION_LOOP = re.compile(r"(?is)\b(?:while|until)\b.*?\bdo\b.*?\bdone\b")
 FINITE_WHILE_READ = re.compile(r"(?is)^\s*while\s+(?:IFS=\S*\s+)?read\b.*?\bdo\b.*?\bdone\b\s*(?:<\s*\S+)?\s*$")
@@ -81,6 +84,48 @@ BRANCH = re.compile(r"^codex/[0-9]+-[a-z0-9][a-z0-9-]*$")
 MAX_PASSIVE_WAIT_SECONDS = 60.0
 MAX_ARTIFACT_BYTES = 1024 * 1024
 LEASE_REQUIRED_KEYS = {"repository", "issue_number", "generation", "base_sha", "branch", "worktree_path", "no_additional_paths", "paths"}
+GIT_READ_ONLY_SUBCOMMANDS = frozenset(
+    {
+        "cat-file",
+        "count-objects",
+        "describe",
+        "diff",
+        "for-each-ref",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge-base",
+        "name-rev",
+        "range-diff",
+        "rev-parse",
+        "shortlog",
+        "show",
+        "status",
+    }
+)
+GH_READ_ONLY_COMMANDS = frozenset(
+    {
+        ("auth", "status"),
+        ("issue", "list"),
+        ("issue", "status"),
+        ("issue", "view"),
+        ("pr", "checks"),
+        ("pr", "diff"),
+        ("pr", "list"),
+        ("pr", "status"),
+        ("pr", "view"),
+        ("release", "list"),
+        ("release", "view"),
+        ("repo", "view"),
+        ("run", "list"),
+        ("run", "view"),
+        ("run", "watch"),
+        ("workflow", "list"),
+        ("workflow", "view"),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -96,6 +141,7 @@ class DeliveryContext:
     canonical_checkout: Path | None = None
     branch: str | None = None
     base_sha: str | None = None
+    repository: str | None = None
 
 
 @dataclass(frozen=True)
@@ -414,6 +460,7 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         canonical_checkout,
         branch,
         base_sha,
+        str(payload["source"]["repository"]),
     )
 
 
@@ -451,6 +498,7 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
         canonical_checkout,
         branch,
         base_sha,
+        str(payload["source"]["repository"]),
     )
 
 
@@ -735,30 +783,138 @@ def _enforce_exact_worktree_command(
     context: DeliveryContext,
     cwd: Path,
 ) -> dict[str, Any] | None:
-    """Permit only the admitted worktree add/remove forms before sandbox review."""
+    """Default-deny Git mutation and permit only exact admitted metadata forms."""
 
     tokens = _shell_tokens(command)
     if not tokens or tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold() != "git":
         return None
+    if GIT_METADATA_ENV.search(command):
+        return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
     index = 1
     repository_cwd = cwd
-    if index < len(tokens) and tokens[index] == "-C":
-        if index + 1 >= len(tokens):
-            return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
-        repository_cwd = _path_value(tokens[index + 1], cwd)
-        index += 2
-    if index >= len(tokens) or tokens[index].casefold() != "worktree":
-        return None
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        if option == "-C":
+            if index + 1 >= len(tokens):
+                return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+            repository_cwd = _path_value(tokens[index + 1], repository_cwd)
+            index += 2
+            continue
+        if option == "--":
+            index += 1
+            break
+        if option in {"--literal-pathspecs", "--no-pager", "--no-replace-objects"}:
+            index += 1
+            continue
+        # Includes --git-dir, --work-tree, -c, --config-env, and aliases.
+        return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+    if index >= len(tokens):
+        return _deny("DELIVERY_GIT_COMMAND_NOT_APPROVED")
+    subcommand = tokens[index].casefold()
     arguments = tokens[index + 1:]
-    if arguments[:1] == ("list",):
-        return None
+    if any(
+        argument in {"--git-dir", "--work-tree"}
+        or argument.startswith(("--git-dir=", "--work-tree="))
+        for argument in arguments
+    ):
+        return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+
+    if subcommand in GIT_READ_ONLY_SUBCOMMANDS:
+        if any(
+            argument == "--output" or argument.startswith("--output=")
+            for argument in arguments
+        ):
+            return _deny("DELIVERY_GIT_COMMAND_NOT_APPROVED")
+        return {}
+    if subcommand == "worktree" and arguments[:1] == ("list",):
+        return {}
+    if subcommand == "branch" and (
+        not arguments
+        or arguments == ("--show-current",)
+        or arguments[:1] == ("--list",)
+    ):
+        return {}
+    if subcommand == "remote" and (
+        not arguments
+        or arguments in {("-v",), ("--verbose",)}
+        or arguments[:1] == ("get-url",)
+    ):
+        return {}
+    if subcommand == "config" and arguments and (
+        arguments[0].startswith("--get") or arguments[0] in {"--list", "-l"}
+    ):
+        return {}
+
+    if subcommand == "fetch":
+        fetch_operands = tuple(
+            argument for argument in arguments if argument not in {"--no-tags", "--quiet", "-q"}
+        )
+        admitted_roots = {context.canonical_checkout, context.worktree}
+        if (
+            context.repository_writes
+            and context.base_sha is not None
+            and repository_cwd in admitted_roots
+            and fetch_operands
+            in {
+                ("origin", "main"),
+                ("origin", "refs/heads/main"),
+                ("origin", context.base_sha),
+            }
+            and _stable_descriptor_path(
+                repository_cwd, repository_cwd, allow_missing_leaf=False
+            )
+        ):
+            return {}
+        return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+
     if (
         not context.repository_writes
         or context.canonical_checkout is None
         or context.worktree is None
         or context.branch is None
         or context.base_sha is None
-        or repository_cwd != context.canonical_checkout
+    ):
+        return _deny("DELIVERY_TARGET_HAS_NO_REPOSITORY_WRITE_AUTHORITY")
+
+    if subcommand == "branch" and arguments in {
+        ("-d", context.branch),
+        ("--delete", context.branch),
+    }:
+        if (
+            repository_cwd != context.canonical_checkout
+            or os.path.lexists(context.worktree)
+            or not _stable_descriptor_path(
+                context.canonical_checkout,
+                context.canonical_checkout,
+                allow_missing_leaf=False,
+            )
+        ):
+            return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+        return {}
+
+    if subcommand in {"add", "rm", "mv", "commit"}:
+        if repository_cwd != context.worktree:
+            return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+        if subcommand == "commit":
+            position = 0
+            while position < len(arguments):
+                argument = arguments[position]
+                if argument in {"-m", "--message"}:
+                    position += 2
+                    continue
+                if argument in {"--no-gpg-sign", "--quiet", "-q", "--signoff", "-s"}:
+                    position += 1
+                    continue
+                return _deny("DELIVERY_GIT_COMMAND_NOT_APPROVED")
+            if not arguments:
+                return _deny("DELIVERY_GIT_COMMAND_NOT_APPROVED")
+        assessment = _git_write(("git", subcommand, *arguments))
+        return _enforce_repository_write(assessment, context, repository_cwd)
+
+    if subcommand != "worktree":
+        return _deny("DELIVERY_GIT_COMMAND_NOT_APPROVED")
+    if (
+        repository_cwd != context.canonical_checkout
         or context.canonical_checkout.parent != context.worktree.parent
         or not _stable_descriptor_path(
             context.canonical_checkout,
@@ -792,6 +948,213 @@ def _enforce_exact_worktree_command(
             else _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
         )
     return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+
+
+def _long_option_value(
+    arguments: tuple[str, ...], name: str
+) -> str | None:
+    for index, argument in enumerate(arguments):
+        if argument == name:
+            return arguments[index + 1] if index + 1 < len(arguments) else ""
+        if argument.startswith(f"{name}="):
+            return argument.split("=", 1)[1]
+    return None
+
+
+def _enforce_gh_command(
+    tokens: tuple[str, ...], context: DeliveryContext, cwd: Path
+) -> dict[str, Any]:
+    index = 1
+    selected_repository: str | None = None
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        if option in {"--repo", "-R", "--hostname"}:
+            if index + 1 >= len(tokens):
+                return _deny("DELIVERY_GH_COMMAND_NOT_APPROVED")
+            if option in {"--repo", "-R"}:
+                selected_repository = tokens[index + 1]
+            index += 2
+            continue
+        if option.startswith("--repo="):
+            selected_repository = option.split("=", 1)[1]
+            index += 1
+            continue
+        if option == "--":
+            index += 1
+            break
+        return _deny("DELIVERY_GH_COMMAND_NOT_APPROVED")
+    if index >= len(tokens):
+        return _deny("DELIVERY_GH_COMMAND_NOT_APPROVED")
+    group = tokens[index].casefold()
+    arguments = tokens[index + 1:]
+    if group == "api":
+        method = "GET"
+        position = 0
+        while position < len(arguments):
+            argument = arguments[position]
+            if argument in {"-X", "--method"}:
+                if position + 1 >= len(arguments):
+                    return _deny("DELIVERY_GH_API_MUTATION_FORBIDDEN")
+                method = arguments[position + 1].upper()
+                position += 2
+                continue
+            if argument.startswith("-X") and argument != "-X":
+                method = argument[2:].upper()
+            if argument.startswith("--method="):
+                method = argument.split("=", 1)[1].upper()
+            if (
+                argument in {"-f", "-F", "--field", "--raw-field", "--input"}
+                or argument.startswith(
+                    ("-f", "-F", "--field=", "--raw-field=", "--input=")
+                )
+                or argument.casefold() == "graphql"
+            ):
+                return _deny("DELIVERY_GH_API_MUTATION_FORBIDDEN")
+            position += 1
+        return (
+            {}
+            if method in {"GET", "HEAD"}
+            else _deny("DELIVERY_GH_API_MUTATION_FORBIDDEN")
+        )
+    if group == "status":
+        return {}
+    if not arguments:
+        return _deny("DELIVERY_GH_COMMAND_NOT_APPROVED")
+    action = arguments[0].casefold()
+    if (group, action) in GH_READ_ONLY_COMMANDS:
+        return {}
+    if group == "pr" and action == "create":
+        pr_arguments = arguments[1:]
+        head = _long_option_value(pr_arguments, "--head")
+        base = _long_option_value(pr_arguments, "--base")
+        repository = _long_option_value(pr_arguments, "--repo")
+        repository = selected_repository if repository is None else repository
+        if (
+            "--draft" not in pr_arguments
+            or not context.repository_writes
+            or context.worktree is None
+            or context.branch is None
+            or cwd != context.worktree
+            or (head is not None and head != context.branch)
+            or (base is not None and base != "main")
+            or (
+                repository is not None
+                and context.repository is not None
+                and repository != context.repository
+            )
+            or any(argument in {"--web", "--recover"} for argument in pr_arguments)
+            or not _stable_descriptor_path(cwd, context.worktree, allow_missing_leaf=False)
+        ):
+            return _deny("DELIVERY_GH_PR_FLOW_OUTSIDE_EXACT_ADMISSION")
+        return {}
+    return _deny("DELIVERY_GH_COMMAND_NOT_APPROVED")
+
+
+def _enforce_curl_command(tokens: tuple[str, ...]) -> dict[str, Any]:
+    method = "GET"
+    position = 1
+    while position < len(tokens):
+        argument = tokens[position]
+        if argument in {"-X", "--request"}:
+            if position + 1 >= len(tokens):
+                return _deny("DELIVERY_CURL_MUTATION_FORBIDDEN")
+            method = tokens[position + 1].upper()
+            position += 2
+            continue
+        if argument.startswith("--request="):
+            method = argument.split("=", 1)[1].upper()
+        elif argument.startswith("-X") and argument != "-X":
+            method = argument[2:].upper()
+        if argument in {"-I", "--head"}:
+            method = "HEAD"
+        if (
+            argument in {
+                "-d",
+                "--data",
+                "--data-ascii",
+                "--data-binary",
+                "--data-raw",
+                "--data-urlencode",
+                "-F",
+                "--form",
+                "--form-string",
+                "-T",
+                "--upload-file",
+                "--json",
+                "-K",
+                "--config",
+                "-o",
+                "--output",
+                "-O",
+                "--remote-name",
+                "--remote-header-name",
+                "--output-dir",
+            }
+            or argument.startswith(
+                (
+                    "-d",
+                    "--data=",
+                    "--data-ascii=",
+                    "--data-binary=",
+                    "--data-raw=",
+                    "--data-urlencode=",
+                    "-F",
+                    "--form=",
+                    "--form-string=",
+                    "-T",
+                    "--upload-file=",
+                    "--json=",
+                    "-K",
+                    "--config=",
+                    "-o",
+                    "--output=",
+                    "--output-dir=",
+                )
+            )
+        ):
+            return _deny("DELIVERY_CURL_MUTATION_FORBIDDEN")
+        position += 1
+    return (
+        {}
+        if method in {"GET", "HEAD"}
+        else _deny("DELIVERY_CURL_MUTATION_FORBIDDEN")
+    )
+
+
+def _enforce_outbound_command(
+    command: str, context: DeliveryContext, cwd: Path
+) -> dict[str, Any] | None:
+    tokens = _shell_tokens(command)
+    if not tokens:
+        return _deny("DELIVERY_OUTBOUND_COMMAND_UNDETERMINED")
+    executable = tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    if executable in {"prepush_control", "prepush_control.py"}:
+        if (
+            Path(tokens[0]) == CANONICAL_PREPUSH_CONTROL
+            and len(tokens) >= 2
+            and tokens[1] == "guarded-push"
+            and context.repository_writes
+            and context.worktree is not None
+            and cwd == context.worktree
+            and _stable_descriptor_path(cwd, context.worktree, allow_missing_leaf=False)
+        ):
+            return {}
+        return _deny("DELIVERY_PREPUSH_CONTROLLER_NOT_APPROVED")
+    if executable == "gh":
+        return _enforce_gh_command(tokens, context, cwd)
+    if executable == "curl":
+        return _enforce_curl_command(tokens)
+    if executable in {
+        "ssh",
+        "scp",
+        "sftp",
+        "git-push",
+        "git-send-pack",
+        "git-receive-pack",
+        "git-shell",
+    }:
+        return _deny("DELIVERY_RAW_REMOTE_MUTATION_FORBIDDEN")
+    return None
 
 
 def _shell_write(command: str) -> ShellWrite:
@@ -1165,7 +1528,11 @@ def _command_leaves(command: str, *, bounded_wait: bool = False, depth: int = 0)
             if executable in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {"pytest", "unittest"}:
                 leaves.append(CommandLeaf(segment, bounded_wait))
                 continue
-            if str(CANONICAL_PREPUSH_CONTROL) in tokens[1:] and "guarded-push" in tokens:
+            if (
+                len(tokens) >= 3
+                and tokens[1] == str(CANONICAL_PREPUSH_CONTROL)
+                and tokens[2] == "guarded-push"
+            ):
                 leaves.append(CommandLeaf(segment, bounded_wait))
                 continue
             if len(tokens) > 1 and not all(token.startswith("-") for token in tokens[1:]):
@@ -1217,6 +1584,8 @@ def _python_interpreter_write(source: str) -> ShellWrite:
 
 
 def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[str, Any]:
+    if GIT_METADATA_ENV.search(command):
+        return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
     if _contains_raw_push(command):
         return _deny("RAW_GIT_PUSH_FORBIDDEN_USE_SQLITE_EXACT_HEAD_GUARDED_PUSH")
     if _contains_open_ended_wait(command):
@@ -1230,6 +1599,11 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
             return _deny("RAW_GIT_PUSH_FORBIDDEN_USE_SQLITE_EXACT_HEAD_GUARDED_PUSH")
         if _contains_open_ended_wait(leaf.command) and not leaf.bounded_wait:
             return _deny("OPEN_ENDED_WAIT_FORBIDDEN_USE_SESSION_WAIT_OR_MAX_60S_POLL")
+        outbound_decision = _enforce_outbound_command(leaf.command, context, cwd)
+        if outbound_decision is not None:
+            if outbound_decision:
+                return outbound_decision
+            continue
         worktree_decision = _enforce_exact_worktree_command(
             leaf.command, context, cwd
         )

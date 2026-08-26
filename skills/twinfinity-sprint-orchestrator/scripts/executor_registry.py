@@ -824,14 +824,17 @@ def load_registry_config(
         raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
     if profile_validation_scope not in {"current", "catalog"}:
         raise RegistryError("REGISTRY_PROFILE_VALIDATION_SCOPE_INVALID")
+    runtime_roles = roles
     if selected_current_endpoint_id is not None:
         selected = endpoints.get(selected_current_endpoint_id)
         if (
             profile_validation_scope != "current"
             or selected is None
-            or roles[selected.role].endpoint_id != selected_current_endpoint_id
+            or selected_current_endpoint_id in staged_endpoint_ids
         ):
             raise RegistryError("REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT")
+        runtime_roles = dict(roles)
+        runtime_roles[selected.role] = selected
         profiled_endpoints = {selected_current_endpoint_id: selected}
     elif profile_validation_scope == "catalog":
         profiled_endpoints = endpoints
@@ -856,7 +859,7 @@ def load_registry_config(
     )
     return RegistryConfig(
         schema_version=2,
-        roles=roles,
+        roles=runtime_roles,
         endpoints=endpoints,
         staged_endpoint_ids=tuple(sorted(staged_endpoint_ids)),
         source_sha256=hashlib.sha256(raw).hexdigest(),

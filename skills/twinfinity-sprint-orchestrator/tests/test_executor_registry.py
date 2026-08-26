@@ -471,12 +471,18 @@ class ExecutorRegistryTests(unittest.TestCase):
                 )
                 self.assertEqual("COMPLETE", result["state"])
 
+                rollback_profile = (
+                    selected_home / "twinfinity-development-v3.config.toml"
+                )
+                rollback_profile.write_bytes(
+                    (ROOT / "references" / rollback_profile.name).read_bytes()
+                )
                 wrong_endpoint_message_id = enqueue("selected-v6-wrong-endpoint")
                 attempt_count = production.connection.execute(
                     "SELECT COUNT(*) FROM executor_attempts"
                 ).fetchone()[0]
                 with self.assertRaisesRegex(
-                    RegistryError, "REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT"
+                    RegistryError, "EXECUTOR_CONFIG_ENDPOINT_MISMATCH"
                 ):
                     execute_role(
                         production.connection,
@@ -1552,10 +1558,10 @@ class ExecutorRegistryTests(unittest.TestCase):
 
         observed_profiles: list[str] = []
 
-        def launch_v6() -> None:
+        def launch(endpoint_id: str, key: str, expected_profile: str) -> None:
             message_id = self.store.enqueue_message(
-                idempotency_key="endpoint-v6-cutover",
-                recipient_session_id=DEVELOPMENT_V6_ENDPOINT,
+                idempotency_key=key,
+                recipient_session_id=endpoint_id,
                 topic="coordination.notice",
                 payload={
                     "source": {
@@ -1576,25 +1582,25 @@ class ExecutorRegistryTests(unittest.TestCase):
             def succeed(command, **_kwargs):
                 observed_profiles.append(command[command.index("--profile") + 1])
                 self.store.claim_message(
-                    message_id, DEVELOPMENT_V6_ENDPOINT, "2026-08-24T10:00:04Z"
+                    message_id, endpoint_id, "2026-08-24T10:00:04Z"
                 )
                 self.store.complete_message(
-                    message_id, DEVELOPMENT_V6_ENDPOINT, "2026-08-24T10:00:05Z"
+                    message_id, endpoint_id, "2026-08-24T10:00:05Z"
                 )
                 return _ImmediateProcess()
 
             self.assertEqual(
-                DEVELOPMENT_V6_ENDPOINT,
+                endpoint_id,
                 load_registry_config(
                     PRODUCTION_CONFIG,
-                    selected_current_endpoint_id=DEVELOPMENT_V6_ENDPOINT,
+                    selected_current_endpoint_id=endpoint_id,
                 ).roles["development"].endpoint_id,
             )
             result = execute_role(
                 self.store.connection,
                 config_path=PRODUCTION_CONFIG,
                 role="development",
-                endpoint_id=DEVELOPMENT_V6_ENDPOINT,
+                endpoint_id=endpoint_id,
                 target_kind="message",
                 target_key=str(message_id),
                 prompt="Inspect the exact endpoint rollback probe.",
@@ -1603,6 +1609,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                 popen=succeed,
             )
             self.assertEqual("COMPLETE", result["state"])
+            self.assertEqual(expected_profile, observed_profiles[-1])
 
         plan = build_plan(
             self.store.connection,
@@ -1627,7 +1634,11 @@ class ExecutorRegistryTests(unittest.TestCase):
         self.assertEqual((DEVELOPMENT_V6_ENDPOINT, 2), cutover_pointers["development"])
         self.assertEqual((PLANNER_ENDPOINT, 1), cutover_pointers["planner"])
         self.assertEqual(("role.sre.v3", 1), cutover_pointers["sre"])
-        launch_v6()
+        launch(
+            DEVELOPMENT_V6_ENDPOINT,
+            "endpoint-v6-cutover",
+            "twinfinity-development-v6",
+        )
         rolled_back = rollback_change(
             self.store.connection,
             change_id=applied["change_id"],
@@ -1654,8 +1665,13 @@ class ExecutorRegistryTests(unittest.TestCase):
             (DEVELOPMENT_V3_ENDPOINT,),
         ).fetchone()
         self.assertEqual(rollback_endpoint.config_sha256, stored_rollback[0])
+        launch(
+            DEVELOPMENT_V3_ENDPOINT,
+            "endpoint-v3-after-rollback",
+            "twinfinity-development-v3",
+        )
         self.assertEqual(
-            ["twinfinity-development-v6"],
+            ["twinfinity-development-v6", "twinfinity-development-v3"],
             observed_profiles,
         )
 

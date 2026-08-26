@@ -528,6 +528,13 @@ class CleanControlPlaneTests(unittest.TestCase):
             pointers = dict(connection.execute("SELECT role, endpoint_id FROM executor_role_endpoint_current"))
             self.assertEqual(clean.EXPECTED_ENDPOINTS, pointers)
             self.assertEqual("role.development.v6", pointers["development"])
+            catalog = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT endpoint_id FROM executor_role_endpoints"
+                )
+            }
+            self.assertIn("role.development.v3", catalog)
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM portfolio_readiness_campaigns").fetchone()[0])
             stored = json.loads(connection.execute("SELECT manifest_json FROM coordination_bootstrap_provenance").fetchone()[0])
             self.assertEqual(
