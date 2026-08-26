@@ -528,9 +528,37 @@ def _validate_profile_directory(value: Any, error_prefix: str) -> Path:
     absolute = Path(os.path.abspath(path))
     current = Path(absolute.anchor)
     anchor_metadata = current.lstat()
-    if (
-        not stat.S_ISDIR(anchor_metadata.st_mode)
-        or anchor_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+    def component_is_safe(
+        component: Path, metadata: os.stat_result, *, is_final: bool
+    ) -> bool:
+        shared_sticky_ancestor = not is_final and bool(
+            metadata.st_mode & stat.S_ISVTX
+        )
+        mapped_namespace_ancestor = (
+            not is_final
+            and component in {Path("/"), Path("/home")}
+            and metadata.st_uid == 65534
+            and stat.S_IMODE(metadata.st_mode) == 0o755
+        )
+        owner_is_trusted = (
+            metadata.st_uid in {0, os.getuid()}
+            or shared_sticky_ancestor
+            or mapped_namespace_ancestor
+        )
+        return not (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (is_final and metadata.st_uid != os.getuid())
+            or (not is_final and not owner_is_trusted)
+            or (
+                metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                and not shared_sticky_ancestor
+            )
+        )
+
+    if not component_is_safe(
+        current, anchor_metadata, is_final=absolute == current
     ):
         raise RegistryError(f"{error_prefix}_UNSAFE")
     parts = absolute.parts[1:]
@@ -541,18 +569,7 @@ def _validate_profile_directory(value: Any, error_prefix: str) -> Path:
         except OSError as exc:
             raise RegistryError(f"{error_prefix}_MISSING") from exc
         is_final = ordinal == len(parts) - 1
-        shared_sticky_ancestor = not is_final and bool(
-            metadata.st_mode & stat.S_ISVTX
-        )
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISDIR(metadata.st_mode)
-            or (is_final and metadata.st_uid != os.getuid())
-            or (
-                metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                and not shared_sticky_ancestor
-            )
-        ):
+        if not component_is_safe(current, metadata, is_final=is_final):
             raise RegistryError(f"{error_prefix}_UNSAFE")
     return absolute
 

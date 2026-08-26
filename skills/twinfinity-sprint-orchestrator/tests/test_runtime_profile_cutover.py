@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -113,7 +114,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             )
             self.assertNotIn("Traceback", completed.stderr)
 
-    def test_profile_root_accepts_immutable_non_current_owned_ancestor(self) -> None:
+    def test_profile_root_rejects_arbitrary_foreign_owned_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             ancestor = Path(temporary) / "immutable-ancestor"
             profile_root = ancestor / "profile-root"
@@ -130,19 +131,21 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 return metadata
 
             with mock.patch.object(Path, "lstat", real_shaped_lstat):
-                self.assertEqual(
-                    profile_root,
-                    _validate_profile_directory(profile_root, "REGISTRY_CODEX_HOME"),
-                )
+                with self.assertRaisesRegex(
+                    RegistryError, "REGISTRY_CODEX_HOME_UNSAFE"
+                ):
+                    _validate_profile_directory(
+                        profile_root, "REGISTRY_CODEX_HOME"
+                    )
 
-                def final_owned_elsewhere_lstat(path: Path):
-                    metadata = original_lstat(path)
-                    if path == profile_root:
-                        return SimpleNamespace(
-                            st_mode=metadata.st_mode,
-                            st_uid=os.getuid() + 1,
-                        )
-                    return metadata
+            def final_owned_elsewhere_lstat(path: Path):
+                metadata = original_lstat(path)
+                if path == profile_root:
+                    return SimpleNamespace(
+                        st_mode=metadata.st_mode,
+                        st_uid=os.getuid() + 1,
+                    )
+                return metadata
 
             with mock.patch.object(Path, "lstat", final_owned_elsewhere_lstat):
                 with self.assertRaisesRegex(
@@ -151,6 +154,27 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                     _validate_profile_directory(
                         profile_root, "REGISTRY_CODEX_HOME"
                     )
+
+    def test_profile_root_accepts_only_mapped_namespace_ancestors(self) -> None:
+        profile_root = Path("/home/ubuntu/.codex")
+        metadata_by_path = {
+            Path("/"): SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=65534),
+            Path("/home"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755, st_uid=65534
+            ),
+            Path("/home/ubuntu"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o750, st_uid=os.getuid()
+            ),
+            profile_root: SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755, st_uid=os.getuid()
+            ),
+        }
+
+        with mock.patch.object(Path, "lstat", lambda path: metadata_by_path[path]):
+            self.assertEqual(
+                profile_root,
+                _validate_profile_directory(profile_root, "REGISTRY_CODEX_HOME"),
+            )
 
     def test_profile_root_rejects_writable_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
