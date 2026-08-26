@@ -547,10 +547,7 @@ def _validate_profile_directory(value: Any, error_prefix: str) -> Path:
         if (
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISDIR(metadata.st_mode)
-            or (
-                metadata.st_uid not in {0, os.getuid()}
-                and not shared_sticky_ancestor
-            )
+            or (is_final and metadata.st_uid != os.getuid())
             or (
                 metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 and not shared_sticky_ancestor
