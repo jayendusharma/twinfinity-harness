@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -81,6 +82,45 @@ class EnvironmentRestoreControlTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return control_restore(**arguments)  # type: ignore[arg-type]
+
+    def _mocked_user_bus_context(
+        self, *metadata: os.stat_result
+    ) -> restore_module.SystemdUserBusContext:
+        runtime_root = Path(self.temporary.name) / "run" / "user"
+        with mock.patch.object(
+            restore_module, "_reject_symlink_components"
+        ), mock.patch.object(
+            restore_module.Path,
+            "lstat",
+            side_effect=list(metadata),
+        ):
+            return restore_module._systemd_user_bus_context(
+                runtime_root=runtime_root
+            )
+
+    @staticmethod
+    def _metadata(
+        kind: int,
+        mode: int,
+        *,
+        uid: int | None = None,
+        nlink: int = 1,
+        inode: int = 11,
+    ) -> os.stat_result:
+        return os.stat_result(
+            (
+                kind | mode,
+                inode,
+                12,
+                nlink,
+                os.getuid() if uid is None else uid,
+                os.getgid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
 
     def test_dry_run_is_default_and_does_not_create_destinations(self) -> None:
         current_sha256 = _sha256(self.database)
@@ -192,11 +232,20 @@ class EnvironmentRestoreControlTests(unittest.TestCase):
             "twinfinity-role-executor-active.service loaded running running description\n"
             "twinfinity-role-executor-old.service loaded failed failed description\n"
         )
+        user_bus = restore_module.SystemdUserBusContext(
+            environment={"XDG_RUNTIME_DIR": "/run/user/1234"},
+            runtime_identity=(1, 2, stat.S_IFDIR | 0o700, 1234),
+            bus_identity=(1, 4, stat.S_IFSOCK | 0o666, 1234, 1),
+        )
         with mock.patch.object(
+            restore_module,
+            "_systemd_user_bus_context",
+            return_value=user_bus,
+        ), mock.patch.object(
             restore_module,
             "_systemctl_run",
             side_effect=["\n\n".join(show_blocks), role_units],
-        ):
+        ) as systemctl_run:
             active = probe_active_systemd_units()
         self.assertEqual(
             [
@@ -205,6 +254,227 @@ class EnvironmentRestoreControlTests(unittest.TestCase):
             ],
             active,
         )
+        self.assertEqual(
+            [user_bus, user_bus],
+            [call.kwargs["user_bus"] for call in systemctl_run.call_args_list],
+        )
+
+    def test_systemd_probe_rejects_user_bus_drift_between_successful_calls(
+        self,
+    ) -> None:
+        before = restore_module.SystemdUserBusContext(
+            environment={
+                "HOME": "/safe/home",
+                "PATH": "/usr/bin:/bin",
+                "XDG_RUNTIME_DIR": "/run/user/1234",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1234/bus",
+            },
+            runtime_identity=(1, 2, stat.S_IFDIR | 0o700, 1234),
+            bus_identity=(1, 4, stat.S_IFSOCK | 0o666, 1234, 1),
+        )
+        after = restore_module.SystemdUserBusContext(
+            environment=before.environment,
+            runtime_identity=before.runtime_identity,
+            bus_identity=(1, 5, stat.S_IFSOCK | 0o666, 1234, 1),
+        )
+        show = "\n\n".join(
+            f"Id={unit}\nActiveState=inactive" for unit in restore_module.MANAGED_UNITS
+        )
+        responses = [
+            mock.Mock(returncode=0, stdout=show, stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+        with mock.patch.object(
+            restore_module,
+            "_systemd_user_bus_context",
+            side_effect=[before, before, after],
+        ), mock.patch.object(
+            restore_module.subprocess,
+            "run",
+            side_effect=responses,
+        ) as run:
+            with self.assertRaisesRegex(
+                EnvironmentRestoreError, "RESTORE_SYSTEMD_BUS_DRIFT"
+            ):
+                probe_active_systemd_units()
+        self.assertEqual(2, run.call_count)
+
+    def test_systemctl_run_passes_only_derived_user_bus_environment(self) -> None:
+        context = restore_module.SystemdUserBusContext(
+            environment={
+                "HOME": "/safe/home",
+                "PATH": "/usr/bin:/bin",
+                "XDG_RUNTIME_DIR": "/run/user/1234",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1234/bus",
+            },
+            runtime_identity=(1, 2, 3, 1234),
+            bus_identity=(1, 4, 5, 1234, 1),
+        )
+        completed = mock.Mock(returncode=0, stdout="running\n", stderr="")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": "/hostile/home",
+                "PATH": "/hostile/bin",
+                "XDG_RUNTIME_DIR": "/hostile/runtime",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/hostile/bus",
+                "LD_PRELOAD": "/hostile/library.so",
+            },
+        ), mock.patch.object(
+            restore_module,
+            "_systemd_user_bus_context",
+            side_effect=[context, context],
+        ), mock.patch.object(
+            restore_module.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            output = restore_module._systemctl_run(["/usr/bin/systemctl", "--user"])
+
+        self.assertEqual("running\n", output)
+        self.assertEqual(context.environment, run.call_args.kwargs["env"])
+        self.assertNotIn("LD_PRELOAD", run.call_args.kwargs["env"])
+
+    def test_systemctl_run_rejects_user_bus_identity_drift(self) -> None:
+        before = restore_module.SystemdUserBusContext(
+            environment={
+                "HOME": "/safe/home",
+                "PATH": "/usr/bin:/bin",
+                "XDG_RUNTIME_DIR": "/run/user/1234",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1234/bus",
+            },
+            runtime_identity=(1, 2, stat.S_IFDIR | 0o700, 1234),
+            bus_identity=(1, 4, stat.S_IFSOCK | 0o666, 1234, 1),
+        )
+        after = restore_module.SystemdUserBusContext(
+            environment=before.environment,
+            runtime_identity=before.runtime_identity,
+            bus_identity=(1, 5, stat.S_IFSOCK | 0o666, 1234, 1),
+        )
+        completed = mock.Mock(returncode=0, stdout="running\n", stderr="")
+        with mock.patch.object(
+            restore_module,
+            "_systemd_user_bus_context",
+            side_effect=[before, after],
+        ), mock.patch.object(
+            restore_module.subprocess,
+            "run",
+            return_value=completed,
+        ):
+            with self.assertRaisesRegex(
+                EnvironmentRestoreError, "RESTORE_SYSTEMD_BUS_DRIFT"
+            ):
+                restore_module._systemctl_run(["/usr/bin/systemctl", "--user"])
+
+    def test_systemd_user_bus_context_validates_runtime_and_socket(self) -> None:
+        runtime_root = Path(self.temporary.name) / "run" / "user"
+        runtime_dir = runtime_root / str(os.getuid())
+        bus = runtime_dir / "bus"
+        context = self._mocked_user_bus_context(
+            self._metadata(stat.S_IFDIR, 0o700, nlink=2),
+            self._metadata(stat.S_IFSOCK, 0o666, inode=13),
+        )
+        self.assertEqual(str(runtime_dir), context.environment["XDG_RUNTIME_DIR"])
+        self.assertEqual(
+            f"unix:path={bus}", context.environment["DBUS_SESSION_BUS_ADDRESS"]
+        )
+
+    def test_systemd_user_bus_context_rejects_missing_runtime(self) -> None:
+        runtime_root = Path(self.temporary.name) / "run" / "user"
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            restore_module._systemd_user_bus_context(runtime_root=runtime_root)
+
+    def test_systemd_user_bus_context_accepts_nonwritable_runtime_mode_0755(
+        self,
+    ) -> None:
+        runtime_root = Path(self.temporary.name) / "run" / "user"
+        runtime_dir = runtime_root / str(os.getuid())
+        context = self._mocked_user_bus_context(
+            self._metadata(stat.S_IFDIR, 0o755, nlink=2),
+            self._metadata(stat.S_IFSOCK, 0o666, inode=13),
+        )
+        self.assertEqual(str(runtime_dir), context.environment["XDG_RUNTIME_DIR"])
+
+    def test_systemd_user_bus_context_rejects_group_writable_runtime(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            self._mocked_user_bus_context(self._metadata(stat.S_IFDIR, 0o775))
+
+    def test_systemd_user_bus_context_rejects_incomplete_owner_access(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            self._mocked_user_bus_context(self._metadata(stat.S_IFDIR, 0o655))
+
+    def test_systemd_user_bus_context_rejects_world_writable_runtime(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            self._mocked_user_bus_context(self._metadata(stat.S_IFDIR, 0o757))
+
+    def test_systemd_user_bus_context_rejects_symlink_runtime_component(self) -> None:
+        actual_root = Path(self.temporary.name) / "actual-user"
+        actual_root.mkdir(mode=0o700)
+        linked_root = Path(self.temporary.name) / "linked-user"
+        linked_root.symlink_to(actual_root, target_is_directory=True)
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            restore_module._systemd_user_bus_context(runtime_root=linked_root)
+
+    def test_systemd_user_bus_context_rejects_symlink_runtime_directory(self) -> None:
+        runtime_root = Path(self.temporary.name) / "run" / "user"
+        runtime_root.mkdir(parents=True)
+        actual_runtime = Path(self.temporary.name) / "actual-runtime"
+        actual_runtime.mkdir(mode=0o700)
+        (runtime_root / str(os.getuid())).symlink_to(
+            actual_runtime, target_is_directory=True
+        )
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            restore_module._systemd_user_bus_context(runtime_root=runtime_root)
+
+    def test_systemd_user_bus_context_rejects_runtime_wrong_owner(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            self._mocked_user_bus_context(
+                self._metadata(stat.S_IFDIR, 0o700, uid=os.getuid() + 1)
+            )
+
+    def test_systemd_user_bus_context_rejects_runtime_wrong_type(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_RUNTIME_UNSAFE"):
+            self._mocked_user_bus_context(self._metadata(stat.S_IFREG, 0o700))
+
+    def test_systemd_user_bus_context_rejects_missing_bus(self) -> None:
+        runtime_root = Path(self.temporary.name) / "run" / "user"
+        runtime_dir = runtime_root / str(os.getuid())
+        runtime_dir.mkdir(parents=True, mode=0o700)
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_BUS_UNSAFE"):
+            restore_module._systemd_user_bus_context(runtime_root=runtime_root)
+
+    def test_systemd_user_bus_context_rejects_symlink_bus(self) -> None:
+        runtime_root = Path(self.temporary.name) / "run" / "user"
+        runtime_dir = runtime_root / str(os.getuid())
+        runtime_dir.mkdir(parents=True, mode=0o700)
+        target = Path(self.temporary.name) / "other-bus"
+        target.write_text("not a socket", encoding="utf-8")
+        (runtime_dir / "bus").symlink_to(target)
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_BUS_UNSAFE"):
+            restore_module._systemd_user_bus_context(runtime_root=runtime_root)
+
+    def test_systemd_user_bus_context_rejects_bus_wrong_owner(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_BUS_UNSAFE"):
+            self._mocked_user_bus_context(
+                self._metadata(stat.S_IFDIR, 0o700, nlink=2),
+                self._metadata(
+                    stat.S_IFSOCK, 0o666, uid=os.getuid() + 1, inode=13
+                ),
+            )
+
+    def test_systemd_user_bus_context_rejects_bus_wrong_type(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_BUS_UNSAFE"):
+            self._mocked_user_bus_context(
+                self._metadata(stat.S_IFDIR, 0o700, nlink=2),
+                self._metadata(stat.S_IFREG, 0o600, inode=13),
+            )
+
+    def test_systemd_user_bus_context_rejects_bus_link_count(self) -> None:
+        with self.assertRaisesRegex(EnvironmentRestoreError, "SYSTEMD_BUS_UNSAFE"):
+            self._mocked_user_bus_context(
+                self._metadata(stat.S_IFDIR, 0o700, nlink=2),
+                self._metadata(stat.S_IFSOCK, 0o666, nlink=2, inode=13),
+            )
 
     def test_active_state_in_backup_is_not_revived(self) -> None:
         self.backup.unlink()

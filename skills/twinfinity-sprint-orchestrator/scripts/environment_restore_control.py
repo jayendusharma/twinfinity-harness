@@ -53,6 +53,13 @@ class RestorePaths:
         return self.database.parent
 
 
+@dataclass(frozen=True)
+class SystemdUserBusContext:
+    environment: dict[str, str]
+    runtime_identity: tuple[int, ...]
+    bus_identity: tuple[int, ...]
+
+
 SystemdProbe = Callable[[], Sequence[str]]
 
 
@@ -218,7 +225,71 @@ def _inspect_database(path: Path, *, require_integrity: bool) -> dict[str, int |
     }
 
 
-def _systemctl_run(arguments: list[str]) -> str:
+def _systemd_user_bus_context(
+    *, runtime_root: Path = Path("/run/user")
+) -> SystemdUserBusContext:
+    uid = os.getuid()
+    runtime_dir = runtime_root / str(uid)
+    bus = runtime_dir / "bus"
+    try:
+        _reject_symlink_components(runtime_dir)
+        runtime_metadata = runtime_dir.lstat()
+    except (EnvironmentRestoreError, OSError) as exc:
+        raise EnvironmentRestoreError("RESTORE_SYSTEMD_RUNTIME_UNSAFE") from exc
+    runtime_mode = stat.S_IMODE(runtime_metadata.st_mode)
+    if (
+        not stat.S_ISDIR(runtime_metadata.st_mode)
+        or runtime_metadata.st_uid != uid
+        or runtime_mode & 0o700 != 0o700
+        or runtime_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise EnvironmentRestoreError("RESTORE_SYSTEMD_RUNTIME_UNSAFE")
+    try:
+        _reject_symlink_components(bus)
+        bus_metadata = bus.lstat()
+    except (EnvironmentRestoreError, OSError) as exc:
+        raise EnvironmentRestoreError("RESTORE_SYSTEMD_BUS_UNSAFE") from exc
+    if (
+        not stat.S_ISSOCK(bus_metadata.st_mode)
+        or bus_metadata.st_uid != uid
+        or bus_metadata.st_nlink != 1
+    ):
+        raise EnvironmentRestoreError("RESTORE_SYSTEMD_BUS_UNSAFE")
+    try:
+        home = Path(pwd.getpwuid(uid).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise EnvironmentRestoreError("RESTORE_SYSTEMD_ENVIRONMENT_UNSAFE") from exc
+    if not home.is_absolute():
+        raise EnvironmentRestoreError("RESTORE_SYSTEMD_ENVIRONMENT_UNSAFE")
+    return SystemdUserBusContext(
+        environment={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "XDG_RUNTIME_DIR": str(runtime_dir),
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
+        },
+        runtime_identity=(
+            runtime_metadata.st_dev,
+            runtime_metadata.st_ino,
+            runtime_metadata.st_mode,
+            runtime_metadata.st_uid,
+        ),
+        bus_identity=(
+            bus_metadata.st_dev,
+            bus_metadata.st_ino,
+            bus_metadata.st_mode,
+            bus_metadata.st_uid,
+            bus_metadata.st_nlink,
+        ),
+    )
+
+
+def _systemctl_run(
+    arguments: list[str], *, user_bus: SystemdUserBusContext | None = None
+) -> str:
+    expected_user_bus = (
+        user_bus if user_bus is not None else _systemd_user_bus_context()
+    )
     try:
         result = subprocess.run(
             arguments,
@@ -228,19 +299,19 @@ def _systemctl_run(arguments: list[str]) -> str:
             text=True,
             timeout=15,
             check=False,
-            env={
-                "HOME": str(Path(pwd.getpwuid(os.getuid()).pw_dir)),
-                "PATH": "/usr/bin:/bin",
-            },
+            env=expected_user_bus.environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise EnvironmentRestoreError("RESTORE_SYSTEMD_PROBE_FAILED") from exc
     if result.returncode != 0:
         raise EnvironmentRestoreError("RESTORE_SYSTEMD_PROBE_FAILED")
+    if _systemd_user_bus_context() != expected_user_bus:
+        raise EnvironmentRestoreError("RESTORE_SYSTEMD_BUS_DRIFT")
     return result.stdout
 
 
 def probe_active_systemd_units() -> list[str]:
+    user_bus = _systemd_user_bus_context()
     show = _systemctl_run(
         [
             "/usr/bin/systemctl",
@@ -250,7 +321,8 @@ def probe_active_systemd_units() -> list[str]:
             "--property=Id",
             "--property=ActiveState",
             *MANAGED_UNITS,
-        ]
+        ],
+        user_bus=user_bus,
     )
     active: list[str] = []
     blocks = [block for block in show.strip().split("\n\n") if block.strip()]
@@ -276,7 +348,8 @@ def probe_active_systemd_units() -> list[str]:
             "--plain",
             "--no-legend",
             "twinfinity-role-executor-*",
-        ]
+        ],
+        user_bus=user_bus,
     )
     for line in role_output.splitlines():
         fields = line.split(None, 4)
