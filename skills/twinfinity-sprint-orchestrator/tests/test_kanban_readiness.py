@@ -393,6 +393,40 @@ class KanbanReadinessTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_dispatch_preserves_factual_docker_readiness_evidence(self) -> None:
+        self.h.seed([1])
+        plan = self.h.plan(1)
+        plan["gates"].append(
+            {
+                "gate_key": "local-docker-boundary",
+                "description": "Confirm the candidate-local Docker boundary.",
+                "requested_evidence": [
+                    "Local Docker identity and isolation evidence",
+                    "Local Docker boundary ownership",
+                    "Docker endpoint provenance",
+                ],
+            }
+        )
+        register(self.h.store.connection, plan, now=NOW)
+
+        dispatched = dispatch(
+            self.h.store, REPOSITORY, max_parallel=1, now=NOW
+        )["dispatched"]
+
+        self.assertEqual(1, len(dispatched))
+        message = self.h.store.connection.execute(
+            "SELECT state,payload_json FROM coordination_messages WHERE id=?",
+            (int(dispatched[0]["message_id"]),),
+        ).fetchone()
+        payload = json.loads(message["payload_json"])
+        self.assertEqual("PREPARED", message["state"])
+        self.assertTrue(
+            any(
+                "Docker endpoint provenance" in evidence
+                for evidence in payload["requested_evidence"]
+            )
+        )
+
     def test_supervisor_picks_up_one_exact_staged_receipt_after_terminal(self) -> None:
         self.h.seed([1])
         plan = self.h.plan(1)

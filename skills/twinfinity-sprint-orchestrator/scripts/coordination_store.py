@@ -255,10 +255,12 @@ NOTICE_MUTATION_OPERATION = re.compile(
     r"\s+[A-Za-z][A-Za-z0-9-]*\b"
     r"|\bgh\b(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*"
     r"\s+[A-Za-z][A-Za-z0-9-]*\b"
-    r"|\bdocker\b(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*"
-    r"\s+(?:compose\s+)?[A-Za-z][A-Za-z0-9-]*\b"
     r"|\b(?:kubectl|gcloud|supabase|curl|wget|rm|mv)\b"
     r")"
+)
+NOTICE_DOCKER_OPERATION = re.compile(
+    r"\bdocker\b(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*"
+    r"\s+(?:compose\s+)?[A-Za-z][A-Za-z0-9-]*\b"
 )
 NOTICE_FACTUAL_REMAINDER = re.compile(
     r"(?i)^\s+(?:was|were|is|are|has|have|had|did|does|do|remains?|"
@@ -846,13 +848,14 @@ def _normalized_notice_key(value: str) -> str:
 
 
 def _notice_string_is_command(value: str) -> bool:
-    for match in NOTICE_MUTATION_OPERATION.finditer(value):
-        remainder = value[match.end() :]
-        sentence = re.split(r"[.\n]", remainder, maxsplit=1)[0]
-        if NOTICE_AUTHORITY_WORD.search(sentence):
-            return True
-        if not NOTICE_FACTUAL_REMAINDER.match(remainder):
-            return True
+    for operation_pattern in (NOTICE_MUTATION_OPERATION, NOTICE_DOCKER_OPERATION):
+        for match in operation_pattern.finditer(value):
+            remainder = value[match.end() :]
+            sentence = re.split(r"[.\n]", remainder, maxsplit=1)[0]
+            if NOTICE_AUTHORITY_WORD.search(sentence):
+                return True
+            if not NOTICE_FACTUAL_REMAINDER.match(remainder):
+                return True
     return False
 
 
