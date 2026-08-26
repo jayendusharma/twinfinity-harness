@@ -71,6 +71,7 @@ DEVELOPMENT_UUID = "22222222-2222-4222-8222-222222222222"
 SRE_UUID = "33333333-3333-4333-8333-333333333333"
 DEVELOPMENT_ENDPOINT = "role.development.v4"
 DEVELOPMENT_V3_ENDPOINT = "role.development.v3"
+DEVELOPMENT_V6_ENDPOINT = "role.development.v6"
 SRE_ENDPOINT = "role.sre.v4"
 PLANNER_ENDPOINT = "role.planner.v2"
 LEASE = "5" * 64
@@ -354,6 +355,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             "twinfinity-planner-v2",
             "twinfinity-development-v3",
             "twinfinity-development-v4",
+            "twinfinity-development-v6",
             "twinfinity-sre-v3",
             "twinfinity-sre-v4",
         ):
@@ -373,25 +375,25 @@ class ExecutorRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(RegistryError, "REGISTRY_PROFILE_DIGEST_MISMATCH"):
             load_registry_config(CONFIG, codex_home=mismatched_home)
 
-    def test_actual_v3_launch_preflight_requires_only_selected_current_profile(self) -> None:
+    def test_actual_v6_launch_preflight_requires_only_selected_current_profile(self) -> None:
         # Exercise the real runner and registry loaders; the suite-level v4
         # fixture mocks would otherwise hide ambient profile loading.
         self.runner_registry_loader.stop()
         self.registry_loader.stop()
-        selected_home = Path(self.temp.name) / "selected-v3-codex-home"
+        selected_home = Path(self.temp.name) / "selected-v6-codex-home"
         selected_home.mkdir(mode=0o700)
-        selected_profile = selected_home / "twinfinity-development-v3.config.toml"
+        selected_profile = selected_home / "twinfinity-development-v6.config.toml"
         selected_profile.write_bytes(
             (ROOT / "references" / selected_profile.name).read_bytes()
         )
-        production_root = Path(self.temp.name) / "production-v3"
+        production_root = Path(self.temp.name) / "production-v6"
         production_root.mkdir(mode=0o700)
         production = CoordinationStore(production_root / "state.sqlite3")
         try:
             with patch.dict(os.environ, {"CODEX_HOME": str(selected_home)}):
                 config = load_registry_config(
                     PRODUCTION_CONFIG,
-                    selected_current_endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                    selected_current_endpoint_id=DEVELOPMENT_V6_ENDPOINT,
                 )
                 aliases, alias_sha = load_legacy_alias_fixture(ALIASES)
                 plan = build_plan(
@@ -403,7 +405,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                 apply_plan(
                     production.connection,
                     plan=plan,
-                    operation_key="selected-v3-launch-preflight",
+                    operation_key="selected-v6-launch-preflight",
                     expected_plan_sha256=plan["plan_sha256"],
                     now="2026-08-25T22:00:00Z",
                 )
@@ -411,7 +413,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                     repository=REPOSITORY,
                     object_kind="issue",
                     object_number=92,
-                    payload={"number": 92, "title": "selected v3 launch"},
+                    payload={"number": 92, "title": "selected v6 launch"},
                     source_updated_at="2026-08-25T22:00:00Z",
                     fetched_at="2026-08-25T22:00:01Z",
                 )
@@ -420,7 +422,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                     with registry_config_scope(config):
                         return production.enqueue_message(
                             idempotency_key=key,
-                            recipient_session_id=DEVELOPMENT_V3_ENDPOINT,
+                            recipient_session_id=DEVELOPMENT_V6_ENDPOINT,
                             topic="coordination.notice",
                             payload={
                                 "source": {
@@ -431,24 +433,24 @@ class ExecutorRegistryTests(unittest.TestCase):
                                 },
                                 "notice_kind": "status",
                                 "mutation_authority": False,
-                                "subject": "Selected v3 profile preflight",
+                                "subject": "Selected v6 profile preflight",
                                 "summary": "Launch from a selected-profile-only CODEX_HOME.",
                                 "evidence": {},
                             },
                             now="2026-08-25T22:00:02Z",
                         )
 
-                message_id = enqueue("selected-v3-positive")
+                message_id = enqueue("selected-v6-positive")
 
                 def complete_target(_command, **_kwargs):
                     production.claim_message(
                         message_id,
-                        DEVELOPMENT_V3_ENDPOINT,
+                        DEVELOPMENT_V6_ENDPOINT,
                         "2026-08-25T22:00:03Z",
                     )
                     production.complete_message(
                         message_id,
-                        DEVELOPMENT_V3_ENDPOINT,
+                        DEVELOPMENT_V6_ENDPOINT,
                         "2026-08-25T22:00:04Z",
                     )
                     return _ImmediateProcess()
@@ -457,10 +459,10 @@ class ExecutorRegistryTests(unittest.TestCase):
                     production.connection,
                     config_path=PRODUCTION_CONFIG,
                     role="development",
-                    endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                    endpoint_id=DEVELOPMENT_V6_ENDPOINT,
                     target_kind="message",
                     target_key=str(message_id),
-                    prompt="Inspect the selected current v3 target.",
+                    prompt="Inspect the selected current v6 target.",
                     systemd_invocation_id=INVOCATION_ID,
                     systemd_evidence=systemd_evidence(
                         target_key=str(message_id)
@@ -469,18 +471,24 @@ class ExecutorRegistryTests(unittest.TestCase):
                 )
                 self.assertEqual("COMPLETE", result["state"])
 
-                wrong_endpoint_message_id = enqueue("selected-v3-wrong-endpoint")
+                rollback_profile = (
+                    selected_home / "twinfinity-development-v3.config.toml"
+                )
+                rollback_profile.write_bytes(
+                    (ROOT / "references" / rollback_profile.name).read_bytes()
+                )
+                wrong_endpoint_message_id = enqueue("selected-v6-wrong-endpoint")
                 attempt_count = production.connection.execute(
                     "SELECT COUNT(*) FROM executor_attempts"
                 ).fetchone()[0]
                 with self.assertRaisesRegex(
-                    RegistryError, "REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT"
+                    RegistryError, "EXECUTOR_CONFIG_ENDPOINT_MISMATCH"
                 ):
                     execute_role(
                         production.connection,
                         config_path=PRODUCTION_CONFIG,
                         role="development",
-                        endpoint_id="role.development.v4",
+                        endpoint_id=DEVELOPMENT_V3_ENDPOINT,
                         target_kind="message",
                         target_key=str(wrong_endpoint_message_id),
                         prompt="Reject a noncurrent endpoint selection.",
@@ -497,7 +505,7 @@ class ExecutorRegistryTests(unittest.TestCase):
                     ).fetchone()[0],
                 )
 
-                rejected_message_id = enqueue("selected-v3-negative")
+                rejected_message_id = enqueue("selected-v6-negative")
                 selected_profile.write_bytes(selected_profile.read_bytes() + b"\n")
                 attempt_count = production.connection.execute(
                     "SELECT COUNT(*) FROM executor_attempts"
@@ -509,10 +517,10 @@ class ExecutorRegistryTests(unittest.TestCase):
                         production.connection,
                         config_path=PRODUCTION_CONFIG,
                         role="development",
-                        endpoint_id=DEVELOPMENT_V3_ENDPOINT,
+                        endpoint_id=DEVELOPMENT_V6_ENDPOINT,
                         target_kind="message",
                         target_key=str(rejected_message_id),
-                        prompt="Reject a changed selected current v3 profile.",
+                        prompt="Reject a changed selected current v6 profile.",
                         systemd_invocation_id=INVOCATION_ID,
                         systemd_evidence=systemd_evidence(
                             target_key=str(rejected_message_id)
@@ -1523,17 +1531,19 @@ class ExecutorRegistryTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_v3_launch_v4_cutover_launch_rollback_and_v3_launch(self) -> None:
-        # This activation/rollback boundary must load each selected catalog,
-        # rather than the generic fixture config injected for unrelated tests.
+    def test_v3_to_v6_cutover_launch_and_exact_v3_rollback(self) -> None:
+        # This activation boundary must load the real source-current v6 catalog,
+        # rather than the generic v4 fixture injected for unrelated tests.
         self.runner_registry_loader.stop()
+        self.registry_loader.stop()
+        v6_config = load_registry_config(PRODUCTION_CONFIG)
         source = self.snapshot()
         now = "2026-08-24T09:00:00Z"
-        for endpoint in self.config.endpoints.values():
+        for endpoint in v6_config.endpoints.values():
             _verify_or_insert_endpoint(self.store.connection, endpoint.payload, now)
         initial = {
             "planner": PLANNER_ENDPOINT,
-            "development": "role.development.v3",
+            "development": DEVELOPMENT_V3_ENDPOINT,
             "sre": "role.sre.v3",
         }
         for role, endpoint_id in initial.items():
@@ -1548,9 +1558,9 @@ class ExecutorRegistryTests(unittest.TestCase):
 
         observed_profiles: list[str] = []
 
-        def launch(endpoint_id: str, suffix: str) -> None:
+        def launch(endpoint_id: str, key: str, expected_profile: str) -> None:
             message_id = self.store.enqueue_message(
-                idempotency_key=f"endpoint-rollback-{suffix}",
+                idempotency_key=key,
                 recipient_session_id=endpoint_id,
                 topic="coordination.notice",
                 payload={
@@ -1566,34 +1576,29 @@ class ExecutorRegistryTests(unittest.TestCase):
                     "summary": "Validate an immutable endpoint runtime profile.",
                     "evidence": {},
                 },
-                now=f"2026-08-24T10:00:0{suffix}Z",
+                now="2026-08-24T10:00:03Z",
             )
 
             def succeed(command, **_kwargs):
                 observed_profiles.append(command[command.index("--profile") + 1])
                 self.store.claim_message(
-                    message_id, endpoint_id, f"2026-08-24T10:00:1{suffix}Z"
+                    message_id, endpoint_id, "2026-08-24T10:00:04Z"
                 )
                 self.store.complete_message(
-                    message_id, endpoint_id, f"2026-08-24T10:00:2{suffix}Z"
+                    message_id, endpoint_id, "2026-08-24T10:00:05Z"
                 )
                 return _ImmediateProcess()
 
-            selected_config = (
-                PRODUCTION_CONFIG
-                if endpoint_id == "role.development.v3"
-                else CONFIG
-            )
             self.assertEqual(
                 endpoint_id,
                 load_registry_config(
-                    selected_config,
+                    PRODUCTION_CONFIG,
                     selected_current_endpoint_id=endpoint_id,
                 ).roles["development"].endpoint_id,
             )
             result = execute_role(
                 self.store.connection,
-                config_path=selected_config,
+                config_path=PRODUCTION_CONFIG,
                 role="development",
                 endpoint_id=endpoint_id,
                 target_kind="message",
@@ -1604,11 +1609,11 @@ class ExecutorRegistryTests(unittest.TestCase):
                 popen=succeed,
             )
             self.assertEqual("COMPLETE", result["state"])
+            self.assertEqual(expected_profile, observed_profiles[-1])
 
-        launch("role.development.v3", "1")
         plan = build_plan(
             self.store.connection,
-            self.config,
+            v6_config,
             self.aliases,
             alias_fixture_sha256=self.alias_sha,
         )
@@ -1619,21 +1624,54 @@ class ExecutorRegistryTests(unittest.TestCase):
             expected_plan_sha256=plan["plan_sha256"],
             now="2026-08-24T10:00:02Z",
         )
-        launch(DEVELOPMENT_ENDPOINT, "3")
+        cutover_pointers = {
+            row["role"]: (row["endpoint_id"], int(row["pointer_version"]))
+            for row in self.store.connection.execute(
+                "SELECT role,endpoint_id,pointer_version "
+                "FROM executor_role_endpoint_current"
+            )
+        }
+        self.assertEqual((DEVELOPMENT_V6_ENDPOINT, 2), cutover_pointers["development"])
+        self.assertEqual((PLANNER_ENDPOINT, 1), cutover_pointers["planner"])
+        self.assertEqual(("role.sre.v3", 1), cutover_pointers["sre"])
+        launch(
+            DEVELOPMENT_V6_ENDPOINT,
+            "endpoint-v6-cutover",
+            "twinfinity-development-v6",
+        )
         rolled_back = rollback_change(
             self.store.connection,
             change_id=applied["change_id"],
             expected_version=1,
-            now="2026-08-24T10:00:04Z",
+            now="2026-08-24T10:00:06Z",
         )
         self.assertEqual("ROLLED_BACK", rolled_back["state"])
-        launch("role.development.v3", "5")
+        rollback_pointers = {
+            row["role"]: (row["endpoint_id"], int(row["pointer_version"]))
+            for row in self.store.connection.execute(
+                "SELECT role,endpoint_id,pointer_version "
+                "FROM executor_role_endpoint_current"
+            )
+        }
+        self.assertEqual((DEVELOPMENT_V3_ENDPOINT, 3), rollback_pointers["development"])
+        self.assertEqual((PLANNER_ENDPOINT, 1), rollback_pointers["planner"])
+        self.assertEqual(("role.sre.v3", 1), rollback_pointers["sre"])
+        rollback_endpoint = v6_config.endpoints[DEVELOPMENT_V3_ENDPOINT]
         self.assertEqual(
-            [
-                "twinfinity-development-v3",
-                "twinfinity-development-v4",
-                "twinfinity-development-v3",
-            ],
+            "twinfinity-development-v3", rollback_endpoint.runtime_codex_profile
+        )
+        stored_rollback = self.store.connection.execute(
+            "SELECT config_sha256 FROM executor_role_endpoints WHERE endpoint_id=?",
+            (DEVELOPMENT_V3_ENDPOINT,),
+        ).fetchone()
+        self.assertEqual(rollback_endpoint.config_sha256, stored_rollback[0])
+        launch(
+            DEVELOPMENT_V3_ENDPOINT,
+            "endpoint-v3-after-rollback",
+            "twinfinity-development-v3",
+        )
+        self.assertEqual(
+            ["twinfinity-development-v6", "twinfinity-development-v3"],
             observed_profiles,
         )
 

@@ -83,6 +83,7 @@ COMMON_ROLE_KEYS = {
 PROFILED_ROLE_KEYS = COMMON_ROLE_KEYS | {"profile_sha256"}
 BROKERED_ROLE_KEYS = PROFILED_ROLE_KEYS | {"execution_protocol"}
 BROKERED_READINESS_PROTOCOL = "readiness/v1"
+RUNTIME_ROLLBACK_ENDPOINT_IDS = frozenset({"role.development.v3"})
 EXPECTED_CODEX_PROFILES = {
     "planner": "twinfinity-planner",
     "development": "twinfinity-development",
@@ -685,7 +686,7 @@ def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
         )
         or (
             role in {"development", "sre"}
-            and version >= 5
+            and version == 5
             and execution_protocol != BROKERED_READINESS_PROTOCOL
         )
         or (role == "planner" and execution_protocol is not None)
@@ -824,14 +825,26 @@ def load_registry_config(
         raise RegistryError("REGISTRY_PROFILE_NOT_EXCLUSIVE")
     if profile_validation_scope not in {"current", "catalog"}:
         raise RegistryError("REGISTRY_PROFILE_VALIDATION_SCOPE_INVALID")
+    runtime_roles = roles
     if selected_current_endpoint_id is not None:
         selected = endpoints.get(selected_current_endpoint_id)
+        source_current = (
+            selected is not None
+            and roles[selected.role].endpoint_id == selected_current_endpoint_id
+        )
         if (
             profile_validation_scope != "current"
             or selected is None
-            or roles[selected.role].endpoint_id != selected_current_endpoint_id
+            or selected_current_endpoint_id in staged_endpoint_ids
+            or (
+                not source_current
+                and selected_current_endpoint_id
+                not in RUNTIME_ROLLBACK_ENDPOINT_IDS
+            )
         ):
             raise RegistryError("REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT")
+        runtime_roles = dict(roles)
+        runtime_roles[selected.role] = selected
         profiled_endpoints = {selected_current_endpoint_id: selected}
     elif profile_validation_scope == "catalog":
         profiled_endpoints = endpoints
@@ -856,7 +869,7 @@ def load_registry_config(
     )
     return RegistryConfig(
         schema_version=2,
-        roles=roles,
+        roles=runtime_roles,
         endpoints=endpoints,
         staged_endpoint_ids=tuple(sorted(staged_endpoint_ids)),
         source_sha256=hashlib.sha256(raw).hexdigest(),
