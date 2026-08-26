@@ -366,7 +366,13 @@ class Harness:
         ).fetchone()
         if pickup["state"] != "HOLD":
             raise AssertionError(f"expected terminal HOLD, got {pickup['state']}")
-        return dict(current)
+        return {**dict(current), "planner_message_id": pickup["planner_message_id"]}
+
+    def complete_planner_notice(self, hold: dict) -> None:
+        planner = self.endpoints["planner"]
+        message_id = int(hold["planner_message_id"])
+        self.store.claim_message(message_id, planner, "2026-08-25T05:01:30Z")
+        self.store.complete_message(message_id, planner, "2026-08-25T05:01:31Z")
 
     def advance_generation(self, *, accepted_main: str = MAIN) -> dict:
         prior = self.store.connection.execute(
@@ -453,6 +459,7 @@ class KanbanReadinessTests(unittest.TestCase):
 
     def test_terminal_hold_reopens_only_to_new_bound_prepared_generation(self) -> None:
         hold = self.h.terminal_hold()
+        self.h.complete_planner_notice(hold)
         old_gates = [
             tuple(row)
             for row in self.h.store.connection.execute(
@@ -511,6 +518,7 @@ class KanbanReadinessTests(unittest.TestCase):
 
     def test_terminal_hold_reopen_rejects_same_generation_without_mutation(self) -> None:
         hold = self.h.terminal_hold()
+        self.h.complete_planner_notice(hold)
         with self.assertRaisesRegex(
             ReadinessError, "READINESS_TERMINAL_HOLD_NEW_GENERATION_REQUIRED"
         ):
@@ -533,6 +541,7 @@ class KanbanReadinessTests(unittest.TestCase):
 
     def test_terminal_hold_reopen_requires_exact_receipt_and_current_fences(self) -> None:
         hold = self.h.terminal_hold()
+        self.h.complete_planner_notice(hold)
         self.h.advance_generation()
         for field, value, error in (
             ("campaign_id", int(hold["campaign_id"]) + 1,
@@ -611,6 +620,7 @@ class KanbanReadinessTests(unittest.TestCase):
 
     def test_terminal_hold_reopen_rejects_active_attempt(self) -> None:
         hold = self.h.terminal_hold()
+        self.h.complete_planner_notice(hold)
         self.h.advance_generation()
         with self.h.store.transaction():
             self.h.store.connection.execute(
@@ -645,11 +655,6 @@ class KanbanReadinessTests(unittest.TestCase):
     def test_terminal_hold_reopen_rejects_nonterminal_old_message(self) -> None:
         hold = self.h.terminal_hold()
         self.h.advance_generation()
-        with self.h.store.transaction():
-            self.h.store.connection.execute(
-                "UPDATE coordination_messages SET state='CLAIMED' WHERE id=?",
-                (int(hold["message_id"]),),
-            )
         with self.assertRaisesRegex(
             ReadinessError, "READINESS_TERMINAL_HOLD_MESSAGE_NONTERMINAL"
         ):
@@ -657,6 +662,7 @@ class KanbanReadinessTests(unittest.TestCase):
 
     def test_terminal_hold_reopen_rejects_binding_drift(self) -> None:
         hold = self.h.terminal_hold()
+        self.h.complete_planner_notice(hold)
         self.h.advance_generation(accepted_main="b" * 40)
         with self.assertRaisesRegex(
             ReadinessError, "READINESS_TERMINAL_HOLD_BINDING_DRIFT"
@@ -671,6 +677,7 @@ class KanbanReadinessTests(unittest.TestCase):
 
     def test_terminal_hold_reopen_cli_uses_exact_fences(self) -> None:
         hold = self.h.terminal_hold()
+        self.h.complete_planner_notice(hold)
         self.h.advance_generation()
         argv = [
             "kanban_pull_buffer.py",

@@ -2115,6 +2115,42 @@ def reopen_terminal_hold(
             raise ReadinessError("READINESS_TERMINAL_HOLD_RECEIPT_FENCE_LOST")
         if current["message_state"] not in {"COMPLETE", "HOLD"}:
             raise ReadinessError("READINESS_TERMINAL_HOLD_MESSAGE_NONTERMINAL")
+        planner_message = connection.execute(
+            """
+            SELECT state, payload_sha256, payload_json
+            FROM coordination_messages WHERE idempotency_key=?
+            """,
+            (f"kanban-readiness-planner:{expected_terminal_receipt_sha256}",),
+        ).fetchone()
+        if planner_message is None:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_MESSAGE_MISSING")
+        try:
+            planner_payload = json.loads(
+                str(planner_message["payload_json"]),
+                object_pairs_hook=_strict_object,
+            )
+        except (TypeError, json.JSONDecodeError, ReadinessError) as exc:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_MESSAGE_BINDING_DRIFT") from exc
+        planner_evidence = planner_payload.get("evidence")
+        planner_source = planner_payload.get("source")
+        if (
+            digest_json(planner_payload) != planner_message["payload_sha256"]
+            or not isinstance(planner_evidence, dict)
+            or not isinstance(planner_source, dict)
+            or planner_evidence.get("readiness_plan_sha256")
+            != current["plan_sha256"]
+            or planner_evidence.get("readiness_receipt_sha256")
+            != expected_terminal_receipt_sha256
+            or planner_evidence.get("verdict") != "TERMINAL_HOLD"
+            or planner_source.get("repository") != repository
+            or planner_source.get("object_kind") != "issue"
+            or planner_source.get("object_number") != issue_number
+            or planner_source.get("payload_sha256")
+            != current["source_payload_sha256"]
+        ):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_MESSAGE_BINDING_DRIFT")
+        if planner_message["state"] not in {"COMPLETE", "HOLD"}:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_MESSAGE_NONTERMINAL")
         if current["attempt_state"] not in {"COMPLETE", "HOLD", "LAUNCH_FAILED"}:
             raise ReadinessError("READINESS_TERMINAL_HOLD_ATTEMPT_ACTIVE")
         active_attempt = connection.execute(
