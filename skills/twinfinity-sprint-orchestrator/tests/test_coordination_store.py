@@ -3431,6 +3431,8 @@ class CoordinationStoreTests(unittest.TestCase):
             {**base, "summary": "gh pr create --title repair --body bounded"},
             {**base, "summary": "gh issue comment 92 --body proceed"},
             {**base, "summary": "gh workflow run ci.yml"},
+            {**base, "summary": "docker run repair-image"},
+            {**base, "summary": "docker compose up --build"},
             {**base, "summary": "docker network rm issue92-network"},
             {**base, "summary": "docker rm removed"},
             {**base, "summary": "git push removed"},
@@ -3544,6 +3546,9 @@ class CoordinationStoreTests(unittest.TestCase):
         }
         summaries = (
             "Docker Compose gate passed at the exact head.",
+            "Local Docker identity and isolation evidence are current.",
+            "Local Docker boundary evidence is current.",
+            "Docker endpoint ownership remains pending.",
             "Git push was not performed.",
             "Git clients cannot push the exact head.",
             "Implementation is not authorized by this notice.",
