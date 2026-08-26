@@ -32,6 +32,7 @@ REPOSITORY = "twinfinityai/twinfinityapp"
 DEVELOPMENT_V3 = "role.development.v3"
 DEVELOPMENT_V6 = "role.development.v6"
 SRE_V3 = "role.sre.v3"
+SRE_V6 = "role.sre.v6"
 NOW = "2026-08-26T08:45:00Z"
 APPLY_NOW = "2026-08-26T08:46:00Z"
 ROLLBACK_NOW = "2026-08-26T08:47:00Z"
@@ -182,22 +183,28 @@ class CurrentEndpointOwnerRotationTests(unittest.TestCase):
         )
         plan = self._plan()
         self.assertEqual(
-            [("development", DEVELOPMENT_V3, DEVELOPMENT_V6)],
+            [
+                ("development", DEVELOPMENT_V3, DEVELOPMENT_V6),
+                ("sre", SRE_V3, SRE_V6),
+            ],
             [
                 (change["role"], change["before_endpoint_id"], change["after_endpoint_id"])
                 for change in plan["pointer_changes"]
                 if change["before_endpoint_id"] != change["after_endpoint_id"]
             ],
         )
-        self.assertEqual({328, 329}, {row["issue_number"] for row in plan["item_changes"]})
         self.assertEqual(
-            {"watch-328", "watch-329"},
+            {320, 328, 329},
+            {row["issue_number"] for row in plan["item_changes"]},
+        )
+        self.assertEqual(
+            {"watch-320", "watch-328", "watch-329"},
             {row["watch_key"] for row in plan["watch_changes"]},
         )
 
-        applied = self._migrate(plan, "development-v6-owner-rotation")
+        applied = self._migrate(plan, "execution-v6-owner-rotation")
         self.assertEqual(applied["change_id"], self._migrate(
-            plan, "development-v6-owner-rotation"
+            plan, "execution-v6-owner-rotation"
         )["change_id"])
         for issue in (328, 329):
             after = dict(self.connection.execute(
@@ -220,11 +227,30 @@ class CurrentEndpointOwnerRotationTests(unittest.TestCase):
                 "admission_payload_sha256", "claim_attempt_id",
             ):
                 self.assertEqual(before_watches[key][field], after[field])
-        for issue in (320, 330):
+        after_320 = dict(self.connection.execute(
+            "SELECT * FROM coordination_items WHERE issue_number=320"
+        ).fetchone())
+        self.assertEqual(SRE_V6, after_320["accountable_session_id"])
+        self.assertEqual(before_items[320]["version"] + 1, after_320["version"])
+        for field in (
+            "status", "allocation_class", "generation", "lease_manifest_sha256",
+            "development_units", "shared_units", "sre_units", "source_payload_sha256",
+        ):
+            self.assertEqual(before_items[320][field], after_320[field])
+        after_watch_320 = dict(self.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key='watch-320'"
+        ).fetchone())
+        self.assertEqual(SRE_V6, after_watch_320["accountable_session_id"])
+        for field in (
+            "lease_manifest_sha256", "state", "admission_message_id",
+            "admission_payload_sha256", "claim_attempt_id",
+        ):
+            self.assertEqual(before_watches["watch-320"][field], after_watch_320[field])
+        for issue in (330,):
             self.assertEqual(before_items[issue], dict(self.connection.execute(
                 "SELECT * FROM coordination_items WHERE issue_number=?", (issue,)
             ).fetchone()))
-        for key in ("watch-320", "watch-330"):
+        for key in ("watch-330",):
             self.assertEqual(before_watches[key], dict(self.connection.execute(
                 "SELECT * FROM coordination_terminal_watches WHERE watch_key=?", (key,)
             ).fetchone()))
@@ -253,11 +279,25 @@ class CurrentEndpointOwnerRotationTests(unittest.TestCase):
             ).fetchone()),
         )
         self.assertEqual(
+            (SRE_V3, 3),
+            tuple(self.connection.execute(
+                "SELECT endpoint_id,pointer_version FROM executor_role_endpoint_current "
+                "WHERE role='sre'"
+            ).fetchone()),
+        )
+        self.assertEqual(
             {DEVELOPMENT_V3},
             {row[0] for row in self.connection.execute(
                 "SELECT accountable_session_id FROM coordination_items "
                 "WHERE issue_number IN (328,329)"
             )},
+        )
+        self.assertEqual(
+            SRE_V3,
+            self.connection.execute(
+                "SELECT accountable_session_id FROM coordination_items "
+                "WHERE issue_number=320"
+            ).fetchone()[0],
         )
 
     def test_plan_digest_and_forward_cas_fail_closed(self) -> None:
@@ -305,6 +345,13 @@ class CurrentEndpointOwnerRotationTests(unittest.TestCase):
             tuple(self.connection.execute(
                 "SELECT endpoint_id,pointer_version FROM executor_role_endpoint_current "
                 "WHERE role='development'"
+            ).fetchone()),
+        )
+        self.assertEqual(
+            (SRE_V6, 2),
+            tuple(self.connection.execute(
+                "SELECT endpoint_id,pointer_version FROM executor_role_endpoint_current "
+                "WHERE role='sre'"
             ).fetchone()),
         )
         self.assertEqual(

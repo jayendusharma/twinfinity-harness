@@ -29,7 +29,7 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"])
 EXPECTED_ENDPOINTS = {
     "planner": ("role.planner.v2", 2),
     "development": ("role.development.v6", 6),
-    "sre": ("role.sre.v3", 3),
+    "sre": ("role.sre.v6", 6),
 }
 class RuntimeProfileCutoverTests(unittest.TestCase):
     def audit_command(self, *extra: str) -> list[str]:
@@ -66,17 +66,11 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 {
                     "planner": "role.planner.v2",
                     "development": "role.development.v6",
-                    "sre": "role.sre.v3",
+                    "sre": "role.sre.v6",
                 },
                 result["endpoints"],
             )
-            self.assertEqual(
-                [
-                    "role.sre.v4",
-                    "role.sre.v5",
-                ],
-                result["staged_endpoints"],
-            )
+            self.assertEqual([], result["staged_endpoints"])
             self.assertFalse(absent_codex_home.exists())
 
     def test_v6_is_direct_and_v5_alone_is_broker_only(self) -> None:
@@ -85,73 +79,79 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        direct_v6 = registry["roles"]["development"]
-        self.assertIsNone(
-            _parse_endpoint_config("development", direct_v6).execution_protocol
-        )
-        brokered_v5 = next(
-            endpoint
-            for endpoint in registry["historical_endpoints"]
-            if endpoint["endpoint_id"] == "role.development.v5"
-        )
-        brokered_payload = {
-            key: value for key, value in brokered_v5.items() if key != "role"
-        }
-        self.assertEqual(
-            "readiness/v1",
-            _parse_endpoint_config(
-                "development", brokered_payload
-            ).execution_protocol,
-        )
-        with self.assertRaisesRegex(RegistryError, "REGISTRY_CONFIG_ROLE_INVALID"):
-            _parse_endpoint_config(
-                "development",
-                {
+        for role in ("development", "sre"):
+            with self.subTest(role=role):
+                direct_v6 = registry["roles"][role]
+                self.assertIsNone(
+                    _parse_endpoint_config(role, direct_v6).execution_protocol
+                )
+                brokered_v5 = next(
+                    endpoint
+                    for endpoint in registry["historical_endpoints"]
+                    if endpoint["endpoint_id"] == f"role.{role}.v5"
+                )
+                brokered_payload = {
                     key: value
-                    for key, value in brokered_payload.items()
-                    if key != "execution_protocol"
-                },
-            )
-        with self.assertRaisesRegex(RegistryError, "REGISTRY_CONFIG_ROLE_INVALID"):
-            _parse_endpoint_config(
-                "development",
-                {**direct_v6, "execution_protocol": "readiness/v1"},
-            )
+                    for key, value in brokered_v5.items()
+                    if key != "role"
+                }
+                self.assertEqual(
+                    "readiness/v1",
+                    _parse_endpoint_config(
+                        role, brokered_payload
+                    ).execution_protocol,
+                )
+                with self.assertRaisesRegex(
+                    RegistryError, "REGISTRY_CONFIG_ROLE_INVALID"
+                ):
+                    _parse_endpoint_config(
+                        role,
+                        {
+                            key: value
+                            for key, value in brokered_payload.items()
+                            if key != "execution_protocol"
+                        },
+                    )
+                with self.assertRaisesRegex(
+                    RegistryError, "REGISTRY_CONFIG_ROLE_INVALID"
+                ):
+                    _parse_endpoint_config(
+                        role,
+                        {**direct_v6, "execution_protocol": "readiness/v1"},
+                    )
 
     def test_runtime_selection_allows_v6_and_v3_but_rejects_v4_and_v5(self) -> None:
         config_path = ROOT / "references" / "twinfinity-executor-registry.toml"
-        for endpoint_id, accepted in (
-            ("role.development.v6", True),
-            ("role.development.v3", True),
-            ("role.development.v4", False),
-            ("role.development.v5", False),
-        ):
-            version = endpoint_id.rsplit("v", 1)[1]
-            with self.subTest(endpoint_id=endpoint_id), tempfile.TemporaryDirectory() as temporary:
-                codex_home = Path(temporary) / "codex-home"
-                codex_home.mkdir(mode=0o700)
-                profile = f"twinfinity-development-v{version}.config.toml"
-                shutil.copy2(ROOT / "references" / profile, codex_home / profile)
-                if accepted:
-                    loaded = load_registry_config(
-                        config_path,
-                        codex_home=codex_home,
-                        profile_template_root=ROOT / "references",
-                        selected_current_endpoint_id=endpoint_id,
-                    )
-                    self.assertEqual(
-                        endpoint_id, loaded.roles["development"].endpoint_id
-                    )
+        for role in ("development", "sre"):
+            for version, accepted in ((6, True), (3, True), (4, False), (5, False)):
+                endpoint_id = f"role.{role}.v{version}"
+                profile = f"twinfinity-{role}-v{version}.config.toml"
+                if role == "development":
+                    profile = f"twinfinity-development-v{version}.config.toml"
                 else:
-                    with self.assertRaisesRegex(
-                        RegistryError, "REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT"
-                    ):
-                        load_registry_config(
+                    profile = f"twinfinity-sre-v{version}.config.toml"
+                with self.subTest(endpoint_id=endpoint_id), tempfile.TemporaryDirectory() as temporary:
+                    codex_home = Path(temporary) / "codex-home"
+                    codex_home.mkdir(mode=0o700)
+                    shutil.copy2(ROOT / "references" / profile, codex_home / profile)
+                    if accepted:
+                        loaded = load_registry_config(
                             config_path,
                             codex_home=codex_home,
                             profile_template_root=ROOT / "references",
                             selected_current_endpoint_id=endpoint_id,
                         )
+                        self.assertEqual(endpoint_id, loaded.roles[role].endpoint_id)
+                    else:
+                        with self.assertRaisesRegex(
+                            RegistryError, "REGISTRY_PROFILE_ENDPOINT_NOT_CURRENT"
+                        ):
+                            load_registry_config(
+                                config_path,
+                                codex_home=codex_home,
+                                profile_template_root=ROOT / "references",
+                                selected_current_endpoint_id=endpoint_id,
+                            )
 
     def test_profile_root_rejects_symlink_and_world_writable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -295,7 +295,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             for profile in (
                 "twinfinity-planner-v2.config.toml",
                 "twinfinity-development-v6.config.toml",
-                "twinfinity-sre-v3.config.toml",
+                "twinfinity-sre-v6.config.toml",
             ):
                 shutil.copy2(ROOT / "references" / profile, codex_home / profile)
             config = load_registry_config(
@@ -306,7 +306,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 {
                     "role.planner.v2",
                     "role.development.v6",
-                    "role.sre.v3",
+                    "role.sre.v6",
                 },
                 {
                     endpoint.endpoint_id for endpoint in config.roles.values()
@@ -353,6 +353,10 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
         self.assertEqual(
             "twinfinity-development-v6",
             loaded.roles["development"].runtime_codex_profile,
+        )
+        self.assertEqual(
+            "twinfinity-sre-v6",
+            loaded.roles["sre"].runtime_codex_profile,
         )
         for role in ("planner", "development", "sre"):
             endpoint = registry["roles"][role]
@@ -404,9 +408,9 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                     self.assertIn("fresh bounded Twinfinity", instructions)
                     if role == "development":
                         self.assertIn("SQLite coordination rows", instructions)
-                        self.assertEqual("auto_review", profile["approvals_reviewer"])
                     else:
                         self.assertIn("hosted authority", instructions)
+                    self.assertEqual("auto_review", profile["approvals_reviewer"])
                 command = endpoint["command_prefix"]
                 self.assertEqual(profile_name, command[command.index("--profile") + 1])
 
@@ -419,18 +423,30 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 "role.development.v3",
                 "role.development.v4",
                 "role.development.v5",
+                "role.sre.v3",
+                "role.sre.v4",
+                "role.sre.v5",
             },
             set(historical),
+        )
+        self.assertEqual(
+            {
+                "role.sre.v3": "918c0564b39d28d7776a9b3e4fb7b040b0de2935ad5e8a98099650e6c5ced7f0",
+                "role.sre.v4": "2257302ec8dafb3ad7f45018b28b98e6a120344f0fab1cc9ae81037639edd5e7",
+                "role.sre.v5": "010e8df7de6a99bf13f455cb915dec88f30100f221ff3f957f7a574edf8b0b17",
+            },
+            {
+                endpoint_id: endpoint["profile_sha256"]
+                for endpoint_id, endpoint in historical.items()
+                if endpoint_id.startswith("role.sre.")
+            },
         )
         staged = {
             endpoint["endpoint_id"]: endpoint
             for endpoint in registry["staged_endpoints"]
         }
         self.assertEqual(
-            {
-                "role.sre.v4",
-                "role.sre.v5",
-            },
+            set(),
             set(staged),
         )
         for endpoint in (*historical.values(), *staged.values()):

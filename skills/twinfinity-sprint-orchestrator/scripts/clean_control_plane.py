@@ -47,11 +47,7 @@ SCHEMA = "twinfinity-clean-control-plane-bootstrap/v1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-EXPECTED_ENDPOINTS = {
-    "planner": "role.planner.v2",
-    "development": "role.development.v6",
-    "sre": "role.sre.v3",
-}
+ROLE_NAMES = frozenset({"planner", "development", "sre"})
 SOURCE_HARNESS_REPOSITORY = "jayendusharma/twinfinity-harness"
 STRANDED_IDENTITIES = {
     328: (2, "c448fd19-40a6-4511-bdf7-9ca7bbbb2788"),
@@ -590,7 +586,7 @@ def _validate_manifest_closed(
         role = profile["role"]
         endpoint_id = profile["endpoint_id"]
         if (
-            role not in EXPECTED_ENDPOINTS
+            role not in ROLE_NAMES
             or not isinstance(endpoint_id, str)
             or endpoint_id in declared_profiles
             or profile["path"] in declared_profile_paths
@@ -625,7 +621,7 @@ def _validate_manifest_closed(
     except RegistryError as exc:
         raise CleanControlPlaneError(str(exc)) from exc
     current = {role: endpoint.endpoint_id for role, endpoint in config.roles.items()}
-    if current != EXPECTED_ENDPOINTS or manifest["current_endpoints"] != EXPECTED_ENDPOINTS:
+    if manifest["current_endpoints"] != current:
         raise CleanControlPlaneError("BOOTSTRAP_CURRENT_ENDPOINTS_INVALID")
     expected_profiles = {
         endpoint_id: (
@@ -715,7 +711,7 @@ def _validate_manifest_closed(
             retained["issue_number"] != 320
             or type(retained["generation"]) is not int
             or retained["generation"] < 0
-            or retained["accountable_endpoint_id"] != "role.sre.v3"
+            or retained["accountable_endpoint_id"] != current["sre"]
             or retained["development_units"] != 0
             or retained["shared_units"] != 0
             or retained["sre_units"] != 1
@@ -964,7 +960,10 @@ def validate_database(
             str(item["role"]): str(item["endpoint_id"])
             for item in connection.execute("SELECT role, endpoint_id FROM executor_role_endpoint_current")
         }
-        if pointers != EXPECTED_ENDPOINTS:
+        expected_endpoints = {
+            role: endpoint.endpoint_id for role, endpoint in config.roles.items()
+        }
+        if pointers != expected_endpoints:
             raise CleanControlPlaneError("BOOTSTRAP_CURRENT_ENDPOINTS_INVALID")
         endpoint_rows = {
             str(item["endpoint_id"]): item
@@ -1016,7 +1015,7 @@ def validate_database(
                 int(items[0]["issue_number"]) != 320,
                 items[0]["status"] != "HOLD",
                 items[0]["allocation_class"] != "RETAINED",
-                items[0]["accountable_session_id"] != "role.sre.v3",
+                items[0]["accountable_session_id"] != expected_endpoints["sre"],
                 items[0]["lease_manifest_sha256"] != retained["lease_manifest_sha256"],
                 int(items[0]["development_units"]) != 0,
                 int(items[0]["shared_units"]) != 0,

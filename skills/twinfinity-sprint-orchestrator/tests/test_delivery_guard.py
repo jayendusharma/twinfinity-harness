@@ -387,6 +387,140 @@ class DeliveryGuardTests(unittest.TestCase):
                         ),
                     )
 
+    def test_sre_v6_matches_development_v6_guarded_boundary_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / "twinfinityapp"
+            worktree = root / "twinfinityapp-issue-330"
+            unrelated = root / "twinfinityapp-issue-999"
+            for path in (canonical, worktree, unrelated):
+                path.mkdir()
+            (worktree / "frontend").mkdir()
+            (worktree / "frontend" / "vite.config.ts").touch()
+            branch = "codex/330-bounded-vitest-timeout"
+            base_sha = "a" * 40
+            escalation = {
+                "sandbox_permissions": "require_escalated",
+                "justification": "Read exact GitHub truth or use admitted Git metadata",
+            }
+            allowed = (
+                ("gh issue view 330 --repo twinfinityai/twinfinityapp", worktree),
+                (
+                    "gh api --method GET repos/twinfinityai/twinfinityapp/issues/330",
+                    worktree,
+                ),
+                ("git fetch origin main", canonical),
+                (
+                    f"gh pr create --draft --head {branch} --base main "
+                    "--repo twinfinityai/twinfinityapp",
+                    worktree,
+                ),
+            )
+            denied = (
+                ("gh issue edit 330 --title changed", worktree),
+                (
+                    "curl -X PATCH "
+                    "https://api.github.com/repos/twinfinityai/twinfinityapp",
+                    worktree,
+                ),
+                ("git push origin HEAD", worktree),
+                ("git commit -m unrelated", unrelated),
+                ("gcloud run services list", worktree),
+            )
+            for role, endpoint_id in (
+                ("development", "role.development.v6"),
+                ("sre", "role.sre.v6"),
+            ):
+                self.load_context.return_value = DeliveryContext(
+                    role=role,
+                    endpoint_id=endpoint_id,
+                    target_kind="message",
+                    target_key="1",
+                    topic=f"{role}.admission",
+                    worktree=worktree,
+                    lease_paths=frozenset(
+                        {worktree / "frontend" / "vite.config.ts"}
+                    ),
+                    repository_writes=True,
+                    canonical_checkout=canonical,
+                    branch=branch,
+                    base_sha=base_sha,
+                    repository="twinfinityai/twinfinityapp",
+                )
+                for command, workdir in allowed:
+                    with self.subTest(role=role, allowed=command):
+                        self.assertEqual(
+                            {},
+                            pre_tool(
+                                self.event(
+                                    "exec_command",
+                                    {
+                                        "cmd": command,
+                                        "workdir": str(workdir),
+                                        **escalation,
+                                    },
+                                )
+                            ),
+                        )
+                for command, workdir in denied:
+                    with self.subTest(role=role, denied=command):
+                        self.assert_denied(
+                            pre_tool(
+                                self.event(
+                                    "exec_command",
+                                    {
+                                        "cmd": command,
+                                        "workdir": str(workdir),
+                                        **escalation,
+                                    },
+                                )
+                            )
+                        )
+
+    def test_sre_readiness_notice_can_read_github_but_cannot_mutate(self) -> None:
+        self.load_context.return_value = DeliveryContext(
+            role="sre",
+            endpoint_id="role.sre.v6",
+            target_kind="message",
+            target_key="1",
+            topic="coordination.notice",
+            worktree=None,
+            lease_paths=frozenset(),
+            repository_writes=False,
+        )
+        escalation = {
+            "sandbox_permissions": "require_escalated",
+            "justification": "Read exact GitHub readiness evidence",
+        }
+        for command in (
+            "gh issue view 330 --repo twinfinityai/twinfinityapp",
+            "gh api --method GET repos/twinfinityai/twinfinityapp/issues/330",
+        ):
+            with self.subTest(allowed=command):
+                self.assertEqual(
+                    {},
+                    pre_tool(
+                        self.event(
+                            "exec_command", {"cmd": command, **escalation}
+                        )
+                    ),
+                )
+        for command in (
+            "git fetch origin main",
+            "gh issue edit 330 --title changed",
+            "gh pr create --draft",
+            "gcloud run services list",
+            "touch readiness-result.json",
+        ):
+            with self.subTest(denied=command):
+                self.assert_denied(
+                    pre_tool(
+                        self.event(
+                            "exec_command", {"cmd": command, **escalation}
+                        )
+                    )
+                )
+
     def test_native_delivery_guard_remains_scoped_to_native_controls(self) -> None:
         """The native hook guards delivery flow without disabling role capabilities."""
         native_only = (

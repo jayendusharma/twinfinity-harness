@@ -36,13 +36,13 @@ systemctl --user is-system-running
 | Endpoint registry config | `/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml` |
 | Planner current profile | `/home/ubuntu/.codex/twinfinity-planner-v2.config.toml` |
 | Development source-current profile | `/home/ubuntu/.codex/twinfinity-development-v6.config.toml` |
-| SRE current profile | `/home/ubuntu/.codex/twinfinity-sre-v3.config.toml` |
+| SRE source-current profile | `/home/ubuntu/.codex/twinfinity-sre-v6.config.toml` |
 
-Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The reviewed source catalog targets Planner v2, Development v6, and SRE v3; Development v3 remains the exact rollback endpoint and v5 alone remains broker-only. A source-catalog target is not evidence that the corresponding profile is installed or that the live pointer has moved. A current runtime launch validates only its exact selected current installed profile. An explicit catalog audit or staged activation boundary uses `executor_registry.py --profile-root <absolute-staged-reference-root> audit-config` and validates the complete catalog without reading or writing live `CODEX_HOME`. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
+Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The reviewed source catalog targets Planner v2, Development v6, and SRE v6; each execution role preserves v3 as its exact direct rollback endpoint, and v5 alone remains broker-only. A source-catalog target is not evidence that the corresponding profile is installed or that the live pointer has moved. A current runtime launch validates only its exact selected current installed profile. An explicit catalog audit or staged activation boundary uses `executor_registry.py --profile-root <absolute-staged-reference-root> audit-config` and validates the complete catalog without reading or writing live `CODEX_HOME`. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
 
 ## Clean control-plane bootstrap
 
-`scripts/clean_control_plane.py` creates only an explicit nonexisting, noncanonical database. Its closed manifest binds the reviewed source main, registry and current-profile hashes, approved goal, application main and exact GitHub snapshots, capacity authority, v2/v6/v3 pointers, optional retained #320 evidence, and an immutable old-database archive digest. `validate` is read-only and manifest-authenticated. Neither command switches the canonical database or starts timers.
+`scripts/clean_control_plane.py` creates only an explicit nonexisting, noncanonical database. Its closed manifest binds the reviewed source main, registry-declared current-profile hashes and pointers, approved goal, application main and exact GitHub snapshots, capacity authority, optional retained #320 evidence, and an immutable old-database archive digest. `validate` is read-only and manifest-authenticated. Neither command switches the canonical database or starts timers.
 
 Create the candidate in the private coordination root, validate it, then use SQLite backup to place a byte-equivalent candidate under `backups/` for the existing stopped-state `environment_restore_control.py` dry-run/apply seam. That restore keeps the former canonical database and sidecars queryable in its unique forensic directory and rolls filesystem placement back on failure. Do not drop tables or overwrite the old archive.
 
@@ -59,7 +59,7 @@ python3 scripts/clean_control_plane.py validate \
   --harness-main-sha '<exact-main-sha>'
 ```
 
-The manifest's old-control-plane disposition durably supersedes stranded readiness campaigns 1 and 2 without replaying their attempts or fabricating receipts. Omitting `retained_item` creates no retained work; when supplied, it may bind only #320 with exact SRE v3, source, lease, and registered artifact evidence.
+The manifest's old-control-plane disposition durably supersedes stranded readiness campaigns 1 and 2 without replaying their attempts or fabricating receipts. Omitting `retained_item` creates no retained work; when supplied, it may bind only #320 with the registry-declared current SRE endpoint, exact source, lease, and registered artifact evidence.
 
 ## Source installation atom
 

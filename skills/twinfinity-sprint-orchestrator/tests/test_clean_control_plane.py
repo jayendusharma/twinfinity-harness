@@ -39,6 +39,20 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def current_endpoints() -> dict[str, str]:
+    registry = tomllib.loads(
+        (
+            SKILL_ROOT
+            / "references"
+            / "twinfinity-executor-registry.toml"
+        ).read_text(encoding="utf-8")
+    )
+    return {
+        role: str(endpoint["endpoint_id"])
+        for role, endpoint in registry["roles"].items()
+    }
+
+
 class CleanControlPlaneTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="clean-control-plane-")
@@ -362,7 +376,7 @@ class CleanControlPlaneTests(unittest.TestCase):
             retained_item = {
                 "issue_number": 320,
                 "generation": 4,
-                "accountable_endpoint_id": "role.sre.v3",
+                "accountable_endpoint_id": current_endpoints()["sre"],
                 "source_payload_sha256": payload_sha,
                 "lease_manifest_path": "retained/lease.json",
                 "lease_manifest_sha256": sha(lease_path),
@@ -436,7 +450,7 @@ class CleanControlPlaneTests(unittest.TestCase):
                 "sre_limit": 5,
                 "authority_sha256": "c" * 64,
             },
-            "current_endpoints": copy.deepcopy(clean.EXPECTED_ENDPOINTS),
+            "current_endpoints": current_endpoints(),
             "retained_item": retained_item,
             "old_control_plane": {
                 "archive_path": str(self.archive),
@@ -544,8 +558,9 @@ class CleanControlPlaneTests(unittest.TestCase):
         connection = sqlite3.connect(database)
         try:
             pointers = dict(connection.execute("SELECT role, endpoint_id FROM executor_role_endpoint_current"))
-            self.assertEqual(clean.EXPECTED_ENDPOINTS, pointers)
+            self.assertEqual(current_endpoints(), pointers)
             self.assertEqual("role.development.v6", pointers["development"])
+            self.assertEqual("role.sre.v6", pointers["sre"])
             catalog = {
                 row[0]
                 for row in connection.execute(
@@ -563,6 +578,7 @@ class CleanControlPlaneTests(unittest.TestCase):
                     "role.sre.v3",
                     "role.sre.v4",
                     "role.sre.v5",
+                    "role.sre.v6",
                 },
                 catalog,
             )
@@ -590,7 +606,10 @@ class CleanControlPlaneTests(unittest.TestCase):
             item = connection.execute(
                 "SELECT issue_number,status,allocation_class,sre_units,accountable_session_id FROM coordination_items"
             ).fetchone()
-            self.assertEqual((320, "HOLD", "RETAINED", 1, "role.sre.v3"), item)
+            self.assertEqual(
+                (320, "HOLD", "RETAINED", 1, current_endpoints()["sre"]),
+                item,
+            )
             self.assertEqual(2, connection.execute("SELECT COUNT(*) FROM coordination_artifacts").fetchone()[0])
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM coordination_terminal_watches").fetchone()[0])
         finally:
