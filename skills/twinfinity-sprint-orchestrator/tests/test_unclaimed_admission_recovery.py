@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
-from copy import deepcopy
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -26,23 +26,29 @@ from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from executor_registry import (  # noqa: E402
     attempt_lineage_for_target,
     current_endpoint,
+    load_registry_config,
     reserve_attempt,
     stable_systemd_unit,
     transition_attempt,
 )
 import kanban_pull_buffer as pull_buffer  # noqa: E402
 from kanban_pull_buffer import (  # noqa: E402
-    LEGACY_329_DURABLE_FENCE,
-    LEGACY_329_NORMALIZATION_EVENTS,
-    LEGACY_329_RECOVERY_REASON,
+    LEGACY_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA,
+    LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON,
     PullBufferError,
     UNCLAIMED_ADMISSION_RECOVERY_SCHEMA,
-    _legacy_329_recovery_fence,
     _legacy_recovery_stable_source,
+    digest_json,
+    legacy_unclaimed_admission_recovery_notice_payload,
     recover_unclaimed_admission,
 )
 from portfolio_convergence import PortfolioConvergence  # noqa: E402
 from portfolio_graph import replace_graph  # noqa: E402
+from reconcile_routing_artifacts import (  # noqa: E402
+    apply_plan,
+    build_plan,
+    load_legacy_alias_fixture,
+)
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
@@ -64,7 +70,7 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         self.root.mkdir(mode=0o700)
         self.database = self.root / "state.sqlite3"
         self.store = CoordinationStore(self.database)
-        apply_reviewed_current_endpoint_catalog(
+        self.registry_config = apply_reviewed_current_endpoint_catalog(
             self.store.connection,
             ROOT,
             operation_key="unclaimed-admission-recovery-tests",
@@ -75,7 +81,7 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _admitted(self, role: str = "development", issue: int = 273) -> dict:
-        endpoint = SRE if role == "sre" else DEVELOPMENT
+        endpoint = str(current_endpoint(self.store.connection, role)["endpoint_id"])
         payload = {
             "_projection_version": 3,
             "number": issue,
@@ -210,6 +216,48 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         )
         return running, token
 
+    def _claim_recovery_notice(
+        self, request: dict, *, claim: bool = True
+    ) -> tuple[dict, str]:
+        notice_id = int(request["recovery_notice_message_id"])
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="planner",
+            endpoint_id=request["planner_session_id"],
+            target_kind="message",
+            target_key=str(notice_id),
+            now="2026-08-26T10:07:30Z",
+            precondition=lambda _connection: None,
+        )
+        unit = stable_systemd_unit("planner", "message", str(notice_id))
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id=hashlib.md5(unit.encode()).hexdigest(),
+            systemd_control_group=f"/user.slice/{unit}",
+            now="2026-08-26T10:07:30Z",
+        )
+        running = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=9275,
+            now="2026-08-26T10:07:31Z",
+        )
+        if claim:
+            self.store.claim_message(
+                notice_id,
+                request["planner_session_id"],
+                "2026-08-26T10:07:32Z",
+            )
+        return running, token
+
     def _run_to_third_attempt(self, lineage: dict) -> CoordinationSupervisor:
         supervisor = CoordinationSupervisor(
             self.store,
@@ -299,6 +347,7 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
             "portfolio_pull_buffer_retirements",
             "portfolio_readiness_events",
             "coordination_events",
+            "executor_attempts",
         )
         rows = {
             table: [dict(row) for row in self.store.connection.execute(
@@ -309,99 +358,243 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         return hashlib.sha256(canonical_json(rows).encode()).hexdigest()
 
     def _assert_recovery_rejected_without_writes(
-        self, request: dict, error: str
+        self,
+        request: dict,
+        error: str,
+        *,
+        attempt_id: str | None = None,
+        executor_token: str | None = None,
+        compatibility_descriptor: dict | None = None,
     ) -> None:
         baseline = self._fingerprint()
         with self.assertRaisesRegex(PullBufferError, error):
             recover_unclaimed_admission(
-                self.store, request, now="2026-08-26T10:08:00Z"
+                self.store,
+                request,
+                now="2026-08-26T10:08:00Z",
+                attempt_id=attempt_id,
+                executor_token=executor_token,
+                compatibility_descriptor=compatibility_descriptor,
             )
         self.assertEqual(baseline, self._fingerprint())
 
-    def _legacy_329_request(self) -> dict:
-        return {
-            "schema": UNCLAIMED_ADMISSION_RECOVERY_SCHEMA,
-            "repository": LEGACY_329_DURABLE_FENCE["repository"],
-            "issue_number": LEGACY_329_DURABLE_FENCE["issue_number"],
-            "planner_session_id": "role.planner.v4",
-            "generation": LEGACY_329_DURABLE_FENCE["generation"],
-            "retained_item_version": LEGACY_329_DURABLE_FENCE[
-                "retained_item_version"
-            ],
-            "source_payload_sha256": LEGACY_329_DURABLE_FENCE[
-                "source_payload_sha256"
-            ],
-            "current_source_payload_sha256": LEGACY_329_DURABLE_FENCE[
-                "source_payload_sha256"
-            ],
-            "accountable_session_id": LEGACY_329_DURABLE_FENCE[
-                "accountable_session_id"
-            ],
-            "lease_manifest_sha256": LEGACY_329_DURABLE_FENCE[
-                "lease_manifest_sha256"
-            ],
-            "admission_message_id": LEGACY_329_DURABLE_FENCE[
-                "admission_message_id"
-            ],
-            "admission_payload_sha256": LEGACY_329_DURABLE_FENCE[
-                "admission_payload_sha256"
-            ],
-            "wake_key": LEGACY_329_DURABLE_FENCE["wake_key"],
-            "wake_attempts": LEGACY_329_DURABLE_FENCE["wake_attempts"],
-            "target_progress_sha256": LEGACY_329_DURABLE_FENCE[
-                "target_progress_sha256"
-            ],
-            "watch_key": f"terminal:{REPOSITORY}:issue:329:generation:2",
-            "recovery_notice_message_id": None,
-            "recovery_reason": LEGACY_329_RECOVERY_REASON,
-        }
+    def _apply_development_endpoint(
+        self, endpoint_id: str, *, operation_key: str, now: str
+    ) -> dict:
+        config = replace(
+            self.registry_config,
+            roles={
+                **self.registry_config.roles,
+                "development": self.registry_config.endpoints[endpoint_id],
+            },
+        )
+        aliases, aliases_sha256 = load_legacy_alias_fixture(
+            ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
+        )
+        plan = build_plan(
+            self.store.connection,
+            config,
+            aliases,
+            alias_fixture_sha256=aliases_sha256,
+        )
+        return apply_plan(
+            self.store.connection,
+            plan=plan,
+            operation_key=operation_key,
+            expected_plan_sha256=plan["plan_sha256"],
+            now=now,
+        )
 
-    @staticmethod
-    def _legacy_329_rows() -> dict:
-        return {
-            "message": {
-                "recipient_session_id": LEGACY_329_DURABLE_FENCE[
-                    "admission_recipient"
-                ],
-                "state": "HOLD",
-                "last_error": "WAKE_RETRY_EXHAUSTED",
-            },
-            "wake": {
-                "state": "HOLD",
-                "last_error": "WAKE_RETRY_EXHAUSTED",
-                "last_attempt_at": LEGACY_329_DURABLE_FENCE[
-                    "wake_last_attempt_at"
-                ],
-            },
-            "watch": {
-                "state": "COMPLETE",
-                "accountable_session_id": LEGACY_329_DURABLE_FENCE[
-                    "admission_recipient"
-                ],
-                "process_id": None,
-                "attempts": 0,
-                "updated_at": LEGACY_329_DURABLE_FENCE["watch_updated_at"],
-            },
-            "item": {
-                "updated_at": LEGACY_329_DURABLE_FENCE["item_updated_at"],
-            },
-            "candidate": {"id": LEGACY_329_DURABLE_FENCE["ready_candidate_id"]},
-            "finalization": {
-                "id": LEGACY_329_DURABLE_FENCE["ready_finalization_id"],
-                "campaign_id": LEGACY_329_DURABLE_FENCE[
-                    "readiness_campaign_id"
-                ],
-                "receipt_id": LEGACY_329_DURABLE_FENCE[
-                    "readiness_receipt_id"
-                ],
-                "dirty_event_id": LEGACY_329_DURABLE_FENCE[
-                    "finalization_dirty_event_id"
-                ],
-                "finalization_sha256": LEGACY_329_DURABLE_FENCE[
-                    "ready_finalization_sha256"
-                ],
-            },
+    def _legacy_compatible_transaction(self) -> tuple[dict, dict]:
+        """Build a full synthetic equivalent of the one-time legacy lineage."""
+
+        historical_endpoint = "role.development.v3"
+        current_endpoint_id = "role.development.v4"
+        self._apply_development_endpoint(
+            historical_endpoint,
+            operation_key="legacy-compatible-historical-route",
+            now="2026-08-26T09:00:00Z",
+        )
+        lineage = self._admitted(issue=812)
+        self.assertEqual(historical_endpoint, lineage["endpoint"])
+        self._run_to_third_attempt(lineage)
+
+        message = self.store.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        payload = json.loads(message["payload_json"])
+        watch_key = (
+            f"terminal:{REPOSITORY}:issue:{lineage['issue']}:"
+            f"generation:{payload['generation']}"
+        )
+        normalized_at = "2026-08-26T10:04:00Z"
+        hold_reason = "WAKE_RETRY_EXHAUSTED"
+        item = self.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, lineage["issue"]),
+        ).fetchone()
+        with self.store.transaction():
+            self.store.connection.execute(
+                "UPDATE coordination_messages SET state='HOLD', updated_at=?, "
+                "last_error=? WHERE id=? AND state='PREPARED' AND claimed_by IS NULL",
+                (normalized_at, hold_reason, lineage["message_id"]),
+            )
+            self.store.connection.execute(
+                "UPDATE coordination_wakes SET state='HOLD', process_id=NULL, "
+                "updated_at=?, last_error=? WHERE message_id=? AND attempts=3",
+                (normalized_at, hold_reason, lineage["message_id"]),
+            )
+        normalized = self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=lineage["issue"],
+            status="HOLD",
+            allocation_class="RETAINED",
+            generation=int(item["generation"]),
+            accountable_session_id=historical_endpoint,
+            lease_manifest_sha256=item["lease_manifest_sha256"],
+            development_units=int(item["development_units"]),
+            shared_units=int(item["shared_units"]),
+            sre_units=int(item["sre_units"]),
+            expected_source_sha256=item["source_payload_sha256"],
+            expected_version=int(item["version"]),
+            now=normalized_at,
+        )
+        normalized_version = int(normalized["version"])
+
+        historical_attempt, historical_token = self._reserve_running_attempt(lineage)
+        transition_attempt(
+            self.store.connection,
+            attempt_id=historical_attempt["attempt_id"],
+            token=historical_token,
+            expected_version=historical_attempt["version"],
+            new_state="HOLD",
+            exit_code=0,
+            last_error="EXECUTOR_TARGET_NO_PROGRESS",
+            now="2026-08-26T10:04:30Z",
+        )
+        change = self._apply_development_endpoint(
+            current_endpoint_id,
+            operation_key="legacy-compatible-current-route",
+            now="2026-08-26T10:05:00Z",
+        )
+        projected = {
+            **lineage["source_payload"],
+            "labels": [*lineage["source_payload"]["labels"], {"name": "agent-ready"}],
+            "updated_at": "2026-08-26T10:05:01Z",
+            "_projection_version": 4,
         }
+        current_source = self.store.ingest_snapshot(
+            repository=REPOSITORY,
+            object_kind="issue",
+            object_number=lineage["issue"],
+            payload=projected,
+            source_updated_at=projected["updated_at"],
+            fetched_at="2026-08-26T10:05:02Z",
+        )
+
+        message = self.store.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        wake = self.store.connection.execute(
+            "SELECT * FROM coordination_wakes WHERE message_id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        watch = self.store.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        item = self.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, lineage["issue"]),
+        ).fetchone()
+        finalization = self.store.connection.execute(
+            "SELECT * FROM portfolio_ready_finalizations "
+            "WHERE repository=? AND issue_number=? AND generation=?",
+            (REPOSITORY, lineage["issue"], payload["generation"]),
+        ).fetchone()
+        events = self.store.connection.execute(
+            "SELECT id,event_type,entity_key,payload_sha256,created_at "
+            "FROM coordination_events WHERE entity_key=? AND created_at=? "
+            "AND event_type IN ('TERMINAL_WATCH_COMPLETED','ISSUE_STATUS_CHANGED') "
+            "ORDER BY id",
+            (f"{REPOSITORY}:issue:{lineage['issue']}", normalized_at),
+        ).fetchall()
+        executor_attempt = self.store.connection.execute(
+            "SELECT attempt_id,role,endpoint_id,target_kind,target_key,state,"
+            "exit_code,last_error FROM executor_attempts WHERE attempt_id=?",
+            (historical_attempt["attempt_id"],),
+        ).fetchone()
+        planner = current_endpoint(self.store.connection, "planner")
+        request = {
+            "schema": UNCLAIMED_ADMISSION_RECOVERY_SCHEMA,
+            "repository": REPOSITORY,
+            "issue_number": lineage["issue"],
+            "planner_session_id": planner["endpoint_id"],
+            "generation": payload["generation"],
+            "retained_item_version": int(item["version"]),
+            "source_payload_sha256": payload["source"]["payload_sha256"],
+            "current_source_payload_sha256": current_source.payload_sha256,
+            "accountable_session_id": item["accountable_session_id"],
+            "lease_manifest_sha256": item["lease_manifest_sha256"],
+            "admission_message_id": lineage["message_id"],
+            "admission_payload_sha256": message["payload_sha256"],
+            "wake_key": wake["wake_key"],
+            "wake_attempts": int(wake["attempts"]),
+            "target_progress_sha256": wake["target_progress_sha256"],
+            "watch_key": watch_key,
+            "recovery_notice_message_id": 1,
+            "recovery_reason": LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON,
+        }
+        evidence = {
+            **{key: request[key] for key in (
+                "repository", "issue_number", "generation",
+                "retained_item_version", "source_payload_sha256",
+                "accountable_session_id", "lease_manifest_sha256",
+                "admission_message_id", "admission_payload_sha256", "wake_key",
+                "wake_attempts", "target_progress_sha256", "watch_key",
+            )},
+            "historical_recipient": historical_endpoint,
+            "hold_reason": hold_reason,
+            "wake_last_attempt_at": wake["last_attempt_at"],
+            "watch_updated_at": watch["updated_at"],
+            "item_updated_at": item["updated_at"],
+            "ready_candidate_id": int(finalization["ready_candidate_id"]),
+            "ready_finalization_id": int(finalization["id"]),
+            "readiness_campaign_id": int(finalization["campaign_id"]),
+            "readiness_receipt_id": int(finalization["receipt_id"]),
+            "finalization_dirty_event_id": int(finalization["dirty_event_id"]),
+            "ready_finalization_sha256": finalization["finalization_sha256"],
+            "normalization_events": [dict(event) for event in events],
+            "endpoint_rotation": {
+                "change_id": change["change_id"],
+                "change_version": int(change["version"]),
+                "before_item_version": normalized_version,
+                "not_before": normalized_at,
+            },
+            "executor_attempt": dict(executor_attempt),
+        }
+        descriptor = {
+            "schema": LEGACY_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA,
+            "evidence": evidence,
+            "evidence_sha256": digest_json(evidence),
+        }
+        descriptor_sha256 = digest_json(descriptor)
+        notice_id = self.store.enqueue_message(
+            idempotency_key=(
+                "legacy-unclaimed-admission-recovery:"
+                f"{descriptor_sha256}"
+            ),
+            recipient_session_id=request["planner_session_id"],
+            topic="coordination.notice",
+            payload=legacy_unclaimed_admission_recovery_notice_payload(
+                request, descriptor_sha256
+            ),
+            now="2026-08-26T10:05:03Z",
+        )
+        request["recovery_notice_message_id"] = notice_id
+        return request, descriptor
 
     def test_exact_source_claim_ignores_absent_stale_ready_projection(self) -> None:
         lineage = self._admitted()
@@ -517,12 +710,17 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
     def test_planner_rebaseline_replays_and_reaches_genuine_claim(self) -> None:
         lineage = self._admitted()
         request = self._exhaust(lineage)
+        planner_attempt, planner_token = self._claim_recovery_notice(request)
         units = self.store.connection.execute(
             "SELECT development_units,shared_units,sre_units FROM coordination_items "
             "WHERE repository=? AND issue_number=?", (REPOSITORY, lineage["issue"]),
         ).fetchone()
         result = recover_unclaimed_admission(
-            self.store, request, now="2026-08-26T10:08:00Z"
+            self.store,
+            request,
+            now="2026-08-26T10:08:00Z",
+            attempt_id=planner_attempt["attempt_id"],
+            executor_token=planner_token,
         )
         item = self.store.connection.execute(
             "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
@@ -540,7 +738,11 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         self.assertEqual(
             result,
             recover_unclaimed_admission(
-                self.store, request, now="2026-08-26T10:08:01Z"
+                self.store,
+                request,
+                now="2026-08-26T10:08:01Z",
+                attempt_id=planner_attempt["attempt_id"],
+                executor_token=planner_token,
             ),
         )
         self.assertEqual(before_replay, self._fingerprint())
@@ -577,16 +779,113 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         self.assertEqual(
             result,
             recover_unclaimed_admission(
-                self.store, request, now="2026-08-26T10:09:03Z"
+                self.store,
+                request,
+                now="2026-08-26T10:09:03Z",
+                attempt_id=planner_attempt["attempt_id"],
+                executor_token=planner_token,
             ),
         )
         self.assertEqual(downstream, self._fingerprint())
 
     def test_recovery_requires_the_current_planner_without_writes(self) -> None:
         request = self._exhaust(self._admitted())
+        attempt, token = self._claim_recovery_notice(request)
         request["planner_session_id"] = DEVELOPMENT
         self._assert_recovery_rejected_without_writes(
-            request, "CURRENT_PLANNER_ENDPOINT_REQUIRED"
+            request,
+            "CURRENT_PLANNER_ENDPOINT_REQUIRED",
+            attempt_id=attempt["attempt_id"],
+            executor_token=token,
+        )
+
+    def test_recovery_authenticates_claimed_notice_attempt_and_token(self) -> None:
+        request = self._exhaust(self._admitted())
+        planner_attempt, planner_token = self._claim_recovery_notice(
+            request, claim=False
+        )
+        self._assert_recovery_rejected_without_writes(
+            request,
+            "UNCLAIMED_ADMISSION_RECOVERY_NOTICE_NOT_CLAIMED",
+            attempt_id=planner_attempt["attempt_id"],
+            executor_token=planner_token,
+        )
+        self.store.claim_message(
+            request["recovery_notice_message_id"],
+            request["planner_session_id"],
+            "2026-08-26T10:07:32Z",
+        )
+        for name, attempt_id, token, error in (
+            (
+                "missing-attempt",
+                None,
+                planner_token,
+                "UNCLAIMED_ADMISSION_RECOVERY_ATTEMPT_REQUIRED",
+            ),
+            (
+                "missing-token",
+                planner_attempt["attempt_id"],
+                None,
+                "UNCLAIMED_ADMISSION_RECOVERY_ATTEMPT_REQUIRED",
+            ),
+            (
+                "unknown-attempt",
+                "00000000-0000-0000-0000-000000000000",
+                planner_token,
+                "UNCLAIMED_ADMISSION_RECOVERY_ATTEMPT_NOT_FOUND",
+            ),
+            (
+                "wrong-token",
+                planner_attempt["attempt_id"],
+                "wrong-token",
+                "UNCLAIMED_ADMISSION_RECOVERY_TOKEN_MISMATCH",
+            ),
+        ):
+            with self.subTest(case=name):
+                self._assert_recovery_rejected_without_writes(
+                    request,
+                    error,
+                    attempt_id=attempt_id,
+                    executor_token=token,
+                )
+
+        spoof, spoof_token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT,
+            target_kind="message",
+            target_key=str(request["recovery_notice_message_id"]),
+            now="2026-08-26T10:07:33Z",
+            precondition=lambda _connection: None,
+        )
+        unit = stable_systemd_unit(
+            "development", "message", str(request["recovery_notice_message_id"])
+        )
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=spoof["attempt_id"],
+            token=spoof_token,
+            expected_version=spoof["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id=hashlib.md5(unit.encode()).hexdigest(),
+            systemd_control_group=f"/user.slice/{unit}",
+            now="2026-08-26T10:07:33Z",
+        )
+        spoof = transition_attempt(
+            self.store.connection,
+            attempt_id=spoof["attempt_id"],
+            token=spoof_token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=9276,
+            now="2026-08-26T10:07:34Z",
+        )
+        self._assert_recovery_rejected_without_writes(
+            request,
+            "UNCLAIMED_ADMISSION_RECOVERY_ATTEMPT_BINDING_MISMATCH",
+            attempt_id=spoof["attempt_id"],
+            executor_token=spoof_token,
         )
 
     def test_claim_evidence_blocks_recovery_without_writes(self) -> None:
@@ -688,12 +987,12 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
     def test_recovery_failpoints_and_stale_fences_are_write_free(self) -> None:
         lineage = self._admitted()
         request = self._exhaust(lineage)
+        attempt, token = self._claim_recovery_notice(request)
         baseline = self._fingerprint()
         for marker in (
             "recovery.after_item",
             "recovery.after_readiness",
             "recovery.after_refill_event",
-            "recovery.after_notice_claim",
             "recovery.after_notice_complete",
             "recovery.after_readiness_event",
             "recovery.after_audit_event",
@@ -703,6 +1002,8 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
                     self.store,
                     request,
                     now="2026-08-26T10:08:00Z",
+                    attempt_id=attempt["attempt_id"],
+                    executor_token=token,
                     failpoint=lambda point, wanted=marker: (
                         (_ for _ in ()).throw(RuntimeError(point))
                         if point == wanted else None
@@ -711,28 +1012,65 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
             self.assertEqual(baseline, self._fingerprint())
         wrong = {**request, "lease_manifest_sha256": "f" * 64}
         with self.assertRaises(PullBufferError):
-            recover_unclaimed_admission(self.store, wrong, now="2026-08-26T10:08:00Z")
+            recover_unclaimed_admission(
+                self.store,
+                wrong,
+                now="2026-08-26T10:08:00Z",
+                attempt_id=attempt["attempt_id"],
+                executor_token=token,
+            )
         self.assertEqual(baseline, self._fingerprint())
 
     def test_owner_cli_recovers_one_exact_transaction_file(self) -> None:
         request = self._exhaust(self._admitted())
+        attempt, token = self._claim_recovery_notice(request)
         request_path = self.root / "recover-unclaimed-admission.json"
         request_path.write_text(canonical_json(request), encoding="utf-8")
+        argv = [
+            "kanban_pull_buffer.py",
+            "recover-unclaimed-admission",
+            "--transaction-file",
+            str(request_path),
+        ]
+        baseline = self._fingerprint()
+        rejected_output = io.StringIO()
+        with (
+            patch.object(pull_buffer, "DEFAULT_DATABASE", self.database),
+            patch.object(sys, "argv", argv),
+            patch.object(
+                pull_buffer, "utc_now", return_value="2026-08-26T10:08:00Z"
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "TWINFINITY_EXECUTOR_ATTEMPT_ID": "",
+                    "TWINFINITY_EXECUTOR_TOKEN": "",
+                },
+                clear=False,
+            ),
+            redirect_stdout(rejected_output),
+        ):
+            rejected_code = pull_buffer.main()
+        rejected = json.loads(rejected_output.getvalue())
+        self.assertEqual(1, rejected_code)
+        self.assertEqual("HOLD", rejected["phase"])
+        self.assertIn("ATTEMPT_REQUIRED", rejected["error"])
+        self.assertEqual(baseline, self._fingerprint())
+
         output = io.StringIO()
         with (
             patch.object(pull_buffer, "DEFAULT_DATABASE", self.database),
-            patch.object(
-                sys,
-                "argv",
-                [
-                    "kanban_pull_buffer.py",
-                    "recover-unclaimed-admission",
-                    "--transaction-file",
-                    str(request_path),
-                ],
-            ),
+            patch.object(sys, "argv", argv),
             patch.object(
                 pull_buffer, "utc_now", return_value="2026-08-26T10:08:00Z"
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "TWINFINITY_EXECUTOR_ATTEMPT_ID": attempt["attempt_id"],
+                    "TWINFINITY_EXECUTOR_TOKEN": token,
+                },
+                clear=False,
             ),
             redirect_stdout(output),
         ):
@@ -748,90 +1086,140 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(("PREPARED", "NONE", 1), tuple(item))
 
-    def test_exact_legacy_329_fence_accepts_only_proven_lineage(self) -> None:
-        request = self._legacy_329_request()
-        rows = self._legacy_329_rows()
-        expected_attempt = (
-            LEGACY_329_DURABLE_FENCE["executor_attempt_id"],
-            "development",
-            LEGACY_329_DURABLE_FENCE["admission_recipient"],
-            "message",
-            "16",
-            "HOLD",
-            0,
-            "EXECUTOR_TARGET_NO_PROGRESS",
+    def test_synthetic_legacy_transaction_rejects_drift_and_recovers(self) -> None:
+        request, descriptor = self._legacy_compatible_transaction()
+        invalid = json.loads(canonical_json(descriptor))
+        invalid["evidence_sha256"] = "0" * 64
+        self._assert_recovery_rejected_without_writes(
+            request,
+            "LEGACY_RECOVERY_DESCRIPTOR_INVALID",
+            compatibility_descriptor=invalid,
+        )
+        drifted = json.loads(canonical_json(descriptor))
+        drifted["evidence"]["normalization_events"][0]["payload_sha256"] = "f" * 64
+        drifted["evidence_sha256"] = digest_json(drifted["evidence"])
+        self._assert_recovery_rejected_without_writes(
+            request,
+            "LEGACY_RECOVERY_FENCE_MISMATCH",
+            compatibility_descriptor=drifted,
         )
 
-        class Result:
-            def __init__(self, values: list) -> None:
-                self.values = values
-
-            def fetchall(self) -> list:
-                return self.values
-
-        class Connection:
-            def __init__(self, events: list[dict]) -> None:
-                self.events = events
-
-            def execute(self, sql: str, _values: tuple = ()) -> Result:
-                if "coordination_events" in sql:
-                    return Result(self.events)
-                if "executor_attempts" in sql:
-                    return Result([expected_attempt])
-                raise AssertionError(sql)
-
-        connection = Connection(list(LEGACY_329_NORMALIZATION_EVENTS))
-        with patch.object(
-            pull_buffer,
-            "applied_endpoint_rotation_chain",
-            return_value={"state": "APPLIED"},
-        ) as rotation:
-            _legacy_329_recovery_fence(
-                connection, rows, request, replay=False
-            )
-        rotation.assert_called_once_with(
-            connection,
-            repository=REPOSITORY,
-            issue_number=329,
-            before_identity=LEGACY_329_DURABLE_FENCE["admission_recipient"],
-            before_item_version=6,
-            after_identity=LEGACY_329_DURABLE_FENCE["accountable_session_id"],
-            after_item_version=7,
-            not_before=LEGACY_329_NORMALIZATION_EVENTS[1]["created_at"],
-            change_id=LEGACY_329_DURABLE_FENCE["rotation_change_id"],
-            change_version=LEGACY_329_DURABLE_FENCE["rotation_change_version"],
-        )
-
-        drifted = deepcopy(rows)
-        drifted["item"]["updated_at"] = "2026-08-26T09:26:22Z"
-        with self.assertRaisesRegex(
-            PullBufferError, "LEGACY_329_RECOVERY_FENCE_MISMATCH"
-        ):
-            _legacy_329_recovery_fence(
-                connection, drifted, request, replay=False
-            )
+        preserved = {
+            "message": dict(self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?",
+                (request["admission_message_id"],),
+            ).fetchone()),
+            "wake": dict(self.store.connection.execute(
+                "SELECT * FROM coordination_wakes WHERE wake_key=?",
+                (request["wake_key"],),
+            ).fetchone()),
+            "watch": dict(self.store.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (request["watch_key"],),
+            ).fetchone()),
+            "attempt": dict(self.store.connection.execute(
+                "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                (descriptor["evidence"]["executor_attempt"]["attempt_id"],),
+            ).fetchone()),
+        }
+        units = self.store.connection.execute(
+            "SELECT development_units,shared_units,sre_units FROM coordination_items "
+            "WHERE repository=? AND issue_number=?",
+            (REPOSITORY, request["issue_number"]),
+        ).fetchone()
+        attempt, token = self._claim_recovery_notice(request)
+        request_path = self.root / "legacy-compatible-recovery.json"
+        descriptor_path = self.root / "legacy-compatible-descriptor.json"
+        request_path.write_text(canonical_json(request), encoding="utf-8")
+        descriptor_path.write_text(canonical_json(descriptor), encoding="utf-8")
+        output = io.StringIO()
         with (
+            patch.object(pull_buffer, "DEFAULT_DATABASE", self.database),
             patch.object(
-                pull_buffer, "applied_endpoint_rotation_chain", return_value=None
+                sys,
+                "argv",
+                [
+                    "kanban_pull_buffer.py",
+                    "recover-unclaimed-admission",
+                    "--transaction-file",
+                    str(request_path),
+                    "--compatibility-descriptor-file",
+                    str(descriptor_path),
+                ],
             ),
-            self.assertRaisesRegex(
-                PullBufferError, "LEGACY_329_RECOVERY_FENCE_MISMATCH"
+            patch.object(
+                pull_buffer, "utc_now", return_value="2026-08-26T10:06:00Z"
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "TWINFINITY_EXECUTOR_ATTEMPT_ID": attempt["attempt_id"],
+                    "TWINFINITY_EXECUTOR_TOKEN": token,
+                },
+                clear=False,
+            ),
+            redirect_stdout(output),
+        ):
+            return_code = pull_buffer.main()
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(0, return_code)
+        self.assertEqual("COMPLETE", receipt["phase"])
+        result = receipt["result"]
+        item = self.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, request["issue_number"]),
+        ).fetchone()
+        readiness = self.store.connection.execute(
+            "SELECT state FROM portfolio_readiness_current "
+            "WHERE repository=? AND issue_number=?",
+            (REPOSITORY, request["issue_number"]),
+        ).fetchone()
+        self.assertEqual(
+            ("PREPARED", "NONE", request["generation"] + 1),
+            (item["status"], item["allocation_class"], int(item["generation"])),
+        )
+        self.assertIsNone(item["accountable_session_id"])
+        self.assertIsNone(item["lease_manifest_sha256"])
+        self.assertEqual(request["current_source_payload_sha256"], item["source_payload_sha256"])
+        self.assertEqual(tuple(units), (
+            item["development_units"], item["shared_units"], item["sre_units"]
+        ))
+        self.assertEqual("STALE", readiness["state"])
+        for table, key, value in (
+            ("coordination_messages", "id", request["admission_message_id"]),
+            ("coordination_wakes", "wake_key", request["wake_key"]),
+            ("coordination_terminal_watches", "watch_key", request["watch_key"]),
+            (
+                "executor_attempts",
+                "attempt_id",
+                descriptor["evidence"]["executor_attempt"]["attempt_id"],
             ),
         ):
-            _legacy_329_recovery_fence(
-                connection, rows, request, replay=False
-            )
-
-    def test_legacy_329_fences_and_projection_delta_are_exact(self) -> None:
-        self.assertEqual(329, LEGACY_329_DURABLE_FENCE["issue_number"])
-        self.assertEqual(16, LEGACY_329_DURABLE_FENCE["admission_message_id"])
-        self.assertEqual([3003, 3004], [row["id"] for row in LEGACY_329_NORMALIZATION_EVENTS])
+            observed = dict(self.store.connection.execute(
+                f"SELECT * FROM {table} WHERE {key}=?", (value,)
+            ).fetchone())
+            name = {
+                "coordination_messages": "message",
+                "coordination_wakes": "wake",
+                "coordination_terminal_watches": "watch",
+                "executor_attempts": "attempt",
+            }[table]
+            self.assertEqual(preserved[name], observed)
+        before_replay = self._fingerprint()
         self.assertEqual(
-            LEGACY_329_NORMALIZATION_EVENTS[0]["payload_sha256"],
-            hashlib.sha256(canonical_json({
-                "allocation_class": "RETAINED", "item_version": 6, "status": "HOLD"
-            }).encode()).hexdigest(),
+            result,
+            recover_unclaimed_admission(
+                self.store,
+                request,
+                now="2026-08-26T10:06:01Z",
+                attempt_id=attempt["attempt_id"],
+                executor_token=token,
+                compatibility_descriptor=descriptor,
+            ),
         )
+        self.assertEqual(before_replay, self._fingerprint())
+
+    def test_legacy_projection_delta_is_narrow(self) -> None:
         bound = {"title": "Stable", "labels": ["delivery"], "updated_at": "one"}
         projected = {
             **bound,
