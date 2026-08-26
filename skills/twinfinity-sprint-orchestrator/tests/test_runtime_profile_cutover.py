@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from executor_registry import (  # noqa: E402
     RegistryError,
+    _parse_endpoint_config,
     _validate_profile_directory,
     load_registry_config,
 )
@@ -27,7 +28,7 @@ REPOSITORY_ROOT = ROOT.parents[1]
 CODEX_HOME = Path(os.environ["CODEX_HOME"])
 EXPECTED_ENDPOINTS = {
     "planner": ("role.planner.v2", 2),
-    "development": ("role.development.v3", 3),
+    "development": ("role.development.v6", 6),
     "sre": ("role.sre.v3", 3),
 }
 class RuntimeProfileCutoverTests(unittest.TestCase):
@@ -64,21 +65,58 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "planner": "role.planner.v2",
-                    "development": "role.development.v3",
+                    "development": "role.development.v6",
                     "sre": "role.sre.v3",
                 },
                 result["endpoints"],
             )
             self.assertEqual(
                 [
-                    "role.development.v4",
-                    "role.development.v5",
                     "role.sre.v4",
                     "role.sre.v5",
                 ],
                 result["staged_endpoints"],
             )
             self.assertFalse(absent_codex_home.exists())
+
+    def test_v6_is_direct_and_v5_alone_is_broker_only(self) -> None:
+        registry = tomllib.loads(
+            (ROOT / "references" / "twinfinity-executor-registry.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        direct_v6 = registry["roles"]["development"]
+        self.assertIsNone(
+            _parse_endpoint_config("development", direct_v6).execution_protocol
+        )
+        brokered_v5 = next(
+            endpoint
+            for endpoint in registry["historical_endpoints"]
+            if endpoint["endpoint_id"] == "role.development.v5"
+        )
+        brokered_payload = {
+            key: value for key, value in brokered_v5.items() if key != "role"
+        }
+        self.assertEqual(
+            "readiness/v1",
+            _parse_endpoint_config(
+                "development", brokered_payload
+            ).execution_protocol,
+        )
+        with self.assertRaisesRegex(RegistryError, "REGISTRY_CONFIG_ROLE_INVALID"):
+            _parse_endpoint_config(
+                "development",
+                {
+                    key: value
+                    for key, value in brokered_payload.items()
+                    if key != "execution_protocol"
+                },
+            )
+        with self.assertRaisesRegex(RegistryError, "REGISTRY_CONFIG_ROLE_INVALID"):
+            _parse_endpoint_config(
+                "development",
+                {**direct_v6, "execution_protocol": "readiness/v1"},
+            )
 
     def test_profile_root_rejects_symlink_and_world_writable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -221,7 +259,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             codex_home.mkdir(mode=0o700)
             for profile in (
                 "twinfinity-planner-v2.config.toml",
-                "twinfinity-development-v3.config.toml",
+                "twinfinity-development-v6.config.toml",
                 "twinfinity-sre-v3.config.toml",
             ):
                 shutil.copy2(ROOT / "references" / profile, codex_home / profile)
@@ -232,7 +270,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "role.planner.v2",
-                    "role.development.v3",
+                    "role.development.v6",
                     "role.sre.v3",
                 },
                 {
@@ -272,6 +310,15 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             )
         )
         self.assertEqual(2, registry["schema_version"])
+        loaded = load_registry_config(
+            ROOT / "references" / "twinfinity-executor-registry.toml",
+            codex_home=CODEX_HOME,
+            profile_template_root=ROOT / "references",
+        )
+        self.assertEqual(
+            "twinfinity-development-v6",
+            loaded.roles["development"].runtime_codex_profile,
+        )
         for role in ("planner", "development", "sre"):
             endpoint = registry["roles"][role]
             profile_name = endpoint["codex_profile"]
@@ -322,26 +369,36 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                     self.assertIn("fresh bounded Twinfinity", instructions)
                     if role == "development":
                         self.assertIn("SQLite coordination rows", instructions)
+                        self.assertEqual("auto_review", profile["approvals_reviewer"])
                     else:
                         self.assertIn("hosted authority", instructions)
                 command = endpoint["command_prefix"]
                 self.assertEqual(profile_name, command[command.index("--profile") + 1])
 
-        self.assertEqual([], registry["historical_endpoints"])
+        historical = {
+            endpoint["endpoint_id"]: endpoint
+            for endpoint in registry["historical_endpoints"]
+        }
+        self.assertEqual(
+            {
+                "role.development.v3",
+                "role.development.v4",
+                "role.development.v5",
+            },
+            set(historical),
+        )
         staged = {
             endpoint["endpoint_id"]: endpoint
             for endpoint in registry["staged_endpoints"]
         }
         self.assertEqual(
             {
-                "role.development.v4",
-                "role.development.v5",
                 "role.sre.v4",
                 "role.sre.v5",
             },
             set(staged),
         )
-        for endpoint in staged.values():
+        for endpoint in (*historical.values(), *staged.values()):
             versioned = (
                 ROOT
                 / "references"

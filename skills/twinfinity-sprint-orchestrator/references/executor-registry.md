@@ -24,7 +24,7 @@ The installed role contracts are:
 | Development | `development` | `development.*` only | `twinfinity-development-executor` |
 | SRE | `sre` | `sre.*` only | `twinfinity-devops-sre` |
 
-Planner, Development, and SRE use distinct strict Codex profiles. Planner has no delivery hook and receives only non-authorizing `coordination.notice` work. Current direct Development/SRE v3 profiles retain the focused `delivery_guard.py` hook and support their complete writer topics plus non-authorizing readiness notices. Every reviewed endpoint has a versioned portable template named `$CODEX_HOME/<logical-profile>-v<version>.config.toml`; the registry binds its exact SHA-256 and command manifest. A runtime launch validates and loads only the exact selected source-current endpoint's installed profile. Other current-role profiles and staged v4/v5 templates are not launch prerequisites. The complete installed catalog is required only at an explicit catalog audit, migration, rollback, or staged-activation boundary. Staged v4/v5 templates are not current pointer intent. A profile or endpoint cannot grant mutation authority outside the role contract, current user authority, and exact control-plane row.
+Planner, Development, and SRE use distinct strict Codex profiles. Planner has no delivery hook and receives only non-authorizing `coordination.notice` work. The source-current Development v6 and SRE v3 direct profiles retain the focused `delivery_guard.py` hook and support their complete writer topics plus non-authorizing readiness notices. Development v6 adds on-request Auto-review for narrowly scoped admitted Git metadata and guarded network boundary crossings while keeping `workspace-write`, the existing writable roots, and sandbox network disabled. Every reviewed endpoint has a versioned portable template named `$CODEX_HOME/<logical-profile>-v<version>.config.toml`; the registry binds its exact SHA-256 and command manifest. A runtime launch validates and loads only the exact selected source-current endpoint's installed profile. The complete installed catalog is required only at an explicit catalog audit, migration, rollback, or staged-activation boundary. Development v3 remains the exact direct-writer rollback endpoint; v5 alone is broker-only. A profile or endpoint cannot grant mutation authority outside the role contract, current user authority, and exact control-plane row.
 
 Changing a role creates a new immutable endpoint version. Advance only that role's current pointer by compare-and-swap. Never edit a persisted endpoint or alias in place.
 
@@ -34,15 +34,17 @@ The checked-in registry and portable templates are staged cutover inputs, not ev
 
 | Role | Endpoint | Portable profile SHA-256 | Status |
 | --- | --- | --- | --- |
-| Planner | `role.planner.v2` | `38d39166c7573d676206a0f70efd4ebbc68c2d74cd743bab85f48de56b5128cf` | production current |
-| Development | `role.development.v3` | `e75697c80eb2107dbd338ba1d49e9ac47364bb36aa414d99a8aa28145dafc247` | production current direct writer/readiness |
-| SRE | `role.sre.v3` | `918c0564b39d28d7776a9b3e4fb7b040b0de2935ad5e8a98099650e6c5ced7f0` | production current direct writer/readiness |
-| Development/SRE | v4 | registry-bound files | staged historical hardening; not current |
-| Development/SRE | v5 | registry-bound files | dormant experimental readiness isolation; not current |
+| Planner | `role.planner.v2` | `38d39166c7573d676206a0f70efd4ebbc68c2d74cd743bab85f48de56b5128cf` | source-current and production current |
+| Development | `role.development.v6` | `7822788d1ace463acb48505511e82302dcb317d8aef306506de202236089a145` | source-current direct-writer cutover target; not proof of installation or activation |
+| Development | `role.development.v3` | `e75697c80eb2107dbd338ba1d49e9ac47364bb36aa414d99a8aa28145dafc247` | exact direct-writer rollback endpoint |
+| Development | `role.development.v4` | registry-bound file | retained historical hardening |
+| Development | `role.development.v5` | registry-bound file | dormant broker-only readiness isolation |
+| SRE | `role.sre.v3` | `918c0564b39d28d7776a9b3e4fb7b040b0de2935ad5e8a98099650e6c5ced7f0` | source-current and production current direct writer/readiness |
+| SRE | v4/v5 | registry-bound files | staged only; v5 is broker-only |
 
-The v5 profiles accept only the experimental brokered `readiness/v1` behavior implemented in `role_executor_broker.py`. They are preserved for later hardening work, but they are deliberately not current, install-required, or on the production critical path. Writer messages, terminal watches, recovery work, hosted operations, and credential transport remain unimplemented at v5. No current Planner, Development, SRE, readiness, or product-delivery path may depend on them.
+The v5 profiles alone accept the experimental brokered `readiness/v1` behavior implemented in `role_executor_broker.py`. They are preserved for later hardening work, but they are deliberately not install-required or on the production critical path. Writer messages, terminal watches, recovery work, hosted operations, and credential transport remain unimplemented at v5. No current Planner, Development, SRE, readiness, or product-delivery path may depend on them. Development v6 has no `execution_protocol` and validates as a direct writer.
 
-Validate the production catalog from source or a staged atom with `executor_registry.py --profile-root <profile-directory> audit-config`. Do not install or activate v4/v5 merely because their dormant artifacts validate. Any future v5 work requires a separate reviewed source change, complete missing mechanics, explicit installation authority, and a fresh pointer decision. Planner stays at v2 unless its bytes or contract change.
+Validate the catalog from source or a staged atom with `executor_registry.py --profile-root <profile-directory> audit-config`. Do not install or activate any endpoint merely because its source artifacts validate. Development v6 installation and compare-and-swap activation remain separate stopped-state operations; the source catalog preserves v3 for exact rollback. Any future v5 work requires a separate reviewed source change, complete missing mechanics, explicit installation authority, and a fresh pointer decision. Planner stays at v2 unless its bytes or contract change.
 
 ### Dormant experimental v5 boundary
 
@@ -85,7 +87,7 @@ Each reservation records an authoritative target-progress digest and each termin
 
 The Planner endpoint loads its exact versioned `twinfinity-planner-v2` profile, must read `twinfinity-sprint-orchestrator/SKILL.md`, remains non-coding, and has owner-local write access only to the coordination root. A direct Development or SRE endpoint likewise loads the exact versioned profile bound to its immutable manifest and reads its role skill before acting. A future brokered v5 evaluator receives only the v5 profile, its self-contained digest-bound readiness instruction, the exact receipt schema, and canonical broker inputs inside its private mount tree; it does not receive the mutable generic Development or SRE skill tree.
 
-Development and SRE direct v3/v4 attempts perform their authorized Git, network, Docker, GitHub, provider, and cleanup work only through their role skill, exact admission, strict topic set, and controlled escalation. V5 is not a native writer profile: it is the isolated readiness evaluator described above, and all unimplemented target kinds fail closed.
+Development direct v3/v4/v6 and SRE direct v3/v4 attempts perform their authorized Git, network, Docker, GitHub, provider, and cleanup work only through their role skill, exact admission, strict topic set, and controlled escalation. V5 alone is not a native writer profile: it is the isolated readiness evaluator described above, and all unimplemented target kinds fail closed.
 
 ## Crash recovery
 
@@ -147,7 +149,7 @@ python3 scripts/reconcile_routing_artifacts.py \
   rollback --change-id '<change-id>' --expected-version '<version>'
 ```
 
-An exact repeat is idempotent. Pointer, item, watch, profile, endpoint-manifest, or change-version drift is `HOLD`; never force an older value over newer work. After a v5-to-v4 or v4-to-v3 rollback, fresh attempts load the exact immutable versioned profile through a new attempt; no session resumes. File-level SQLite restore is disaster recovery, not endpoint rollback.
+An exact repeat is idempotent. Pointer, item, watch, profile, endpoint-manifest, or change-version drift is `HOLD`; never force an older value over newer work. An exact Development v6-to-v3 rollback restores only the Development pointer and bound mutable routing fields; Planner and SRE remain unchanged, and the next Development launch loads immutable v3 through a fresh attempt. No session resumes. File-level SQLite restore is disaster recovery, not endpoint rollback.
 
 ## GitHub body remediation
 

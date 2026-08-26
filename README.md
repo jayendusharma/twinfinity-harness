@@ -16,7 +16,7 @@ Generated caches, bytecode, databases, credentials, live receipts, spools, and o
 - `integration/*` branches combine compatible changes and resolve shared state-machine surfaces.
 - `audit/*` branches contain audit-driven documentation or remediation prepared from a fixed integration head.
 
-Changes that share SQLite transitions or supervisor behavior may be developed separately, but they are installed only from a validated integration head. Live endpoint installation, service activation, and database replacement remain explicit Planner-controlled operations; a pushed branch is not an installation or deployment. The production source catalog is Planner v2 / Development v3 / SRE v3. V4/v5 artifacts are staged only, and v5 is dormant experimental hardening rather than a delivery prerequisite.
+Changes that share SQLite transitions or supervisor behavior may be developed separately, but they are installed only from a validated integration head. Live endpoint installation, service activation, and database replacement remain explicit Planner-controlled operations; a pushed branch is not an installation or deployment. The reviewed source-catalog target is Planner v2 / Development v6 / SRE v3. Development v3 remains the exact direct-writer rollback endpoint, v4 is retained historical hardening, and v5 alone remains dormant broker-only readiness hardening.
 
 Reviewed and merged source is not installed or live state. Source maintenance reaches `SOURCE_COMPLETE` only under [the shared harness contract](skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md); installation, registration, cutover, and runtime attestation remain separate explicitly authorized operations.
 

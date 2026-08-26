@@ -24,7 +24,7 @@ Read and apply, without duplicating them:
 
 Use GitHub for external issue/PR facts, authority publication, collaboration, CI/review evidence, and audit. Use the owner-only SQLite store for same-host queue, claim, capacity, lease, attempt, watch, acknowledgement, guarded-publication, and terminal state. Never use GitHub comments as a local queue or acknowledgement channel.
 
-For a harness-repository maintenance admission, also read [the source self-maintenance contract](../twinfinity-sprint-orchestrator/references/harness-self-maintenance.md). The fresh direct v3 writer may prepare one source branch and PR, but may not self-review, merge, install, cut over, or claim that reviewed source is live.
+For a harness-repository maintenance admission, also read [the source self-maintenance contract](../twinfinity-sprint-orchestrator/references/harness-self-maintenance.md). The fresh current direct Development writer may prepare one source branch and PR, but may not self-review, merge, install, cut over, or claim that reviewed source is live.
 
 ## Revalidate the exact admission
 
@@ -56,6 +56,8 @@ A successful local gate, guarded push, PR update, or draft-safe review is interm
 ## Keep native and sandbox permissions separate
 
 The fresh Development endpoint is the accountable native executor. It performs authorized native Git, GitHub, package/network, Docker/Compose, and cleanup operations under the exact admission and shared guards.
+
+When admitted Git metadata or guarded GitHub/network publication crosses the `workspace-write` sandbox boundary, request one narrowly scoped Auto-review escalation for that exact command. The first protected-path or sandbox-network denial is a capability signal, not by itself a delivery `HOLD`. The escalation grants no new authority: keep the delivery guard active and remain fenced to the exact admission, branch, worktree, lease, and guarded controller. Raw `git push`, canonical-checkout edits, out-of-lease paths, unrelated worktrees, broad sandbox/network bypasses, and unchanged retries remain prohibited.
 
 Sandbox children may inspect and patch only their exact owner-local workdir and run deterministic offline checks. They must not claim coordination rows, use Docker or container runners, access GitHub or providers, run outbound Git, download packages or artifacts, or perform cleanup. When useful, require a child to return a literal bounded native-host packet; independently verify it before execution. Sandbox failure never diagnoses native network, credentials, Docker, or provider state.
 
