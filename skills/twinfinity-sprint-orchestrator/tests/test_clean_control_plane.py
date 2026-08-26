@@ -382,10 +382,11 @@ class CleanControlPlaneTests(unittest.TestCase):
                     },
                 ],
             }
+        profile_versions = {"planner": 2, "development": 6, "sre": 3}
         value: dict[str, object] = {
             "schema": clean.SCHEMA,
             "manifest_sha256": "0" * 64,
-            "bootstrap_id": "clean-v3-test",
+            "bootstrap_id": "clean-v6-test",
             "created_at": NOW,
             "source_harness": {
                 "repository": "jayendusharma/twinfinity-harness",
@@ -396,10 +397,10 @@ class CleanControlPlaneTests(unittest.TestCase):
                     {
                         "role": role,
                         "endpoint_id": endpoint,
-                        "path": f"skills/twinfinity-sprint-orchestrator/references/twinfinity-{role if role == 'planner' else role}-v{2 if role == 'planner' else 3}.config.toml",
+                        "path": f"skills/twinfinity-sprint-orchestrator/references/twinfinity-{role}-v{profile_versions[role]}.config.toml",
                         "sha256": sha(
                             references
-                            / f"twinfinity-{role if role == 'planner' else role}-v{2 if role == 'planner' else 3}.config.toml"
+                            / f"twinfinity-{role}-v{profile_versions[role]}.config.toml"
                         ),
                     }
                     for role, endpoint in clean.EXPECTED_ENDPOINTS.items()
@@ -526,6 +527,7 @@ class CleanControlPlaneTests(unittest.TestCase):
         try:
             pointers = dict(connection.execute("SELECT role, endpoint_id FROM executor_role_endpoint_current"))
             self.assertEqual(clean.EXPECTED_ENDPOINTS, pointers)
+            self.assertEqual("role.development.v6", pointers["development"])
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM portfolio_readiness_campaigns").fetchone()[0])
             stored = json.loads(connection.execute("SELECT manifest_json FROM coordination_bootstrap_provenance").fetchone()[0])
             self.assertEqual(
