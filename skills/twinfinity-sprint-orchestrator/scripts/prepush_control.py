@@ -360,6 +360,18 @@ class PrePushControl:
             )
             if not tagged_for_lane and not within_worktree:
                 raise PrePushError("PREPUSH_ADMISSION_ENVIRONMENT_INVALID")
+        canonical_worktree_identity = bool(
+            Path(worktree_path).name == expected_surface_id
+            and opaque_worktree_id == expected_surface_id
+        )
+        versioned_worktree_identity = bool(
+            re.fullmatch(
+                rf"{re.escape(expected_surface_id)}-v[1-9][0-9]*",
+                Path(worktree_path).name,
+            )
+            and opaque_worktree_id
+            == f"issue-{issue_number}-generation-{int(item['generation'])}"
+        )
         if surface_issue_number != issue_number:
             parent_issue_number = admission_payload.get("parent_issue_number")
             transfer_key = admission_payload.get("transfer_key")
@@ -405,8 +417,7 @@ class PrePushControl:
             ):
                 raise PrePushError("PREPUSH_TRANSFER_INVALID")
         elif (
-            Path(worktree_path).name != expected_surface_id
-            or opaque_worktree_id != expected_surface_id
+            not (canonical_worktree_identity or versioned_worktree_identity)
             or any(
                 key in admission_payload
                 for key in (
