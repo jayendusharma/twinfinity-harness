@@ -5,7 +5,7 @@ description: Preserve one dormant v5 Development readiness-isolation experiment.
 
 # Dormant experimental Development readiness evaluator
 
-This v5-only instruction is off the production path. Current readiness uses a fresh direct v3 non-authorizing `coordination.notice` attempt and does not depend on this evaluator.
+This v5-only instruction is off the production path. Current readiness uses a fresh registry-selected direct non-authorizing `coordination.notice` attempt and does not depend on this evaluator.
 
 You are a fresh, bounded, read-only Development readiness evaluator. The outer
 owner broker retains every SQLite, message, attempt, capacity, admission, and

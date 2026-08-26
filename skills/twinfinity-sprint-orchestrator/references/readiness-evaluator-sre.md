@@ -5,7 +5,7 @@ description: Preserve one dormant v5 SRE readiness-isolation experiment.
 
 # Dormant experimental SRE readiness evaluator
 
-This v5-only instruction is off the production path. Current readiness uses a fresh direct v3 non-authorizing `coordination.notice` attempt and does not depend on this evaluator.
+This v5-only instruction is off the production path. Current readiness uses a fresh registry-selected direct non-authorizing `coordination.notice` attempt and does not depend on this evaluator.
 
 You are a fresh, bounded, read-only SRE readiness evaluator. The outer owner
 broker retains every SQLite, message, attempt, capacity, admission, hosted, and

@@ -83,7 +83,9 @@ COMMON_ROLE_KEYS = {
 PROFILED_ROLE_KEYS = COMMON_ROLE_KEYS | {"profile_sha256"}
 BROKERED_ROLE_KEYS = PROFILED_ROLE_KEYS | {"execution_protocol"}
 BROKERED_READINESS_PROTOCOL = "readiness/v1"
-RUNTIME_ROLLBACK_ENDPOINT_IDS = frozenset({"role.development.v3"})
+RUNTIME_ROLLBACK_ENDPOINT_IDS = frozenset(
+    {"role.development.v3", "role.sre.v3"}
+)
 EXPECTED_CODEX_PROFILES = {
     "planner": "twinfinity-planner",
     "development": "twinfinity-development",

@@ -73,6 +73,8 @@ DEVELOPMENT_ENDPOINT = "role.development.v4"
 DEVELOPMENT_V3_ENDPOINT = "role.development.v3"
 DEVELOPMENT_V6_ENDPOINT = "role.development.v6"
 SRE_ENDPOINT = "role.sre.v4"
+SRE_V3_ENDPOINT = "role.sre.v3"
+SRE_V6_ENDPOINT = "role.sre.v6"
 PLANNER_ENDPOINT = "role.planner.v2"
 LEASE = "5" * 64
 INVOCATION_ID = "a" * 32
@@ -358,6 +360,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             "twinfinity-development-v6",
             "twinfinity-sre-v3",
             "twinfinity-sre-v4",
+            "twinfinity-sre-v6",
         ):
             source = ROOT / "references" / f"{profile}.config.toml"
             (codex_home / f"{profile}.config.toml").write_bytes(source.read_bytes())
@@ -1531,7 +1534,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_v3_to_v6_cutover_launch_and_exact_v3_rollback(self) -> None:
+    def test_execution_roles_v3_to_v6_cutover_launch_and_exact_v3_rollback(self) -> None:
         # This activation boundary must load the real source-current v6 catalog,
         # rather than the generic v4 fixture injected for unrelated tests.
         self.runner_registry_loader.stop()
@@ -1544,7 +1547,7 @@ class ExecutorRegistryTests(unittest.TestCase):
         initial = {
             "planner": PLANNER_ENDPOINT,
             "development": DEVELOPMENT_V3_ENDPOINT,
-            "sre": "role.sre.v3",
+            "sre": SRE_V3_ENDPOINT,
         }
         for role, endpoint_id in initial.items():
             self.store.connection.execute(
@@ -1558,7 +1561,9 @@ class ExecutorRegistryTests(unittest.TestCase):
 
         observed_profiles: list[str] = []
 
-        def launch(endpoint_id: str, key: str, expected_profile: str) -> None:
+        def launch(
+            role: str, endpoint_id: str, key: str, expected_profile: str
+        ) -> None:
             message_id = self.store.enqueue_message(
                 idempotency_key=key,
                 recipient_session_id=endpoint_id,
@@ -1594,18 +1599,20 @@ class ExecutorRegistryTests(unittest.TestCase):
                 load_registry_config(
                     PRODUCTION_CONFIG,
                     selected_current_endpoint_id=endpoint_id,
-                ).roles["development"].endpoint_id,
+                ).roles[role].endpoint_id,
             )
             result = execute_role(
                 self.store.connection,
                 config_path=PRODUCTION_CONFIG,
-                role="development",
+                role=role,
                 endpoint_id=endpoint_id,
                 target_kind="message",
                 target_key=str(message_id),
                 prompt="Inspect the exact endpoint rollback probe.",
                 systemd_invocation_id=INVOCATION_ID,
-                systemd_evidence=systemd_evidence(target_key=str(message_id)),
+                systemd_evidence=systemd_evidence(
+                    role=role, target_key=str(message_id)
+                ),
                 popen=succeed,
             )
             self.assertEqual("COMPLETE", result["state"])
@@ -1633,11 +1640,18 @@ class ExecutorRegistryTests(unittest.TestCase):
         }
         self.assertEqual((DEVELOPMENT_V6_ENDPOINT, 2), cutover_pointers["development"])
         self.assertEqual((PLANNER_ENDPOINT, 1), cutover_pointers["planner"])
-        self.assertEqual(("role.sre.v3", 1), cutover_pointers["sre"])
+        self.assertEqual((SRE_V6_ENDPOINT, 2), cutover_pointers["sre"])
         launch(
+            "development",
             DEVELOPMENT_V6_ENDPOINT,
-            "endpoint-v6-cutover",
+            "development-endpoint-v6-cutover",
             "twinfinity-development-v6",
+        )
+        launch(
+            "sre",
+            SRE_V6_ENDPOINT,
+            "sre-endpoint-v6-cutover",
+            "twinfinity-sre-v6",
         )
         rolled_back = rollback_change(
             self.store.connection,
@@ -1655,23 +1669,39 @@ class ExecutorRegistryTests(unittest.TestCase):
         }
         self.assertEqual((DEVELOPMENT_V3_ENDPOINT, 3), rollback_pointers["development"])
         self.assertEqual((PLANNER_ENDPOINT, 1), rollback_pointers["planner"])
-        self.assertEqual(("role.sre.v3", 1), rollback_pointers["sre"])
-        rollback_endpoint = v6_config.endpoints[DEVELOPMENT_V3_ENDPOINT]
-        self.assertEqual(
-            "twinfinity-development-v3", rollback_endpoint.runtime_codex_profile
-        )
-        stored_rollback = self.store.connection.execute(
-            "SELECT config_sha256 FROM executor_role_endpoints WHERE endpoint_id=?",
-            (DEVELOPMENT_V3_ENDPOINT,),
-        ).fetchone()
-        self.assertEqual(rollback_endpoint.config_sha256, stored_rollback[0])
+        self.assertEqual((SRE_V3_ENDPOINT, 3), rollback_pointers["sre"])
+        for endpoint_id, expected_profile in (
+            (DEVELOPMENT_V3_ENDPOINT, "twinfinity-development-v3"),
+            (SRE_V3_ENDPOINT, "twinfinity-sre-v3"),
+        ):
+            rollback_endpoint = v6_config.endpoints[endpoint_id]
+            self.assertEqual(
+                expected_profile, rollback_endpoint.runtime_codex_profile
+            )
+            stored_rollback = self.store.connection.execute(
+                "SELECT config_sha256 FROM executor_role_endpoints WHERE endpoint_id=?",
+                (endpoint_id,),
+            ).fetchone()
+            self.assertEqual(rollback_endpoint.config_sha256, stored_rollback[0])
         launch(
+            "development",
             DEVELOPMENT_V3_ENDPOINT,
-            "endpoint-v3-after-rollback",
+            "development-endpoint-v3-after-rollback",
             "twinfinity-development-v3",
         )
+        launch(
+            "sre",
+            SRE_V3_ENDPOINT,
+            "sre-endpoint-v3-after-rollback",
+            "twinfinity-sre-v3",
+        )
         self.assertEqual(
-            ["twinfinity-development-v6", "twinfinity-development-v3"],
+            [
+                "twinfinity-development-v6",
+                "twinfinity-sre-v6",
+                "twinfinity-development-v3",
+                "twinfinity-sre-v3",
+            ],
             observed_profiles,
         )
 

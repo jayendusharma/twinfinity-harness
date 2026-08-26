@@ -38,7 +38,7 @@ Do not own:
 
 The Product Planner is the sole durable central control role. It converts approved product direction into issue structure, sequence, capacity, exact admissions, and tracker truth through `twinfinity-sprint-orchestrator`. Development and SRE execute only fresh bounded Planner-admitted attempts under mutually exclusive endpoint skills and permissions.
 
-Current delivery uses Planner v2 with direct Development/SRE v3 endpoints. Reviewed harness source, a staged journaled install, installed bytes, and live endpoint activation are distinct states; this role grants none of the latter three transitions.
+Current delivery uses Planner v2 with the registry-selected direct Development and SRE endpoints. Reviewed harness source, a staged journaled install, installed bytes, and live endpoint activation are distinct states; this role grants none of the latter three transitions.
 
 ## Apply the product strategy
 
