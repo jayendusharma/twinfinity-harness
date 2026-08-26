@@ -20,6 +20,10 @@ from typing import Any, Iterable, Mapping
 
 DEFAULT_DATABASE = Path.home() / ".codex/twinfinity-coordination/ack-transactions.sqlite3"
 DEFAULT_WORKTREE_ROOT = Path("/home/ubuntu/code")
+CANONICAL_PREPUSH_CONTROL = Path(
+    "/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/"
+    "scripts/prepush_control.py"
+)
 SHELL_TOOL = re.compile(r"(?i)(?:exec|shell|bash|command)")
 SHELL_SEGMENT = re.compile(r"&&|\|\||[;|\n]")
 TOKEN = re.compile(r"[A-Za-z0-9_./-]+")
@@ -89,6 +93,9 @@ class DeliveryContext:
     worktree: Path | None
     lease_paths: frozenset[Path]
     repository_writes: bool
+    canonical_checkout: Path | None = None
+    branch: str | None = None
+    base_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -324,13 +331,19 @@ def _source_is_current(connection: sqlite3.Connection, payload: dict[str, Any]) 
     return bool(row is not None and isinstance(source.get("payload_sha256"), str) and secrets.compare_digest(str(row["payload_sha256"]), source["payload_sha256"]))
 
 
-def _load_lease(connection: sqlite3.Connection, database: Path, payload: dict[str, Any], worktree_root: Path) -> tuple[Path, frozenset[Path]]:
+def _load_lease(
+    connection: sqlite3.Connection,
+    database: Path,
+    payload: dict[str, Any],
+    worktree_root: Path,
+) -> tuple[Path, frozenset[Path], Path, str, str]:
     source = payload.get("source")
     if not isinstance(source, dict):
         raise GuardError("DELIVERY_TARGET_INVALID")
     repository, issue_number, generation = source.get("repository"), payload.get("issue_number"), payload.get("generation")
     digest, worktree_value = payload.get("lease_manifest_sha256"), payload.get("worktree_path")
-    if not isinstance(repository, str) or type(issue_number) is not int or issue_number <= 0 or type(generation) is not int or generation < 0 or not isinstance(digest, str) or SHA256.fullmatch(digest) is None or not isinstance(worktree_value, str):
+    repository_parts = repository.split("/", 1) if isinstance(repository, str) else []
+    if not isinstance(repository, str) or len(repository_parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in repository_parts) or type(issue_number) is not int or issue_number <= 0 or type(generation) is not int or generation < 0 or not isinstance(digest, str) or SHA256.fullmatch(digest) is None or not isinstance(worktree_value, str):
         raise GuardError("DELIVERY_TARGET_INVALID")
     worktree = Path(worktree_value)
     if not worktree.is_absolute() or worktree.parent != worktree_root:
@@ -344,7 +357,13 @@ def _load_lease(connection: sqlite3.Connection, database: Path, payload: dict[st
     manifest = _parse_lease(raw)
     if manifest["repository"] != repository or manifest["issue_number"] != issue_number or manifest["generation"] != generation or manifest["base_sha"] != payload.get("base_sha") or manifest["branch"] != payload.get("branch") or manifest["worktree_path"] != worktree_value:
         raise GuardError("DELIVERY_LEASE_INVALID")
-    return worktree, frozenset(worktree / entry["path"] for entry in manifest["paths"])
+    return (
+        worktree,
+        frozenset(worktree / entry["path"] for entry in manifest["paths"]),
+        worktree_root / repository_parts[1],
+        str(manifest["branch"]),
+        str(manifest["base_sha"]),
+    )
 
 
 def _item_matches(connection: sqlite3.Connection, payload: dict[str, Any], endpoint_id: str, *, exact_version: bool) -> bool:
@@ -380,8 +399,22 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         return DeliveryContext(role, endpoint_id, "message", target_key, topic, None, frozenset(), False)
     if topic not in {"development.admission", "development.recovery_commit", "sre.admission"} or not _item_matches(connection, payload, endpoint_id, exact_version=True):
         raise GuardError("DELIVERY_TARGET_INVALID")
-    worktree, paths = _load_lease(connection, database, payload, worktree_root)
-    return DeliveryContext(role, endpoint_id, "message", target_key, topic, worktree, paths, True)
+    worktree, paths, canonical_checkout, branch, base_sha = _load_lease(
+        connection, database, payload, worktree_root
+    )
+    return DeliveryContext(
+        role,
+        endpoint_id,
+        "message",
+        target_key,
+        topic,
+        worktree,
+        paths,
+        True,
+        canonical_checkout,
+        branch,
+        base_sha,
+    )
 
 
 def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, role: str, endpoint_id: str, target_key: str, worktree_root: Path) -> DeliveryContext:
@@ -403,8 +436,22 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
             break
     if payload is None or not _source_is_current(connection, payload) or not _item_matches(connection, payload, endpoint_id, exact_version=False):
         raise GuardError("DELIVERY_TARGET_INVALID")
-    worktree, paths = _load_lease(connection, database, payload, worktree_root)
-    return DeliveryContext(role, endpoint_id, "terminal_watch", target_key, None, worktree, paths, True)
+    worktree, paths, canonical_checkout, branch, base_sha = _load_lease(
+        connection, database, payload, worktree_root
+    )
+    return DeliveryContext(
+        role,
+        endpoint_id,
+        "terminal_watch",
+        target_key,
+        None,
+        worktree,
+        paths,
+        True,
+        canonical_checkout,
+        branch,
+        base_sha,
+    )
 
 
 def _hosted_context(connection: sqlite3.Connection, *, role: str, endpoint_id: str, target_key: str) -> DeliveryContext:
@@ -647,7 +694,22 @@ def _git_write(tokens: tuple[str, ...]) -> ShellWrite:
     if index >= len(tokens):
         return ShellWrite()
     subcommand = tokens[index].casefold()
-    if subcommand in {"status", "diff", "show", "log", "rev-parse", "ls-files", "ls-tree", "branch", "remote", "config", "grep", "cat-file", "merge-base"}:
+    arguments = tokens[index + 1:]
+    if subcommand in {"status", "diff", "show", "log", "rev-parse", "ls-files", "ls-tree", "grep", "cat-file", "merge-base"}:
+        return ShellWrite()
+    if subcommand == "worktree" and arguments[:1] == ("list",):
+        return ShellWrite()
+    if subcommand == "branch" and (
+        not arguments or arguments == ("--show-current",) or arguments[:1] == ("--list",)
+    ):
+        return ShellWrite()
+    if subcommand == "remote" and (
+        not arguments or arguments in {("-v",), ("--verbose",)} or arguments[:1] == ("get-url",)
+    ):
+        return ShellWrite()
+    if subcommand == "config" and arguments and (
+        arguments[0].startswith("--get") or arguments[0] in {"--list", "-l"}
+    ):
         return ShellWrite()
     if subcommand in {"add", "rm"}:
         paths = _operands(tokens, index + 1)
@@ -655,11 +717,81 @@ def _git_write(tokens: tuple[str, ...]) -> ShellWrite:
     if subcommand == "mv":
         paths = _operands(tokens, index + 1)
         return ShellWrite(True, paths=paths, ambiguous=alternate_worktree or len(paths) != 2)
-    if subcommand in {"commit", "tag", "notes"}:
-        return ShellWrite(True, worktree_only=True, ambiguous=alternate_worktree)
+    if subcommand == "commit":
+        return ShellWrite(
+            True,
+            worktree_only=True,
+            ambiguous=alternate_worktree or any(
+                argument in {"-a", "--all"} for argument in arguments
+            ),
+        )
     if subcommand == "push":
         return ShellWrite()
     return ShellWrite(True, ambiguous=True)
+
+
+def _enforce_exact_worktree_command(
+    command: str,
+    context: DeliveryContext,
+    cwd: Path,
+) -> dict[str, Any] | None:
+    """Permit only the admitted worktree add/remove forms before sandbox review."""
+
+    tokens = _shell_tokens(command)
+    if not tokens or tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold() != "git":
+        return None
+    index = 1
+    repository_cwd = cwd
+    if index < len(tokens) and tokens[index] == "-C":
+        if index + 1 >= len(tokens):
+            return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+        repository_cwd = _path_value(tokens[index + 1], cwd)
+        index += 2
+    if index >= len(tokens) or tokens[index].casefold() != "worktree":
+        return None
+    arguments = tokens[index + 1:]
+    if arguments[:1] == ("list",):
+        return None
+    if (
+        not context.repository_writes
+        or context.canonical_checkout is None
+        or context.worktree is None
+        or context.branch is None
+        or context.base_sha is None
+        or repository_cwd != context.canonical_checkout
+        or context.canonical_checkout.parent != context.worktree.parent
+        or not _stable_descriptor_path(
+            context.canonical_checkout,
+            context.canonical_checkout,
+            allow_missing_leaf=False,
+        )
+    ):
+        return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+    if arguments == (
+        "add",
+        "-b",
+        context.branch,
+        str(context.worktree),
+        context.base_sha,
+    ):
+        if os.path.lexists(context.worktree) or not _stable_descriptor_path(
+            context.worktree.parent,
+            context.worktree.parent,
+            allow_missing_leaf=False,
+        ):
+            return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+        return {}
+    if arguments == ("remove", str(context.worktree)):
+        return (
+            {}
+            if _stable_descriptor_path(
+                context.worktree,
+                context.worktree,
+                allow_missing_leaf=False,
+            )
+            else _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
+        )
+    return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
 
 
 def _shell_write(command: str) -> ShellWrite:
@@ -1033,7 +1165,7 @@ def _command_leaves(command: str, *, bounded_wait: bool = False, depth: int = 0)
             if executable in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {"pytest", "unittest"}:
                 leaves.append(CommandLeaf(segment, bounded_wait))
                 continue
-            if any(token.endswith("prepush_control.py") for token in tokens[1:]) and "guarded-push" in tokens:
+            if str(CANONICAL_PREPUSH_CONTROL) in tokens[1:] and "guarded-push" in tokens:
                 leaves.append(CommandLeaf(segment, bounded_wait))
                 continue
             if len(tokens) > 1 and not all(token.startswith("-") for token in tokens[1:]):
@@ -1098,6 +1230,13 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
             return _deny("RAW_GIT_PUSH_FORBIDDEN_USE_SQLITE_EXACT_HEAD_GUARDED_PUSH")
         if _contains_open_ended_wait(leaf.command) and not leaf.bounded_wait:
             return _deny("OPEN_ENDED_WAIT_FORBIDDEN_USE_SESSION_WAIT_OR_MAX_60S_POLL")
+        worktree_decision = _enforce_exact_worktree_command(
+            leaf.command, context, cwd
+        )
+        if worktree_decision is not None:
+            if worktree_decision:
+                return worktree_decision
+            continue
         if _provider_command(leaf.command):
             if context.role == "development":
                 return _deny("DEVELOPMENT_HOSTED_PROVIDER_OPERATION_FORBIDDEN")

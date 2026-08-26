@@ -685,7 +685,7 @@ def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
         )
         or (
             role in {"development", "sre"}
-            and version >= 5
+            and version == 5
             and execution_protocol != BROKERED_READINESS_PROTOCOL
         )
         or (role == "planner" and execution_protocol is not None)

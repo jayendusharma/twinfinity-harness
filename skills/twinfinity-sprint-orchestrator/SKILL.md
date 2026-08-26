@@ -30,7 +30,7 @@ GitHub is authoritative for external repository, issue, pull-request, milestone,
 
 The owner-only SQLite store is authoritative for same-host queue, claim, capacity, lease, attempt, terminal-watch, acknowledgement, approval-ledger, outbox, scheduler, and artifact-lifecycle state. Bind derived rows to exact normalized GitHub snapshot digests. A local row transports existing authority; it never creates product, repository, provider, deployment, or destructive-action authority.
 
-In the current direct v3 operating mode, the Planner may use only the official owner-safe SQLite APIs and registered scripts under its strict profile. A future broker or v5 evaluator is optional off-path hardening, not a prerequisite for portfolio reconciliation, direct v3 readiness, admission, or delivery.
+In the current direct operating mode, the Planner may use only the official owner-safe SQLite APIs and registered scripts under its strict profile. The v5 evaluator is optional off-path hardening, not a prerequisite for portfolio reconciliation, direct readiness, admission, or delivery.
 
 Do not use GitHub comments as a local queue, lock, scheduler, heartbeat, or acknowledgement channel. Do not derive operational truth from chat, archived conversations, process presence, or historical endpoint identities.
 

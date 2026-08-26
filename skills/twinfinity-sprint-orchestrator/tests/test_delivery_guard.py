@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -11,7 +12,11 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import delivery_guard  # noqa: E402
-from delivery_guard import DeliveryContext, pre_tool  # noqa: E402
+from delivery_guard import (  # noqa: E402
+    CANONICAL_PREPUSH_CONTROL,
+    DeliveryContext,
+    pre_tool,
+)
 
 
 class DeliveryGuardTests(unittest.TestCase):
@@ -30,7 +35,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 repository_writes=True,
             ),
         )
-        self.context.start()
+        self.load_context = self.context.start()
 
     def tearDown(self) -> None:
         self.context.stop()
@@ -86,7 +91,7 @@ class DeliveryGuardTests(unittest.TestCase):
             self.event(
                 "exec_command",
                 {
-                    "cmd": "python3 /opt/prepush_control.py guarded-push --repository x/y --issue 1"
+                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository x/y --issue 1"
                 },
             ),
             self.event("exec_command", {"cmd": "rg -n 'git push' docs"}),
@@ -95,6 +100,199 @@ class DeliveryGuardTests(unittest.TestCase):
         for event in safe:
             with self.subTest(event=event):
                 self.assertEqual({}, pre_tool(event))
+
+    def test_exact_admitted_git_metadata_can_reach_auto_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / "twinfinityapp"
+            worktree = root / "twinfinityapp-issue-328-v3"
+            canonical.mkdir()
+            branch = "codex/328-evaluation-client-validation-v3"
+            base_sha = "a" * 40
+            self.load_context.return_value = DeliveryContext(
+                role="development",
+                endpoint_id="role.development.v6",
+                target_kind="terminal_watch",
+                target_key="watch-328",
+                topic=None,
+                worktree=worktree,
+                lease_paths=frozenset({worktree / "docs" / "allowed.md"}),
+                repository_writes=True,
+                canonical_checkout=canonical,
+                branch=branch,
+                base_sha=base_sha,
+            )
+            escalation = {
+                "sandbox_permissions": "require_escalated",
+                "justification": "Use only admitted Git metadata",
+            }
+            add = self.event(
+                "exec_command",
+                {
+                    "cmd": f"git worktree add -b {branch} {worktree} {base_sha}",
+                    "workdir": str(canonical),
+                    **escalation,
+                },
+            )
+            self.assertEqual({}, pre_tool(add))
+
+            worktree.mkdir()
+            (worktree / "docs").mkdir()
+            (worktree / "docs" / "allowed.md").touch()
+            commit = self.event(
+                "exec_command",
+                {
+                    "cmd": "git commit -m bounded-change",
+                    "workdir": str(worktree),
+                    **escalation,
+                },
+            )
+            self.assertEqual({}, pre_tool(commit))
+            self.assertEqual(
+                {},
+                pre_tool(
+                    self.event(
+                        "exec_command",
+                        {
+                            "cmd": "git add docs/allowed.md",
+                            "workdir": str(worktree),
+                            **escalation,
+                        },
+                    )
+                ),
+            )
+            remove = self.event(
+                "exec_command",
+                {
+                    "cmd": f"git worktree remove {worktree}",
+                    "workdir": str(canonical),
+                    **escalation,
+                },
+            )
+            self.assertEqual({}, pre_tool(remove))
+
+    def test_escalation_stays_inside_exact_git_and_publication_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / "twinfinityapp"
+            worktree = root / "twinfinityapp-issue-328-v3"
+            unrelated = root / "twinfinityapp-issue-999"
+            canonical.mkdir()
+            worktree.mkdir()
+            unrelated.mkdir()
+            (worktree / "docs").mkdir()
+            (worktree / "docs" / "allowed.md").touch()
+            branch = "codex/328-evaluation-client-validation-v3"
+            base_sha = "a" * 40
+            self.load_context.return_value = DeliveryContext(
+                role="development",
+                endpoint_id="role.development.v6",
+                target_kind="terminal_watch",
+                target_key="watch-328",
+                topic=None,
+                worktree=worktree,
+                lease_paths=frozenset({worktree / "docs" / "allowed.md"}),
+                repository_writes=True,
+                canonical_checkout=canonical,
+                branch=branch,
+                base_sha=base_sha,
+            )
+            escalation = {
+                "sandbox_permissions": "require_escalated",
+                "justification": "Use only admitted Git metadata",
+            }
+            denied = (
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": f"git worktree add -b codex/328-wrong {worktree} {base_sha}",
+                        "workdir": str(canonical),
+                        **escalation,
+                    },
+                ),
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": f"git worktree remove {unrelated}",
+                        "workdir": str(canonical),
+                        **escalation,
+                    },
+                ),
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": "git commit -m canonical-edit",
+                        "workdir": str(canonical),
+                        **escalation,
+                    },
+                ),
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": "git commit -m unrelated-edit",
+                        "workdir": str(unrelated),
+                        **escalation,
+                    },
+                ),
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": "git add docs/outside.md",
+                        "workdir": str(worktree),
+                        **escalation,
+                    },
+                ),
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": "git commit -a -m broad-commit",
+                        "workdir": str(worktree),
+                        **escalation,
+                    },
+                ),
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": "git push origin HEAD",
+                        "workdir": str(worktree),
+                        **escalation,
+                    },
+                ),
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": "python3 /opt/prepush_control.py guarded-push --repository x/y --issue 328",
+                        "workdir": str(worktree),
+                        **escalation,
+                    },
+                ),
+            )
+            for event in denied:
+                with self.subTest(event=event):
+                    self.assert_denied(pre_tool(event))
+
+            guarded = self.event(
+                "exec_command",
+                {
+                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository x/y --issue 328",
+                    "workdir": str(worktree),
+                    **escalation,
+                },
+            )
+            self.assertEqual({}, pre_tool(guarded))
+            self.assertEqual(
+                {},
+                pre_tool(
+                    self.event(
+                        "exec_command",
+                        {
+                            "cmd": "gh pr create --draft",
+                            "workdir": str(worktree),
+                            **escalation,
+                        },
+                    )
+                ),
+            )
 
     def test_native_delivery_guard_remains_scoped_to_native_controls(self) -> None:
         """The native hook guards delivery flow without disabling role capabilities."""
@@ -142,7 +340,7 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "984be7830e5ffc64fef126d3e018b059ee7507c9ce250d5db0992b9ab152ee35",
+                "df637bfe65cb06931db35af372fcc0fb16a2f7e04193ea41a30a16a27ba83628",
         }
         for path, digest in expected.items():
             with self.subTest(path=path):

@@ -35,10 +35,10 @@ systemctl --user is-system-running
 | User unit directory | `/home/ubuntu/.config/systemd/user` |
 | Endpoint registry config | `/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml` |
 | Planner current profile | `/home/ubuntu/.codex/twinfinity-planner-v2.config.toml` |
-| Development current profile | `/home/ubuntu/.codex/twinfinity-development-v3.config.toml` |
+| Development source-current profile | `/home/ubuntu/.codex/twinfinity-development-v6.config.toml` |
 | SRE current profile | `/home/ubuntu/.codex/twinfinity-sre-v3.config.toml` |
 
-Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The production catalog points to Planner v2, Development v3, and SRE v3. A current runtime launch validates only its exact selected current installed profile; other current roles and staged v4/v5 bytes are not launch prerequisites. An explicit catalog audit or staged activation boundary uses `executor_registry.py --profile-root <absolute-staged-reference-root> audit-config` and validates the complete catalog without reading or writing live `CODEX_HOME`. V4/v5 remain staged artifacts only, and v5 is dormant experimental hardening. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
+Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The reviewed source catalog targets Planner v2, Development v6, and SRE v3; Development v3 remains the exact rollback endpoint and v5 alone remains broker-only. A source-catalog target is not evidence that the corresponding profile is installed or that the live pointer has moved. A current runtime launch validates only its exact selected current installed profile. An explicit catalog audit or staged activation boundary uses `executor_registry.py --profile-root <absolute-staged-reference-root> audit-config` and validates the complete catalog without reading or writing live `CODEX_HOME`. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
 
 ## Clean control-plane bootstrap
 
