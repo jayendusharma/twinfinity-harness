@@ -71,6 +71,28 @@ MAX_RECEIPT_PICKUP_ATTEMPTS = 3
 RECEIPT_PICKUP_RETRY_SECONDS = 60
 MAX_RECEIPT_PICKUPS_PER_SCAN = 8
 WORKER_ROLES = {"development", "sre"}
+TERMINAL_HOLD_REFRESH_PHASE_SUMMARY = (
+    "Reassess the current prepared candidate against its structured live bindings "
+    "and the canonical admission-readiness checklist."
+)
+TERMINAL_HOLD_REFRESH_GATES = (
+    {
+        "gate_key": "complete-review",
+        "description": (
+            "Assess the complete current candidate for safe writer admission "
+            "using its structured readiness-plan bindings."
+        ),
+        "requested_evidence": [
+            "Exact current verdict for source, accepted main, graph, capacity "
+            "policy, item generation and version, candidate, and dependencies",
+            "Current issue scope, acceptance-scenario, validation, and rollback "
+            "verdict",
+            "Current branch, worktree, mutable-path, active-attempt, and "
+            "pull-request collision and exclusive-lease audit",
+            "Current approval and operational-authority verdict",
+        ],
+    },
+)
 RESOLUTION_ACTION_KEYS = {
     "kind",
     "target",
@@ -1306,6 +1328,19 @@ def transition_evidence_sha256(
     return digest_json(transition_evidence_payload(parent_plan, successor_plan))
 
 
+def _terminal_hold_refresh_gates() -> list[dict[str, Any]]:
+    """Return a fresh copy of the stable checklist for a current-bound refresh."""
+
+    return [
+        {
+            "gate_key": str(gate["gate_key"]),
+            "description": str(gate["description"]),
+            "requested_evidence": list(gate["requested_evidence"]),
+        }
+        for gate in TERMINAL_HOLD_REFRESH_GATES
+    ]
+
+
 def _campaign(
     connection: sqlite3.Connection, repository: str, issue_number: int
 ) -> sqlite3.Row:
@@ -2247,6 +2282,8 @@ def reopen_terminal_hold(
             "graph_version": int(graph["version"]),
             "capacity_policy_version": int(policy["version"]),
             "candidate_sha256": str(candidate["candidate_sha256"]),
+            "phase_summary": TERMINAL_HOLD_REFRESH_PHASE_SUMMARY,
+            "gates": _terminal_hold_refresh_gates(),
             "transition": {
                 "kind": "REFRESH",
                 "parent_campaign_id": expected_campaign_id,
