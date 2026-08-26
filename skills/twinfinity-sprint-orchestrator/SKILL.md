@@ -71,6 +71,8 @@ Never dispatch a tracker, epic, customer dependency, or incomplete body as codin
 
 Use `scripts/coordination_store.py activate-admission --transaction-file <json>` for an already-reviewed READY-to-ACTIVE transition so item state, exact typed admission, allocation, lease, and terminal watch commit together. Use `scripts/coordination_transfer.py` only for an authorized atomic predecessor-to-successor transfer. Partial local state changes are not admission.
 
+After an applied role-endpoint rotation, preserve the claimed admission as immutable historical provenance and route only fresh continuation attempts to the current endpoint. If the prior runtime produced the exact paired item-version/watch-binding HOLDs, use the store's endpoint-rotation rearm preview and digest-bound apply operation only after its strict migration-ledger, lineage, attempt, closeout, and timestamp fences pass; do not recreate or edit the admission.
+
 ## Route execution through fresh endpoints
 
 A Development admission conditionally covers the complete authorized routine chain: current-main preflight, implementation, focused gates, applicable final-head local Docker Compose acceptance, commit, guarded private push, PR and natural CI, independent exact-head review, one bounded repair cycle, routine merge, cleanup, terminal receipt, and capacity release. Native repository, network, Docker, GitHub, and cleanup operations belong to the fresh Development attempt under its strict profile and controlled escalation.

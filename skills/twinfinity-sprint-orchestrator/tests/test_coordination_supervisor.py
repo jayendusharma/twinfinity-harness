@@ -422,7 +422,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
         early = self.supervisor.run_once("2026-08-22T10:00:30Z")
         retry = self.supervisor.run_once("2026-08-22T10:01:06Z")
 
-        self.assertEqual(1, len(first["launched"]))
+        self.assertEqual([], first["launched"])
         self.assertEqual([], early["launched"])
         self.assertEqual([], retry["launched"])
         self.assertEqual(1, len(retry["terminal_watch_launches"]))
@@ -435,7 +435,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             (f"message:{message_id}:claimed",),
         ).fetchone()
         self.assertEqual(("CLAIMED", None), tuple(observed))
-        self.assertEqual(("INFLIGHT", 1), tuple(wake))
+        self.assertIsNone(wake)
 
     def test_claimed_retry_backoff_does_not_block_a_different_target(self) -> None:
         source, message_id = self.claimed_admission()
@@ -462,10 +462,10 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
         cooling_down = self.supervisor.run_once("2026-08-22T10:00:30Z")
 
-        self.assertEqual(1, len(first["launched"]))
+        self.assertEqual([], first["launched"])
         self.assertEqual(1, len(cooling_down["launched"]))
         self.assertEqual(
-            [(DEVELOPMENT_SESSION, message_id), (DEVELOPMENT_SESSION, newer_id)],
+            [(DEVELOPMENT_SESSION, newer_id)],
             self.launches,
         )
         newer_wakes = self.store.connection.execute(
@@ -497,7 +497,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             (f"message:{message_id}:claimed",),
         ).fetchone()
         self.assertEqual(("HOLD", "SOURCE_SNAPSHOT_DRIFT"), tuple(observed))
-        self.assertEqual("COMPLETE", wake["state"])
+        self.assertIsNone(wake)
 
     def test_claimed_item_drift_holds_message_and_terminates_wake(self) -> None:
         source, message_id = self.claimed_admission()
@@ -534,7 +534,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             (f"message:{message_id}:claimed",),
         ).fetchone()
         self.assertEqual(("HOLD", "MESSAGE_ITEM_STATE_MISMATCH"), tuple(observed))
-        self.assertEqual("COMPLETE", wake["state"])
+        self.assertIsNone(wake)
 
     def test_claimed_schema_valid_payload_drift_holds_message_and_terminates_wake(self) -> None:
         _source, message_id = self.claimed_admission()
@@ -564,7 +564,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             (f"message:{message_id}:claimed",),
         ).fetchone()
         self.assertEqual(("HOLD", "MESSAGE_PAYLOAD_MISMATCH"), tuple(observed))
-        self.assertEqual("COMPLETE", wake["state"])
+        self.assertIsNone(wake)
 
     def test_claimed_retry_rejects_payload_and_digest_rebinding(self) -> None:
         _source, message_id = self.claimed_admission()
@@ -594,9 +594,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             (f"message:{message_id}:claimed",),
         ).fetchone()
         self.assertEqual(("HOLD", "MESSAGE_PAYLOAD_MISMATCH"), tuple(observed))
-        self.assertEqual(
-            ("COMPLETE", "MESSAGE_PAYLOAD_MISMATCH"), tuple(wake)
-        )
+        self.assertIsNone(wake)
 
     def test_claimed_envelope_cannot_rebind_before_first_wake(self) -> None:
         _source, message_id = self.claimed_admission()
@@ -617,7 +615,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             "SELECT state, payload_json FROM coordination_messages WHERE id=?",
             (message_id,),
         ).fetchone()
-        self.assertEqual(1, len(result["launched"]))
+        self.assertEqual([], result["launched"])
         self.assertEqual("CLAIMED", observed["state"])
         self.assertEqual("a" * 40, json.loads(observed["payload_json"])["base_sha"])
 
@@ -782,6 +780,11 @@ class CoordinationSupervisorTests(unittest.TestCase):
             "SELECT watch_key FROM coordination_terminal_watches"
         ).fetchone()
         watch_key = str(watch["watch_key"])
+        self.store.connection.execute(
+            "UPDATE coordination_terminal_watches SET claim_attempt_id=NULL "
+            "WHERE watch_key=?",
+            (watch_key,),
+        )
         self.store.heartbeat_terminal_watch(
             watch_key=watch_key,
             session_id=DEVELOPMENT_SESSION,

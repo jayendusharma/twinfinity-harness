@@ -17,6 +17,14 @@ import stat
 import sys
 from typing import Any, Iterable, Mapping
 
+from coordination_store import terminal_watch_key
+from executor_registry import (
+    RegistryError,
+    applied_endpoint_rotation_chain,
+    digest_json,
+    identity_role,
+)
+
 
 DEFAULT_DATABASE = Path.home() / ".codex/twinfinity-coordination/ack-transactions.sqlite3"
 DEFAULT_WORKTREE_ROOT = Path("/home/ubuntu/code")
@@ -428,7 +436,123 @@ def _item_matches(connection: sqlite3.Connection, payload: dict[str, Any], endpo
     if not isinstance(source, dict):
         return False
     row = connection.execute("SELECT * FROM coordination_items WHERE repository=? AND issue_number=?", (source.get("repository"), payload.get("issue_number"))).fetchone()
-    return bool(row is not None and row["status"] in {"ACTIVE", "ACTIVE_FENCED", "MONITOR", "HOLD"} and row["allocation_class"] in {"ACTIVE", "RETAINED"} and int(row["generation"]) == payload.get("generation") and row["accountable_session_id"] == endpoint_id and row["lease_manifest_sha256"] == payload.get("lease_manifest_sha256") and row["source_payload_sha256"] == source.get("payload_sha256") and (not exact_version or int(row["version"]) == payload.get("item_version")))
+    return bool(row is not None and row["status"] in {"ACTIVE", "ACTIVE_FENCED", "MONITOR", "HOLD", "PUBLICATION_PENDING"} and row["allocation_class"] in {"ACTIVE", "RETAINED"} and int(row["generation"]) == payload.get("generation") and row["accountable_session_id"] == endpoint_id and row["lease_manifest_sha256"] == payload.get("lease_manifest_sha256") and row["source_payload_sha256"] == source.get("payload_sha256") and (not exact_version or int(row["version"]) == payload.get("item_version")))
+
+
+def _rotated_admission_matches(
+    connection: sqlite3.Connection,
+    *,
+    message: sqlite3.Row,
+    message_id: int,
+    payload: dict[str, Any],
+    role: str,
+    endpoint_id: str,
+    watch: sqlite3.Row,
+) -> bool:
+    source = payload.get("source")
+    capacity = payload.get("capacity")
+    if (
+        message["topic"]
+        not in (
+            {"development.admission"}
+            if role == "development"
+            else {"sre.admission"}
+        )
+        or
+        not isinstance(source, dict)
+        or not isinstance(capacity, dict)
+        or message["state"] != "CLAIMED"
+        or message["claimed_by"] != message["recipient_session_id"]
+        or identity_role(connection, str(message["recipient_session_id"])) != role
+        or digest_json(payload) != message["payload_sha256"]
+        or payload.get("accountable_session_id")
+        != message["recipient_session_id"]
+        or source.get("object_kind") != "issue"
+        or type(source.get("object_number")) is not int
+        or payload.get("issue_number") != source.get("object_number")
+        or type(payload.get("generation")) is not int
+        or type(payload.get("item_version")) is not int
+        or any(
+            type(capacity.get(field)) is not int
+            for field in ("development_units", "shared_units", "sre_units")
+        )
+        or (role == "development" and capacity.get("sre_units") != 0)
+        or (
+            role == "sre"
+            and (
+                capacity.get("development_units") != 0
+                or capacity.get("shared_units") != 0
+                or capacity.get("sre_units", 0) <= 0
+            )
+        )
+    ):
+        return False
+    item = connection.execute(
+        "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+        (source.get("repository"), source["object_number"]),
+    ).fetchone()
+    claim_attempt = connection.execute(
+        "SELECT * FROM executor_attempts WHERE attempt_id=?",
+        (watch["claim_attempt_id"],),
+    ).fetchone()
+    expected_watch_key = terminal_watch_key(
+        str(source.get("repository")),
+        int(source["object_number"]),
+        int(payload["generation"]),
+    )
+    if (
+        item is None
+        or item["status"]
+        not in {"ACTIVE", "ACTIVE_FENCED", "PUBLICATION_PENDING"}
+        or item["allocation_class"] != "ACTIVE"
+        or int(item["generation"]) != payload["generation"]
+        or item["accountable_session_id"] != endpoint_id
+        or item["lease_manifest_sha256"] != payload.get("lease_manifest_sha256")
+        or item["source_payload_sha256"] != source.get("payload_sha256")
+        or int(item["development_units"]) != capacity.get("development_units")
+        or int(item["shared_units"]) != capacity.get("shared_units")
+        or int(item["sre_units"]) != capacity.get("sre_units")
+        or watch["watch_key"] != expected_watch_key
+        or watch["repository"] != source.get("repository")
+        or int(watch["issue_number"]) != source["object_number"]
+        or int(watch["generation"]) != payload["generation"]
+        or watch["state"] != "ACTIVE"
+        or watch["accountable_session_id"] != endpoint_id
+        or watch["lease_manifest_sha256"] != payload.get("lease_manifest_sha256")
+        or int(watch["admission_message_id"] or 0) != message_id
+        or watch["admission_payload_sha256"] != message["payload_sha256"]
+        or claim_attempt is None
+        or claim_attempt["role"] != role
+        or claim_attempt["endpoint_id"] != message["recipient_session_id"]
+        or claim_attempt["state"] not in {"COMPLETE", "HOLD"}
+        or claim_attempt["target_kind"] != "message"
+        or claim_attempt["target_key"] != str(message_id)
+        or claim_attempt["lineage_repository"] != source.get("repository")
+        or int(claim_attempt["lineage_issue_number"] or -1)
+        != source["object_number"]
+        or int(
+            claim_attempt["lineage_generation"]
+            if claim_attempt["lineage_generation"] is not None
+            else -1
+        )
+        != payload["generation"]
+        or claim_attempt["lineage_lease_sha256"]
+        != payload.get("lease_manifest_sha256")
+    ):
+        return False
+    return applied_endpoint_rotation_chain(
+        connection,
+        repository=str(source.get("repository")),
+        issue_number=int(source["object_number"]),
+        before_identity=str(message["recipient_session_id"]),
+        before_item_version=int(payload["item_version"])
+        + (1 if message["topic"] == "development.recovery_commit" else 0),
+        after_identity=endpoint_id,
+        after_item_version=int(item["version"]),
+        watch_key=expected_watch_key,
+        expected_watch_state="ACTIVE",
+        not_before=str(claim_attempt["created_at"]),
+    ) is not None
 
 
 def _message_context(connection: sqlite3.Connection, database: Path, *, role: str, endpoint_id: str, target_key: str, worktree_root: Path) -> DeliveryContext:
@@ -436,8 +560,8 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         message_id = int(target_key)
     except ValueError as exc:
         raise GuardError("DELIVERY_TARGET_INVALID") from exc
-    row = connection.execute("SELECT recipient_session_id,topic,payload_json,state FROM coordination_messages WHERE id=?", (message_id,)).fetchone()
-    if row is None or row["state"] not in {"PREPARED", "CLAIMED"} or row["recipient_session_id"] != endpoint_id:
+    row = connection.execute("SELECT * FROM coordination_messages WHERE id=?", (message_id,)).fetchone()
+    if row is None or row["state"] not in {"PREPARED", "CLAIMED"}:
         raise GuardError("DELIVERY_TARGET_INVALID")
     topic = str(row["topic"])
     if topic != "coordination.notice" and not topic.startswith(f"{role}."):
@@ -448,13 +572,31 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         raise GuardError("DELIVERY_TARGET_INVALID") from exc
     if not isinstance(payload, dict) or not _source_is_current(connection, payload):
         raise GuardError("DELIVERY_TARGET_INVALID")
+    if (
+        topic
+        not in {"development.admission", "development.recovery_commit", "sre.admission"}
+        and row["recipient_session_id"] != endpoint_id
+    ):
+        raise GuardError("DELIVERY_TARGET_INVALID")
     if topic == "coordination.notice":
         if payload.get("mutation_authority") is not False:
             raise GuardError("DELIVERY_TARGET_INVALID")
         return DeliveryContext(role, endpoint_id, "message", target_key, topic, None, frozenset(), False)
     if topic in {"development.recovery_prepare", "development.terminal_closeout"}:
         return DeliveryContext(role, endpoint_id, "message", target_key, topic, None, frozenset(), False)
-    if topic not in {"development.admission", "development.recovery_commit", "sre.admission"} or not _item_matches(connection, payload, endpoint_id, exact_version=True):
+    watch = connection.execute(
+        "SELECT * FROM coordination_terminal_watches "
+        "WHERE repository=? AND issue_number=? AND generation=?",
+        (
+            payload.get("source", {}).get("repository"),
+            payload.get("issue_number"),
+            payload.get("generation"),
+        ),
+    ).fetchone()
+    exact_current = row["recipient_session_id"] == endpoint_id and _item_matches(
+        connection, payload, endpoint_id, exact_version=True
+    )
+    if topic not in {"development.admission", "development.recovery_commit", "sre.admission"} or not exact_current:
         raise GuardError("DELIVERY_TARGET_INVALID")
     worktree, paths, canonical_checkout, branch, base_sha = _load_lease(
         connection, database, payload, worktree_root
@@ -480,19 +622,36 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
     if watch is None or watch["state"] != "ACTIVE" or watch["accountable_session_id"] != endpoint_id:
         raise GuardError("DELIVERY_TARGET_INVALID")
     topics = {"development.admission", "development.recovery_commit"} if role == "development" else {"sre.admission"}
-    payload: dict[str, Any] | None = None
-    for candidate in connection.execute("SELECT topic,payload_json FROM coordination_messages WHERE recipient_session_id=? ORDER BY id DESC", (endpoint_id,)).fetchall():
-        if candidate["topic"] not in topics:
-            continue
-        try:
-            value = json.loads(candidate["payload_json"])
-        except json.JSONDecodeError:
-            continue
-        source = value.get("source") if isinstance(value, dict) else None
-        if isinstance(source, dict) and source.get("repository") == watch["repository"] and value.get("issue_number") == int(watch["issue_number"]) and value.get("generation") == int(watch["generation"]) and value.get("lease_manifest_sha256") == watch["lease_manifest_sha256"]:
-            payload = value
-            break
-    if payload is None or not _source_is_current(connection, payload) or not _item_matches(connection, payload, endpoint_id, exact_version=False):
+    candidate = connection.execute(
+        "SELECT * FROM coordination_messages WHERE id=?",
+        (watch["admission_message_id"],),
+    ).fetchone()
+    try:
+        payload = None if candidate is None else json.loads(candidate["payload_json"])
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+    exact_current = bool(
+        candidate is not None
+        and candidate["topic"] in topics
+        and candidate["recipient_session_id"] == endpoint_id
+        and isinstance(payload, dict)
+        and _item_matches(connection, payload, endpoint_id, exact_version=False)
+    )
+    rotated_current = bool(
+        candidate is not None
+        and candidate["topic"] in topics
+        and isinstance(payload, dict)
+        and _rotated_admission_matches(
+            connection,
+            message=candidate,
+            message_id=int(watch["admission_message_id"]),
+            payload=payload,
+            role=role,
+            endpoint_id=endpoint_id,
+            watch=watch,
+        )
+    )
+    if not isinstance(payload, dict) or not _source_is_current(connection, payload) or not (exact_current or rotated_current):
         raise GuardError("DELIVERY_TARGET_INVALID")
     worktree, paths, canonical_checkout, branch, base_sha = _load_lease(
         connection, database, payload, worktree_root
@@ -1781,7 +1940,14 @@ def pre_tool(event: dict[str, Any], *, environ: Mapping[str, str] | None = None,
             if decision:
                 return decision
         return {}
-    except (GuardError, OSError, sqlite3.Error, TypeError, ValueError):
+    except (
+        GuardError,
+        RegistryError,
+        OSError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ):
         return _deny("DELIVERY_CONTEXT_INVALID")
 
 
