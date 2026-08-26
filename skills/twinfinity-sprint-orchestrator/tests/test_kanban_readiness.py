@@ -24,6 +24,8 @@ from kanban_readiness import (  # noqa: E402
     PLAN_SCHEMA,
     RECEIPT_SCHEMA,
     SUCCESSOR_PLAN_SCHEMA,
+    TERMINAL_HOLD_REFRESH_GATES,
+    TERMINAL_HOLD_REFRESH_PHASE_SUMMARY,
     ReadinessError,
     attach,
     discover,
@@ -336,9 +338,11 @@ class Harness:
         ).fetchone()[0]
         return pickup_receipt(self.store, int(campaign_id), now=now)
 
-    def terminal_hold(self) -> dict:
-        self.seed([1])
-        registered = register(self.store.connection, self.plan(1), now=NOW)
+    def terminal_hold(self, plan: dict | None = None) -> dict:
+        if plan is None:
+            self.seed([1])
+            plan = self.plan(1)
+        registered = register(self.store.connection, plan, now=NOW)
         dispatched = dispatch(
             self.store, REPOSITORY, max_parallel=1, now=NOW
         )["dispatched"][0]
@@ -503,7 +507,18 @@ class KanbanReadinessTests(unittest.TestCase):
         self.assertEqual(int(hold["campaign_id"]), current["parent_campaign_id"])
         self.assertEqual("REFRESH", current["transition_kind"])
         self.assertEqual(self.h.candidates[1], current["candidate_sha256"])
-        self.assertEqual(old_gates, new_gates)
+        self.assertNotEqual(old_gates, new_gates)
+        self.assertEqual(
+            [
+                (
+                    gate["gate_key"],
+                    gate["description"],
+                    canonical_json(gate["requested_evidence"]),
+                )
+                for gate in TERMINAL_HOLD_REFRESH_GATES
+            ],
+            new_gates,
+        )
         self.assertEqual(int(current["campaign_id"]), result["campaign_id"])
         self.assertEqual(int(hold["receipt_id"]), result["terminal_receipt_id"])
         self.assertEqual(
@@ -515,6 +530,50 @@ class KanbanReadinessTests(unittest.TestCase):
                 (int(hold["campaign_id"]),),
             ).fetchone()[0],
         )
+
+    def test_terminal_hold_refresh_does_not_copy_stale_parent_instructions(self) -> None:
+        self.h.seed([1])
+        stale_plan = self.h.plan(1)
+        stale_plan["phase_summary"] = (
+            "Use graph v1, branch codex/1-v2, worktree /tmp/issue-1-v2, "
+            "and exactly four paths."
+        )
+        stale_plan["gates"][0] = {
+            "gate_key": "complete-review",
+            "description": (
+                "Require graph v1, branch codex/1-v2, worktree "
+                "/tmp/issue-1-v2, and the old four-path lease."
+            ),
+            "requested_evidence": [
+                "Prove graph v1 and exactly four old paths"
+            ],
+        }
+        hold = self.h.terminal_hold(stale_plan)
+        self.h.complete_planner_notice(hold)
+        item = self.h.advance_generation()
+
+        result = self.reopen(hold)
+        successor = json.loads(
+            self.h.store.connection.execute(
+                "SELECT plan_json FROM portfolio_readiness_campaigns WHERE id=?",
+                (int(result["campaign_id"]),),
+            ).fetchone()[0]
+        )
+
+        self.assertEqual(TERMINAL_HOLD_REFRESH_PHASE_SUMMARY, successor["phase_summary"])
+        self.assertEqual(list(TERMINAL_HOLD_REFRESH_GATES), successor["gates"])
+        self.assertEqual(int(item["generation"]), successor["generation"])
+        self.assertEqual(self.h.candidates[1], successor["candidate_sha256"])
+        prose = canonical_json(
+            {
+                "phase_summary": successor["phase_summary"],
+                "gates": successor["gates"],
+            }
+        )
+        for stale_instruction in (
+            "graph v1", "codex/1-v2", "/tmp/issue-1-v2", "four path"
+        ):
+            self.assertNotIn(stale_instruction, prose)
 
     def test_terminal_hold_reopen_rejects_same_generation_without_mutation(self) -> None:
         hold = self.h.terminal_hold()
