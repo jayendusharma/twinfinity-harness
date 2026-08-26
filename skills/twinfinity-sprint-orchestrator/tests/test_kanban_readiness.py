@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 
@@ -16,6 +18,7 @@ sys.path.insert(0, str(STAGED))
 
 from coordination_store import CoordinationStore, canonical_json  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
+import kanban_pull_buffer  # noqa: E402
 from kanban_pull_buffer import ensure_pull_buffer_schema  # noqa: E402
 from kanban_readiness import (  # noqa: E402
     PLAN_SCHEMA,
@@ -29,6 +32,7 @@ from kanban_readiness import (  # noqa: E402
     ensure_schema as ensure_readiness_schema,
     pickup_receipt,
     register,
+    reopen_terminal_hold,
     show,
     stage_receipt,
     transition_evidence_sha256,
@@ -332,6 +336,101 @@ class Harness:
         ).fetchone()[0]
         return pickup_receipt(self.store, int(campaign_id), now=now)
 
+    def terminal_hold(self) -> dict:
+        self.seed([1])
+        registered = register(self.store.connection, self.plan(1), now=NOW)
+        dispatched = dispatch(
+            self.store, REPOSITORY, max_parallel=1, now=NOW
+        )["dispatched"][0]
+        message_id = int(dispatched["message_id"])
+        attempt_id = "11111111-1111-4111-8111-111111111111"
+        self.start_attempt(1, message_id, attempt_id)
+        receipt = self.receipt(registered, message_id, attempt_id)
+        receipt["verdict"] = "TERMINAL_HOLD"
+        receipt["gate_results"][0]["verdict"] = "HOLD"
+        receipt["gate_results"][0]["summary"] = "The old generation is terminal."
+        receipt["summary"] = "The old prepared generation cannot proceed."
+        self.stage(receipt, message_id, attempt_id)
+        self.finish_attempt(message_id, attempt_id)
+        pickup = self.pickup()
+        current = self.store.connection.execute(
+            """
+            SELECT current.campaign_id, current.version, current.receipt_id,
+                   receipt.receipt_sha256, current.message_id
+            FROM portfolio_readiness_current current
+            JOIN portfolio_readiness_receipts receipt
+              ON receipt.id=current.receipt_id
+            WHERE current.repository=? AND current.issue_number=1
+            """,
+            (REPOSITORY,),
+        ).fetchone()
+        if pickup["state"] != "HOLD":
+            raise AssertionError(f"expected terminal HOLD, got {pickup['state']}")
+        return dict(current)
+
+    def advance_generation(self, *, accepted_main: str = MAIN) -> dict:
+        prior = self.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=1",
+            (REPOSITORY,),
+        ).fetchone()
+        item = self.store.set_issue_status(
+            repository=REPOSITORY,
+            issue_number=1,
+            status="PREPARED",
+            allocation_class="NONE",
+            generation=int(prior["generation"]) + 1,
+            accountable_session_id=None,
+            lease_manifest_sha256=None,
+            development_units=int(prior["development_units"]),
+            shared_units=int(prior["shared_units"]),
+            sre_units=int(prior["sre_units"]),
+            expected_source_sha256=self.sources[1],
+            expected_version=int(prior["version"]),
+            now="2026-08-25T05:01:00Z",
+        )
+        candidate_sha = hashlib.sha256(
+            f"candidate:1:generation:{item['generation']}:{accepted_main}".encode()
+        ).hexdigest()
+        policy_version = self.store.connection.execute(
+            "SELECT version FROM coordination_capacity_current WHERE repository=?",
+            (REPOSITORY,),
+        ).fetchone()[0]
+        with self.store.transaction():
+            cursor = self.store.connection.execute(
+                """
+                INSERT INTO portfolio_pull_buffer_candidates(
+                    repository, issue_number, generation, item_version,
+                    source_payload_sha256, accepted_main_sha, graph_version,
+                    capacity_policy_version, lane_key, state, verticality,
+                    development_units, shared_units, sre_units, promotion_trigger,
+                    artifact_relative_path, artifact_content_sha256,
+                    candidate_sha256, registered_at
+                ) VALUES (?, 1, ?, ?, ?, ?, 1, ?, 'lane-1',
+                          'PREPARED_NOT_READY', 'END_TO_END', ?, ?, ?,
+                          'Close refreshed readiness phase', ?, ?, ?, ?)
+                """,
+                (
+                    REPOSITORY, int(item["generation"]), int(item["version"]),
+                    self.sources[1], accepted_main, int(policy_version),
+                    int(prior["development_units"]), int(prior["shared_units"]),
+                    int(prior["sre_units"]), "plans/issue-1-generation-2.json",
+                    "f" * 64, candidate_sha, "2026-08-25T05:01:00Z",
+                ),
+            )
+            self.store.connection.execute(
+                """
+                UPDATE portfolio_pull_buffer_current
+                SET candidate_id=?, updated_at=?
+                WHERE repository=? AND issue_number=1
+                """,
+                (
+                    int(cursor.lastrowid), "2026-08-25T05:01:00Z", REPOSITORY,
+                ),
+            )
+        self.items[1] = item
+        self.candidates[1] = candidate_sha
+        return item
+
 
 class KanbanReadinessTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -339,6 +438,261 @@ class KanbanReadinessTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.h.close()
+
+    def reopen(self, hold: dict) -> dict:
+        return reopen_terminal_hold(
+            self.h.store.connection,
+            REPOSITORY,
+            1,
+            expected_campaign_id=int(hold["campaign_id"]),
+            expected_current_version=int(hold["version"]),
+            expected_terminal_receipt_id=int(hold["receipt_id"]),
+            expected_terminal_receipt_sha256=str(hold["receipt_sha256"]),
+            now="2026-08-25T05:02:00Z",
+        )
+
+    def test_terminal_hold_reopens_only_to_new_bound_prepared_generation(self) -> None:
+        hold = self.h.terminal_hold()
+        old_gates = [
+            tuple(row)
+            for row in self.h.store.connection.execute(
+                """
+                SELECT gate_key,description,requested_evidence_json
+                FROM portfolio_readiness_gates WHERE campaign_id=? ORDER BY id
+                """,
+                (int(hold["campaign_id"]),),
+            )
+        ]
+        item = self.h.advance_generation()
+
+        result = self.reopen(hold)
+
+        current = self.h.store.connection.execute(
+            """
+            SELECT current.state,current.campaign_id,current.version,
+                   campaign.generation,campaign.item_version,
+                   campaign.parent_campaign_id,campaign.transition_kind,
+                   campaign.candidate_sha256
+            FROM portfolio_readiness_current current
+            JOIN portfolio_readiness_campaigns campaign
+              ON campaign.id=current.campaign_id
+            WHERE current.repository=? AND current.issue_number=1
+            """,
+            (REPOSITORY,),
+        ).fetchone()
+        new_gates = [
+            tuple(row)
+            for row in self.h.store.connection.execute(
+                """
+                SELECT gate_key,description,requested_evidence_json
+                FROM portfolio_readiness_gates WHERE campaign_id=? ORDER BY id
+                """,
+                (int(current["campaign_id"]),),
+            )
+        ]
+        self.assertEqual("PENDING", current["state"])
+        self.assertEqual(int(item["generation"]), current["generation"])
+        self.assertEqual(int(item["version"]), current["item_version"])
+        self.assertEqual(int(hold["campaign_id"]), current["parent_campaign_id"])
+        self.assertEqual("REFRESH", current["transition_kind"])
+        self.assertEqual(self.h.candidates[1], current["candidate_sha256"])
+        self.assertEqual(old_gates, new_gates)
+        self.assertEqual(int(current["campaign_id"]), result["campaign_id"])
+        self.assertEqual(int(hold["receipt_id"]), result["terminal_receipt_id"])
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_events "
+                "WHERE campaign_id=? "
+                "AND event_type='READINESS_TERMINAL_HOLD_REOPENED'",
+                (int(hold["campaign_id"]),),
+            ).fetchone()[0],
+        )
+
+    def test_terminal_hold_reopen_rejects_same_generation_without_mutation(self) -> None:
+        hold = self.h.terminal_hold()
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_TERMINAL_HOLD_NEW_GENERATION_REQUIRED"
+        ):
+            self.reopen(hold)
+        current = self.h.store.connection.execute(
+            "SELECT campaign_id,state,version FROM portfolio_readiness_current "
+            "WHERE repository=? AND issue_number=1",
+            (REPOSITORY,),
+        ).fetchone()
+        self.assertEqual(
+            (int(hold["campaign_id"]), "HOLD", int(hold["version"])),
+            tuple(current),
+        )
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_campaigns"
+            ).fetchone()[0],
+        )
+
+    def test_terminal_hold_reopen_requires_exact_receipt_and_current_fences(self) -> None:
+        hold = self.h.terminal_hold()
+        self.h.advance_generation()
+        for field, value, error in (
+            ("campaign_id", int(hold["campaign_id"]) + 1,
+             "READINESS_TERMINAL_HOLD_REOPEN_FENCE_LOST"),
+            ("version", int(hold["version"]) + 1,
+             "READINESS_TERMINAL_HOLD_REOPEN_FENCE_LOST"),
+            ("receipt_id", int(hold["receipt_id"]) + 1,
+             "READINESS_TERMINAL_HOLD_RECEIPT_FENCE_LOST"),
+            ("receipt_sha256", "0" * 64,
+             "READINESS_TERMINAL_HOLD_RECEIPT_FENCE_LOST"),
+        ):
+            candidate = {**hold, field: value}
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ReadinessError, error
+            ):
+                self.reopen(candidate)
+        self.assertEqual(
+            (int(hold["campaign_id"]), "HOLD", int(hold["version"])),
+            tuple(
+                self.h.store.connection.execute(
+                    "SELECT campaign_id,state,version "
+                    "FROM portfolio_readiness_current WHERE issue_number=1"
+                ).fetchone()
+            ),
+        )
+
+    def test_terminal_hold_reopen_rejects_arbitrary_and_protected_holds(self) -> None:
+        for protected_state in ("HOLD", "APPROVAL_PENDING", "FINALIZED"):
+            harness = Harness()
+            try:
+                harness.seed([1])
+                registered = register(
+                    harness.store.connection, harness.plan(1), now=NOW
+                )
+                with harness.store.transaction():
+                    harness.store.connection.execute(
+                        "UPDATE portfolio_readiness_current SET state=? "
+                        "WHERE campaign_id=?",
+                        (protected_state, int(registered["campaign_id"])),
+                    )
+                before = tuple(
+                    harness.store.connection.execute(
+                        "SELECT campaign_id,state,version "
+                        "FROM portfolio_readiness_current WHERE issue_number=1"
+                    ).fetchone()
+                )
+                expected_error = (
+                    "READINESS_TERMINAL_HOLD_RECEIPT_FENCE_LOST"
+                    if protected_state == "HOLD"
+                    else "READINESS_TERMINAL_HOLD_REOPEN_STATE_CONFLICT"
+                )
+                with self.subTest(state=protected_state), self.assertRaisesRegex(
+                    ReadinessError, expected_error
+                ):
+                    reopen_terminal_hold(
+                        harness.store.connection,
+                        REPOSITORY,
+                        1,
+                        expected_campaign_id=int(registered["campaign_id"]),
+                        expected_current_version=int(before[2]),
+                        expected_terminal_receipt_id=1,
+                        expected_terminal_receipt_sha256="a" * 64,
+                        now="2026-08-25T05:02:00Z",
+                    )
+                self.assertEqual(
+                    before,
+                    tuple(
+                        harness.store.connection.execute(
+                            "SELECT campaign_id,state,version "
+                            "FROM portfolio_readiness_current WHERE issue_number=1"
+                        ).fetchone()
+                    ),
+                )
+            finally:
+                harness.close()
+
+    def test_terminal_hold_reopen_rejects_active_attempt(self) -> None:
+        hold = self.h.terminal_hold()
+        self.h.advance_generation()
+        with self.h.store.transaction():
+            self.h.store.connection.execute(
+                """
+                INSERT INTO executor_attempts(
+                    attempt_id, role, endpoint_id, instance_id, token_sha256,
+                    target_kind, target_key, state, process_id, exit_code,
+                    heartbeat_at, version, created_at, updated_at
+                ) VALUES (?, 'sre', ?, ?, ?, 'message', ?, 'RUNNING', 9002,
+                          NULL, ?, 1, ?, ?)
+                """,
+                (
+                    "22222222-2222-4222-8222-222222222222",
+                    self.h.endpoints["sre"], "active-retry-instance", "b" * 64,
+                    str(hold["message_id"]), NOW, NOW, NOW,
+                ),
+            )
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_TERMINAL_HOLD_ATTEMPT_ACTIVE"
+        ):
+            self.reopen(hold)
+        self.assertEqual(
+            (int(hold["campaign_id"]), "HOLD", int(hold["version"])),
+            tuple(
+                self.h.store.connection.execute(
+                    "SELECT campaign_id,state,version "
+                    "FROM portfolio_readiness_current WHERE issue_number=1"
+                ).fetchone()
+            ),
+        )
+
+    def test_terminal_hold_reopen_rejects_nonterminal_old_message(self) -> None:
+        hold = self.h.terminal_hold()
+        self.h.advance_generation()
+        with self.h.store.transaction():
+            self.h.store.connection.execute(
+                "UPDATE coordination_messages SET state='CLAIMED' WHERE id=?",
+                (int(hold["message_id"]),),
+            )
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_TERMINAL_HOLD_MESSAGE_NONTERMINAL"
+        ):
+            self.reopen(hold)
+
+    def test_terminal_hold_reopen_rejects_binding_drift(self) -> None:
+        hold = self.h.terminal_hold()
+        self.h.advance_generation(accepted_main="b" * 40)
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_TERMINAL_HOLD_BINDING_DRIFT"
+        ):
+            self.reopen(hold)
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_campaigns"
+            ).fetchone()[0],
+        )
+
+    def test_terminal_hold_reopen_cli_uses_exact_fences(self) -> None:
+        hold = self.h.terminal_hold()
+        self.h.advance_generation()
+        argv = [
+            "kanban_pull_buffer.py",
+            "readiness-reopen-terminal-hold",
+            "--repository", REPOSITORY,
+            "--issue", "1",
+            "--expected-campaign-id", str(hold["campaign_id"]),
+            "--expected-current-version", str(hold["version"]),
+            "--expected-terminal-receipt-id", str(hold["receipt_id"]),
+            "--expected-terminal-receipt-sha256", str(hold["receipt_sha256"]),
+        ]
+        output = io.StringIO()
+        with (
+            patch.object(kanban_pull_buffer, "DEFAULT_DATABASE", self.h.database),
+            patch.object(sys, "argv", argv),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(0, kanban_pull_buffer.main())
+        payload = json.loads(output.getvalue())
+        self.assertEqual("COMPLETE", payload["phase"])
+        self.assertEqual("PENDING", payload["result"]["state"])
+        self.assertEqual(2, payload["result"]["generation"])
 
     def test_discovery_returns_two_candidate_phases(self) -> None:
         self.h.seed([1, 2])
