@@ -246,26 +246,6 @@ NOTICE_FORBIDDEN_KEYS = {
     "shell_command",
     "tokens",
 }
-NOTICE_MUTATION_OPERATION = re.compile(
-    r"(?i)(?:"
-    r"\bgit\b(?:\s+(?:"
-    r"-[A-Za-z]\S*(?:\s+(?![A-Za-z][A-Za-z0-9-]*\b)\S+)?"
-    r"|--[A-Za-z0-9-]+(?:=\S+|\s+(?![A-Za-z][A-Za-z0-9-]*\b)\S+)?"
-    r"))*"
-    r"\s+[A-Za-z][A-Za-z0-9-]*\b"
-    r"|\bgh\b(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*"
-    r"\s+[A-Za-z][A-Za-z0-9-]*\b"
-    r"|\b(?:kubectl|gcloud|supabase|curl|wget|rm|mv)\b"
-    r")"
-)
-NOTICE_DOCKER_OPERATION = re.compile(
-    r"\bdocker\b(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*"
-    r"\s+(?:compose\s+)?[A-Za-z][A-Za-z0-9-]*\b"
-)
-NOTICE_FACTUAL_REMAINDER = re.compile(
-    r"(?i)^\s+(?:was|were|is|are|has|have|had|did|does|do|remains?|"
-    r"succeeded|failed|passed|completed|cannot|could\s+not|not\b)"
-)
 TERMINAL_CLEANUP_BOOLEAN_KEYS = {
     "docker_resources_absent",
     "local_branch_absent",
@@ -318,43 +298,6 @@ TERMINAL_CAPACITY_INTEGER_KEY = re.compile(
 )
 TERMINAL_CAPACITY_STATE_KEY = re.compile(
     r"^issue_[1-9][0-9]*_(allocation_class|status)$"
-)
-NOTICE_AUTHORITY_WORD = re.compile(
-    r"(?i)\b(?:authori[sz](?:ed|ation)|approv(?:ed|al)|"
-    r"permi(?:tted|ssion)|allowed|clear(?:ance|ed)|granted|green-?lit|"
-    r"green\s+light|go(?:-|\s+)ahead)\b"
-)
-NOTICE_AUTHORITY_NEGATED_PREFIX = re.compile(
-    r"(?i)\b(?:not|never|neither|no\s+longer)\s+$"
-)
-NOTICE_AUTHORITY_NEGATED_SUFFIX = re.compile(
-    r"(?i)^\s+(?:(?:is|was|has\s+been|remains)\s+)?"
-    r"(?:revoked|withdrawn|denied|rejected|pending|absent|missing|unconfirmed)\b"
-)
-NOTICE_EXECUTION_DIRECTIVE = re.compile(
-    r"(?i)\b(?:proceed|continue|resume|start|begin)\b"
-    r"[^.\n]{0,120}\b(?:implementation|repair|editing|mutation|execution|"
-    r"merge|deployment|operation|work)\b"
-)
-NOTICE_MODAL_EXECUTION_DIRECTIVE = re.compile(
-    r"(?i)\b(?:development|implementation|repair|editing|mutation|execution|"
-    r"merge|deployment|operation|work)\b[^.\n]{0,80}"
-    r"\b(?:may|can|should|must|will)\s+(?:proceed|continue|resume|start|begin)\b"
-)
-NOTICE_EXECUTION_DOMAIN = re.compile(
-    r"(?i)\b(?:development|implementation|repair|editing|mutation|execution|"
-    r"merge|deployment|operation|work)\b"
-)
-NOTICE_POSITIVE_MODALITY = re.compile(
-    r"(?i)\b(?:may|can|could|should|must|will|shall)\s+"
-    r"(?:proceed|continue|resume|start|begin|advance|move\s+forward|go\s+ahead)\b"
-    r"|\b(?:ready|free|okay|ok|unblocked)\s+to\s+"
-    r"(?:proceed|continue|resume|start|begin|advance|move\s+forward|go\s+ahead)\b"
-    r"|\bunblocked\b"
-)
-NOTICE_CONSENT_GIVEN = re.compile(
-    r"(?i)(?:\bconsent\b[^.\n]{0,48}\b(?:given|granted|confirmed)\b|"
-    r"\b(?:given|granted|confirmed)\b[^.\n]{0,48}\bconsent\b)"
 )
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 BRANCH = re.compile(r"^codex/[0-9]+-[a-z0-9][a-z0-9-]*$")
@@ -847,67 +790,6 @@ def _normalized_notice_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", words.casefold()).strip("_")
 
 
-def _notice_string_is_command(value: str) -> bool:
-    for operation_pattern in (NOTICE_MUTATION_OPERATION, NOTICE_DOCKER_OPERATION):
-        for match in operation_pattern.finditer(value):
-            remainder = value[match.end() :]
-            sentence = re.split(r"[.\n]", remainder, maxsplit=1)[0]
-            if NOTICE_AUTHORITY_WORD.search(sentence):
-                return True
-            if not NOTICE_FACTUAL_REMAINDER.match(remainder):
-                return True
-    return False
-
-
-def _notice_string_claims_authority(value: str) -> bool:
-    for sentence in re.split(r"[.\n;]", value):
-        for match in NOTICE_AUTHORITY_WORD.finditer(sentence):
-            prefix = sentence[: match.start()]
-            suffix = sentence[match.end() :]
-            if NOTICE_AUTHORITY_NEGATED_PREFIX.search(prefix):
-                continue
-            if NOTICE_AUTHORITY_NEGATED_SUFFIX.search(suffix):
-                continue
-            return True
-        if NOTICE_EXECUTION_DIRECTIVE.search(sentence):
-            return True
-        if NOTICE_MODAL_EXECUTION_DIRECTIVE.search(sentence):
-            return True
-        if NOTICE_EXECUTION_DOMAIN.search(sentence):
-            for match in NOTICE_POSITIVE_MODALITY.finditer(sentence):
-                if not NOTICE_AUTHORITY_NEGATED_PREFIX.search(sentence[: match.start()]):
-                    return True
-            if NOTICE_CONSENT_GIVEN.search(sentence):
-                return True
-    return False
-
-
-def _notice_string_values(
-    value: Any,
-    *,
-    path: tuple[str, ...] = (),
-    exempt_key_paths: frozenset[tuple[str, ...]] = frozenset(),
-) -> list[str]:
-    if isinstance(value, dict):
-        return [
-            string
-            for key, item in value.items()
-            for string in (
-                [_normalized_notice_key(key).replace("_", " ")]
-                if isinstance(key, str) and path + (key,) not in exempt_key_paths
-                else []
-            )
-            + _notice_string_values(
-                item,
-                path=path + (key,) if isinstance(key, str) else path,
-                exempt_key_paths=exempt_key_paths,
-            )
-        ]
-    if isinstance(value, (list, tuple)):
-        return [string for item in value for string in _notice_string_values(item)]
-    return [value] if isinstance(value, str) else []
-
-
 def _validate_terminal_notice_evidence(
     payload: dict[str, Any],
 ) -> frozenset[tuple[str, ...]]:
@@ -1087,13 +969,7 @@ def _notice_has_forbidden_content(value: Any) -> bool:
             for key, item in value.items()
         )
     if isinstance(value, (list, tuple)):
-        return (
-            bool(value)
-            and all(isinstance(item, str) for item in value)
-            and _notice_string_is_command(" ".join(value))
-        ) or any(_notice_has_forbidden_content(item) for item in value)
-    if isinstance(value, str):
-        return _notice_string_is_command(value) or _notice_string_claims_authority(value)
+        return any(_notice_has_forbidden_content(item) for item in value)
     return False
 
 
@@ -4147,19 +4023,9 @@ class CoordinationStore:
             notice_kind = payload.get("notice_kind")
             if notice_kind not in NOTICE_KINDS:
                 raise CoordinationError("NOTICE_KIND_INVALID")
-            exempt_key_paths = (
+            if notice_kind == "terminal_receipt":
                 _validate_terminal_notice_evidence(payload)
-                if notice_kind == "terminal_receipt"
-                else frozenset()
-            )
-            aggregate_notice_text = " ".join(
-                _notice_string_values(payload, exempt_key_paths=exempt_key_paths)
-            )
-            if (
-                _notice_has_forbidden_content(payload)
-                or _notice_string_is_command(aggregate_notice_text)
-                or _notice_string_claims_authority(aggregate_notice_text)
-            ):
+            if _notice_has_forbidden_content(payload):
                 raise CoordinationError("NOTICE_MUTATION_FIELDS_FORBIDDEN")
             if set(payload) != NOTICE_ALLOWED_KEYS[notice_kind] and not (
                 notice_kind != "planning_request"
