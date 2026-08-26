@@ -259,18 +259,8 @@ NOTICE_MUTATION_OPERATION = re.compile(
     r")"
 )
 NOTICE_DOCKER_OPERATION = re.compile(
-    r"(?i)\bdocker\b(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*\s+(?:"
-    r"compose(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*\s+"
-    r"(?:attach|build|config|convert|cp|create|down|events|exec|images|kill|"
-    r"logs|ls|pause|port|ps|pull|push|restart|rm|run|start|stop|top|unpause|"
-    r"up|version|wait|watch)"
-    r"|attach|build|builder|buildx|checkpoint|commit|config|container|context|"
-    r"cp|create|debug|diff|events|exec|export|history|image|images|import|info|"
-    r"init|inspect|kill|load|login|logout|logs|manifest|network|node|pause|"
-    r"plugin|port|ps|pull|push|rename|restart|rm|rmi|run|save|search|secret|"
-    r"service|stack|start|stats|stop|swarm|system|tag|top|trust|unpause|"
-    r"update|version|volume|wait"
-    r")\b"
+    r"\bdocker\b(?:\s+(?:-[A-Za-z]\S*|--[A-Za-z0-9-]+(?:=\S+)?))*"
+    r"\s+(?:compose\s+)?[A-Za-z][A-Za-z0-9-]*\b"
 )
 NOTICE_FACTUAL_REMAINDER = re.compile(
     r"(?i)^\s+(?:was|were|is|are|has|have|had|did|does|do|remains?|"
