@@ -1770,6 +1770,7 @@ def _register_locked(
     now: str,
     approval_verified: bool,
     resolution_verified: bool = False,
+    terminal_hold_refresh_verified: bool = False,
 ) -> dict[str, Any]:
     """Register one initial or explicitly fenced successor while holding BEGIN IMMEDIATE."""
 
@@ -1811,6 +1812,8 @@ def _register_locked(
     resolution_action_set_sha256: str | None = None
     approval: dict[str, Any] | None = None
     if prior is None:
+        if terminal_hold_refresh_verified:
+            raise ReadinessError("READINESS_TRANSITION_INVALID")
         if plan["schema"] != PLAN_SCHEMA:
             raise ReadinessError("READINESS_INITIAL_PLAN_REQUIRED")
     else:
@@ -1833,6 +1836,10 @@ def _register_locked(
             "REFRESH": "STALE",
             "APPROVAL_RESUME": "APPROVAL_PENDING",
         }[transition_kind]
+        if terminal_hold_refresh_verified:
+            if transition_kind != "REFRESH":
+                raise ReadinessError("READINESS_TRANSITION_INVALID")
+            expected_state = "HOLD"
         if prior["state"] != expected_state:
             raise ReadinessError("READINESS_SUCCESSOR_STATE_CONFLICT")
         if approval is not None and not approval_verified:
@@ -2001,6 +2008,253 @@ def register(
         )
         connection.execute("COMMIT")
         return result
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def reopen_terminal_hold(
+    connection: sqlite3.Connection,
+    repository: str,
+    issue_number: int,
+    *,
+    expected_campaign_id: int,
+    expected_current_version: int,
+    expected_terminal_receipt_id: int,
+    expected_terminal_receipt_sha256: str,
+    now: str,
+) -> dict[str, Any]:
+    """Create one fenced REFRESH successor for a newer prepared generation."""
+
+    if (
+        not isinstance(repository, str)
+        or REPOSITORY.fullmatch(repository) is None
+        or type(issue_number) is not int
+        or issue_number <= 0
+        or type(expected_campaign_id) is not int
+        or expected_campaign_id <= 0
+        or type(expected_current_version) is not int
+        or expected_current_version <= 0
+        or type(expected_terminal_receipt_id) is not int
+        or expected_terminal_receipt_id <= 0
+        or not isinstance(expected_terminal_receipt_sha256, str)
+        or SHA256.fullmatch(expected_terminal_receipt_sha256) is None
+    ):
+        raise ReadinessError("READINESS_TERMINAL_HOLD_REOPEN_INPUT_INVALID")
+    ensure_schema(connection)
+    _require_pull_buffer_schema(connection)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        current = connection.execute(
+            """
+            SELECT campaign.*, current.state, current.message_id,
+                   current.attempt_id, current.receipt_id,
+                   current.version AS current_version,
+                   receipt.verdict AS receipt_verdict,
+                   receipt.message_id AS receipt_message_id,
+                   receipt.attempt_id AS receipt_attempt_id,
+                   receipt.receipt_sha256, receipt.receipt_json,
+                   message.state AS message_state,
+                   attempt.state AS attempt_state
+            FROM portfolio_readiness_current current
+            JOIN portfolio_readiness_campaigns campaign
+              ON campaign.id=current.campaign_id
+            LEFT JOIN portfolio_readiness_receipts receipt
+              ON receipt.id=current.receipt_id
+             AND receipt.campaign_id=current.campaign_id
+            LEFT JOIN coordination_messages message
+              ON message.id=current.message_id
+            LEFT JOIN executor_attempts attempt
+              ON attempt.attempt_id=current.attempt_id
+            WHERE current.repository=? AND current.issue_number=?
+            """,
+            (repository, issue_number),
+        ).fetchone()
+        if (
+            current is None
+            or int(current["id"]) != expected_campaign_id
+            or int(current["current_version"]) != expected_current_version
+        ):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_REOPEN_FENCE_LOST")
+        if current["state"] != "HOLD":
+            raise ReadinessError("READINESS_TERMINAL_HOLD_REOPEN_STATE_CONFLICT")
+        if (
+            current["receipt_id"] is None
+            or int(current["receipt_id"]) != expected_terminal_receipt_id
+            or current["receipt_verdict"] != "TERMINAL_HOLD"
+            or current["receipt_sha256"] != expected_terminal_receipt_sha256
+        ):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_RECEIPT_FENCE_LOST")
+        try:
+            parent_plan = json.loads(
+                str(current["plan_json"]), object_pairs_hook=_strict_object
+            )
+            terminal_receipt = json.loads(
+                str(current["receipt_json"]), object_pairs_hook=_strict_object
+            )
+        except (TypeError, json.JSONDecodeError, ReadinessError) as exc:
+            raise ReadinessError(
+                "READINESS_TERMINAL_HOLD_RECEIPT_FENCE_LOST"
+            ) from exc
+        _validate_plan(parent_plan)
+        _validate_receipt(terminal_receipt)
+        if (
+            digest_json(parent_plan) != current["plan_sha256"]
+            or digest_json(terminal_receipt) != current["receipt_sha256"]
+            or terminal_receipt["verdict"] != "TERMINAL_HOLD"
+            or terminal_receipt["readiness_plan_sha256"]
+            != current["plan_sha256"]
+            or int(terminal_receipt["message_id"])
+            != int(current["receipt_message_id"])
+            or terminal_receipt["attempt_id"] != current["receipt_attempt_id"]
+            or current["message_id"] is None
+            or int(current["message_id"]) != int(current["receipt_message_id"])
+            or current["attempt_id"] != current["receipt_attempt_id"]
+        ):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_RECEIPT_FENCE_LOST")
+        if current["message_state"] not in {"COMPLETE", "HOLD"}:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_MESSAGE_NONTERMINAL")
+        if current["attempt_state"] not in {"COMPLETE", "HOLD", "LAUNCH_FAILED"}:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_ATTEMPT_ACTIVE")
+        active_attempt = connection.execute(
+            """
+            SELECT 1 FROM executor_attempts
+            WHERE state IN ('RESERVED','LAUNCHING','RUNNING')
+              AND (attempt_id=? OR (target_kind='message' AND target_key=?))
+            LIMIT 1
+            """,
+            (str(current["receipt_attempt_id"]), str(current["receipt_message_id"])),
+        ).fetchone()
+        if active_attempt is not None:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_ATTEMPT_ACTIVE")
+
+        item = connection.execute(
+            """
+            SELECT * FROM coordination_items
+            WHERE repository=? AND issue_number=?
+            """,
+            (repository, issue_number),
+        ).fetchone()
+        if item is None:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_ITEM_MISSING")
+        if item["allocation_class"] in {"ACTIVE", "RETAINED"}:
+            raise ReadinessError("READINESS_TERMINAL_HOLD_ALLOCATION_ACTIVE")
+        if item["status"] != "PREPARED" or item["allocation_class"] != "NONE":
+            raise ReadinessError("READINESS_TERMINAL_HOLD_ITEM_NOT_PREPARED")
+        if int(item["generation"]) <= int(current["generation"]):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_NEW_GENERATION_REQUIRED")
+
+        source = connection.execute(
+            """
+            SELECT payload_sha256 FROM github_current
+            WHERE repository=? AND object_kind='issue' AND object_number=?
+            """,
+            (repository, issue_number),
+        ).fetchone()
+        graph = connection.execute(
+            "SELECT * FROM portfolio_graph_current WHERE repository=?",
+            (repository,),
+        ).fetchone()
+        policy = connection.execute(
+            "SELECT version FROM coordination_capacity_current WHERE repository=?",
+            (repository,),
+        ).fetchone()
+        candidate = connection.execute(
+            """
+            SELECT candidate.* FROM portfolio_pull_buffer_current pointer
+            JOIN portfolio_pull_buffer_candidates candidate
+              ON candidate.id=pointer.candidate_id
+            WHERE pointer.repository=? AND pointer.issue_number=?
+            """,
+            (repository, issue_number),
+        ).fetchone()
+        node = None
+        if graph is not None:
+            node = connection.execute(
+                """
+                SELECT * FROM portfolio_graph_nodes
+                WHERE repository=? AND graph_version=? AND issue_number=?
+                """,
+                (repository, int(graph["version"]), issue_number),
+            ).fetchone()
+        if (
+            source is None
+            or graph is None
+            or graph["health"] != "CURRENT"
+            or policy is None
+            or candidate is None
+            or node is None
+            or candidate["state"] != "PREPARED_NOT_READY"
+            or candidate["source_payload_sha256"] != source["payload_sha256"]
+            or item["source_payload_sha256"] != source["payload_sha256"]
+            or node["source_payload_sha256"] != source["payload_sha256"]
+            or int(candidate["generation"]) != int(item["generation"])
+            or int(candidate["item_version"]) != int(item["version"])
+            or candidate["accepted_main_sha"] != graph["observed_main_sha"]
+            or int(candidate["graph_version"]) != int(graph["version"])
+            or int(candidate["capacity_policy_version"]) != int(policy["version"])
+            or int(candidate["development_units"])
+            != int(item["development_units"])
+            or int(candidate["shared_units"]) != int(item["shared_units"])
+            or int(candidate["sre_units"]) != int(item["sre_units"])
+        ):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_BINDING_DRIFT")
+
+        successor = {
+            **parent_plan,
+            "schema": SUCCESSOR_PLAN_SCHEMA,
+            "generation": int(item["generation"]),
+            "item_version": int(item["version"]),
+            "source_payload_sha256": str(source["payload_sha256"]),
+            "accepted_main_sha": str(graph["observed_main_sha"]),
+            "graph_version": int(graph["version"]),
+            "capacity_policy_version": int(policy["version"]),
+            "candidate_sha256": str(candidate["candidate_sha256"]),
+            "transition": {
+                "kind": "REFRESH",
+                "parent_campaign_id": expected_campaign_id,
+                "expected_parent_version": expected_current_version,
+                "changed_evidence_sha256": "0" * 64,
+                "resolution_action_set_sha256": None,
+                "approval": None,
+            },
+        }
+        successor["transition"]["changed_evidence_sha256"] = (
+            transition_evidence_sha256(parent_plan, successor)
+        )
+        _validate_plan(successor)
+        result = _register_locked(
+            connection,
+            successor,
+            now=now,
+            approval_verified=False,
+            terminal_hold_refresh_verified=True,
+        )
+        _event(
+            connection,
+            expected_campaign_id,
+            "READINESS_TERMINAL_HOLD_REOPENED",
+            {
+                "expected_current_version": expected_current_version,
+                "terminal_receipt_id": expected_terminal_receipt_id,
+                "terminal_receipt_sha256": expected_terminal_receipt_sha256,
+                "successor_campaign_id": int(result["campaign_id"]),
+                "successor_plan_sha256": str(result["plan_sha256"]),
+                "generation": int(item["generation"]),
+                "candidate_sha256": str(candidate["candidate_sha256"]),
+            },
+            now,
+        )
+        connection.execute("COMMIT")
+        return {
+            **result,
+            "parent_campaign_id": expected_campaign_id,
+            "terminal_receipt_id": expected_terminal_receipt_id,
+            "terminal_receipt_sha256": expected_terminal_receipt_sha256,
+            "generation": int(item["generation"]),
+            "candidate_sha256": str(candidate["candidate_sha256"]),
+        }
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
@@ -5749,7 +6003,9 @@ def show(connection: sqlite3.Connection, repository: str) -> dict[str, Any]:
         SELECT campaign.issue_number, campaign.generation, campaign.plan_sha256,
                campaign.candidate_sha256, campaign.worker_role, current.state,
                current.message_id, current.attempt_id, current.endpoint_id,
-               current.resolution_cycles, current.version, current.updated_at,
+               current.receipt_id, receipt.verdict AS receipt_verdict,
+               receipt.receipt_sha256, current.resolution_cycles,
+               current.version, current.updated_at,
                current.last_error, current.finalized_candidate_id,
                current.finalized_event_id, current.finalized_at,
                pickup.state AS receipt_pickup_state,
@@ -5761,6 +6017,9 @@ def show(connection: sqlite3.Connection, repository: str) -> dict[str, Any]:
         JOIN portfolio_readiness_campaigns campaign ON campaign.id=current.campaign_id
         LEFT JOIN portfolio_readiness_receipt_pickups pickup
           ON pickup.campaign_id=campaign.id
+        LEFT JOIN portfolio_readiness_receipts receipt
+          ON receipt.id=current.receipt_id
+         AND receipt.campaign_id=current.campaign_id
         WHERE current.repository=? ORDER BY campaign.issue_number
         """,
         (repository,),

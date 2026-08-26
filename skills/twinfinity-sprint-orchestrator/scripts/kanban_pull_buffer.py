@@ -2517,6 +2517,17 @@ def main() -> int:
     readiness_stage.add_argument("--receipt", type=Path, required=True)
     readiness_stage.add_argument("--message-id", type=int, required=True)
     readiness_stage.add_argument("--attempt-id", required=True)
+    readiness_reopen = subparsers.add_parser("readiness-reopen-terminal-hold")
+    readiness_reopen.add_argument("--repository", required=True)
+    readiness_reopen.add_argument("--issue", type=int, required=True)
+    readiness_reopen.add_argument("--expected-campaign-id", type=int, required=True)
+    readiness_reopen.add_argument("--expected-current-version", type=int, required=True)
+    readiness_reopen.add_argument(
+        "--expected-terminal-receipt-id", type=int, required=True
+    )
+    readiness_reopen.add_argument(
+        "--expected-terminal-receipt-sha256", required=True
+    )
     readiness_decision = subparsers.add_parser("readiness-apply-decision")
     readiness_decision.add_argument("--message-id", type=int, required=True)
     readiness_decision.add_argument("--planner-session-id", required=True)
@@ -2576,6 +2587,7 @@ def main() -> int:
                 execute_readiness_resolution_action,
                 read_json as read_readiness_json,
                 register as register_readiness,
+                reopen_terminal_hold,
                 show as show_readiness,
                 stage_receipt as stage_readiness_receipt,
             )
@@ -2609,6 +2621,21 @@ def main() -> int:
                     args.receipt,
                     message_id=args.message_id,
                     attempt_id=args.attempt_id,
+                    now=utc_now(),
+                )
+            elif args.command == "readiness-reopen-terminal-hold":
+                result = reopen_terminal_hold(
+                    connection,
+                    args.repository,
+                    args.issue,
+                    expected_campaign_id=args.expected_campaign_id,
+                    expected_current_version=args.expected_current_version,
+                    expected_terminal_receipt_id=(
+                        args.expected_terminal_receipt_id
+                    ),
+                    expected_terminal_receipt_sha256=(
+                        args.expected_terminal_receipt_sha256
+                    ),
                     now=utc_now(),
                 )
             elif args.command == "readiness-apply-decision":
