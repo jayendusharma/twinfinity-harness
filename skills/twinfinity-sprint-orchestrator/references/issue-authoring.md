@@ -155,3 +155,5 @@ Feature: <capability or control outcome>
 7. Reconcile later material state changes through the authorized body-mutation path while preserving decision and delivery history in append-only comments.
 
 An issue title, label, parent link, or comment cannot supply missing original-body authority. A historical authoring-complete body may use only the narrow volatile-control overlay defined in [control-plane.md](control-plane.md#issue-body-mutation); new issue creation never receives that exception.
+
+Keep volatile queue, readiness, and capacity state outside the stable product-and-delivery contract; publish it only through the bounded dashboard projection or authorized volatile-control overlay. Readiness labels and readiness-status prose are presentation, not delivery-control authority. Never write an issue so `agent-ready` or exact READY wording is a claim precondition: immutable readiness finalization, admission, source digest, generation, lease, endpoint, attempt, and watch rows own that handshake. Missing or stale projection cannot authorize work and does not veto an otherwise exact claim; any material body change produces source drift and still fails closed.

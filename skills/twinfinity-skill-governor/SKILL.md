@@ -27,7 +27,7 @@ Use only the evidence required by the material trigger:
 - installed Twinfinity `SKILL.md` files and directly relevant references;
 - the current Product Planner goal;
 - current immutable `planner`, `development`, and `sre` endpoint profiles and role pointers;
-- the current direct v3 official SQLite/API, hook, supervisor, and target-attempt contracts implicated by the trigger, plus any explicitly staged experimental boundary;
+- the current selected-path official SQLite/API, hook, supervisor, and target-attempt contracts implicated by the trigger, plus any explicitly staged experimental boundary;
 - typed readiness, READY-finalization, Development/SRE admission, recovery, terminal-watch, terminal-closeout, and hosted-operation templates or validators implicated by the trigger;
 - current SQLite policy and compact control-state summaries when capacity, lease, attempt, watch, or acknowledgement behavior is at issue; and
 - measured product/release flow and any bounded portfolio or capacity-advisor finding.
@@ -53,9 +53,9 @@ The Product Planner may commission the capacity scheduler, portfolio evaluator, 
 
 ## Audit the delivery state machine
 
-Treat prose as intended design, not proof. Current production execution is the direct v3 path: Planner v2 is the sole durable non-coding owner and Development/SRE v3 are fresh bounded full executors using the owner-safe official APIs, strict profiles, hooks, attempts, leases, and terminal watches. A non-authorizing `coordination.notice` may route one direct v3 all-gates readiness assessment with zero writer allocation. V5 brokered isolation is dormant experimental hardening and must not be certified as current, installed, or required for v3 throughput.
+Treat prose as intended design, not proof. Current production execution is the path whose checked-in source-current role selection, live SQLite role pointer, and installed immutable endpoint identity are exactly equal, with installed profile bytes and SHA-256 equal to the checked-in profile. Planner is the sole durable non-coding owner and Development/SRE are fresh bounded full executors using that exact path's official APIs, strict profiles, hooks, attempts, leases, and terminal watches. A non-authorizing `coordination.notice` may route one all-gates readiness assessment with zero writer allocation. An experimental path is not current unless it is the checked-in source-current selection and every one of those equality checks passes.
 
-For an affected path, verify together that current pointers and exact profile hashes are v2/v3/v3; every target uses a fresh current-endpoint attempt; readiness remains read-only and non-authorizing; mutating topics stay role-exclusive; admission commits item, allocation, lease, message, and watch atomically; terminal publication and cleanup retain capacity until exact closeout; Planner alone reconciles queue and capacity; and no unavailable broker-only RPC is described as executable. Reject split-brain contracts in which source, installed bytes, live pointers, or mechanics disagree. Prefer `MECHANIZE` for clear prose without enforcement and `UPDATE` for prose that contradicts verified mechanics.
+For an affected path, verify together that each role's checked-in source-current endpoint ID equals its live SQLite current pointer and installed endpoint identity, and that the installed immutable profile bytes and SHA-256 equal the checked-in profile bytes and hash; every target uses a fresh attempt at that exact current endpoint; readiness remains read-only and non-authorizing; mutating topics stay role-exclusive; admission commits item, allocation, lease, message, and watch atomically; terminal publication and cleanup retain capacity until exact closeout; Planner alone reconciles queue and capacity; and no unavailable RPC is described as executable. Reject split-brain contracts in which source, installed bytes, live pointers, or mechanics disagree. Prefer `MECHANIZE` for clear prose without enforcement and `UPDATE` for prose that contradicts verified mechanics.
 
 ## Diagnose before changing instructions
 
@@ -79,7 +79,7 @@ For each affected artifact, judge:
 5. **Effectiveness:** improves accepted outcomes, flow, quality, safety, or release readiness.
 6. **Efficiency:** reduces context, duplicate gates, WIP age, repair cycles, and coordination latency.
 7. **Enforceability:** critical rules live in endpoint profiles, validators, hooks, or transactions where feasible.
-8. **Executable-boundary fit:** exact installed current endpoint versions and direct v3 APIs exist, credentials remain within their authorized role boundary, and dormant v5 prose does not claim unavailable RPCs are live.
+8. **Executable-boundary fit:** each checked-in source-current endpoint, live role pointer, and installed endpoint identity is exactly equal; installed immutable profile bytes and SHA-256 equal the checked-in profile; the selected path's APIs exist; credentials remain within their authorized role boundary; and prose does not claim an unavailable RPC or non-current path is live.
 9. **Consistency and sustainability:** no contradiction, stale identity routing, resumed attempt, redundant agent, or disproportionate instruction cost.
 
 ## Propose the smallest safe disposition

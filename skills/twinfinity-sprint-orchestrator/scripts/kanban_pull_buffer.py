@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -15,19 +16,28 @@ from typing import Any, Callable
 
 from coordination_store import (
     DEFAULT_DATABASE,
+    UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA,
+    UNCLAIMED_ADMISSION_RETRY_REASON,
     CoordinationError,
     CoordinationStore,
     artifact_registry_identity,
     artifact_registry_identity_matches,
     canonical_json,
     parse_structured_lease_manifest,
+    terminal_watch_key,
+    unclaimed_admission_exhaustion_payload,
+    unclaimed_admission_recovery_notice_payload,
     validate_admission_dispatch_bindings,
 )
 from executor_registry import (
+    RegistryError,
+    applied_endpoint_rotation_chain,
+    canonical_repository_scope,
     canonical_endpoint_id,
     configured_identity_role,
     current_endpoint,
     identity_role,
+    require_current_endpoint_identity,
 )
 from owner_safe_sqlite import open_owner_database_readonly, prepare_owner_database
 from portfolio_graph import (
@@ -42,6 +52,43 @@ SCHEMA = "twinfinity-kanban-pull-buffer/v2"
 READY_SCHEMA = "twinfinity-kanban-pull-buffer/v3"
 FINALIZATION_SCHEMA = "twinfinity-kanban-ready-finalization/v1"
 DRIFT_RECOVERY_SCHEMA = "twinfinity-kanban-ready-drift-recovery/v1"
+UNCLAIMED_ADMISSION_RECOVERY_SCHEMA = "twinfinity-unclaimed-admission-recovery/v1"
+UNCLAIMED_ADMISSION_REFILL_TRIGGER = "UNCLAIMED_ADMISSION_RECOVERY_REFILL"
+LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON = (
+    "LEGACY_UNCLAIMED_ADMISSION_RECOVERY"
+)
+LEGACY_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA = (
+    "twinfinity-legacy-unclaimed-admission-recovery-descriptor/v1"
+)
+LEGACY_UNCLAIMED_ADMISSION_HOLD_REASON = "WAKE_RETRY_EXHAUSTED"
+LEGACY_UNCLAIMED_ADMISSION_ATTEMPT_ERROR = "EXECUTOR_TARGET_NO_PROGRESS"
+UNCLAIMED_RECOVERY_REQUEST_KEYS = set("""
+schema repository issue_number planner_session_id generation retained_item_version
+source_payload_sha256 current_source_payload_sha256 accountable_session_id
+lease_manifest_sha256 admission_message_id admission_payload_sha256 wake_key
+wake_attempts target_progress_sha256 watch_key recovery_notice_message_id
+recovery_reason
+""".split())
+LEGACY_RECOVERY_DESCRIPTOR_KEYS = {"schema", "evidence", "evidence_sha256"}
+LEGACY_RECOVERY_EVIDENCE_KEYS = set("""
+repository issue_number generation retained_item_version source_payload_sha256
+accountable_session_id lease_manifest_sha256 admission_message_id
+admission_payload_sha256 wake_key wake_attempts target_progress_sha256 watch_key
+historical_recipient hold_reason wake_last_attempt_at watch_updated_at
+item_updated_at ready_candidate_id ready_finalization_id readiness_campaign_id
+readiness_receipt_id finalization_dirty_event_id ready_finalization_sha256
+normalization_events endpoint_rotation executor_attempt
+""".split())
+LEGACY_RECOVERY_EVENT_KEYS = {
+    "id", "event_type", "entity_key", "payload_sha256", "created_at"
+}
+LEGACY_RECOVERY_ROTATION_KEYS = {
+    "change_id", "change_version", "before_item_version", "not_before"
+}
+LEGACY_RECOVERY_ATTEMPT_KEYS = {
+    "attempt_id", "role", "endpoint_id", "target_kind", "target_key",
+    "state", "exit_code", "last_error",
+}
 STATES = {"PREPARED_NOT_READY", "READY"}
 VERTICALITY = {"END_TO_END", "BOUNDED_ENABLER"}
 ZERO_WIP_STATUSES = {"PREPARED", "QUEUED", "READY"}
@@ -66,6 +113,27 @@ def utc_now() -> str:
 
 def digest_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _legacy_recovery_stable_source(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip only the non-authorizing dashboard projection fields."""
+
+    stable = {
+        key: value
+        for key, value in payload.items()
+        if key != "updated_at" and not key.startswith("_projection_")
+    }
+    labels = stable.get("labels")
+    if isinstance(labels, list):
+        stable["labels"] = [
+            label
+            for label in labels
+            if not (
+                label == "agent-ready"
+                or (isinstance(label, dict) and label.get("name") == "agent-ready")
+            )
+        ]
+    return stable
 
 
 def _sha256_descriptor(descriptor: int) -> str:
@@ -2115,6 +2183,949 @@ def _recover_finalized_ready_candidate(
     }
 
 
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and not set(value).difference("0123456789abcdef")
+    )
+
+
+def legacy_unclaimed_admission_recovery_notice_payload(
+    request: dict[str, Any], descriptor_sha256: str
+) -> dict[str, Any]:
+    """Build the non-authorizing Planner notice bound to legacy evidence."""
+
+    issue_number = int(request["issue_number"])
+    return {
+        "source": {
+            "repository": request["repository"],
+            "object_kind": "issue",
+            "object_number": issue_number,
+            "payload_sha256": request["current_source_payload_sha256"],
+        },
+        "notice_kind": "planning_request",
+        "mutation_authority": False,
+        "subject": f"Issue {issue_number} legacy admission recovery review",
+        "summary": (
+            "An external digest-bound descriptor proves one retained, "
+            "unclaimed admission is eligible for Planner recovery."
+        ),
+        "evidence": {
+            "schema": LEGACY_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA,
+            "descriptor_sha256": descriptor_sha256,
+            "recovery_reason": LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON,
+            "admission_message_id": request["admission_message_id"],
+            "wake_key": request["wake_key"],
+            "watch_key": request["watch_key"],
+            "generation": request["generation"],
+            "retained_item_version": request["retained_item_version"],
+            "lease_manifest_sha256": request["lease_manifest_sha256"],
+        },
+        "requested_evidence": [
+            "Exact relational proof that the historical admission was never "
+            "claimed and that its delivery lineage is terminal."
+        ],
+        "next_observation": (
+            "The current Planner may recover only through the claimed notice "
+            "and its exact running executor attempt."
+        ),
+    }
+
+
+def _validate_legacy_recovery_descriptor(
+    descriptor: Any, request: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    """Validate the closed external compatibility descriptor without writes."""
+
+    if (
+        not isinstance(descriptor, dict)
+        or set(descriptor) != LEGACY_RECOVERY_DESCRIPTOR_KEYS
+        or descriptor.get("schema")
+        != LEGACY_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA
+        or not isinstance(descriptor.get("evidence"), dict)
+        or set(descriptor["evidence"]) != LEGACY_RECOVERY_EVIDENCE_KEYS
+        or not _is_sha256(descriptor.get("evidence_sha256"))
+        or digest_json(descriptor["evidence"]) != descriptor["evidence_sha256"]
+    ):
+        raise PullBufferError("LEGACY_RECOVERY_DESCRIPTOR_INVALID")
+    evidence = descriptor["evidence"]
+    binding_keys = (
+        "repository", "issue_number", "generation", "retained_item_version",
+        "source_payload_sha256", "accountable_session_id",
+        "lease_manifest_sha256", "admission_message_id",
+        "admission_payload_sha256", "wake_key", "wake_attempts",
+        "target_progress_sha256", "watch_key",
+    )
+    integers = (
+        "issue_number", "generation", "retained_item_version",
+        "admission_message_id", "wake_attempts", "ready_candidate_id",
+        "ready_finalization_id", "readiness_campaign_id",
+        "readiness_receipt_id", "finalization_dirty_event_id",
+    )
+    strings = (
+        "repository", "accountable_session_id", "wake_key", "watch_key",
+        "historical_recipient", "hold_reason", "wake_last_attempt_at",
+        "watch_updated_at", "item_updated_at",
+    )
+    hashes = (
+        "source_payload_sha256", "lease_manifest_sha256",
+        "admission_payload_sha256", "target_progress_sha256",
+        "ready_finalization_sha256",
+    )
+    events = evidence.get("normalization_events")
+    rotation = evidence.get("endpoint_rotation")
+    attempt = evidence.get("executor_attempt")
+    valid = bool(
+        all(evidence.get(key) == request.get(key) for key in binding_keys)
+        and all(type(evidence.get(key)) is int for key in integers)
+        and all(isinstance(evidence.get(key), str) and evidence[key] for key in strings)
+        and all(_is_sha256(evidence.get(key)) for key in hashes)
+        and evidence["historical_recipient"] != evidence["accountable_session_id"]
+        and evidence["hold_reason"] == LEGACY_UNCLAIMED_ADMISSION_HOLD_REASON
+        and isinstance(events, list)
+        and len(events) == 2
+        and all(isinstance(event, dict) and set(event) == LEGACY_RECOVERY_EVENT_KEYS
+                for event in events)
+        and [event.get("event_type") for event in events]
+        == ["TERMINAL_WATCH_COMPLETED", "ISSUE_STATUS_CHANGED"]
+        and all(type(event.get("id")) is int and event["id"] > 0 for event in events)
+        and events[0]["id"] < events[1]["id"]
+        and all(_is_sha256(event.get("payload_sha256")) for event in events)
+        and all(isinstance(event.get("created_at"), str) and event["created_at"]
+                for event in events)
+        and events[0]["created_at"] == evidence["watch_updated_at"]
+        and events[1]["created_at"] == evidence["watch_updated_at"]
+        and evidence["wake_last_attempt_at"] <= evidence["watch_updated_at"]
+        and isinstance(rotation, dict)
+        and set(rotation) == LEGACY_RECOVERY_ROTATION_KEYS
+        and _is_sha256(rotation.get("change_id"))
+        and type(rotation.get("change_version")) is int
+        and rotation["change_version"] > 0
+        and rotation.get("before_item_version")
+        == evidence["retained_item_version"] - 1
+        and rotation.get("not_before") == events[1]["created_at"]
+        and isinstance(attempt, dict)
+        and set(attempt) == LEGACY_RECOVERY_ATTEMPT_KEYS
+        and all(isinstance(attempt.get(key), str) and attempt[key] for key in (
+            "attempt_id", "role", "endpoint_id", "target_kind", "target_key",
+            "state", "last_error",
+        ))
+        and type(attempt.get("exit_code")) is int
+        and attempt["role"] == "development"
+        and attempt["state"] == "HOLD"
+        and attempt["exit_code"] == 0
+        and attempt["last_error"] == LEGACY_UNCLAIMED_ADMISSION_ATTEMPT_ERROR
+    )
+    if not valid:
+        raise PullBufferError("LEGACY_RECOVERY_DESCRIPTOR_INVALID")
+    descriptor_sha256 = digest_json(descriptor)
+    return evidence, descriptor_sha256
+
+
+def _validate_unclaimed_recovery_request(request: dict[str, Any]) -> bool:
+    if set(request) != UNCLAIMED_RECOVERY_REQUEST_KEYS:
+        return False
+    integers = (
+        type(request.get("issue_number")) is int and request["issue_number"] > 0,
+        type(request.get("generation")) is int and request["generation"] >= 0,
+        type(request.get("retained_item_version")) is int
+        and request["retained_item_version"] > 0,
+        type(request.get("admission_message_id")) is int
+        and request["admission_message_id"] > 0,
+        request.get("wake_attempts") == 3,
+    )
+    notice_id = request.get("recovery_notice_message_id")
+    notice_valid = type(notice_id) is int and notice_id > 0
+    return bool(
+        request.get("schema") == UNCLAIMED_ADMISSION_RECOVERY_SCHEMA
+        and isinstance(request.get("repository"), str)
+        and all(integers)
+        and request.get("wake_key")
+        == f"message:{request['admission_message_id']}:prepared"
+        and request.get("watch_key")
+        == terminal_watch_key(
+            request["repository"], request["issue_number"], request["generation"]
+        )
+        and all(
+            isinstance(request.get(key), str) and bool(request[key])
+            for key in ("planner_session_id", "accountable_session_id")
+        )
+        and all(
+            _is_sha256(request.get(key))
+            for key in (
+                "source_payload_sha256",
+                "current_source_payload_sha256",
+                "lease_manifest_sha256",
+                "admission_payload_sha256",
+                "target_progress_sha256",
+            )
+        )
+        and request.get("recovery_reason")
+        in {
+            UNCLAIMED_ADMISSION_RETRY_REASON,
+            LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON,
+        }
+        and notice_valid
+    )
+
+
+def _load_unclaimed_recovery_rows(
+    connection: sqlite3.Connection, request: dict[str, Any]
+) -> dict[str, sqlite3.Row]:
+    issue = (request["repository"], request["issue_number"])
+    queries = {
+        "message": ("SELECT * FROM coordination_messages WHERE id=?",
+                    (request["admission_message_id"],)),
+        "wake": ("SELECT * FROM coordination_wakes WHERE wake_key=?",
+                 (request["wake_key"],)),
+        "watch": ("SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                  (request["watch_key"],)),
+        "item": ("SELECT * FROM coordination_items WHERE repository=? AND issue_number=?", issue),
+        "readiness": ("SELECT * FROM portfolio_readiness_current "
+                      "WHERE repository=? AND issue_number=?", issue),
+    }
+    rows = {name: connection.execute(sql, values).fetchone()
+            for name, (sql, values) in queries.items()}
+    if any(row is None for row in rows.values()):
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_FENCE_MISMATCH")
+    admitted = connection.execute(
+        "SELECT finalization.id FROM portfolio_ready_finalizations finalization "
+        "JOIN portfolio_dirty_events dirty ON dirty.id=finalization.dirty_event_id "
+        "WHERE finalization.repository=? AND finalization.issue_number=? "
+        "AND finalization.generation=? AND dirty.state='COMPLETE' "
+        "AND json_extract(dirty.result_json,'$.outcome')='ADMITTED' "
+        "AND json_extract(dirty.result_json,'$.admitted_issue_number')=? "
+        "AND json_extract(dirty.result_json,'$.message_id')=?",
+        (*issue, request["generation"], request["issue_number"],
+         request["admission_message_id"]),
+    ).fetchall()
+    if len(admitted) != 1:
+        raise PullBufferError("UNCLAIMED_ADMISSION_FINALIZATION_DRIFT")
+    finalization = connection.execute(
+        "SELECT * FROM portfolio_ready_finalizations WHERE id=?", (admitted[0][0],)
+    ).fetchone()
+    dirty = connection.execute(
+        "SELECT * FROM portfolio_dirty_events WHERE id=?",
+        (finalization["dirty_event_id"],),
+    ).fetchone()
+    try:
+        result = json.loads(dirty["result_json"], object_pairs_hook=_strict_object)
+    except (TypeError, json.JSONDecodeError, PullBufferError) as exc:
+        raise PullBufferError("UNCLAIMED_ADMISSION_FINALIZATION_DRIFT") from exc
+    if digest_json(result) != dirty["result_sha256"]:
+        raise PullBufferError("UNCLAIMED_ADMISSION_FINALIZATION_DRIFT")
+    candidate = connection.execute(
+        "SELECT * FROM portfolio_pull_buffer_candidates WHERE id=?",
+        (finalization["ready_candidate_id"],),
+    ).fetchone()
+    if candidate is None:
+        raise PullBufferError("UNCLAIMED_ADMISSION_FINALIZATION_DRIFT")
+    rows.update({"finalization": finalization, "dirty": dirty, "candidate": candidate})
+    return rows
+
+
+def _recovery_sources(
+    connection: sqlite3.Connection, request: dict[str, Any], *, legacy: bool
+) -> None:
+    payloads: list[dict[str, Any]] = []
+    for payload_sha256 in (
+        request["source_payload_sha256"],
+        request["current_source_payload_sha256"],
+    ):
+        row = connection.execute(
+            "SELECT payload_json FROM github_snapshots WHERE repository=? "
+            "AND object_kind='issue' AND object_number=? AND payload_sha256=?",
+            (request["repository"], request["issue_number"], payload_sha256),
+        ).fetchone()
+        try:
+            payload = json.loads(row["payload_json"], object_pairs_hook=_strict_object)
+        except (TypeError, json.JSONDecodeError, PullBufferError) as exc:
+            raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_SOURCE_DRIFT") from exc
+        if digest_json(payload) != payload_sha256:
+            raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_SOURCE_DRIFT")
+        payloads.append(payload)
+    bound, current = payloads
+    bound_stable = digest_json(_legacy_recovery_stable_source(bound))
+    current_stable = digest_json(_legacy_recovery_stable_source(current))
+    if legacy:
+        if bound_stable != current_stable:
+            raise PullBufferError("LEGACY_RECOVERY_MATERIAL_SOURCE_DRIFT")
+    elif request["source_payload_sha256"] != request["current_source_payload_sha256"]:
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_SOURCE_DRIFT")
+
+
+def _recovery_terminal_error(
+    connection: sqlite3.Connection, request: dict[str, Any]
+) -> str | None:
+    message_key = f"message:{request['admission_message_id']}"
+    if connection.execute(
+        "SELECT 1 FROM coordination_events WHERE event_type='MESSAGE_CLAIMED' "
+        "AND entity_key=? LIMIT 1",
+        (message_key,),
+    ).fetchone():
+        return "UNCLAIMED_ADMISSION_CLAIM_EVIDENCE_PRESENT"
+    attempts = connection.execute(
+        """
+        SELECT state FROM executor_attempts
+        WHERE (target_kind='message' AND target_key=?)
+           OR (lineage_repository=? AND lineage_issue_number=?
+               AND lineage_generation=? AND lineage_lease_sha256=?)
+        """,
+        (
+            str(request["admission_message_id"]), request["repository"],
+            request["issue_number"], request["generation"],
+            request["lease_manifest_sha256"],
+        ),
+    ).fetchall()
+    if any(row["state"] not in {"COMPLETE", "HOLD", "LAUNCH_FAILED"} for row in attempts):
+        return "UNCLAIMED_ADMISSION_TERMINAL_LINEAGE_PRESENT"
+    lineage = (request["repository"], request["issue_number"], request["generation"])
+    if connection.execute(
+        """
+        SELECT 1 FROM coordination_terminal_closeout_packets
+        WHERE repository=? AND issue_number=? AND generation=?
+        UNION ALL SELECT 1 FROM coordination_pre_push_gates
+        WHERE repository=? AND issue_number=? AND generation=?
+        UNION ALL SELECT 1 FROM coordination_pre_push_publications
+        WHERE repository=? AND issue_number=? AND generation=? LIMIT 1
+        """,
+        lineage * 3,
+    ).fetchone():
+        return "UNCLAIMED_ADMISSION_TERMINAL_LINEAGE_PRESENT"
+    if connection.execute(
+        "SELECT 1 FROM coordination_messages "
+        "WHERE topic='development.terminal_closeout' "
+        "AND json_extract(payload_json,'$.source.repository')=? "
+        "AND json_extract(payload_json,'$.issue_number')=? "
+        "AND json_extract(payload_json,'$.generation')=? LIMIT 1",
+        lineage,
+    ).fetchone():
+        return "UNCLAIMED_ADMISSION_TERMINAL_LINEAGE_PRESENT"
+    return None
+
+
+def _validate_recovery_notice(
+    store: CoordinationStore,
+    request: dict[str, Any],
+    *,
+    compatibility_descriptor_sha256: str | None,
+    replay: bool,
+) -> sqlite3.Row:
+    connection = store.connection
+    notice_id = int(request["recovery_notice_message_id"])
+    notice = connection.execute(
+        "SELECT * FROM coordination_messages WHERE id=?", (notice_id,)
+    ).fetchone()
+    if notice is None:
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_NOTICE_DRIFT")
+    try:
+        observed_payload = json.loads(
+            notice["payload_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, PullBufferError) as exc:
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_NOTICE_DRIFT") from exc
+    if compatibility_descriptor_sha256 is None:
+        exhaustion = unclaimed_admission_exhaustion_payload({
+            **request, "item_version": request["retained_item_version"] - 1,
+        })
+        exhaustion_sha256 = digest_json(exhaustion)
+        expected_payload = unclaimed_admission_recovery_notice_payload(
+            exhaustion, request["source_payload_sha256"]
+        )
+        expected_idempotency_key = (
+            f"unclaimed-admission-recovery:{exhaustion_sha256}"
+        )
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM coordination_events "
+            "WHERE event_type='UNCLAIMED_ADMISSION_RETRY_EXHAUSTED' "
+            "AND entity_key=? AND payload_sha256=?",
+            (
+                f"{request['repository']}:issue:{request['issue_number']}:"
+                f"generation:{request['generation']}",
+                digest_json({
+                    "exhaustion_sha256": exhaustion_sha256,
+                    "planner_message_id": notice_id,
+                    "reason": UNCLAIMED_ADMISSION_RETRY_REASON,
+                }),
+            ),
+        ).fetchone()[0]
+    else:
+        expected_payload = legacy_unclaimed_admission_recovery_notice_payload(
+            request, compatibility_descriptor_sha256
+        )
+        expected_idempotency_key = (
+            "legacy-unclaimed-admission-recovery:"
+            f"{compatibility_descriptor_sha256}"
+        )
+        event_count = 1
+    valid = bool(
+        notice["idempotency_key"] == expected_idempotency_key
+        and observed_payload == expected_payload
+        and event_count == 1
+    )
+    if (
+        not valid
+        or digest_json(observed_payload) != notice["payload_sha256"]
+        or notice["recipient_session_id"] != request["planner_session_id"]
+        or notice["topic"] != "coordination.notice"
+    ):
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_NOTICE_DRIFT")
+    if notice["state"] != ("COMPLETE" if replay else "CLAIMED"):
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_NOTICE_NOT_CLAIMED")
+    if notice["claimed_by"] != request["planner_session_id"]:
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_NOTICE_DRIFT")
+    return notice
+
+
+def _authenticate_recovery_attempt(
+    connection: sqlite3.Connection,
+    request: dict[str, Any],
+    notice: sqlite3.Row,
+    *,
+    attempt_id: str | None,
+    executor_token: str | None,
+) -> None:
+    """Authenticate the current Planner's exact running notice attempt."""
+
+    if (
+        not isinstance(attempt_id, str)
+        or not attempt_id
+        or not isinstance(executor_token, str)
+        or not executor_token
+    ):
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_ATTEMPT_REQUIRED")
+    attempt = connection.execute(
+        "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+    ).fetchone()
+    if attempt is None:
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_ATTEMPT_NOT_FOUND")
+    token_sha256 = hashlib.sha256(executor_token.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(str(attempt["token_sha256"]), token_sha256):
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_TOKEN_MISMATCH")
+    if (
+        attempt["role"] != "planner"
+        or attempt["endpoint_id"] != request["planner_session_id"]
+        or attempt["state"] != "RUNNING"
+        or attempt["target_kind"] != "message"
+        or attempt["target_key"] != str(notice["id"])
+        or attempt["repository_scope"]
+        != canonical_repository_scope(request["repository"])
+    ):
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_ATTEMPT_BINDING_MISMATCH")
+
+
+def _legacy_recovery_fence(
+    connection: sqlite3.Connection,
+    rows: dict[str, sqlite3.Row],
+    request: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    replay: bool,
+) -> None:
+    """Verify one historical unclaimed admission from external exact evidence."""
+
+    message, wake, watch = rows["message"], rows["wake"], rows["watch"]
+    candidate, finalization = rows["candidate"], rows["finalization"]
+    events_descriptor = evidence["normalization_events"]
+    event_ids = tuple(event["id"] for event in events_descriptor)
+    events = connection.execute(
+        "SELECT id,event_type,entity_key,payload_sha256,created_at "
+        "FROM coordination_events WHERE id IN (?,?) ORDER BY id",
+        event_ids,
+    ).fetchall()
+    normalized_version = request["retained_item_version"] - 1
+    entity_key = f"{request['repository']}:issue:{request['issue_number']}"
+    normalized = (
+        digest_json({"allocation_class": "RETAINED", "item_version": normalized_version,
+                     "status": "HOLD"}),
+        digest_json({
+            "allocation_class": "RETAINED", "generation": request["generation"],
+            "issue_number": request["issue_number"],
+            "repository": request["repository"],
+            "source_payload_sha256": request["source_payload_sha256"],
+            "status": "HOLD", "version": normalized_version,
+        }),
+    )
+    exact = (
+        (message["recipient_session_id"], message["state"], message["last_error"])
+        == (evidence["historical_recipient"], "HOLD", evidence["hold_reason"]),
+        (wake["state"], wake["last_error"], wake["last_attempt_at"])
+        == ("HOLD", evidence["hold_reason"], evidence["wake_last_attempt_at"]),
+        (watch["state"], watch["accountable_session_id"], watch["process_id"],
+         watch["claim_attempt_id"], int(watch["attempts"]), watch["updated_at"],
+         watch["last_error"])
+        == ("COMPLETE", evidence["historical_recipient"], None, None, 0,
+            evidence["watch_updated_at"], None),
+        (int(candidate["id"]), int(finalization["id"]),
+         int(finalization["campaign_id"]), int(finalization["receipt_id"]),
+         int(finalization["dirty_event_id"]), finalization["finalization_sha256"])
+        == tuple(evidence[key] for key in (
+            "ready_candidate_id", "ready_finalization_id", "readiness_campaign_id",
+            "readiness_receipt_id", "finalization_dirty_event_id",
+            "ready_finalization_sha256",
+        )),
+        [dict(row) for row in events] == events_descriptor,
+        all(event["entity_key"] == entity_key for event in events_descriptor),
+        normalized == tuple(event["payload_sha256"] for event in events_descriptor),
+        replay or rows["item"]["updated_at"] == evidence["item_updated_at"],
+    )
+    if not all(exact):
+        raise PullBufferError("LEGACY_RECOVERY_FENCE_MISMATCH")
+    rotation_descriptor = evidence["endpoint_rotation"]
+    rotation = applied_endpoint_rotation_chain(
+        connection,
+        repository=request["repository"],
+        issue_number=request["issue_number"],
+        before_identity=evidence["historical_recipient"],
+        before_item_version=normalized_version,
+        after_identity=request["accountable_session_id"],
+        after_item_version=request["retained_item_version"],
+        not_before=rotation_descriptor["not_before"],
+        change_id=rotation_descriptor["change_id"],
+        change_version=rotation_descriptor["change_version"],
+    )
+    attempts = connection.execute(
+        "SELECT attempt_id,role,endpoint_id,target_kind,target_key,state,"
+        "exit_code,last_error FROM executor_attempts "
+        "WHERE target_kind='message' AND target_key=? ORDER BY attempt_id",
+        (str(request["admission_message_id"]),),
+    ).fetchall()
+    attempt = None if len(attempts) != 1 else dict(attempts[0])
+    attempt_descriptor = evidence["executor_attempt"]
+    historical_role = identity_role(connection, evidence["historical_recipient"])
+    if (
+        rotation is None
+        or historical_role != "development"
+        or identity_role(connection, request["accountable_session_id"])
+        != historical_role
+        or attempt != attempt_descriptor
+        or attempt_descriptor["role"] != historical_role
+        or attempt_descriptor["endpoint_id"] != evidence["historical_recipient"]
+        or attempt_descriptor["target_kind"] != "message"
+        or attempt_descriptor["target_key"] != str(request["admission_message_id"])
+        or attempt_descriptor["state"] != "HOLD"
+    ):
+        raise PullBufferError("LEGACY_RECOVERY_FENCE_MISMATCH")
+
+
+def recover_unclaimed_admission(
+    store: CoordinationStore,
+    request: dict[str, Any],
+    *,
+    now: str,
+    attempt_id: str | None = None,
+    executor_token: str | None = None,
+    compatibility_descriptor: dict[str, Any] | None = None,
+    failpoint: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Planner-only, exact, replay-safe rebaseline of one unclaimed admission."""
+
+    if not isinstance(request, dict) or not _validate_unclaimed_recovery_request(request):
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_REQUEST_INVALID")
+    legacy = (
+        request["recovery_reason"]
+        == LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON
+    )
+    compatibility_evidence: dict[str, Any] | None = None
+    compatibility_descriptor_sha256: str | None = None
+    if legacy:
+        compatibility_evidence, compatibility_descriptor_sha256 = (
+            _validate_legacy_recovery_descriptor(compatibility_descriptor, request)
+        )
+    elif compatibility_descriptor is not None:
+        raise PullBufferError("LEGACY_RECOVERY_DESCRIPTOR_UNEXPECTED")
+    connection = store.connection
+    with store.transaction():
+        try:
+            require_current_endpoint_identity(
+                connection,
+                request["planner_session_id"],
+                expected_role="planner",
+            )
+        except RegistryError as exc:
+            raise PullBufferError("CURRENT_PLANNER_ENDPOINT_REQUIRED") from exc
+        rows = _load_unclaimed_recovery_rows(connection, request)
+        message, wake, watch = rows["message"], rows["wake"], rows["watch"]
+        item, readiness = rows["item"], rows["readiness"]
+        candidate, finalization = rows["candidate"], rows["finalization"]
+        try:
+            payload = json.loads(message["payload_json"], object_pairs_hook=_strict_object)
+        except (TypeError, json.JSONDecodeError, PullBufferError) as exc:
+            raise PullBufferError("UNCLAIMED_ADMISSION_FINALIZATION_DRIFT") from exc
+        source = payload.get("source") if isinstance(payload, dict) else None
+        capacity = payload.get("capacity") if isinstance(payload, dict) else None
+        admission_item_version = request["retained_item_version"] - (2 if legacy else 1)
+        expected_watch_owner = (
+            message["recipient_session_id"] if legacy else request["accountable_session_id"]
+        )
+        unit_keys = ("development_units", "shared_units", "sre_units")
+        if (
+            not isinstance(source, dict)
+            or not isinstance(capacity, dict)
+            or message["topic"] not in {"development.admission", "sre.admission"}
+            or message["claimed_by"] is not None
+            or message["payload_sha256"] != request["admission_payload_sha256"]
+            or digest_json(payload) != message["payload_sha256"]
+            or source != {
+                "repository": request["repository"],
+                "object_kind": "issue",
+                "object_number": request["issue_number"],
+                "payload_sha256": request["source_payload_sha256"],
+            }
+            or (
+                payload.get("issue_number"), payload.get("generation"),
+                payload.get("lease_manifest_sha256"), payload.get("item_version"),
+            ) != (
+                request["issue_number"], request["generation"],
+                request["lease_manifest_sha256"],
+                admission_item_version,
+            )
+            or type(payload.get("item_version")) is not int
+            or (
+                wake["message_id"], wake["recipient_session_id"],
+                wake["message_payload_sha256"], int(wake["attempts"]),
+                wake["target_progress_sha256"], wake["process_id"],
+            ) != (
+                request["admission_message_id"], message["recipient_session_id"],
+                message["payload_sha256"], request["wake_attempts"],
+                request["target_progress_sha256"], None,
+            )
+            or (
+                watch["repository"], int(watch["issue_number"]),
+                int(watch["generation"]), int(watch["admission_message_id"] or 0),
+                watch["admission_payload_sha256"], watch["lease_manifest_sha256"],
+                watch["accountable_session_id"], watch["claim_attempt_id"],
+            ) != (
+                request["repository"], request["issue_number"], request["generation"],
+                request["admission_message_id"], message["payload_sha256"],
+                request["lease_manifest_sha256"], expected_watch_owner, None,
+            )
+            or any(
+                type(capacity.get(key)) is not int
+                or capacity[key] != int(item[key]) for key in unit_keys
+            )
+            or (
+                candidate["repository"], int(candidate["issue_number"]),
+                int(candidate["generation"]), candidate["state"],
+                candidate["source_payload_sha256"],
+                int(candidate["readiness_campaign_id"] or -1),
+            ) != (
+                request["repository"], request["issue_number"],
+                request["generation"], "READY",
+                request["source_payload_sha256"], int(finalization["campaign_id"]),
+            )
+        ):
+            raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_FENCE_MISMATCH")
+        _recovery_sources(connection, request, legacy=legacy)
+        recovery_fence: dict[str, Any] = {
+            "request": request,
+            "ready_candidate_id": int(candidate["id"]),
+            "ready_finalization_id": int(finalization["id"]),
+            "ready_finalization_sha256": finalization["finalization_sha256"],
+        }
+        if compatibility_descriptor_sha256 is not None:
+            recovery_fence["compatibility_descriptor_sha256"] = (
+                compatibility_descriptor_sha256
+            )
+        recovery_sha256 = digest_json(recovery_fence)
+        next_generation = request["generation"] + 1
+        next_item_version = request["retained_item_version"] + 1
+        refill_details = {
+            "prior_allocation_class": "RETAINED",
+            "allocation_class": "NONE",
+            "prior_generation": request["generation"],
+            "recovery_sha256": recovery_sha256,
+        }
+        refill_payload = {
+            "trigger_kind": UNCLAIMED_ADMISSION_REFILL_TRIGGER,
+            "repository": request["repository"],
+            "issue_number": request["issue_number"],
+            "release_item_version": next_item_version,
+            "release_source_sha256": request["current_source_payload_sha256"],
+            "status": "PREPARED",
+            "generation": next_generation,
+            **refill_details,
+        }
+        refill_sha256 = digest_json(refill_payload)
+        refill_key = (
+            f"portfolio-dirty:{UNCLAIMED_ADMISSION_REFILL_TRIGGER}:"
+            f"{request['repository']}:{refill_sha256}"
+        )
+        refill = connection.execute(
+            "SELECT * FROM portfolio_dirty_events WHERE event_key=?", (refill_key,)
+        ).fetchone()
+        replay = refill is not None
+        if not replay:
+            current_source = connection.execute(
+                "SELECT payload_sha256 FROM github_current WHERE repository=? "
+                "AND object_kind='issue' AND object_number=?",
+                (request["repository"], request["issue_number"]),
+            ).fetchone()
+            if (
+                current_source is None
+                or current_source["payload_sha256"]
+                != request["current_source_payload_sha256"]
+            ):
+                raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_SOURCE_DRIFT")
+        if legacy:
+            if compatibility_evidence is None:
+                raise PullBufferError("LEGACY_RECOVERY_DESCRIPTOR_INVALID")
+            _legacy_recovery_fence(
+                connection,
+                rows,
+                request,
+                compatibility_evidence,
+                replay=replay,
+            )
+        elif (
+            message["recipient_session_id"] != request["accountable_session_id"]
+            or message["state"] != "HOLD"
+            or message["last_error"] != UNCLAIMED_ADMISSION_RETRY_REASON
+            or wake["state"] != "HOLD"
+            or wake["last_error"] != UNCLAIMED_ADMISSION_RETRY_REASON
+            or watch["state"] != "HOLD"
+            or watch["last_error"] != UNCLAIMED_ADMISSION_RETRY_REASON
+        ):
+            raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_FENCE_MISMATCH")
+        terminal_error = _recovery_terminal_error(connection, request)
+        if terminal_error is not None:
+            raise PullBufferError(terminal_error)
+        notice = _validate_recovery_notice(
+            store,
+            request,
+            compatibility_descriptor_sha256=compatibility_descriptor_sha256,
+            replay=replay,
+        )
+        _authenticate_recovery_attempt(
+            connection,
+            request,
+            notice,
+            attempt_id=attempt_id,
+            executor_token=executor_token,
+        )
+        notice_id = int(notice["id"])
+        result = {
+            "schema": UNCLAIMED_ADMISSION_RECOVERY_SCHEMA,
+            "state": "RECOVERED",
+            "recovery_sha256": recovery_sha256,
+            "prior_generation": request["generation"],
+            "next_generation": next_generation,
+            "prior_item_version": request["retained_item_version"],
+            "next_item_version": next_item_version,
+            "planner_message_id": notice_id,
+            "ready_candidate_id": int(candidate["id"]),
+        }
+        if replay:
+            result["refill_event_id"] = int(refill["id"])
+            retirement = connection.execute(
+                "SELECT * FROM portfolio_pull_buffer_retirements WHERE candidate_id=?",
+                (candidate["id"],),
+            ).fetchone()
+            readiness_payload = {
+                "recovery_sha256": recovery_sha256,
+                "prior_generation": request["generation"],
+                "next_generation": next_generation,
+                "ready_candidate_id": int(candidate["id"]),
+                "planner_message_id": notice_id,
+                "refill_event_id": int(refill["id"]),
+            }
+            readiness_event_count = connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_events "
+                "WHERE campaign_id=? "
+                "AND event_type='READINESS_UNCLAIMED_ADMISSION_REBASELINED' "
+                "AND payload_sha256=? AND payload_json=?",
+                (
+                    finalization["campaign_id"],
+                    digest_json(readiness_payload),
+                    canonical_json(readiness_payload),
+                ),
+            ).fetchone()[0]
+            recovery_event_count = connection.execute(
+                "SELECT COUNT(*) FROM coordination_events "
+                "WHERE event_type='UNCLAIMED_ADMISSION_RECOVERED' "
+                "AND entity_key=? AND payload_sha256=?",
+                (
+                    f"{request['repository']}:issue:{request['issue_number']}:"
+                    f"generation:{next_generation}",
+                    digest_json(result),
+                ),
+            ).fetchone()[0]
+            if (
+                refill["event_sha256"] != refill_sha256
+                or refill["payload_json"] != canonical_json(refill_payload)
+                or refill["state"] not in {"PENDING", "RETRY", "COMPLETE", "HOLD"}
+                or retirement is None
+                or retirement["repository"] != request["repository"]
+                or int(retirement["issue_number"]) != request["issue_number"]
+                or retirement["reasons_json"] != canonical_json(["ADMITTED"])
+                or retirement["reason_sha256"] != digest_json(["ADMITTED"])
+                or (
+                    (pointer := connection.execute(
+                        "SELECT candidate_id FROM portfolio_pull_buffer_current "
+                        "WHERE repository=? AND issue_number=?",
+                        (request["repository"], request["issue_number"]),
+                    ).fetchone())
+                    is not None
+                    and int(pointer["candidate_id"]) == int(candidate["id"])
+                )
+                or int(item["generation"]) < next_generation
+                or int(item["version"]) < next_item_version
+                or notice["state"] != "COMPLETE"
+                or readiness_event_count != 1
+                or recovery_event_count != 1
+            ):
+                raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_REPLAY_DRIFT")
+            return result
+
+        if (
+            item["status"] != "HOLD"
+            or item["allocation_class"] != "RETAINED"
+            or int(item["generation"]) != request["generation"]
+            or int(item["version"]) != request["retained_item_version"]
+            or item["accountable_session_id"] != request["accountable_session_id"]
+            or item["lease_manifest_sha256"] != request["lease_manifest_sha256"]
+            or item["source_payload_sha256"] != request["source_payload_sha256"]
+            or readiness["state"] != "FINALIZED"
+            or ready_attestation_error(connection, dict(candidate)) is not None
+            or notice["state"] != "CLAIMED"
+        ):
+            raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_FENCE_MISMATCH")
+        retirement = connection.execute(
+            "SELECT * FROM portfolio_pull_buffer_retirements WHERE candidate_id=?",
+            (candidate["id"],),
+        ).fetchone()
+        pointer = connection.execute(
+            "SELECT candidate_id FROM portfolio_pull_buffer_current "
+            "WHERE repository=? AND issue_number=?",
+            (request["repository"], request["issue_number"]),
+        ).fetchone()
+        if retirement is None and pointer is not None and int(pointer[0]) == int(candidate["id"]):
+            _retire_pointer(
+                connection,
+                repository=request["repository"],
+                issue_number=request["issue_number"],
+                candidate_id=int(candidate["id"]),
+                reasons=["ADMITTED"],
+                now=now,
+            )
+            store._terminal_failpoint(failpoint, "recovery.after_retirement")
+            retirement = connection.execute(
+                "SELECT * FROM portfolio_pull_buffer_retirements WHERE candidate_id=?",
+                (candidate["id"],),
+            ).fetchone()
+            pointer = None
+        if (
+            retirement is None
+            or retirement["repository"] != request["repository"]
+            or int(retirement["issue_number"]) != request["issue_number"]
+            or retirement["reasons_json"] != canonical_json(["ADMITTED"])
+            or retirement["reason_sha256"] != digest_json(["ADMITTED"])
+            or pointer is not None
+        ):
+            raise PullBufferError("UNCLAIMED_ADMISSION_RETIREMENT_DRIFT")
+        changed = connection.execute(
+            """
+            UPDATE coordination_items
+            SET status='PREPARED', allocation_class='NONE', generation=?,
+                accountable_session_id=NULL, lease_manifest_sha256=NULL,
+                source_payload_sha256=?, version=version+1, updated_at=?
+            WHERE repository=? AND issue_number=? AND status='HOLD'
+              AND allocation_class='RETAINED' AND generation=? AND version=?
+              AND accountable_session_id=? AND lease_manifest_sha256=?
+              AND source_payload_sha256=?
+            """,
+            (
+                next_generation,
+                request["current_source_payload_sha256"],
+                now,
+                request["repository"],
+                request["issue_number"],
+                request["generation"],
+                request["retained_item_version"],
+                request["accountable_session_id"],
+                request["lease_manifest_sha256"],
+                request["source_payload_sha256"],
+            ),
+        ).rowcount
+        if changed != 1:
+            raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_FENCE_MISMATCH")
+        store._terminal_failpoint(failpoint, "recovery.after_item")
+        changed = connection.execute(
+            """
+            UPDATE portfolio_readiness_current
+            SET state='STALE', version=version+1, updated_at=?, last_error=?
+            WHERE repository=? AND issue_number=? AND campaign_id=?
+              AND state='FINALIZED' AND version=?
+              AND finalized_candidate_id=? AND finalized_event_id=?
+            """,
+            (
+                now,
+                f"UNCLAIMED_ADMISSION_RECOVERY:{recovery_sha256}",
+                request["repository"],
+                request["issue_number"],
+                readiness["campaign_id"],
+                readiness["version"],
+                candidate["id"],
+                finalization["dirty_event_id"],
+            ),
+        ).rowcount
+        if changed != 1:
+            raise PullBufferError("UNCLAIMED_ADMISSION_READINESS_DRIFT")
+        store._terminal_failpoint(failpoint, "recovery.after_readiness")
+        try:
+            refill_id = enqueue_convergence_dirty_event(
+                connection,
+                repository=request["repository"],
+                trigger_kind=UNCLAIMED_ADMISSION_REFILL_TRIGGER,
+                issue_number=request["issue_number"],
+                item_version=next_item_version,
+                source_sha256=request["current_source_payload_sha256"],
+                status="PREPARED",
+                generation=next_generation,
+                now=now,
+                details=refill_details,
+                require_pending=True,
+            )
+        except PortfolioGraphError as exc:
+            raise PullBufferError(str(exc)) from exc
+        if refill_id is None:
+            raise PullBufferError("PORTFOLIO_DIRTY_EVENT_SCHEMA_MISSING")
+        store._terminal_failpoint(failpoint, "recovery.after_refill_event")
+        store._complete_message_in_transaction(
+            notice_id, request["planner_session_id"], now
+        )
+        store._terminal_failpoint(failpoint, "recovery.after_notice_complete")
+        result["refill_event_id"] = int(refill_id)
+        readiness_payload = {
+            "recovery_sha256": recovery_sha256,
+            "prior_generation": request["generation"],
+            "next_generation": next_generation,
+            "ready_candidate_id": int(candidate["id"]),
+            "planner_message_id": notice_id,
+            "refill_event_id": int(refill_id),
+        }
+        from kanban_readiness import _event as readiness_event
+
+        readiness_event(
+            connection,
+            int(readiness["campaign_id"]),
+            "READINESS_UNCLAIMED_ADMISSION_REBASELINED",
+            readiness_payload,
+            now,
+        )
+        store._terminal_failpoint(failpoint, "recovery.after_readiness_event")
+        store._event(
+            "UNCLAIMED_ADMISSION_RECOVERED",
+            f"{request['repository']}:issue:{request['issue_number']}:"
+            f"generation:{next_generation}",
+            result,
+            now,
+        )
+        store._terminal_failpoint(failpoint, "recovery.after_audit_event")
+        return result
+
+
 def audit_pull_buffer(
     connection: sqlite3.Connection,
     repository: str,
@@ -2494,6 +3505,9 @@ def main() -> int:
     register.add_argument("--packet", type=Path, required=True)
     finalize = subparsers.add_parser("finalize-ready")
     finalize.add_argument("--packet", type=Path, required=True)
+    recover = subparsers.add_parser("recover-unclaimed-admission")
+    recover.add_argument("--transaction-file", type=Path, required=True)
+    recover.add_argument("--compatibility-descriptor-file", type=Path)
     subparsers.add_parser("initialize")
     audit = subparsers.add_parser("audit")
     audit.add_argument("--repository", required=True)
@@ -2707,6 +3721,41 @@ def main() -> int:
                 )
             finally:
                 finalize_store.close()
+        elif args.command == "recover-unclaimed-admission":
+            descriptor, _relative = _open_packet(
+                DEFAULT_DATABASE, args.transaction_file
+            )
+            try:
+                request = json.loads(
+                    _read_descriptor(descriptor).decode("utf-8"),
+                    object_pairs_hook=_strict_object,
+                )
+            finally:
+                os.close(descriptor)
+            compatibility_descriptor = None
+            if args.compatibility_descriptor_file is not None:
+                compatibility_file, _relative = _open_packet(
+                    DEFAULT_DATABASE, args.compatibility_descriptor_file
+                )
+                try:
+                    compatibility_descriptor = json.loads(
+                        _read_descriptor(compatibility_file).decode("utf-8"),
+                        object_pairs_hook=_strict_object,
+                    )
+                finally:
+                    os.close(compatibility_file)
+            recovery_store = CoordinationStore(DEFAULT_DATABASE)
+            try:
+                result = recover_unclaimed_admission(
+                    recovery_store,
+                    request,
+                    now=utc_now(),
+                    attempt_id=os.environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID"),
+                    executor_token=os.environ.get("TWINFINITY_EXECUTOR_TOKEN"),
+                    compatibility_descriptor=compatibility_descriptor,
+                )
+            finally:
+                recovery_store.close()
         elif args.command == "initialize":
             from kanban_readiness import ensure_schema as ensure_readiness_schema
 

@@ -26,11 +26,13 @@ from kanban_pull_buffer import finalize_ready, register_candidate
 from kanban_readiness import (
     PLAN_SCHEMA,
     RECEIPT_SCHEMA,
+    SUCCESSOR_PLAN_SCHEMA,
     attach,
     dispatch,
     pickup_receipt,
     register,
     stage_receipt,
+    transition_evidence_sha256,
 )
 
 
@@ -45,6 +47,7 @@ def finalize_canonical_ready_candidate(
     worker_endpoint_id: str,
     now: str,
     suffix: str,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Create one real PASS receipt and atomically finalize its READY packet."""
 
@@ -104,6 +107,31 @@ def finalize_canonical_ready_candidate(
             }
         ],
     }
+    if refresh:
+        parent = store.connection.execute(
+            "SELECT current.campaign_id,current.version,campaign.plan_json "
+            "FROM portfolio_readiness_current current "
+            "JOIN portfolio_readiness_campaigns campaign "
+            "ON campaign.id=current.campaign_id "
+            "WHERE current.repository=? AND current.issue_number=? "
+            "AND current.state='STALE'",
+            (repository, issue_number),
+        ).fetchone()
+        if parent is None:
+            raise AssertionError("canonical REFRESH fixture requires STALE readiness")
+        parent_plan = json.loads(parent["plan_json"])
+        plan["schema"] = SUCCESSOR_PLAN_SCHEMA
+        plan["transition"] = {
+            "kind": "REFRESH",
+            "parent_campaign_id": int(parent["campaign_id"]),
+            "expected_parent_version": int(parent["version"]),
+            "changed_evidence_sha256": "0" * 64,
+            "resolution_action_set_sha256": None,
+            "approval": None,
+        }
+        plan["transition"]["changed_evidence_sha256"] = (
+            transition_evidence_sha256(parent_plan, plan)
+        )
     campaign = register(store.connection, plan, now=now)
     dispatched = dispatch(store, repository, max_parallel=1, now=now)[
         "dispatched"
@@ -284,6 +312,7 @@ def finalize_canonical_ready_item(
     worker_endpoint_id: str,
     now: str,
     suffix: str,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Finalize one existing PREPARED/QUEUED item through the canonical path."""
 
@@ -438,4 +467,5 @@ def finalize_canonical_ready_item(
         worker_endpoint_id=worker_endpoint_id,
         now=now,
         suffix=suffix,
+        refresh=refresh,
     )

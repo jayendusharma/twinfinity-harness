@@ -51,6 +51,7 @@ from executor_registry import (
     load_legacy_aliases,
     require_current_endpoint_identity,
     select_role_equivalent_identity,
+    target_progress_digest,
 )
 
 
@@ -128,6 +129,12 @@ PREPARED_MESSAGE_HOLD_REASONS = {
     "SUPERSEDED_BY_ENVIRONMENT_REBIND",
     "SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER",
 }
+UNCLAIMED_ADMISSION_RETRY_REASON = "UNCLAIMED_ADMISSION_RETRY_EXHAUSTED"
+UNCLAIMED_ADMISSION_RETRY_ATTEMPTS = 3
+UNCLAIMED_ADMISSION_TOPICS = {"development.admission", "sre.admission"}
+UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA = (
+    "twinfinity-unclaimed-admission-recovery-notice/v1"
+)
 ACTIVE_EXECUTION_STATUSES = {
     "ACTIVE",
     "ACTIVE_FENCED",
@@ -416,6 +423,73 @@ def canonical_json(value: Any) -> str:
 
 def digest_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def unclaimed_admission_exhaustion_payload(
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    """Canonical evidence shared by exhaustion and its Planner recovery."""
+
+    fields = (
+        "repository",
+        "issue_number",
+        "generation",
+        "item_version",
+        "admission_message_id",
+        "admission_payload_sha256",
+        "wake_key",
+        "wake_attempts",
+        "target_progress_sha256",
+        "watch_key",
+        "lease_manifest_sha256",
+    )
+    return {
+        "schema": UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA,
+        **{field: binding[field] for field in fields},
+        "reason": UNCLAIMED_ADMISSION_RETRY_REASON,
+    }
+
+
+def unclaimed_admission_recovery_notice_payload(
+    exhaustion: dict[str, Any], source_payload_sha256: str
+) -> dict[str, Any]:
+    """Canonical non-authorizing Planner notice for one retained admission."""
+
+    issue_number = int(exhaustion["issue_number"])
+    return {
+        "source": {
+            "repository": exhaustion["repository"],
+            "object_kind": "issue",
+            "object_number": issue_number,
+            "payload_sha256": source_payload_sha256,
+        },
+        "notice_kind": "planning_request",
+        "mutation_authority": False,
+        "subject": f"Issue {issue_number} unclaimed admission retained",
+        "summary": (
+            "The exact pre-claim retry budget was exhausted and the admission "
+            "lineage was retained atomically for Planner recovery."
+        ),
+        "evidence": {
+            "schema": UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA,
+            "exhaustion_sha256": digest_json(exhaustion),
+            "reason": UNCLAIMED_ADMISSION_RETRY_REASON,
+            "admission_message_id": exhaustion["admission_message_id"],
+            "wake_key": exhaustion["wake_key"],
+            "watch_key": exhaustion["watch_key"],
+            "generation": exhaustion["generation"],
+            "retained_item_version": int(exhaustion["item_version"]) + 1,
+            "lease_manifest_sha256": exhaustion["lease_manifest_sha256"],
+        },
+        "requested_evidence": [
+            "Exact proof that the admission was never claimed and no terminal "
+            "or publication lineage began."
+        ],
+        "next_observation": (
+            "The current Planner may run the exact unclaimed-admission "
+            "rebaseline after all stored bindings are revalidated."
+        ),
+    }
 
 
 def routing_endpoint_state_manifest(
@@ -4632,17 +4706,25 @@ class CoordinationStore:
         reason: str,
         session_id: str,
         now: str,
+        _transaction: bool = True,
+        _test_failpoint: Callable[[str], None] | None = None,
+        _internal_retry_exhaustion: bool = False,
     ) -> dict[str, Any]:
         """Fail closed on an unclaimed message using an exact Planner CAS."""
         session_id = canonicalize_coordination_identity(self.connection, session_id)
         _validate_sha256(expected_payload_sha256)
         if coordination_identity_role(self.connection, session_id) != "planner":
             raise CoordinationError("PLANNER_SESSION_REQUIRED")
-        if reason not in PREPARED_MESSAGE_HOLD_REASONS:
+        if reason not in PREPARED_MESSAGE_HOLD_REASONS and not (
+            _internal_retry_exhaustion
+            and reason == UNCLAIMED_ADMISSION_RETRY_REASON
+        ):
             raise CoordinationError("MESSAGE_HOLD_REASON_INVALID")
         if message_id <= 0:
             raise CoordinationError("MESSAGE_NOT_FOUND")
-        with self.transaction():
+        with (self.transaction() if _transaction else nullcontext()):
+            if not self.connection.in_transaction:
+                raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
             row = self.connection.execute(
                 "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
             ).fetchone()
@@ -4663,6 +4745,7 @@ class CoordinationStore:
             )
             if cursor.rowcount != 1:
                 raise CoordinationError("MESSAGE_STATE_CONFLICT")
+            self._terminal_failpoint(_test_failpoint, "exhaustion.after_message")
             if row["topic"] in {"development.admission", "sre.admission"}:
                 payload = json.loads(row["payload_json"])
                 source = payload.get("source", {})
@@ -4697,6 +4780,7 @@ class CoordinationStore:
                     != payload.get("lease_manifest_sha256")
                 ):
                     raise CoordinationError("TERMINAL_WATCH_HOLD_BINDING_MISMATCH")
+                self._terminal_failpoint(_test_failpoint, "exhaustion.after_watch")
                 held_item = self.connection.execute(
                     """
                     UPDATE coordination_items
@@ -4714,16 +4798,261 @@ class CoordinationStore:
                 )
                 if held_item.rowcount != 1:
                     raise CoordinationError("TERMINAL_WATCH_HOLD_BINDING_MISMATCH")
-            self._event(
-                "MESSAGE_HELD",
-                f"message:{message_id}",
-                {"error": reason, "planner_session_id": session_id},
-                now,
-            )
+                self._terminal_failpoint(_test_failpoint, "exhaustion.after_item")
+            if not _internal_retry_exhaustion:
+                self._event(
+                    "MESSAGE_HELD",
+                    f"message:{message_id}",
+                    {"error": reason, "planner_session_id": session_id},
+                    now,
+                )
             held = self.connection.execute(
                 "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
             ).fetchone()
         return dict(held)
+
+    def hold_unclaimed_admission_retry_exhausted(
+        self,
+        *,
+        message_id: int,
+        wake_key: str,
+        expected_target_progress_sha256: str,
+        expected_wake_attempts: int,
+        now: str,
+        _transaction: bool = True,
+        _test_failpoint: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically retain one exact admission after pre-claim retry exhaustion."""
+
+        if message_id <= 0 or wake_key != f"message:{message_id}:prepared":
+            raise CoordinationError("UNCLAIMED_ADMISSION_BINDING_INVALID")
+        _validate_sha256(expected_target_progress_sha256)
+        if expected_wake_attempts != UNCLAIMED_ADMISSION_RETRY_ATTEMPTS:
+            raise CoordinationError("UNCLAIMED_ADMISSION_RETRY_FENCE_MISMATCH")
+
+        with (self.transaction() if _transaction else nullcontext()):
+            if not self.connection.in_transaction:
+                raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+            message = self.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()
+            wake = self.connection.execute(
+                "SELECT * FROM coordination_wakes WHERE wake_key=?", (wake_key,)
+            ).fetchone()
+            if message is None or wake is None:
+                raise CoordinationError("UNCLAIMED_ADMISSION_BINDING_INVALID")
+            try:
+                payload = json.loads(str(message["payload_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH") from exc
+            source = payload.get("source") if isinstance(payload, dict) else None
+            if not isinstance(source, dict):
+                raise CoordinationError("UNCLAIMED_ADMISSION_BINDING_INVALID")
+            repository = source.get("repository")
+            issue_number = payload.get("issue_number")
+            generation = payload.get("generation")
+            lease_sha256 = payload.get("lease_manifest_sha256")
+            if (
+                message["topic"] not in UNCLAIMED_ADMISSION_TOPICS
+                or message["state"] != "PREPARED"
+                or message["claimed_by"] is not None
+                or digest_json(payload) != message["payload_sha256"]
+                or not isinstance(repository, str)
+                or type(issue_number) is not int
+                or type(generation) is not int
+                or not isinstance(lease_sha256, str)
+                or wake["message_id"] != message_id
+                or wake["recipient_session_id"] != message["recipient_session_id"]
+                or wake["message_payload_sha256"] != message["payload_sha256"]
+                or wake["state"] != "INFLIGHT"
+                or int(wake["attempts"]) != expected_wake_attempts
+                or wake["target_progress_sha256"]
+                != expected_target_progress_sha256
+                or target_progress_digest(
+                    self.connection, "message", str(message_id)
+                )
+                != expected_target_progress_sha256
+            ):
+                raise CoordinationError("UNCLAIMED_ADMISSION_RETRY_FENCE_MISMATCH")
+            self._validate_message_source(payload)
+            self._validate_message_contract(
+                topic=str(message["topic"]),
+                recipient_session_id=str(message["recipient_session_id"]),
+                payload=payload,
+                message_id=message_id,
+            )
+
+            expected_watch_key = terminal_watch_key(
+                repository, issue_number, generation
+            )
+            watch = self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (expected_watch_key,),
+            ).fetchone()
+            item = self.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            capacity = payload.get("capacity")
+            if (
+                watch is None
+                or item is None
+                or watch["repository"] != repository
+                or int(watch["issue_number"]) != issue_number
+                or int(watch["generation"]) != generation
+                or watch["state"] != "PENDING_CLAIM"
+                or watch["claim_attempt_id"] is not None
+                or int(watch["admission_message_id"] or 0) != message_id
+                or watch["admission_payload_sha256"] != message["payload_sha256"]
+                or watch["accountable_session_id"]
+                != item["accountable_session_id"]
+                or watch["lease_manifest_sha256"] != lease_sha256
+                or item["status"] not in {"ACTIVE", "ACTIVE_FENCED"}
+                or item["allocation_class"] != "ACTIVE"
+                or int(item["generation"]) != generation
+                or item["lease_manifest_sha256"] != lease_sha256
+                or item["source_payload_sha256"] != source.get("payload_sha256")
+                or not isinstance(capacity, dict)
+                or int(item["development_units"])
+                != capacity.get("development_units")
+                or int(item["shared_units"]) != capacity.get("shared_units")
+                or int(item["sre_units"]) != capacity.get("sre_units")
+            ):
+                raise CoordinationError("UNCLAIMED_ADMISSION_BINDING_INVALID")
+            attempts = self.connection.execute(
+                """
+                SELECT state FROM executor_attempts
+                WHERE (
+                    (target_kind='message' AND target_key=?)
+                    OR (
+                      lineage_repository=? AND lineage_issue_number=?
+                      AND lineage_generation=? AND lineage_lease_sha256=?
+                    )
+                  )
+                """,
+                (
+                    str(message_id),
+                    repository,
+                    issue_number,
+                    generation,
+                    lease_sha256,
+                ),
+            ).fetchall()
+            terminal_started = self.connection.execute(
+                """
+                SELECT 1 FROM coordination_terminal_closeout_packets
+                WHERE repository=? AND issue_number=? AND generation=?
+                UNION ALL SELECT 1 FROM coordination_pre_push_gates
+                WHERE repository=? AND issue_number=? AND generation=?
+                UNION ALL SELECT 1 FROM coordination_pre_push_publications
+                WHERE repository=? AND issue_number=? AND generation=? LIMIT 1
+                """,
+                (repository, issue_number, generation) * 3,
+            ).fetchone()
+            claimed = self.connection.execute(
+                "SELECT 1 FROM coordination_events "
+                "WHERE event_type='MESSAGE_CLAIMED' AND entity_key=? LIMIT 1",
+                (f"message:{message_id}",),
+            ).fetchone()
+            terminal_message = self.connection.execute(
+                "SELECT 1 FROM coordination_messages "
+                "WHERE topic='development.terminal_closeout' "
+                "AND json_extract(payload_json,'$.source.repository')=? "
+                "AND json_extract(payload_json,'$.issue_number')=? "
+                "AND json_extract(payload_json,'$.generation')=? LIMIT 1",
+                (repository, issue_number, generation),
+            ).fetchone()
+            if (
+                any(
+                    attempt["state"] not in {"COMPLETE", "HOLD", "LAUNCH_FAILED"}
+                    for attempt in attempts
+                )
+                or terminal_started is not None
+                or claimed is not None
+                or terminal_message is not None
+            ):
+                raise CoordinationError("UNCLAIMED_ADMISSION_TERMINAL_WORK_PRESENT")
+
+            planner = current_endpoint(self.connection, "planner")
+            if planner is None:
+                raise CoordinationError("CURRENT_PLANNER_ENDPOINT_REQUIRED")
+            exhaustion = unclaimed_admission_exhaustion_payload({
+                "repository": repository,
+                "issue_number": issue_number,
+                "generation": generation,
+                "item_version": int(item["version"]),
+                "admission_message_id": message_id,
+                "admission_payload_sha256": str(message["payload_sha256"]),
+                "wake_key": wake_key,
+                "wake_attempts": expected_wake_attempts,
+                "target_progress_sha256": expected_target_progress_sha256,
+                "watch_key": str(watch["watch_key"]),
+                "lease_manifest_sha256": lease_sha256,
+            })
+            exhaustion_sha256 = digest_json(exhaustion)
+
+            changed = self.connection.execute(
+                """
+                UPDATE coordination_wakes
+                SET state='HOLD', process_id=NULL, updated_at=?, last_error=?
+                WHERE wake_key=? AND state='INFLIGHT' AND attempts=?
+                  AND target_progress_sha256=? AND message_payload_sha256=?
+                """,
+                (
+                    now,
+                    UNCLAIMED_ADMISSION_RETRY_REASON,
+                    wake_key,
+                    expected_wake_attempts,
+                    expected_target_progress_sha256,
+                    message["payload_sha256"],
+                ),
+            ).rowcount
+            if changed != 1:
+                raise CoordinationError("UNCLAIMED_ADMISSION_RETRY_FENCE_MISMATCH")
+            self._terminal_failpoint(_test_failpoint, "exhaustion.after_wake")
+            self.hold_prepared_message(
+                message_id=message_id,
+                expected_payload_sha256=str(message["payload_sha256"]),
+                reason=UNCLAIMED_ADMISSION_RETRY_REASON,
+                session_id=str(planner["endpoint_id"]),
+                now=now,
+                _transaction=False,
+                _test_failpoint=_test_failpoint,
+                _internal_retry_exhaustion=True,
+            )
+
+            notice = unclaimed_admission_recovery_notice_payload(
+                exhaustion, str(source["payload_sha256"])
+            )
+            notice_id = self.enqueue_message(
+                idempotency_key=(
+                    f"unclaimed-admission-recovery:{exhaustion_sha256}"
+                ),
+                recipient_session_id=str(planner["endpoint_id"]),
+                topic="coordination.notice",
+                payload=notice,
+                now=now,
+                _transaction=False,
+            )
+            self._terminal_failpoint(_test_failpoint, "exhaustion.after_notice")
+            self._event(
+                "UNCLAIMED_ADMISSION_RETRY_EXHAUSTED",
+                f"{repository}:issue:{issue_number}:generation:{generation}",
+                {
+                    "exhaustion_sha256": exhaustion_sha256,
+                    "planner_message_id": notice_id,
+                    "reason": UNCLAIMED_ADMISSION_RETRY_REASON,
+                },
+                now,
+            )
+            self._terminal_failpoint(_test_failpoint, "exhaustion.after_event")
+            return {
+                "state": "HOLD",
+                "reason": UNCLAIMED_ADMISSION_RETRY_REASON,
+                "exhaustion_sha256": exhaustion_sha256,
+                "planner_message_id": notice_id,
+                "retained_item_version": int(item["version"]) + 1,
+            }
 
     def prepared_legacy_notice_manifest(self, legacy_recipient: str) -> dict[str, Any]:
         rows = self.connection.execute(

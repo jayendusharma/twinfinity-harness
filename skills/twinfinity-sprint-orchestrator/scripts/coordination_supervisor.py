@@ -1005,6 +1005,43 @@ class CoordinationSupervisor:
                 "MESSAGE_HELD", f"message:{row['id']}", {"error": error}, now
             )
 
+    def _hold_retry_exhausted_locked(
+        self, message: object, wake: object, now: str
+    ) -> None:
+        """Retain exact pre-claim admissions; preserve generic wake behavior."""
+
+        if (
+            message["state"] == "PREPARED"
+            and message["claimed_by"] is None
+            and message["topic"] in {"development.admission", "sre.admission"}
+            and isinstance(wake["target_progress_sha256"], str)
+        ):
+            self.store.hold_unclaimed_admission_retry_exhausted(
+                message_id=int(message["id"]),
+                wake_key=str(wake["wake_key"]),
+                expected_target_progress_sha256=str(
+                    wake["target_progress_sha256"]
+                ),
+                expected_wake_attempts=int(wake["attempts"]),
+                now=now,
+                _transaction=False,
+            )
+            return
+        self._hold_stale_message_locked(message, "WAKE_RETRY_EXHAUSTED", now)
+        self.store.connection.execute(
+            """UPDATE coordination_wakes
+            SET state='HOLD', process_id=NULL, updated_at=?,
+                last_error='WAKE_RETRY_EXHAUSTED'
+            WHERE wake_key=? AND state='INFLIGHT'""",
+            (now, wake["wake_key"]),
+        )
+        self.store._event(
+            "WAKE_HELD",
+            str(wake["wake_key"]),
+            {"error": "WAKE_RETRY_EXHAUSTED"},
+            now,
+        )
+
     def _message_needs_worker(self, row: object) -> bool:
         if not recipient_matches_topic(
             self.store.connection,
@@ -1256,22 +1293,7 @@ class CoordinationSupervisor:
             ):
                 return wake_key, False
             if int(current["attempts"]) >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS:
-                self._hold_stale_message_locked(
-                    current_row, "WAKE_RETRY_EXHAUSTED", now
-                )
-                self.store.connection.execute(
-                    """UPDATE coordination_wakes
-                    SET state='HOLD', process_id=NULL, updated_at=?,
-                        last_error='WAKE_RETRY_EXHAUSTED'
-                    WHERE wake_key=? AND state='INFLIGHT'""",
-                    (now, wake_key),
-                )
-                self.store._event(
-                    "WAKE_HELD",
-                    wake_key,
-                    {"error": "WAKE_RETRY_EXHAUSTED"},
-                    now,
-                )
+                self._hold_retry_exhausted_locked(current_row, current, now)
                 return wake_key, False
             self.store.connection.execute(
                 "UPDATE coordination_wakes SET attempts=attempts+1, process_id=NULL, last_attempt_at=?, updated_at=?, last_error=NULL WHERE wake_key=?",
@@ -1393,22 +1415,18 @@ class CoordinationSupervisor:
                 int(wake["attempts"]) >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
             )
             error = "WAKE_RETRY_EXHAUSTED" if exhausted else "WAKE_LAUNCH_FAILED"
-            self.store.connection.execute(
-                "UPDATE coordination_wakes SET state=?, process_id=NULL, updated_at=?, "
-                "last_error=? "
-                "WHERE wake_key=? AND state='INFLIGHT'",
-                ("HOLD" if exhausted else "INFLIGHT", now, error, wake_key),
-            )
             if exhausted:
-                self._hold_stale_message_locked(
-                    message, "WAKE_RETRY_EXHAUSTED", now
+                self._hold_retry_exhausted_locked(message, wake, now)
+            else:
+                self.store.connection.execute(
+                    "UPDATE coordination_wakes SET state='INFLIGHT', "
+                    "process_id=NULL, updated_at=?, last_error=? "
+                    "WHERE wake_key=? AND state='INFLIGHT'",
+                    (now, error, wake_key),
                 )
-            self.store._event(
-                "WAKE_HELD" if exhausted else "WAKE_LAUNCH_FAILED",
-                wake_key,
-                {"error": error},
-                now,
-            )
+                self.store._event(
+                    "WAKE_LAUNCH_FAILED", wake_key, {"error": error}, now
+                )
 
     def _complete_stale_wakes(self, now: str) -> None:
         with self.store.transaction():
