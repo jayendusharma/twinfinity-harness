@@ -39,6 +39,7 @@ from routing_deprecation_inventory import (  # noqa: E402
     classify_occurrence,
     load_alias_artifact,
     prepare_inventory,
+    preview_inventory,
     published_receipt_body,
     scan_repository,
     stable_scan_repository,
@@ -444,6 +445,122 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                 FROM routing_deprecation_occurrences LIMIT 1
                 """
             )
+
+    def test_successor_prepare_is_non_authorizing_then_exact_promotion_is_idempotent(self) -> None:
+        first, first_outbox = self.prepare()
+        self.complete_outbox(first_outbox)
+        old_inventory = dict(self.store.connection.execute(
+            "SELECT * FROM routing_deprecation_inventories WHERE generation=1"
+        ).fetchone())
+        old_occurrences = [tuple(row) for row in self.store.connection.execute(
+            "SELECT * FROM routing_deprecation_occurrences ORDER BY ordinal"
+        )]
+        changed_body = f"Immutable provenance: never dispatch to {self.alias}."
+        self.source = self.store.ingest_snapshot(
+            repository=REPOSITORY, object_kind="issue", object_number=179,
+            payload={"number": 179, "body": changed_body, "updated_at": UPDATED},
+            source_updated_at="2026-08-24T10:00:00Z", fetched_at="2026-08-24T10:00:01Z",
+        )
+        self.reader = StaticReader([node("issue", 179, changed_body)])
+        preview = preview_inventory(self.store, repository=REPOSITORY, alias_path=ALIASES, page_reader=self.reader)
+        candidate, _ = self.candidate()
+        second, second_outbox = prepare_inventory(
+            self.store, repository=REPOSITORY, alias_path=ALIASES,
+            page_reader=self.reader, expected_inventory_sha256=candidate["inventory_sha256"],
+            expected_endpoint_state_sha256=candidate["endpoint_state_sha256"],
+            expected_issue_179_source_sha256=candidate["issue_179_source_sha256"],
+            expected_preview_sha256=preview["preview_sha256"], expected_prior_generation=1,
+            now="2026-08-24T10:00:02Z",
+        )
+        self.assertEqual(1, self.store.connection.execute(
+            "SELECT generation FROM routing_deprecation_current"
+        ).fetchone()[0])
+        with self.assertRaisesRegex(CoordinationError, "RECEIPT_INCOMPLETE"):
+            self.store.promote_routing_deprecation_inventory(
+                repository=REPOSITORY, generation=2, inventory_sha256=second["inventory_sha256"],
+                expected_prior_generation=1, expected_preview_sha256=preview["preview_sha256"],
+                remote_receipt_body=published_receipt_body(second), now="2026-08-24T10:00:03Z",
+            )
+        self.complete_outbox(second_outbox)
+        promoted = self.store.promote_routing_deprecation_inventory(
+            repository=REPOSITORY, generation=2, inventory_sha256=second["inventory_sha256"],
+            expected_prior_generation=1, expected_preview_sha256=preview["preview_sha256"],
+            remote_receipt_body=published_receipt_body(second), now="2026-08-24T10:00:05Z",
+        )
+        replay = self.store.promote_routing_deprecation_inventory(
+            repository=REPOSITORY, generation=2, inventory_sha256=second["inventory_sha256"],
+            expected_prior_generation=1, expected_preview_sha256=preview["preview_sha256"],
+            remote_receipt_body=published_receipt_body(second), now="2026-08-24T10:00:06Z",
+        )
+        self.assertEqual(promoted, replay)
+        prepared_replay, replay_outbox = prepare_inventory(
+            self.store, repository=REPOSITORY, alias_path=ALIASES,
+            page_reader=self.reader, expected_inventory_sha256=second["inventory_sha256"],
+            expected_endpoint_state_sha256=second["endpoint_state_sha256"],
+            expected_issue_179_source_sha256=second["issue_179_source_sha256"],
+            expected_preview_sha256=preview["preview_sha256"], expected_prior_generation=1,
+            now="2026-08-24T10:00:07Z",
+        )
+        self.assertEqual((second["inventory_sha256"], second_outbox), (prepared_replay["inventory_sha256"], replay_outbox))
+        self.assertEqual(2, self.store.connection.execute("SELECT generation FROM routing_deprecation_current").fetchone()[0])
+        self.assertEqual(old_inventory, dict(self.store.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone()))
+        self.assertEqual(old_occurrences, [tuple(row) for row in self.store.connection.execute("SELECT * FROM routing_deprecation_occurrences WHERE inventory_sha256=? ORDER BY ordinal", (first["inventory_sha256"],))])
+
+    def test_legacy_v1_migration_preserves_inventory_bytes_and_fails_closed(self) -> None:
+        inventory, outbox_id = self.prepare()
+        self.complete_outbox(outbox_id)
+        legacy = dict(self.store.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchone())
+        self.store.connection.commit()
+        self.store.connection.execute("PRAGMA foreign_keys=OFF")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_promotion_immutable_delete")
+        self.store.connection.execute("DELETE FROM routing_deprecation_promotions")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_current_no_delete")
+        self.store.connection.execute("DELETE FROM routing_deprecation_current")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_update")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_delete")
+        self.store.connection.execute("ALTER TABLE routing_deprecation_inventories RENAME TO routing_deprecation_inventories_v2_fixture")
+        self.store.connection.execute("CREATE TABLE routing_deprecation_inventories AS SELECT inventory_sha256,repository,kind,alias_source_sha256,endpoint_state_sha256,issue_179_source_sha256,object_manifest_sha256,occurrence_manifest_sha256,object_manifest_json,object_count,issue_count,pull_request_count,occurrence_count,classification_counts_json,semantic_tag_counts_json,outbox_id,state,created_at FROM routing_deprecation_inventories_v2_fixture")
+        self.store.connection.execute("CREATE UNIQUE INDEX routing_legacy_repository_unique ON routing_deprecation_inventories(repository)")
+        self.store.connection.execute("DROP TABLE routing_deprecation_inventories_v2_fixture")
+        for name in ("routing_deprecation_inventory_immutable_update", "routing_deprecation_inventory_immutable_delete"):
+            action = "UPDATE" if name.endswith("update") else "DELETE"
+            self.store.connection.execute(f"CREATE TRIGGER {name} BEFORE {action} ON routing_deprecation_inventories BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END")
+        self.store.connection.commit()
+        self.store.connection.execute("PRAGMA foreign_keys=ON")
+        result = self.store.migrate_legacy_routing_deprecation_inventory(
+            expected_inventory_sha256=inventory["inventory_sha256"],
+            expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:00:00Z",
+        )
+        self.assertFalse(result["replay"])
+        migrated = dict(self.store.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchone())
+        for key, value in legacy.items():
+            if key not in {"generation", "predecessor_inventory_sha256", "preview_sha256"}:
+                self.assertEqual(value, migrated[key])
+        replay = self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:00:01Z")
+        self.assertTrue(replay["replay"])
+
+    def test_two_successor_prepares_have_one_winner_and_no_orphan_outbox(self) -> None:
+        self.prepare()
+        def install_candidate(body: str, stamp: str):
+            self.store.ingest_snapshot(repository=REPOSITORY, object_kind="issue", object_number=179,
+                payload={"number": 179, "body": body, "updated_at": UPDATED},
+                source_updated_at=stamp, fetched_at=stamp)
+            self.reader = StaticReader([node("issue", 179, body)])
+            return self.candidate()[0], preview_inventory(self.store, repository=REPOSITORY, alias_path=ALIASES, page_reader=self.reader)
+        winner, winner_preview = install_candidate(f"Never route to {self.alias}.", "2026-08-24T12:00:00Z")
+        prepare_inventory(self.store, repository=REPOSITORY, alias_path=ALIASES, page_reader=self.reader,
+            expected_inventory_sha256=winner["inventory_sha256"], expected_endpoint_state_sha256=winner["endpoint_state_sha256"],
+            expected_issue_179_source_sha256=winner["issue_179_source_sha256"], expected_preview_sha256=winner_preview["preview_sha256"],
+            expected_prior_generation=1, now="2026-08-24T12:00:01Z")
+        loser, loser_preview = install_candidate(f"Immutable record of {self.alias}.", "2026-08-24T12:01:00Z")
+        before = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories", "routing_deprecation_occurrences", "github_outbox"))
+        with self.assertRaisesRegex(CoordinationError, "PREPARE_RACE_OR_FORK"):
+            prepare_inventory(self.store, repository=REPOSITORY, alias_path=ALIASES, page_reader=self.reader,
+                expected_inventory_sha256=loser["inventory_sha256"], expected_endpoint_state_sha256=loser["endpoint_state_sha256"],
+                expected_issue_179_source_sha256=loser["issue_179_source_sha256"], expected_preview_sha256=loser_preview["preview_sha256"],
+                expected_prior_generation=1, now="2026-08-24T12:01:01Z")
+        after = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories", "routing_deprecation_occurrences", "github_outbox"))
+        self.assertEqual(before, after)
 
     def test_internal_failure_rolls_back_outbox_inventory_and_occurrences(self) -> None:
         inventory, occurrences = self.candidate()

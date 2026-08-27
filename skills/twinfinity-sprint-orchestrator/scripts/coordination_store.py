@@ -1490,7 +1490,10 @@ class CoordinationStore:
             );
             CREATE TABLE IF NOT EXISTS routing_deprecation_inventories (
                 inventory_sha256 TEXT PRIMARY KEY,
-                repository TEXT NOT NULL UNIQUE,
+                repository TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                predecessor_inventory_sha256 TEXT,
+                preview_sha256 TEXT NOT NULL,
                 kind TEXT NOT NULL CHECK(kind='TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1'),
                 alias_source_sha256 TEXT NOT NULL,
                 endpoint_state_sha256 TEXT NOT NULL,
@@ -1507,7 +1510,31 @@ class CoordinationStore:
                 outbox_id INTEGER NOT NULL UNIQUE,
                 state TEXT NOT NULL CHECK(state='COMPLETE'),
                 created_at TEXT NOT NULL,
+                UNIQUE(repository, generation),
+                UNIQUE(repository, predecessor_inventory_sha256),
+                FOREIGN KEY(predecessor_inventory_sha256)
+                    REFERENCES routing_deprecation_inventories(inventory_sha256),
                 FOREIGN KEY(outbox_id) REFERENCES github_outbox(id)
+            );
+            CREATE TABLE IF NOT EXISTS routing_deprecation_current (
+                repository TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                inventory_sha256 TEXT NOT NULL UNIQUE,
+                version INTEGER NOT NULL CHECK(version > 0),
+                promoted_at TEXT NOT NULL,
+                FOREIGN KEY(inventory_sha256)
+                    REFERENCES routing_deprecation_inventories(inventory_sha256),
+                UNIQUE(repository, generation)
+            );
+            CREATE TABLE IF NOT EXISTS routing_deprecation_promotions (
+                repository TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                prior_generation INTEGER,
+                inventory_sha256 TEXT NOT NULL UNIQUE,
+                preview_sha256 TEXT NOT NULL,
+                remote_receipt TEXT NOT NULL,
+                promoted_at TEXT NOT NULL,
+                PRIMARY KEY(repository, generation)
             );
             CREATE TABLE IF NOT EXISTS routing_deprecation_occurrences (
                 inventory_sha256 TEXT NOT NULL,
@@ -1541,6 +1568,26 @@ class CoordinationStore:
             BEFORE DELETE ON routing_deprecation_inventories
             BEGIN
                 SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_INVENTORY_IMMUTABLE');
+            END;
+            CREATE TRIGGER IF NOT EXISTS routing_deprecation_current_no_delete
+            BEFORE DELETE ON routing_deprecation_current BEGIN
+                SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_CURRENT_IMMUTABLE');
+            END;
+            CREATE TRIGGER IF NOT EXISTS routing_deprecation_current_monotonic
+            BEFORE UPDATE ON routing_deprecation_current
+            WHEN NEW.repository != OLD.repository
+              OR NEW.generation != OLD.generation + 1
+              OR NEW.version != OLD.version + 1
+            BEGIN
+                SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_CURRENT_CAS_INVALID');
+            END;
+            CREATE TRIGGER IF NOT EXISTS routing_deprecation_promotion_immutable_update
+            BEFORE UPDATE ON routing_deprecation_promotions BEGIN
+                SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_PROMOTION_IMMUTABLE');
+            END;
+            CREATE TRIGGER IF NOT EXISTS routing_deprecation_promotion_immutable_delete
+            BEFORE DELETE ON routing_deprecation_promotions BEGIN
+                SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_PROMOTION_IMMUTABLE');
             END;
             CREATE TRIGGER IF NOT EXISTS routing_deprecation_occurrence_immutable_update
             BEFORE UPDATE ON routing_deprecation_occurrences
@@ -8233,6 +8280,8 @@ class CoordinationStore:
         outbox_idempotency_key: str,
         receipt_body: str,
         now: str,
+        expected_preview_sha256: str | None = None,
+        expected_prior_generation: int | None = None,
     ) -> tuple[str, int]:
         """Freeze one repository inventory and its #179 receipt in one transaction."""
 
@@ -8346,9 +8395,46 @@ class CoordinationStore:
             ),
             None,
         )
+        with self.transaction():
+            current = self.connection.execute(
+                "SELECT * FROM routing_deprecation_current WHERE repository=?",
+                (repository,),
+            ).fetchone()
+            prior_generation = None if current is None else int(current["generation"])
+            exact_existing = self.connection.execute(
+                "SELECT generation,predecessor_inventory_sha256 FROM routing_deprecation_inventories WHERE inventory_sha256=?",
+                (inventory["inventory_sha256"],),
+            ).fetchone()
+            reviewed_prior_generation = (
+                int(exact_existing["generation"]) - 1
+                if exact_existing is not None else prior_generation
+            )
+            if expected_prior_generation is not None and reviewed_prior_generation != expected_prior_generation:
+                raise CoordinationError("ROUTING_DEPRECATION_PRIOR_GENERATION_DRIFT")
+            generation = (int(exact_existing["generation"]) if exact_existing is not None
+                          else (1 if prior_generation is None else prior_generation + 1))
+            predecessor = (exact_existing["predecessor_inventory_sha256"] if exact_existing is not None
+                           else (None if current is None else str(current["inventory_sha256"])))
+            preview = {
+                "repository": repository,
+                "generation": generation,
+                "predecessor_inventory_sha256": predecessor,
+                "inventory_sha256": inventory["inventory_sha256"],
+                "alias_source_sha256": inventory["alias_source_sha256"],
+                "endpoint_state_sha256": inventory["endpoint_state_sha256"],
+                "issue_179_source_sha256": inventory["issue_179_source_sha256"],
+                "object_manifest_sha256": inventory["object_manifest_sha256"],
+                "occurrence_manifest_sha256": inventory["occurrence_manifest_sha256"],
+            }
+            preview_sha256 = digest_json(preview)
+            if expected_preview_sha256 is not None and preview_sha256 != expected_preview_sha256:
+                raise CoordinationError("ROUTING_DEPRECATION_PREVIEW_DRIFT")
         stored_values = {
             "inventory_sha256": inventory["inventory_sha256"],
             "repository": repository,
+            "generation": generation,
+            "predecessor_inventory_sha256": predecessor,
+            "preview_sha256": preview_sha256,
             "kind": inventory["kind"],
             "alias_source_sha256": inventory["alias_source_sha256"],
             "endpoint_state_sha256": inventory["endpoint_state_sha256"],
@@ -8380,8 +8466,8 @@ class CoordinationStore:
             ):
                 raise CoordinationError("ROUTING_DEPRECATION_PREPARE_DRIFT")
             prior = self.connection.execute(
-                "SELECT * FROM routing_deprecation_inventories WHERE repository=?",
-                (repository,),
+                "SELECT * FROM routing_deprecation_inventories WHERE inventory_sha256=?",
+                (inventory["inventory_sha256"],),
             ).fetchone()
             if prior is not None:
                 outbox = self.connection.execute(
@@ -8425,11 +8511,14 @@ class CoordinationStore:
                 _transaction=False,
             )
             columns = tuple(stored_values)
-            self.connection.execute(
-                f"INSERT INTO routing_deprecation_inventories({','.join(columns)},outbox_id,state,created_at) "
-                f"VALUES ({','.join('?' for _ in columns)},?,'COMPLETE',?)",
-                tuple(stored_values.values()) + (outbox_id, now),
-            )
+            try:
+                self.connection.execute(
+                    f"INSERT INTO routing_deprecation_inventories({','.join(columns)},outbox_id,state,created_at) "
+                    f"VALUES ({','.join('?' for _ in columns)},?,'COMPLETE',?)",
+                    tuple(stored_values.values()) + (outbox_id, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise CoordinationError("ROUTING_DEPRECATION_PREPARE_RACE_OR_FORK") from exc
             self.connection.executemany(
                 """
                 INSERT INTO routing_deprecation_occurrences(
@@ -8468,7 +8557,154 @@ class CoordinationStore:
                 },
                 now,
             )
+            if generation == 1:
+                self.connection.execute(
+                    "INSERT INTO routing_deprecation_current(repository,generation,inventory_sha256,version,promoted_at) VALUES (?,?,?,?,?)",
+                    (repository, 1, inventory["inventory_sha256"], 1, now),
+                )
+                self.connection.execute(
+                    "INSERT INTO routing_deprecation_promotions(repository,generation,prior_generation,inventory_sha256,preview_sha256,remote_receipt,promoted_at) VALUES (?,?,?,?,?,?,?)",
+                    (repository, 1, None, inventory["inventory_sha256"], preview_sha256, "legacy-generation-1", now),
+                )
         return str(inventory["inventory_sha256"]), outbox_id
+
+    def promote_routing_deprecation_inventory(
+        self, *, repository: str, generation: int, inventory_sha256: str,
+        expected_prior_generation: int, expected_preview_sha256: str,
+        remote_receipt_body: str, now: str,
+    ) -> dict[str, Any]:
+        """CAS-promote one prepared successor after exact COMPLETE receipt readback."""
+        with self.transaction():
+            row = self.connection.execute(
+                "SELECT * FROM routing_deprecation_inventories WHERE repository=? AND generation=?",
+                (repository, generation),
+            ).fetchone()
+            current = self.connection.execute(
+                "SELECT * FROM routing_deprecation_current WHERE repository=?", (repository,)
+            ).fetchone()
+            if row is None or row["inventory_sha256"] != inventory_sha256:
+                raise CoordinationError("ROUTING_DEPRECATION_SUCCESSOR_MISSING")
+            existing = self.connection.execute(
+                "SELECT * FROM routing_deprecation_promotions WHERE repository=? AND generation=?",
+                (repository, generation),
+            ).fetchone()
+            if existing is not None:
+                if (existing["inventory_sha256"], existing["preview_sha256"]) != (inventory_sha256, expected_preview_sha256):
+                    raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CONFLICT")
+                return dict(existing)
+            if current is None or int(current["generation"]) != expected_prior_generation:
+                raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CAS_DRIFT")
+            if generation != expected_prior_generation + 1 or row["preview_sha256"] != expected_preview_sha256 or row["predecessor_inventory_sha256"] != current["inventory_sha256"]:
+                raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_FENCE_DRIFT")
+            outbox = self.connection.execute("SELECT * FROM github_outbox WHERE id=?", (row["outbox_id"],)).fetchone()
+            if outbox is None or outbox["state"] != "COMPLETE" or not isinstance(outbox["remote_receipt"], str) or REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"]) is None:
+                raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_INCOMPLETE")
+            try:
+                payload_body = json.loads(outbox["payload_json"])["body"]
+            except (TypeError, KeyError, json.JSONDecodeError):
+                raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_CORRUPT")
+            marker = hashlib.sha256(outbox["idempotency_key"].encode("utf-8")).hexdigest()
+            if remote_receipt_body != f"{payload_body}\n\n<!-- twinfinity-outbox:{marker} -->":
+                raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_READBACK_DRIFT")
+            self.connection.execute(
+                "UPDATE routing_deprecation_current SET generation=?,inventory_sha256=?,version=version+1,promoted_at=? WHERE repository=? AND generation=?",
+                (generation, inventory_sha256, now, repository, expected_prior_generation),
+            )
+            if self.connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CAS_DRIFT")
+            self.connection.execute(
+                "INSERT INTO routing_deprecation_promotions VALUES (?,?,?,?,?,?,?)",
+                (repository, generation, expected_prior_generation, inventory_sha256, expected_preview_sha256, outbox["remote_receipt"], now),
+            )
+            self._event("ROUTING_DEPRECATION_INVENTORY_PROMOTED", f"{repository}:routing-deprecation-inventory", {"generation": generation, "inventory_sha256": inventory_sha256, "preview_sha256": expected_preview_sha256}, now)
+            return dict(self.connection.execute("SELECT * FROM routing_deprecation_promotions WHERE repository=? AND generation=?", (repository, generation)).fetchone())
+
+    def migrate_legacy_routing_deprecation_inventory(
+        self, *, expected_inventory_sha256: str, expected_occurrence_count: int,
+        now: str,
+    ) -> dict[str, Any]:
+        """Recognize the one reviewed v1 row as generation 1 without changing its values."""
+        columns = [row[1] for row in self.connection.execute("PRAGMA table_info(routing_deprecation_inventories)")]
+        if "generation" in columns:
+            row = self.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE inventory_sha256=? AND generation=1", (expected_inventory_sha256,)).fetchone()
+            if row is None:
+                raise CoordinationError("ROUTING_DEPRECATION_LEGACY_MIGRATION_CONFLICT")
+            return {"inventory_sha256": expected_inventory_sha256, "generation": 1, "replay": True}
+        required_triggers = {
+            "routing_deprecation_inventory_immutable_update",
+            "routing_deprecation_inventory_immutable_delete",
+            "routing_deprecation_occurrence_immutable_update",
+            "routing_deprecation_occurrence_immutable_delete",
+            "routing_deprecation_occurrence_append_fenced",
+            "routing_deprecation_outbox_envelope_immutable",
+        }
+        actual_triggers = {row[0] for row in self.connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'routing_deprecation_%')")}
+        rows = self.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchall()
+        if len(rows) != 1 or rows[0]["inventory_sha256"] != expected_inventory_sha256 or required_triggers - actual_triggers:
+            raise CoordinationError("ROUTING_DEPRECATION_LEGACY_SHAPE_INVALID")
+        legacy = dict(rows[0])
+        occurrences = [dict(row) for row in self.connection.execute("SELECT * FROM routing_deprecation_occurrences ORDER BY ordinal")]
+        outbox = self.connection.execute("SELECT * FROM github_outbox WHERE id=?", (legacy["outbox_id"],)).fetchone()
+        if len(occurrences) != expected_occurrence_count or len(occurrences) != int(legacy["occurrence_count"]) or outbox is None or outbox["state"] != "COMPLETE" or not isinstance(outbox["remote_receipt"], str) or REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"]) is None:
+            raise CoordinationError("ROUTING_DEPRECATION_LEGACY_SHAPE_INVALID")
+        preview = {"repository": legacy["repository"], "generation": 1, "predecessor_inventory_sha256": None, "inventory_sha256": legacy["inventory_sha256"], "alias_source_sha256": legacy["alias_source_sha256"], "endpoint_state_sha256": legacy["endpoint_state_sha256"], "issue_179_source_sha256": legacy["issue_179_source_sha256"], "object_manifest_sha256": legacy["object_manifest_sha256"], "occurrence_manifest_sha256": legacy["occurrence_manifest_sha256"]}
+        preview_sha256 = digest_json(preview)
+        self.connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.transaction():
+                for name in required_triggers:
+                    self.connection.execute(f"DROP TRIGGER {name}")
+                self.connection.execute("ALTER TABLE routing_deprecation_occurrences RENAME TO routing_deprecation_occurrences_legacy_v1")
+                self.connection.execute("ALTER TABLE routing_deprecation_inventories RENAME TO routing_deprecation_inventories_legacy_v1")
+                migration_schema = """
+                CREATE TABLE routing_deprecation_inventories (
+                  inventory_sha256 TEXT PRIMARY KEY, repository TEXT NOT NULL,
+                  generation INTEGER NOT NULL CHECK(generation>0), predecessor_inventory_sha256 TEXT,
+                  preview_sha256 TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind='TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1'),
+                  alias_source_sha256 TEXT NOT NULL, endpoint_state_sha256 TEXT NOT NULL,
+                  issue_179_source_sha256 TEXT NOT NULL, object_manifest_sha256 TEXT NOT NULL,
+                  occurrence_manifest_sha256 TEXT NOT NULL, object_manifest_json TEXT NOT NULL,
+                  object_count INTEGER NOT NULL, issue_count INTEGER NOT NULL, pull_request_count INTEGER NOT NULL,
+                  occurrence_count INTEGER NOT NULL, classification_counts_json TEXT NOT NULL,
+                  semantic_tag_counts_json TEXT NOT NULL, outbox_id INTEGER NOT NULL UNIQUE,
+                  state TEXT NOT NULL CHECK(state='COMPLETE'), created_at TEXT NOT NULL,
+                  UNIQUE(repository,generation), UNIQUE(repository,predecessor_inventory_sha256),
+                  FOREIGN KEY(predecessor_inventory_sha256) REFERENCES routing_deprecation_inventories(inventory_sha256),
+                  FOREIGN KEY(outbox_id) REFERENCES github_outbox(id));
+                CREATE TABLE routing_deprecation_occurrences (
+                  inventory_sha256 TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+                  object_kind TEXT NOT NULL CHECK(object_kind IN ('issue','pull_request')),
+                  object_number INTEGER NOT NULL CHECK(object_number>0), node_id TEXT NOT NULL,
+                  object_updated_at TEXT NOT NULL, body_sha256 TEXT NOT NULL, alias TEXT NOT NULL,
+                  byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, line_number INTEGER NOT NULL,
+                  byte_column INTEGER NOT NULL, classification TEXT NOT NULL,
+                  semantic_tags_json TEXT NOT NULL, PRIMARY KEY(inventory_sha256,ordinal),
+                  UNIQUE(inventory_sha256,object_kind,object_number,byte_start,alias),
+                  FOREIGN KEY(inventory_sha256) REFERENCES routing_deprecation_inventories(inventory_sha256));
+                """
+                for statement in migration_schema.split(";"):
+                    if statement.strip():
+                        self.connection.execute(statement)
+                old_columns = list(legacy)
+                insert_columns = old_columns[:2] + ["generation", "predecessor_inventory_sha256", "preview_sha256"] + old_columns[2:]
+                values = [legacy[old_columns[0]], legacy[old_columns[1]], 1, None, preview_sha256] + [legacy[name] for name in old_columns[2:]]
+                self.connection.execute(f"INSERT INTO routing_deprecation_inventories({','.join(insert_columns)}) VALUES ({','.join('?' for _ in values)})", values)
+                occurrence_columns = list(occurrences[0]) if occurrences else [row[1] for row in self.connection.execute("PRAGMA table_info(routing_deprecation_occurrences_legacy_v1)")]
+                if occurrences:
+                    self.connection.executemany(f"INSERT INTO routing_deprecation_occurrences({','.join(occurrence_columns)}) VALUES ({','.join('?' for _ in occurrence_columns)})", [[item[name] for name in occurrence_columns] for item in occurrences])
+                self.connection.execute("INSERT INTO routing_deprecation_current VALUES (?,?,?,?,?)", (legacy["repository"],1,legacy["inventory_sha256"],1,now))
+                self.connection.execute("INSERT INTO routing_deprecation_promotions VALUES (?,?,?,?,?,?,?)", (legacy["repository"],1,None,legacy["inventory_sha256"],preview_sha256,outbox["remote_receipt"],now))
+                self.connection.execute("DROP TABLE routing_deprecation_occurrences_legacy_v1")
+                self.connection.execute("DROP TABLE routing_deprecation_inventories_legacy_v1")
+            # Re-running schema installation reinstalls the reviewed immutable triggers.
+            self._create_schema()
+        finally:
+            self.connection.execute("PRAGMA foreign_keys=ON")
+        migrated = dict(self.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone())
+        for key, value in legacy.items():
+            if migrated[key] != value:
+                raise CoordinationError("ROUTING_DEPRECATION_LEGACY_BYTE_DRIFT")
+        return {"inventory_sha256": expected_inventory_sha256, "generation": 1, "preview_sha256": preview_sha256, "replay": False}
 
     def terminal_outbox_context(self, outbox_id: int) -> dict[str, Any] | None:
         row = self.connection.execute(

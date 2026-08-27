@@ -91,6 +91,8 @@ LOCAL_DIGEST_TABLES = (
     "portfolio_pull_buffer_current",
     "routing_deprecation_inventories",
     "routing_deprecation_occurrences",
+    "routing_deprecation_current",
+    "routing_deprecation_promotions",
 )
 
 
@@ -386,16 +388,54 @@ def _routing_inventory_local_gate(
     required = {
         "routing_deprecation_inventories",
         "routing_deprecation_occurrences",
+        "routing_deprecation_current",
+        "routing_deprecation_promotions",
         "github_outbox",
     }
     if not all(_table_exists(connection, table) for table in required):
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_REQUIRED"}], None
     rows = connection.execute(
-        "SELECT * FROM routing_deprecation_inventories ORDER BY repository"
+        "SELECT * FROM routing_deprecation_inventories ORDER BY repository,generation"
     ).fetchall()
-    if len(rows) != 1:
+    currents = connection.execute("SELECT * FROM routing_deprecation_current").fetchall()
+    if not rows or len(currents) != 1:
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
-    row = rows[0]
+    current = currents[0]
+    matching = [item for item in rows if item["repository"] == current["repository"] and int(item["generation"]) == int(current["generation"]) and item["inventory_sha256"] == current["inventory_sha256"]]
+    if len(matching) != 1:
+        return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
+    expected_generation = 1
+    predecessor = None
+    for historic in rows:
+        if int(historic["generation"]) != expected_generation or historic["predecessor_inventory_sha256"] != predecessor:
+            return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
+        promotion = connection.execute("SELECT 1 FROM routing_deprecation_promotions WHERE repository=? AND generation=? AND inventory_sha256=?", (historic["repository"], historic["generation"], historic["inventory_sha256"])).fetchone()
+        if int(historic["generation"]) <= int(current["generation"]) and promotion is None:
+            return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
+        try:
+            historic_objects = json.loads(historic["object_manifest_json"])
+            historic_occurrence_rows = connection.execute(
+                "SELECT * FROM routing_deprecation_occurrences WHERE inventory_sha256=? ORDER BY ordinal",
+                (historic["inventory_sha256"],),
+            ).fetchall()
+            historic_occurrences = [{
+                "ordinal": int(item["ordinal"]), "object_kind": item["object_kind"],
+                "object_number": int(item["object_number"]), "node_id": item["node_id"],
+                "body_sha256": item["body_sha256"], "alias": item["alias"],
+                "byte_start": int(item["byte_start"]), "byte_end": int(item["byte_end"]),
+                "line_number": int(item["line_number"]), "byte_column": int(item["byte_column"]),
+                "classification": item["classification"],
+                "semantic_tags": json.loads(item["semantic_tags_json"]),
+            } for item in historic_occurrence_rows]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
+        if (digest_json(historic_objects) != historic["object_manifest_sha256"]
+                or digest_json(historic_occurrences) != historic["occurrence_manifest_sha256"]
+                or len(historic_occurrences) != int(historic["occurrence_count"])):
+            return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
+        predecessor = historic["inventory_sha256"]
+        expected_generation += 1
+    row = matching[0]
     try:
         objects = json.loads(row["object_manifest_json"])
         classification_counts = json.loads(row["classification_counts_json"])
