@@ -821,6 +821,21 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                 self.assertEqual("HOLD", case.readiness(inventory)["phase"])
             finally: case.tearDown()
 
+    def test_archive_escaped_surrogate_and_malformed_outbox_number_hold_no_reads(self) -> None:
+        mutations = (
+            ("DROP TRIGGER routing_deprecation_occurrence_immutable_update", "UPDATE routing_deprecation_occurrences SET semantic_tags_json='[\"\\ud800\"]'"),
+            ("DROP TRIGGER routing_deprecation_outbox_envelope_immutable", "UPDATE github_outbox SET object_number='abc' WHERE id=(SELECT outbox_id FROM routing_deprecation_inventories)"),
+        )
+        for setup, mutation in mutations:
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                inventory, outbox = case.prepare(); case.complete_outbox(outbox)
+                case.store.connection.execute(setup); case.store.connection.execute(mutation); case.store.connection.commit()
+                reads: list[int] = []
+                result = case.readiness(inventory, comment=lambda repository, issue, comment_id: reads.append(comment_id))
+                self.assertEqual("HOLD", result["phase"]); self.assertEqual([], reads)
+            finally: case.tearDown()
+
     def test_preexisting_incomplete_v2_schema_holds_before_any_schema_mutation(self) -> None:
         path = self.store.path
         self.store.close()
@@ -1153,6 +1168,22 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         replay = self.store.migrate_legacy_routing_deprecation_inventory(expected_repository=REPOSITORY, expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:00:01Z")
         self.assertTrue(replay["replay"])
 
+    def test_actual_two_table_six_trigger_v1_reopens_and_migrates(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        for name in ("routing_deprecation_current_no_delete", "routing_deprecation_current_monotonic",
+                     "routing_deprecation_promotion_immutable_update", "routing_deprecation_promotion_immutable_delete"):
+            self.store.connection.execute(f"DROP TRIGGER {name}")
+        self.store.connection.execute("DROP TABLE routing_deprecation_promotions")
+        self.store.connection.execute("DROP TABLE routing_deprecation_current")
+        self.store.connection.commit()
+        path = self.store.path; self.store.close()
+        self.store = CoordinationStore(path)
+        result = self.store.migrate_legacy_routing_deprecation_inventory(
+            expected_repository=REPOSITORY, expected_inventory_sha256=inventory["inventory_sha256"],
+            expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:00:03Z")
+        self.assertFalse(result["replay"])
+
     def test_migrated_v2_schema_matches_fresh_canonical_sql_and_enforces_checks(self) -> None:
         inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
         self.downgrade_to_exact_legacy_v1()
@@ -1185,8 +1216,21 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         self.store.connection.execute("UPDATE sqlite_master SET sql=? WHERE name='routing_deprecation_occurrences'", (sql.replace(" CHECK(typeof(byte_start)='integer' AND byte_start >= 0)", ""),))
         self.store.connection.execute("PRAGMA writable_schema=OFF"); self.store.connection.commit()
         before = self.legacy_database_fingerprint()
-        with self.assertRaisesRegex(CoordinationError, "MIGRATION_CONFLICT"):
+        with self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
             self.store.migrate_legacy_routing_deprecation_inventory(expected_repository=REPOSITORY, expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:02:00Z")
+        self.assertEqual(before, self.legacy_database_fingerprint())
+
+    def test_v2_migration_replay_rejects_lowercase_quoted_check_literal_zero_write(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.store.connection.execute("PRAGMA writable_schema=ON")
+        sql = self.store.connection.execute("SELECT sql FROM sqlite_master WHERE name='routing_deprecation_inventories'").fetchone()[0]
+        self.store.connection.execute("UPDATE sqlite_master SET sql=? WHERE name='routing_deprecation_inventories'", (sql.replace("TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1", "twinfinity_routing_deprecation_inventory_v1"),))
+        self.store.connection.execute("PRAGMA writable_schema=OFF"); self.store.connection.commit()
+        before = self.legacy_database_fingerprint()
+        with self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+            self.store.migrate_legacy_routing_deprecation_inventory(
+                expected_repository=REPOSITORY, expected_inventory_sha256=inventory["inventory_sha256"],
+                expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:02:01Z")
         self.assertEqual(before, self.legacy_database_fingerprint())
 
     def legacy_database_fingerprint(self):

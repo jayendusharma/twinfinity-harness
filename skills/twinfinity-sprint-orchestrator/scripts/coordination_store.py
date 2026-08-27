@@ -1143,12 +1143,12 @@ class CoordinationStore:
         try:
             self.connection = sqlite3.connect(path, isolation_level=None, timeout=5)
             self.connection.row_factory = sqlite3.Row
-            self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA synchronous=FULL")
             self.connection.execute("PRAGMA foreign_keys=ON")
             self.connection.execute("PRAGMA busy_timeout=5000")
             with self._schema_initialization_lock():
                 self._create_schema()
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=FULL")
         except sqlite3.OperationalError as exc:
             lowered = str(exc).lower()
             if "readonly" in lowered or "read-only" in lowered:
@@ -1465,19 +1465,41 @@ class CoordinationStore:
                 and (routing_names or routing_trigger_names)):
             raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
         if "routing_deprecation_inventories" in routing_names and "generation" not in inventory_columns:
-            expected_legacy_tables = {"routing_deprecation_inventories", "routing_deprecation_occurrences", "routing_deprecation_current", "routing_deprecation_promotions"}
+            expected_legacy_tables = {"routing_deprecation_inventories", "routing_deprecation_occurrences"}
             expected_legacy_triggers = {
                 "routing_deprecation_inventory_immutable_update", "routing_deprecation_inventory_immutable_delete",
-                "routing_deprecation_current_no_delete", "routing_deprecation_current_monotonic",
-                "routing_deprecation_promotion_immutable_update", "routing_deprecation_promotion_immutable_delete",
                 "routing_deprecation_occurrence_immutable_update", "routing_deprecation_occurrence_immutable_delete",
                 "routing_deprecation_occurrence_append_fenced", "routing_deprecation_outbox_envelope_immutable",
             }
+            expected_legacy_trigger_sql = {
+                'routing_deprecation_inventory_immutable_delete': "create trigger routing_deprecation_inventory_immutable_delete before delete on routing_deprecation_inventories begin select raise(abort,'ROUTING_DEPRECATION_INVENTORY_IMMUTABLE');end",
+                'routing_deprecation_inventory_immutable_update': "create trigger routing_deprecation_inventory_immutable_update before update on routing_deprecation_inventories begin select raise(abort,'ROUTING_DEPRECATION_INVENTORY_IMMUTABLE');end",
+                'routing_deprecation_occurrence_append_fenced': "create trigger routing_deprecation_occurrence_append_fenced before insert on routing_deprecation_occurrences when(select count(*)from routing_deprecation_occurrences where inventory_sha256=new.inventory_sha256)>=(select occurrence_count from routing_deprecation_inventories where inventory_sha256=new.inventory_sha256)begin select raise(abort,'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE');end",
+                'routing_deprecation_occurrence_immutable_delete': "create trigger routing_deprecation_occurrence_immutable_delete before delete on routing_deprecation_occurrences begin select raise(abort,'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE');end",
+                'routing_deprecation_occurrence_immutable_update': "create trigger routing_deprecation_occurrence_immutable_update before update on routing_deprecation_occurrences begin select raise(abort,'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE');end",
+                'routing_deprecation_outbox_envelope_immutable': "create trigger routing_deprecation_outbox_envelope_immutable before update of idempotency_key,repository,object_kind,object_number,operation,expected_source_sha256,payload_sha256,payload_json,created_at on github_outbox when exists(select 1 from routing_deprecation_inventories where outbox_id=old.id)begin select raise(abort,'ROUTING_DEPRECATION_OUTBOX_IMMUTABLE');end",
+            }
+            actual_legacy_trigger_sql = {row[0]: _normalized_schema_sql(row[1]) for row in self.connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND (name LIKE 'routing_deprecation_%' OR tbl_name IN ('routing_deprecation_inventories','routing_deprecation_occurrences'))"
+            )}
             legacy_inventory_columns = tuple(row[1] for row in self.connection.execute("PRAGMA table_info(routing_deprecation_inventories)"))
             legacy_occurrence_columns = tuple(row[1] for row in self.connection.execute("PRAGMA table_info(routing_deprecation_occurrences)"))
+            def legacy_index_shapes(table: str) -> set[tuple[Any, ...]]:
+                return {(int(item[2]), item[3], int(item[4]), tuple(row[2] for row in self.connection.execute(f"PRAGMA index_info({item[1]})")))
+                        for item in self.connection.execute(f"PRAGMA index_list({table})")}
+            legacy_inventory_indexes = {(1,"pk",0,("inventory_sha256",)),(1,"u",0,("repository",)),(1,"u",0,("outbox_id",))}
+            legacy_occurrence_indexes = {(1,"pk",0,("inventory_sha256","ordinal")),(1,"u",0,("inventory_sha256","object_kind","object_number","byte_start","alias"))}
+            legacy_inventory_fks = {tuple(row[2:8]) for row in self.connection.execute("PRAGMA foreign_key_list(routing_deprecation_inventories)")}
+            legacy_occurrence_fks = {tuple(row[2:8]) for row in self.connection.execute("PRAGMA foreign_key_list(routing_deprecation_occurrences)")}
             if (routing_names != expected_legacy_tables or routing_trigger_names != expected_legacy_triggers
+                    or actual_legacy_trigger_sql != expected_legacy_trigger_sql
                     or legacy_inventory_columns != ("inventory_sha256","repository","kind","alias_source_sha256","endpoint_state_sha256","issue_179_source_sha256","object_manifest_sha256","occurrence_manifest_sha256","object_manifest_json","object_count","issue_count","pull_request_count","occurrence_count","classification_counts_json","semantic_tag_counts_json","outbox_id","state","created_at")
-                    or legacy_occurrence_columns != ("inventory_sha256","ordinal","object_kind","object_number","node_id","object_updated_at","body_sha256","alias","byte_start","byte_end","line_number","byte_column","classification","semantic_tags_json")):
+                    or legacy_occurrence_columns != ("inventory_sha256","ordinal","object_kind","object_number","node_id","object_updated_at","body_sha256","alias","byte_start","byte_end","line_number","byte_column","classification","semantic_tags_json")
+                    or legacy_index_shapes("routing_deprecation_inventories") != legacy_inventory_indexes
+                    or legacy_index_shapes("routing_deprecation_occurrences") != legacy_occurrence_indexes
+                    or legacy_inventory_fks != {("github_outbox","outbox_id","id","NO ACTION","NO ACTION","NONE")}
+                    or legacy_occurrence_fks != {("routing_deprecation_inventories","inventory_sha256","inventory_sha256","NO ACTION","NO ACTION","NONE")}
+                    or self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None):
                 raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
         if "generation" in inventory_columns:
             expected_tables = {
@@ -8800,8 +8822,7 @@ class CoordinationStore:
                 and REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"]) is not None
             )
         def normalized_sql(value: str | None) -> str:
-            compact = " ".join((value or "").split()).lower().rstrip(";")
-            return re.sub(r"\s*([(),;=<>])\s*", r"\1", compact)
+            return _normalized_schema_sql(value)
 
         def table_info(name: str) -> list[tuple[Any, ...]]:
             return [tuple(row) for row in self.connection.execute(f"PRAGMA table_info({name})")]
@@ -8897,6 +8918,9 @@ class CoordinationStore:
                 row = None
             relevant = {item[0]: normalized_sql(item[1]) for item in self.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'routing_deprecation_%'")}
             replay_table_sql = {item[0]: normalized_sql(item[1]) for item in self.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('routing_deprecation_inventories','routing_deprecation_occurrences','routing_deprecation_current','routing_deprecation_promotions')")}
+            expected_replay_table_sql = {"routing_deprecation_inventories": normalized_sql(ROUTING_INVENTORIES_TABLE_SQL), "routing_deprecation_occurrences": normalized_sql(ROUTING_OCCURRENCES_TABLE_SQL), "routing_deprecation_current": normalized_sql(ROUTING_CURRENT_TABLE_SQL), "routing_deprecation_promotions": normalized_sql(ROUTING_PROMOTIONS_TABLE_SQL)}
+            if replay_table_sql != expected_replay_table_sql:
+                raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
             if (row is None or row["repository"] != expected_repository or current is None or promotion is None or outbox is None
                     or int(occurrences) != expected_occurrence_count
                     or type(current["generation"]) is not int or type(current["version"]) is not int
@@ -8904,7 +8928,6 @@ class CoordinationStore:
                     or (promotion["generation"], promotion["prior_generation"], promotion["inventory_sha256"], promotion["preview_sha256"], promotion["remote_receipt"]) != (1, None, expected_inventory_sha256, row["preview_sha256"], outbox["remote_receipt"])
                     or not valid_bound_outbox(row, outbox)
                     or relevant != {name: normalized_sql(sql) for name, sql in {**trigger_sql, **generation_trigger_sql}.items()}
-                    or replay_table_sql != {"routing_deprecation_inventories": normalized_sql(ROUTING_INVENTORIES_TABLE_SQL), "routing_deprecation_occurrences": normalized_sql(ROUTING_OCCURRENCES_TABLE_SQL), "routing_deprecation_current": normalized_sql(ROUTING_CURRENT_TABLE_SQL), "routing_deprecation_promotions": normalized_sql(ROUTING_PROMOTIONS_TABLE_SQL)}
                     or table_info("routing_deprecation_inventories") != v2_inventory_info
                     or table_info("routing_deprecation_occurrences") != legacy_occurrence_info
                     or table_info("routing_deprecation_current") != current_info

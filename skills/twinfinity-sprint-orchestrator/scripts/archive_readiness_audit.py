@@ -457,7 +457,7 @@ def _routing_inventory_local_gate(
                 or promotion["preview_sha256"] != preview_sha256
                 or outbox is None or outbox["state"] != "COMPLETE"
                 or outbox["repository"] != historic["repository"] or outbox["object_kind"] != "issue"
-                or int(outbox["object_number"]) != 179 or outbox["operation"] != "comment"
+                or type(outbox["object_number"]) is not int or outbox["object_number"] != 179 or outbox["operation"] != "comment"
                 or outbox["expected_source_sha256"] != historic["issue_179_source_sha256"]
                 or outbox["idempotency_key"] != outbox_idempotency_key(historic_inventory)
                 or payload != {"body": receipt_body(historic_inventory)}
@@ -589,7 +589,7 @@ def _routing_inventory_local_gate(
             outbox["state"] != "COMPLETE"
             or outbox["repository"] != row["repository"]
             or outbox["object_kind"] != "issue"
-            or int(outbox["object_number"]) != 179
+            or type(outbox["object_number"]) is not int or outbox["object_number"] != 179
             or outbox["expected_source_sha256"] != row["issue_179_source_sha256"]
             or outbox["idempotency_key"] != outbox_idempotency_key(inventory)
             or payload != {"body": receipt_body(inventory)}
