@@ -24,12 +24,22 @@ def _integer(value: Any, *, minimum: int = 0) -> bool:
     return type(value) is int and value >= minimum
 
 
+def _text(value: Any, *, nonempty: bool = False) -> bool:
+    if type(value) is not str or (nonempty and not value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     required = {"kind","repository","alias_source_sha256","endpoint_state_sha256","issue_179_source_sha256","object_manifest_sha256","occurrence_manifest_sha256","object_manifest","object_count","issue_count","pull_request_count","occurrence_count","classification_counts","semantic_tag_counts","inventory_sha256"}
-    if type(inventory) is not dict or set(inventory) != required or inventory.get("kind") != KIND or type(inventory.get("repository")) is not str or not inventory["repository"] or type(occurrences) is not list:
+    if type(inventory) is not dict or set(inventory) != required or inventory.get("kind") != KIND or not _text(inventory.get("repository"), nonempty=True) or type(occurrences) is not list:
         raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     for name in ("alias_source_sha256","endpoint_state_sha256","issue_179_source_sha256","object_manifest_sha256","occurrence_manifest_sha256","inventory_sha256"):
-        if type(inventory.get(name)) is not str or SHA256.fullmatch(inventory[name]) is None:
+        if not _text(inventory.get(name)) or SHA256.fullmatch(inventory[name]) is None:
             raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     objects = inventory.get("object_manifest")
     if type(objects) is not list:
@@ -37,22 +47,22 @@ def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequen
     for item in objects:
         if (type(item) is not dict or set(item) != {"object_kind","object_number","node_id","body_sha256"}
                 or type(item["object_kind"]) is not str or item["object_kind"] not in {"issue","pull_request"} or not _integer(item["object_number"], minimum=1)
-                or type(item["node_id"]) is not str or not item["node_id"] or type(item["body_sha256"]) is not str or SHA256.fullmatch(item["body_sha256"]) is None):
+                or not _text(item["node_id"], nonempty=True) or not _text(item["body_sha256"]) or SHA256.fullmatch(item["body_sha256"]) is None):
             raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     canonical_occurrences: list[dict[str, Any]] = []
     for ordinal, item in enumerate(occurrences):
         semantic_tags = item.get("semantic_tags") if type(item) is dict else None
         tags_valid = (
             type(semantic_tags) is list
-            and all(type(tag) is str and tag in TAGS for tag in semantic_tags)
+            and all(_text(tag) and tag in TAGS for tag in semantic_tags)
             and len(semantic_tags) == len(set(semantic_tags))
             and semantic_tags == sorted(semantic_tags)
         )
         if (type(item) is not dict or set(item) != {"ordinal","object_kind","object_number","node_id","body_sha256","alias","byte_start","byte_end","line_number","byte_column","classification","semantic_tags"}
                 or not _integer(item["ordinal"]) or item["ordinal"] != ordinal
                 or type(item["object_kind"]) is not str or item["object_kind"] not in {"issue","pull_request"} or not _integer(item["object_number"], minimum=1)
-                or type(item["node_id"]) is not str or not item["node_id"] or type(item["body_sha256"]) is not str or SHA256.fullmatch(item["body_sha256"]) is None
-                or type(item["alias"]) is not str or not item["alias"] or not _integer(item["byte_start"])
+                or not _text(item["node_id"], nonempty=True) or not _text(item["body_sha256"]) or SHA256.fullmatch(item["body_sha256"]) is None
+                or not _text(item["alias"], nonempty=True) or not _integer(item["byte_start"])
                 or not _integer(item["byte_end"], minimum=1) or item["byte_end"] <= item["byte_start"]
                 or not _integer(item["line_number"], minimum=1) or not _integer(item["byte_column"], minimum=1)
                 or type(item["classification"]) is not str or item["classification"] not in CLASSIFICATIONS or not tags_valid):
@@ -78,7 +88,11 @@ def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequen
 def validate_inventory_record(row: Mapping[str, Any], occurrence_rows: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     row = dict(row)
     occurrence_rows = [dict(item) for item in occurrence_rows]
-    if row.get("state") != "COMPLETE":
+    text_fields = ("kind","repository","alias_source_sha256","endpoint_state_sha256","issue_179_source_sha256","object_manifest_sha256","occurrence_manifest_sha256","object_manifest_json","classification_counts_json","semantic_tag_counts_json","inventory_sha256","state","created_at")
+    occurrence_text_fields = ("object_kind","node_id","object_updated_at","body_sha256","alias","classification","semantic_tags_json")
+    if (any(not _text(row.get(name)) for name in text_fields)
+            or any(any(not _text(item.get(name)) for name in occurrence_text_fields) for item in occurrence_rows)
+            or row.get("state") != "COMPLETE"):
         raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     try:
         objects = json.loads(row["object_manifest_json"])

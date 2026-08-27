@@ -402,15 +402,23 @@ def _routing_inventory_local_gate(
     if not rows or len(currents) != 1:
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
     current = currents[0]
-    if type(current["generation"]) is not int or type(current["version"]) is not int or current["generation"] < 1 or current["version"] != current["generation"]:
+    if (type(current["repository"]) is not str or not current["repository"]
+            or type(current["inventory_sha256"]) is not str
+            or type(current["generation"]) is not int or type(current["version"]) is not int
+            or current["generation"] < 1 or current["version"] != current["generation"]):
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
-    matching = [item for item in rows if item["repository"] == current["repository"] and int(item["generation"]) == int(current["generation"]) and item["inventory_sha256"] == current["inventory_sha256"]]
+    matching = [item for item in rows if type(item["generation"]) is int and item["repository"] == current["repository"] and item["generation"] == current["generation"] and item["inventory_sha256"] == current["inventory_sha256"]]
     if len(matching) != 1 or int(current["generation"]) != len(rows):
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
     expected_generation = 1
     predecessor = None
+    historic_receipts: list[dict[str, Any]] = []
     for historic in rows:
-        if int(historic["generation"]) != expected_generation or historic["predecessor_inventory_sha256"] != predecessor:
+        if (type(historic["repository"]) is not str
+                or historic["repository"] != current["repository"]
+                or type(historic["generation"]) is not int
+                or historic["generation"] != expected_generation
+                or historic["predecessor_inventory_sha256"] != predecessor):
             return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
         promotion = connection.execute("SELECT * FROM routing_deprecation_promotions WHERE repository=? AND generation=? AND inventory_sha256=?", (historic["repository"], historic["generation"], historic["inventory_sha256"])).fetchone()
         expected_prior = None if expected_generation == 1 else expected_generation - 1
@@ -442,14 +450,14 @@ def _routing_inventory_local_gate(
         preview_sha256 = digest_json(preview)
         outbox = connection.execute("SELECT * FROM github_outbox WHERE id=?", (historic["outbox_id"],)).fetchone()
         try:
-            payload = None if outbox is None else json.loads(outbox["payload_json"])
+            payload = None if outbox is None or type(outbox["payload_json"]) is not str else json.loads(outbox["payload_json"])
         except (TypeError, json.JSONDecodeError):
             payload = None
         if (historic["preview_sha256"] != preview_sha256
                 or promotion["preview_sha256"] != preview_sha256
                 or outbox is None or outbox["state"] != "COMPLETE"
                 or outbox["repository"] != historic["repository"] or outbox["object_kind"] != "issue"
-                or int(outbox["object_number"]) != 179 or outbox["operation"] != "comment"
+                or type(outbox["object_number"]) is not int or outbox["object_number"] != 179 or outbox["operation"] != "comment"
                 or outbox["expected_source_sha256"] != historic["issue_179_source_sha256"]
                 or outbox["idempotency_key"] != outbox_idempotency_key(historic_inventory)
                 or payload != {"body": receipt_body(historic_inventory)}
@@ -457,6 +465,11 @@ def _routing_inventory_local_gate(
                 or re.fullmatch(r"comment:[1-9][0-9]*", str(outbox["remote_receipt"])) is None
                 or promotion["remote_receipt"] != outbox["remote_receipt"]):
             return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
+        historic_receipts.append({
+            "repository": historic["repository"],
+            "inventory": historic_inventory,
+            "remote_receipt": outbox["remote_receipt"],
+        })
         predecessor = historic["inventory_sha256"]
         expected_generation += 1
     row = matching[0]
@@ -567,6 +580,8 @@ def _routing_inventory_local_gate(
         findings.append({"error": "ROUTING_DEPRECATION_OUTBOX_MISSING"})
     else:
         try:
+            if type(outbox["payload_json"]) is not str:
+                raise TypeError
             payload = json.loads(outbox["payload_json"])
         except (TypeError, json.JSONDecodeError):
             payload = None
@@ -574,7 +589,7 @@ def _routing_inventory_local_gate(
             outbox["state"] != "COMPLETE"
             or outbox["repository"] != row["repository"]
             or outbox["object_kind"] != "issue"
-            or int(outbox["object_number"]) != 179
+            or type(outbox["object_number"]) is not int or outbox["object_number"] != 179
             or outbox["expected_source_sha256"] != row["issue_179_source_sha256"]
             or outbox["idempotency_key"] != outbox_idempotency_key(inventory)
             or payload != {"body": receipt_body(inventory)}
@@ -595,6 +610,7 @@ def _routing_inventory_local_gate(
             None if outbox is None or not isinstance(outbox["remote_receipt"], str)
             else str(outbox["remote_receipt"])
         ),
+        "historic_receipts": historic_receipts,
     }
     return findings, context
 
@@ -628,27 +644,22 @@ def _routing_inventory_external_gate(
                 findings.append({"error": "ROUTING_DEPRECATION_OCCURRENCE_DRIFT"})
         except InventoryError:
             findings.append({"error": "ROUTING_DEPRECATION_LIVE_SCAN_INVALID"})
-    remote_receipt = context["remote_receipt"]
-    if remote_receipt is not None:
-        match = re.fullmatch(r"comment:([1-9][0-9]*)", remote_receipt)
-        if match is not None:
-            try:
-                comment = comment_reader(
-                    context["repository"], 179, int(match.group(1))
-                )
-                expected_issue_url = (
-                    f"https://api.github.com/repos/{context['repository']}/issues/179"
-                )
-                if (
-                    not isinstance(comment, dict)
+    for historic in context.get("historic_receipts", []):
+        remote_receipt = historic.get("remote_receipt")
+        match = re.fullmatch(r"comment:([1-9][0-9]*)", remote_receipt) if isinstance(remote_receipt, str) else None
+        if match is None or historic.get("repository") != context["repository"]:
+            findings.append({"error": "ROUTING_DEPRECATION_RECEIPT_MISMATCH"})
+            continue
+        try:
+            comment = comment_reader(context["repository"], 179, int(match.group(1)))
+            expected_issue_url = f"https://api.github.com/repos/{context['repository']}/issues/179"
+            if (not isinstance(comment, dict)
                     or comment.get("id") != int(match.group(1))
-                    or comment.get("body")
-                    != published_receipt_body(context["inventory"])
-                    or comment.get("issue_url") != expected_issue_url
-                ):
-                    findings.append({"error": "ROUTING_DEPRECATION_RECEIPT_MISMATCH"})
-            except InventoryError:
-                findings.append({"error": "ROUTING_DEPRECATION_RECEIPT_MISSING"})
+                    or comment.get("body") != published_receipt_body(historic["inventory"])
+                    or comment.get("issue_url") != expected_issue_url):
+                findings.append({"error": "ROUTING_DEPRECATION_RECEIPT_MISMATCH"})
+        except InventoryError:
+            findings.append({"error": "ROUTING_DEPRECATION_RECEIPT_MISSING"})
     return findings
 
 
