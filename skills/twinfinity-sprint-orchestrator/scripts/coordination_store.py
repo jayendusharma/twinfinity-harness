@@ -1442,6 +1442,53 @@ class CoordinationStore:
         return self.capacity_policy(repository, now=now)
 
     def _create_schema(self) -> None:
+        # A partially present v2 must be rejected before IF NOT EXISTS can
+        # silently manufacture missing pieces and launder an unreviewed shape.
+        routing_names = {row[0] for row in self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'routing_deprecation_%'"
+        )}
+        inventory_columns = {row[1] for row in self.connection.execute(
+            "PRAGMA table_info(routing_deprecation_inventories)"
+        )}
+        if "generation" in inventory_columns:
+            expected_tables = {
+                "routing_deprecation_inventories": _normalized_schema_sql(ROUTING_INVENTORIES_TABLE_SQL),
+                "routing_deprecation_occurrences": _normalized_schema_sql(ROUTING_OCCURRENCES_TABLE_SQL),
+                "routing_deprecation_current": _normalized_schema_sql(ROUTING_CURRENT_TABLE_SQL),
+                "routing_deprecation_promotions": _normalized_schema_sql(ROUTING_PROMOTIONS_TABLE_SQL),
+            }
+            actual_tables = {row[0]: _normalized_schema_sql(row[1]) for row in self.connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='table' AND name LIKE 'routing_deprecation_%'"
+            )}
+            expected_triggers = {
+                'routing_deprecation_current_monotonic': "create trigger routing_deprecation_current_monotonic before update on routing_deprecation_current when new.repository !=old.repository or new.generation !=old.generation + 1 or new.version !=old.version + 1 begin select raise(abort,'routing_deprecation_current_cas_invalid');end",
+                'routing_deprecation_current_no_delete': "create trigger routing_deprecation_current_no_delete before delete on routing_deprecation_current begin select raise(abort,'routing_deprecation_current_immutable');end",
+                'routing_deprecation_inventory_immutable_delete': "create trigger routing_deprecation_inventory_immutable_delete before delete on routing_deprecation_inventories begin select raise(abort,'routing_deprecation_inventory_immutable');end",
+                'routing_deprecation_inventory_immutable_update': "create trigger routing_deprecation_inventory_immutable_update before update on routing_deprecation_inventories begin select raise(abort,'routing_deprecation_inventory_immutable');end",
+                'routing_deprecation_occurrence_append_fenced': "create trigger routing_deprecation_occurrence_append_fenced before insert on routing_deprecation_occurrences when(select count(*)from routing_deprecation_occurrences where inventory_sha256=new.inventory_sha256)>=(select occurrence_count from routing_deprecation_inventories where inventory_sha256=new.inventory_sha256)begin select raise(abort,'routing_deprecation_occurrence_immutable');end",
+                'routing_deprecation_occurrence_immutable_delete': "create trigger routing_deprecation_occurrence_immutable_delete before delete on routing_deprecation_occurrences begin select raise(abort,'routing_deprecation_occurrence_immutable');end",
+                'routing_deprecation_occurrence_immutable_update': "create trigger routing_deprecation_occurrence_immutable_update before update on routing_deprecation_occurrences begin select raise(abort,'routing_deprecation_occurrence_immutable');end",
+                'routing_deprecation_outbox_envelope_immutable': "create trigger routing_deprecation_outbox_envelope_immutable before update of idempotency_key,repository,object_kind,object_number,operation,expected_source_sha256,payload_sha256,payload_json,created_at on github_outbox when exists(select 1 from routing_deprecation_inventories where outbox_id=old.id)begin select raise(abort,'routing_deprecation_outbox_immutable');end",
+                'routing_deprecation_promotion_immutable_delete': "create trigger routing_deprecation_promotion_immutable_delete before delete on routing_deprecation_promotions begin select raise(abort,'routing_deprecation_promotion_immutable');end",
+                'routing_deprecation_promotion_immutable_update': "create trigger routing_deprecation_promotion_immutable_update before update on routing_deprecation_promotions begin select raise(abort,'routing_deprecation_promotion_immutable');end",
+            }
+            actual_triggers = {row[0]: _normalized_schema_sql(row[1]) for row in self.connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'routing_deprecation_%'"
+            )}
+            def index_shapes(table: str) -> set[tuple[Any, ...]]:
+                return {(int(item[2]), item[3], int(item[4]), tuple(row[2] for row in self.connection.execute(f"PRAGMA index_info({item[1]})")))
+                        for item in self.connection.execute(f"PRAGMA index_list({table})")}
+            expected_indexes = {
+                "routing_deprecation_inventories": {(1,"pk",0,("inventory_sha256",)),(1,"u",0,("outbox_id",)),(1,"u",0,("repository","generation")),(1,"u",0,("repository","predecessor_inventory_sha256"))},
+                "routing_deprecation_occurrences": {(1,"pk",0,("inventory_sha256","ordinal")),(1,"u",0,("inventory_sha256","object_kind","object_number","byte_start","alias"))},
+                "routing_deprecation_current": {(1,"pk",0,("repository",)),(1,"u",0,("inventory_sha256",)),(1,"u",0,("repository","generation"))},
+                "routing_deprecation_promotions": {(1,"pk",0,("repository","generation")),(1,"u",0,("inventory_sha256",))},
+            }
+            if (routing_names != set(expected_tables) or actual_tables != expected_tables
+                    or actual_triggers != expected_triggers
+                    or any(index_shapes(table) != shapes for table, shapes in expected_indexes.items())
+                    or self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None):
+                raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS github_snapshots (
@@ -8473,7 +8520,11 @@ class CoordinationStore:
                 exact = exact and outbox["object_kind"] == "issue"
                 exact = exact and int(outbox["object_number"]) == 179
                 exact = exact and outbox["expected_source_sha256"] == inventory["issue_179_source_sha256"]
-                exact = exact and json.loads(outbox["payload_json"]) == {"body": receipt_body}
+                try:
+                    prior_payload = json.loads(outbox["payload_json"]) if type(outbox["payload_json"]) is str else None
+                except json.JSONDecodeError:
+                    prior_payload = None
+                exact = exact and prior_payload == {"body": receipt_body}
                 if not exact:
                     raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_CONFLICT")
                 return str(prior["inventory_sha256"]), int(prior["outbox_id"])
@@ -8594,6 +8645,8 @@ class CoordinationStore:
                     or REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"]) is None):
                 raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_INCOMPLETE")
             try:
+                if type(outbox["payload_json"]) is not str:
+                    raise TypeError
                 payload = json.loads(outbox["payload_json"])
             except (TypeError, json.JSONDecodeError):
                 payload = None
@@ -8672,7 +8725,7 @@ class CoordinationStore:
             preview_sha256 = digest_json(preview)
             outbox = self.connection.execute("SELECT * FROM github_outbox WHERE id=?", (row["outbox_id"],)).fetchone()
             try:
-                payload = None if outbox is None else json.loads(outbox["payload_json"])
+                payload = None if outbox is None or type(outbox["payload_json"]) is not str else json.loads(outbox["payload_json"])
             except (TypeError, json.JSONDecodeError):
                 payload = None
             expected_key = f"routing-deprecation-inventory:{repository}:{row['inventory_sha256']}"
@@ -8697,6 +8750,8 @@ class CoordinationStore:
             if outbox is None:
                 return False
             try:
+                if type(outbox["payload_json"]) is not str:
+                    raise TypeError
                 payload = json.loads(outbox["payload_json"])
             except (TypeError, json.JSONDecodeError):
                 return False

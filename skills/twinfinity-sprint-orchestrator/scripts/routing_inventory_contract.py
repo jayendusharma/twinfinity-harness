@@ -78,7 +78,11 @@ def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequen
 def validate_inventory_record(row: Mapping[str, Any], occurrence_rows: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     row = dict(row)
     occurrence_rows = [dict(item) for item in occurrence_rows]
-    if row.get("state") != "COMPLETE":
+    text_fields = ("kind","repository","alias_source_sha256","endpoint_state_sha256","issue_179_source_sha256","object_manifest_sha256","occurrence_manifest_sha256","object_manifest_json","classification_counts_json","semantic_tag_counts_json","inventory_sha256","state","created_at")
+    occurrence_text_fields = ("object_kind","node_id","object_updated_at","body_sha256","alias","classification","semantic_tags_json")
+    if (any(type(row.get(name)) is not str for name in text_fields)
+            or any(any(type(item.get(name)) is not str for name in occurrence_text_fields) for item in occurrence_rows)
+            or row.get("state") != "COMPLETE"):
         raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     try:
         objects = json.loads(row["object_manifest_json"])

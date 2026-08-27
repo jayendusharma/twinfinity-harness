@@ -221,7 +221,14 @@ def _scan_connection(kind: str, page_reader: PageReader) -> list[dict[str, Any]]
     total_count: int | None = None
     objects: list[dict[str, Any]] = []
     while True:
-        connection = page_reader(kind, cursor)
+        try:
+            connection = page_reader(kind, cursor)
+        except InventoryError:
+            raise
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise InventoryError("GITHUB_INVENTORY_PAGE_INVALID") from exc
+        if type(connection) is not dict:
+            raise InventoryError("GITHUB_INVENTORY_PAGE_INVALID")
         count = connection.get("totalCount")
         nodes = connection.get("nodes")
         page_info = connection.get("pageInfo")

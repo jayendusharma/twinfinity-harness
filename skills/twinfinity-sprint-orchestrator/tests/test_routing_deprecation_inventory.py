@@ -52,6 +52,7 @@ from routing_deprecation_inventory import (  # noqa: E402
     scan_repository,
     stable_scan_repository,
 )
+from routing_inventory_contract import validate_inventory_record  # noqa: E402
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
@@ -94,6 +95,10 @@ class StaticReader:
 
 
 class RoutingInventoryScanTests(unittest.TestCase):
+    def test_none_page_reader_return_is_typed_invalid_page(self) -> None:
+        with self.assertRaisesRegex(InventoryError, "GITHUB_INVENTORY_PAGE_INVALID"):
+            scan_repository(REPOSITORY, {}, lambda kind, cursor: None)
+
     def test_github_read_boundaries_convert_timeouts_to_typed_errors(self) -> None:
         timeout = __import__("subprocess").TimeoutExpired("gh", 30)
         with patch("routing_deprecation_inventory.subprocess.run", side_effect=timeout):
@@ -419,8 +424,8 @@ class RoutingInventoryStoreTests(unittest.TestCase):
 
     def complete_outbox(self, outbox_id: int) -> None:
         self.store.reserve_outbox(outbox_id, "2026-08-24T09:00:03Z")
-        self.store.complete_outbox(outbox_id, "comment:555", "2026-08-24T09:00:04Z")
         row = self.store.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE outbox_id=?", (outbox_id,)).fetchone()
+        self.store.complete_outbox(outbox_id, f"comment:{554 + int(row['generation'])}", "2026-08-24T09:00:04Z")
         current = self.store.connection.execute("SELECT 1 FROM routing_deprecation_current").fetchone()
         if row is not None and int(row["generation"]) == 1 and current is None:
             inventory = self.candidate()[0]
@@ -450,9 +455,24 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             legacy_alias_path=alias_path,
             routing_page_reader=reader or self.reader,
             routing_comment_reader=comment or (
-                lambda repository, issue, comment_id: self.comment(inventory)
+                lambda repository, issue, comment_id: self.history_comment(comment_id, inventory)
             ),
         )
+
+    def history_comment(self, comment_id: int, fallback: dict) -> dict:
+        row = self.store.connection.execute(
+            "SELECT inventory.* FROM routing_deprecation_inventories inventory JOIN github_outbox outbox ON outbox.id=inventory.outbox_id WHERE outbox.remote_receipt=?",
+            (f"comment:{comment_id}",),
+        ).fetchone()
+        if row is None:
+            return self.comment(fallback)
+        occurrences = self.store.connection.execute(
+            "SELECT * FROM routing_deprecation_occurrences WHERE inventory_sha256=? ORDER BY ordinal",
+            (row["inventory_sha256"],),
+        ).fetchall()
+        historic, _ = validate_inventory_record(row, occurrences)
+        return {"id": comment_id, "body": published_receipt_body(historic),
+                "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/179"}
 
     def prepare_second_complete(self):
         _, first_outbox = self.prepare()
@@ -761,6 +781,78 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         second = self.promoted_second_generation()
         self.assertEqual("PASS", self.readiness(second)["phase"])
 
+    def test_archive_remotely_validates_every_historic_receipt(self) -> None:
+        second = self.promoted_second_generation()
+        calls: list[int] = []
+        def edited_history(repository, issue, comment_id):
+            calls.append(comment_id)
+            value = self.history_comment(comment_id, second)
+            if comment_id == 555:
+                value["body"] += " edited"
+            return value
+        result = self.readiness(second, comment=edited_history)
+        self.assertEqual("HOLD", result["phase"])
+        self.assertEqual([555, 556], calls)
+        self.assertTrue(any(item.get("error") == "ROUTING_DEPRECATION_RECEIPT_MISMATCH"
+                            for item in result["gates"]["routing_deprecation_inventory"]))
+
+    def test_archive_cross_repository_history_holds_before_remote_reads(self) -> None:
+        second = self.promoted_second_generation()
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_update")
+        self.store.connection.execute("UPDATE routing_deprecation_inventories SET repository='other/repo' WHERE generation=1")
+        self.store.connection.commit()
+        reads: list[int] = []
+        result = self.readiness(second, comment=lambda repository, issue, comment_id: reads.append(comment_id))
+        self.assertEqual("HOLD", result["phase"])
+        self.assertEqual([], reads)
+
+    def test_archive_blob_and_invalid_utf8_json_hold_without_exception(self) -> None:
+        for value in ("X'5b5d'", "X'80'"):
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                inventory, outbox = case.prepare(); case.complete_outbox(outbox)
+                case.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_update")
+                case.store.connection.execute(f"UPDATE routing_deprecation_inventories SET object_manifest_json={value}")
+                case.store.connection.commit()
+                self.assertEqual("HOLD", case.readiness(inventory)["phase"])
+            finally: case.tearDown()
+
+    def test_preexisting_incomplete_v2_schema_holds_before_any_schema_mutation(self) -> None:
+        path = self.store.path
+        self.store.close()
+        raw = sqlite3.connect(path)
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute("DROP TABLE routing_deprecation_current")
+        raw.commit()
+        before = list(raw.iterdump())
+        raw.close()
+        with self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+            CoordinationStore(path)
+        raw = sqlite3.connect(path)
+        self.assertEqual(before, list(raw.iterdump()))
+        self.assertIsNone(raw.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='routing_deprecation_current'").fetchone())
+        raw.close()
+        self.store = CoordinationStore(Path(self.temp.name) / "replacement.sqlite3")
+
+    def test_preexisting_v2_trigger_index_and_fk_drift_hold_zero_write(self) -> None:
+        mutations = {
+            "trigger": ("DROP TRIGGER routing_deprecation_current_no_delete", "CREATE TRIGGER routing_deprecation_current_no_delete BEFORE DELETE ON routing_deprecation_current BEGIN SELECT RAISE(ABORT,'CHANGED'); END"),
+            "index": ("CREATE INDEX routing_deprecation_unreviewed ON routing_deprecation_inventories(created_at)",),
+            "foreign_key": ("PRAGMA foreign_keys=OFF", "INSERT INTO routing_deprecation_current VALUES ('other/repo',1,'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',1,'now')"),
+        }
+        for name, statements in mutations.items():
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "state.sqlite3"
+                store = CoordinationStore(path); store.close()
+                raw = sqlite3.connect(path)
+                for statement in statements: raw.execute(statement)
+                raw.commit(); before = list(raw.iterdump()); raw.close()
+                with self.subTest(name=name), self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+                    CoordinationStore(path)
+                raw = sqlite3.connect(path)
+                self.assertEqual(before, list(raw.iterdump()))
+                raw.close()
+
     def test_archive_main_derives_reader_from_exact_current_for_one_or_many_generations(self) -> None:
         for generations in (1, 2):
             case = RoutingInventoryStoreTests(); case.setUp()
@@ -954,7 +1046,8 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         self.store.connection.execute("DELETE FROM routing_deprecation_promotions")
         self.store.connection.execute("DROP TRIGGER routing_deprecation_current_no_delete")
         self.store.connection.execute("DELETE FROM routing_deprecation_current")
-        self.store._create_schema()
+        self.store.connection.execute("CREATE TRIGGER routing_deprecation_current_no_delete BEFORE DELETE ON routing_deprecation_current BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_CURRENT_IMMUTABLE'); END")
+        self.store.connection.execute("CREATE TRIGGER routing_deprecation_promotion_immutable_delete BEFORE DELETE ON routing_deprecation_promotions BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_PROMOTION_IMMUTABLE'); END")
         for row in trigger_rows:
             self.store.connection.execute(f"DROP TRIGGER {row['name']}")
         self.store.connection.execute("DROP TABLE routing_deprecation_occurrences")
