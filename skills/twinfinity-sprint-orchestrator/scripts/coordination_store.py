@@ -1461,11 +1461,45 @@ class CoordinationStore:
         inventory_columns = {row[1] for row in self.connection.execute(
             "PRAGMA table_info(routing_deprecation_inventories)"
         )}
+        expected_outbox_triggers = {
+            "coordination_terminal_outbox_complete_immutable": "create trigger coordination_terminal_outbox_complete_immutable before update on github_outbox when old.state='COMPLETE' and exists(select 1 from coordination_terminal_closeout_packets where outbox_id=old.id)begin select raise(abort,'TERMINAL_OUTBOX_COMPLETE_IMMUTABLE');end",
+            "coordination_terminal_outbox_envelope_immutable": "create trigger coordination_terminal_outbox_envelope_immutable before update of idempotency_key,repository,object_kind,object_number,operation,expected_source_sha256,payload_sha256,payload_json,created_at on github_outbox when exists(select 1 from coordination_terminal_closeout_packets where outbox_id=old.id)begin select raise(abort,'TERMINAL_OUTBOX_ENVELOPE_IMMUTABLE');end",
+            "routing_deprecation_outbox_envelope_immutable": "create trigger routing_deprecation_outbox_envelope_immutable before update of idempotency_key,repository,object_kind,object_number,operation,expected_source_sha256,payload_sha256,payload_json,created_at on github_outbox when exists(select 1 from routing_deprecation_inventories where outbox_id=old.id)begin select raise(abort,'ROUTING_DEPRECATION_OUTBOX_IMMUTABLE');end",
+        }
+        actual_outbox_triggers = {row[0]: _normalized_schema_sql(row[1]) for row in self.connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='github_outbox'"
+        )}
         if ("routing_deprecation_inventories" not in routing_names
                 and (routing_names or routing_trigger_names)):
             raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
+        if (routing_names or routing_trigger_names) and actual_outbox_triggers != expected_outbox_triggers:
+            raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
         if "routing_deprecation_inventories" in routing_names and "generation" not in inventory_columns:
             expected_legacy_tables = {"routing_deprecation_inventories", "routing_deprecation_occurrences"}
+            expected_legacy_table_sql = {
+                "routing_deprecation_inventories": _normalized_schema_sql("""CREATE TABLE routing_deprecation_inventories (
+                  inventory_sha256 TEXT PRIMARY KEY, repository TEXT NOT NULL UNIQUE,
+                  kind TEXT NOT NULL CHECK(kind='TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1'), alias_source_sha256 TEXT NOT NULL,
+                  endpoint_state_sha256 TEXT NOT NULL, issue_179_source_sha256 TEXT NOT NULL, object_manifest_sha256 TEXT NOT NULL,
+                  occurrence_manifest_sha256 TEXT NOT NULL, object_manifest_json TEXT NOT NULL,
+                  object_count INTEGER NOT NULL CHECK(object_count >= 0), issue_count INTEGER NOT NULL CHECK(issue_count >= 0),
+                  pull_request_count INTEGER NOT NULL CHECK(pull_request_count >= 0), occurrence_count INTEGER NOT NULL CHECK(occurrence_count >= 0),
+                  classification_counts_json TEXT NOT NULL, semantic_tag_counts_json TEXT NOT NULL, outbox_id INTEGER NOT NULL UNIQUE,
+                  state TEXT NOT NULL CHECK(state='COMPLETE'), created_at TEXT NOT NULL, FOREIGN KEY(outbox_id) REFERENCES github_outbox(id))"""),
+                "routing_deprecation_occurrences": _normalized_schema_sql("""CREATE TABLE routing_deprecation_occurrences (
+                  inventory_sha256 TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                  object_kind TEXT NOT NULL CHECK(object_kind IN ('issue', 'pull_request')), object_number INTEGER NOT NULL CHECK(object_number > 0),
+                  node_id TEXT NOT NULL, object_updated_at TEXT NOT NULL, body_sha256 TEXT NOT NULL, alias TEXT NOT NULL,
+                  byte_start INTEGER NOT NULL CHECK(byte_start >= 0), byte_end INTEGER NOT NULL CHECK(byte_end > byte_start),
+                  line_number INTEGER NOT NULL CHECK(line_number > 0), byte_column INTEGER NOT NULL CHECK(byte_column > 0),
+                  classification TEXT NOT NULL CHECK(classification IN ('EXECUTABLE_ROUTE','ROUTING_REFERENCE','HISTORICAL_PROVENANCE','AMBIGUOUS_REFERENCE')),
+                  semantic_tags_json TEXT NOT NULL, PRIMARY KEY(inventory_sha256, ordinal),
+                  UNIQUE(inventory_sha256, object_kind, object_number, byte_start, alias),
+                  FOREIGN KEY(inventory_sha256) REFERENCES routing_deprecation_inventories(inventory_sha256))"""),
+            }
+            actual_legacy_tables = {row[0]: _normalized_schema_sql(row[1]) for row in self.connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('routing_deprecation_inventories','routing_deprecation_occurrences')"
+            )}
             expected_legacy_triggers = {
                 "routing_deprecation_inventory_immutable_update", "routing_deprecation_inventory_immutable_delete",
                 "routing_deprecation_occurrence_immutable_update", "routing_deprecation_occurrence_immutable_delete",
@@ -1491,7 +1525,8 @@ class CoordinationStore:
             legacy_occurrence_indexes = {(1,"pk",0,("inventory_sha256","ordinal")),(1,"u",0,("inventory_sha256","object_kind","object_number","byte_start","alias"))}
             legacy_inventory_fks = {tuple(row[2:8]) for row in self.connection.execute("PRAGMA foreign_key_list(routing_deprecation_inventories)")}
             legacy_occurrence_fks = {tuple(row[2:8]) for row in self.connection.execute("PRAGMA foreign_key_list(routing_deprecation_occurrences)")}
-            if (routing_names != expected_legacy_tables or routing_trigger_names != expected_legacy_triggers
+            if (routing_names != expected_legacy_tables or actual_legacy_tables != expected_legacy_table_sql
+                    or routing_trigger_names != expected_legacy_triggers
                     or actual_legacy_trigger_sql != expected_legacy_trigger_sql
                     or legacy_inventory_columns != ("inventory_sha256","repository","kind","alias_source_sha256","endpoint_state_sha256","issue_179_source_sha256","object_manifest_sha256","occurrence_manifest_sha256","object_manifest_json","object_count","issue_count","pull_request_count","occurrence_count","classification_counts_json","semantic_tag_counts_json","outbox_id","state","created_at")
                     or legacy_occurrence_columns != ("inventory_sha256","ordinal","object_kind","object_number","node_id","object_updated_at","body_sha256","alias","byte_start","byte_end","line_number","byte_column","classification","semantic_tags_json")

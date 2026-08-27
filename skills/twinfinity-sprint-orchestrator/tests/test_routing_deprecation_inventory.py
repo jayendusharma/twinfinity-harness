@@ -921,6 +921,104 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                     CoordinationStore(path)
                 raw = sqlite3.connect(path); self.assertEqual(before, list(raw.iterdump())); raw.close()
 
+    def test_v2_outbox_attached_trigger_inventory_is_exact_and_zero_write(self) -> None:
+        expected = {
+            "coordination_terminal_outbox_complete_immutable",
+            "coordination_terminal_outbox_envelope_immutable",
+            "routing_deprecation_outbox_envelope_immutable",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "valid.sqlite3"
+            store = CoordinationStore(path)
+            actual = {row[0] for row in store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='github_outbox'"
+            )}
+            self.assertEqual(expected, actual)
+            store.close()
+            CoordinationStore(path).close()
+
+        for name, statements in {
+            "extra": ("CREATE TRIGGER arbitrary_outbox BEFORE UPDATE ON github_outbox BEGIN SELECT RAISE(ABORT,'EXTRA'); END",),
+            "missing_nonrouting": ("DROP TRIGGER coordination_terminal_outbox_complete_immutable",),
+            "altered_nonrouting": (
+                "DROP TRIGGER coordination_terminal_outbox_envelope_immutable",
+                "CREATE TRIGGER coordination_terminal_outbox_envelope_immutable BEFORE UPDATE ON github_outbox BEGIN SELECT RAISE(ABORT,'CHANGED'); END",
+            ),
+        }.items():
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "state.sqlite3"
+                store = CoordinationStore(path); store.close()
+                raw = sqlite3.connect(path)
+                for statement in statements:
+                    raw.execute(statement)
+                raw.commit(); before = list(raw.iterdump()); raw.close()
+                with self.subTest(name=name), self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+                    CoordinationStore(path)
+                raw = sqlite3.connect(path); self.assertEqual(before, list(raw.iterdump())); raw.close()
+
+    def test_exact_legacy_v1_reopen_and_migration_preserve_full_outbox_trigger_set(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_current_no_delete")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_current_monotonic")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_promotion_immutable_update")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_promotion_immutable_delete")
+        self.store.connection.execute("DROP TABLE routing_deprecation_current")
+        self.store.connection.execute("DROP TABLE routing_deprecation_promotions")
+        self.store.connection.commit()
+        path = self.store.path; self.store.close()
+        reopened = CoordinationStore(path)
+        actual = {row[0] for row in reopened.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='github_outbox'"
+        )}
+        self.assertEqual({
+            "coordination_terminal_outbox_complete_immutable",
+            "coordination_terminal_outbox_envelope_immutable",
+            "routing_deprecation_outbox_envelope_immutable",
+        }, actual)
+        result = reopened.migrate_legacy_routing_deprecation_inventory(
+            expected_repository=REPOSITORY,
+            expected_inventory_sha256=inventory["inventory_sha256"],
+            expected_occurrence_count=inventory["occurrence_count"],
+            now="2026-08-24T11:10:00Z",
+        )
+        self.assertFalse(result["replay"])
+        reopened.close()
+        CoordinationStore(path).close()
+        self.store = CoordinationStore(Path(self.temp.name) / "replacement.sqlite3")
+
+    def test_legacy_v1_table_sql_drift_holds_before_any_database_write(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        for trigger in (
+            "routing_deprecation_current_no_delete", "routing_deprecation_current_monotonic",
+            "routing_deprecation_promotion_immutable_update", "routing_deprecation_promotion_immutable_delete",
+        ):
+            self.store.connection.execute(f"DROP TRIGGER {trigger}")
+        self.store.connection.execute("DROP TABLE routing_deprecation_current")
+        self.store.connection.execute("DROP TABLE routing_deprecation_promotions")
+        self.store.connection.commit()
+        path = self.store.path; self.store.close()
+        baseline = sqlite3.connect(path)
+        original = baseline.execute("SELECT sql FROM sqlite_master WHERE name='routing_deprecation_inventories'").fetchone()[0]
+        baseline.close()
+        for name, replacement in {
+            "check": original.replace("state='COMPLETE'", "state IN ('COMPLETE','PREPARED')"),
+            "default": original.replace("created_at TEXT NOT NULL", "created_at TEXT NOT NULL DEFAULT 'changed'"),
+            "constraint": original.replace("object_count >= 0", "object_count >= -1"),
+        }.items():
+            with tempfile.TemporaryDirectory() as temporary:
+                drifted = Path(temporary) / "state.sqlite3"
+                drifted.write_bytes(path.read_bytes())
+                drifted.chmod(0o600)
+                raw = sqlite3.connect(drifted); raw.execute("PRAGMA writable_schema=ON")
+                raw.execute("UPDATE sqlite_master SET sql=? WHERE type='table' AND name='routing_deprecation_inventories'", (replacement,))
+                raw.execute("PRAGMA writable_schema=OFF"); raw.commit(); before = list(raw.iterdump()); raw.close()
+                with self.subTest(name=name), self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+                    CoordinationStore(drifted)
+                raw = sqlite3.connect(drifted); self.assertEqual(before, list(raw.iterdump())); raw.close()
+        self.store = CoordinationStore(Path(self.temp.name) / "replacement.sqlite3")
+
     def test_archive_main_derives_reader_from_exact_current_for_one_or_many_generations(self) -> None:
         for generations in (1, 2):
             case = RoutingInventoryStoreTests(); case.setUp()
