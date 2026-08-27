@@ -20,7 +20,12 @@ from archive_readiness_audit import archive_readiness  # noqa: E402
 from coordination_store import (  # noqa: E402
     CoordinationError,
     CoordinationStore,
+    ROUTING_INVENTORIES_TABLE_SQL,
+    ROUTING_OCCURRENCES_TABLE_SQL,
+    _normalized_schema_sql,
+    canonical_json,
     descriptor_file_sha256,
+    digest_json,
 )
 from executor_registry import (  # noqa: E402
     ensure_executor_registry_schema,
@@ -508,6 +513,35 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             finally:
                 case.tearDown()
 
+    def test_older_promotion_replay_revalidates_entire_current_chain(self) -> None:
+        cases = {
+            "current_generation": ("DROP TRIGGER routing_deprecation_current_monotonic", "UPDATE routing_deprecation_current SET generation=3"),
+            "current_inventory": ("DROP TRIGGER routing_deprecation_current_monotonic", "UPDATE routing_deprecation_current SET inventory_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"),
+            "gen2_prior": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET prior_generation=99 WHERE generation=2"),
+            "gen2_inventory": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET inventory_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE generation=2"),
+        }
+        for name, (setup_sql, mutation_sql) in cases.items():
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                case.promoted_second_generation()
+                first = case.store.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone()
+                outbox = case.store.connection.execute("SELECT * FROM github_outbox WHERE id=?", (first["outbox_id"],)).fetchone()
+                payload_body = json.loads(outbox["payload_json"])["body"]
+                marker = __import__("hashlib").sha256(outbox["idempotency_key"].encode()).hexdigest()
+                readback = f"{payload_body}\n\n<!-- twinfinity-outbox:{marker} -->"
+                case.store.connection.commit(); case.store.connection.execute("PRAGMA foreign_keys=OFF")
+                case.store.connection.execute(setup_sql); case.store.connection.execute(mutation_sql); case.store.connection.commit()
+                before = ([tuple(row) for row in case.store.connection.execute("SELECT * FROM routing_deprecation_current")], [tuple(row) for row in case.store.connection.execute("SELECT * FROM routing_deprecation_promotions ORDER BY generation")])
+                with self.subTest(name=name), self.assertRaisesRegex(CoordinationError, "PROMOTION_CHAIN_INVALID|PROMOTION_CONFLICT"):
+                    case.store.promote_routing_deprecation_inventory(repository=REPOSITORY, generation=1,
+                        inventory_sha256=first["inventory_sha256"], expected_prior_generation=None,
+                        expected_preview_sha256=first["preview_sha256"], remote_receipt_body=readback,
+                        now="2026-08-24T10:10:00Z")
+                after = ([tuple(row) for row in case.store.connection.execute("SELECT * FROM routing_deprecation_current")], [tuple(row) for row in case.store.connection.execute("SELECT * FROM routing_deprecation_promotions ORDER BY generation")])
+                self.assertEqual(before, after)
+            finally:
+                case.tearDown()
+
     def test_archive_validates_intact_multigeneration_history(self) -> None:
         second = self.promoted_second_generation()
         self.assertEqual("PASS", self.readiness(second)["phase"])
@@ -537,6 +571,51 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                     self.assertEqual("HOLD", case.readiness(second)["phase"])
             finally:
                 case.tearDown()
+
+    def test_archive_holds_each_historic_inventory_root_corruption(self) -> None:
+        cases = {
+            "kind": ("inventory", "kind='CHANGED'"), "state": ("inventory", "state='PREPARED'"),
+            "issue_count": ("inventory", "issue_count=99"), "pull_request_count": ("inventory", "pull_request_count=99"),
+            "classification_counts": ("inventory", "classification_counts_json='{}'"),
+            "semantic_tag_counts": ("inventory", "semantic_tag_counts_json='{}'"),
+            "occurrence_updated": ("occurrence", "object_updated_at='2099-01-01T00:00:00Z'"),
+        }
+        for name, (surface, assignment) in cases.items():
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                second = case.promoted_second_generation()
+                case.store.connection.execute("PRAGMA ignore_check_constraints=ON")
+                if surface == "inventory":
+                    case.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_update")
+                    case.store.connection.execute(f"UPDATE routing_deprecation_inventories SET {assignment} WHERE generation=1")
+                else:
+                    case.store.connection.execute("DROP TRIGGER routing_deprecation_occurrence_immutable_update")
+                    case.store.connection.execute(f"UPDATE routing_deprecation_occurrences SET {assignment} WHERE inventory_sha256=(SELECT inventory_sha256 FROM routing_deprecation_inventories WHERE generation=1)")
+                case.store.connection.commit()
+                with self.subTest(name=name): self.assertEqual("HOLD", case.readiness(second)["phase"])
+            finally:
+                case.tearDown()
+
+    def test_archive_holds_coordinated_manifest_preview_outbox_tamper_with_unchanged_root(self) -> None:
+        second = self.promoted_second_generation()
+        row = self.store.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone()
+        objects = json.loads(row["object_manifest_json"]); objects[0]["node_id"] = "tampered-node"
+        object_digest = digest_json(objects)
+        preview = {"repository": row["repository"], "generation": 1, "predecessor_inventory_sha256": None,
+            "inventory_sha256": row["inventory_sha256"], "alias_source_sha256": row["alias_source_sha256"],
+            "endpoint_state_sha256": row["endpoint_state_sha256"], "issue_179_source_sha256": row["issue_179_source_sha256"],
+            "object_manifest_sha256": object_digest, "occurrence_manifest_sha256": row["occurrence_manifest_sha256"]}
+        preview_digest = digest_json(preview)
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_update")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_promotion_immutable_update")
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_outbox_envelope_immutable")
+        self.store.connection.execute("UPDATE routing_deprecation_inventories SET object_manifest_json=?,object_manifest_sha256=?,preview_sha256=? WHERE generation=1", (canonical_json(objects), object_digest, preview_digest))
+        self.store.connection.execute("UPDATE routing_deprecation_promotions SET preview_sha256=? WHERE generation=1", (preview_digest,))
+        changed = self.store.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone()
+        body = self.store._routing_deprecation_receipt_body(changed); payload = {"body": body}
+        self.store.connection.execute("UPDATE github_outbox SET payload_json=?,payload_sha256=? WHERE id=?", (canonical_json(payload), digest_json(payload), row["outbox_id"]))
+        self.store.connection.commit()
+        self.assertEqual("HOLD", self.readiness(second)["phase"])
 
     def test_successor_prepare_is_non_authorizing_then_exact_promotion_is_idempotent(self) -> None:
         first, first_outbox = self.prepare()
@@ -660,6 +739,35 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             self.assertEqual(value, migrated[key])
         replay = self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:00:01Z")
         self.assertTrue(replay["replay"])
+
+    def test_migrated_v2_schema_matches_fresh_canonical_sql_and_enforces_checks(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:01:00Z")
+        actual = {row[0]: _normalized_schema_sql(row[1]) for row in self.store.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('routing_deprecation_inventories','routing_deprecation_occurrences')")}
+        self.assertEqual({"routing_deprecation_inventories": _normalized_schema_sql(ROUTING_INVENTORIES_TABLE_SQL), "routing_deprecation_occurrences": _normalized_schema_sql(ROUTING_OCCURRENCES_TABLE_SQL)}, actual)
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_occurrence_append_fenced")
+        original = dict(self.store.connection.execute("SELECT * FROM routing_deprecation_occurrences LIMIT 1").fetchone())
+        cases = {"byte_start": (-1, original["byte_end"]), "byte_end": (original["byte_start"], original["byte_start"]), "line_number": (original["byte_start"] + 100, original["byte_end"] + 100), "byte_column": (original["byte_start"] + 200, original["byte_end"] + 200), "classification": (original["byte_start"] + 300, original["byte_end"] + 300)}
+        for offset, (name, (start, end)) in enumerate(cases.items(), 10):
+            row = dict(original); row["ordinal"] = offset; row["byte_start"] = start; row["byte_end"] = end
+            row["line_number"] = 0 if name == "line_number" else row["line_number"]
+            row["byte_column"] = 0 if name == "byte_column" else row["byte_column"]
+            row["classification"] = "INVALID" if name == "classification" else row["classification"]
+            columns = list(row)
+            with self.subTest(name=name), self.assertRaises(sqlite3.IntegrityError):
+                self.store.connection.execute(f"INSERT INTO routing_deprecation_occurrences({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", [row[key] for key in columns])
+
+    def test_v2_replay_rejects_degraded_check_schema_without_writes(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.store.connection.execute("PRAGMA writable_schema=ON")
+        sql = self.store.connection.execute("SELECT sql FROM sqlite_master WHERE name='routing_deprecation_occurrences'").fetchone()[0]
+        self.store.connection.execute("UPDATE sqlite_master SET sql=? WHERE name='routing_deprecation_occurrences'", (sql.replace(" CHECK(byte_start >= 0)", ""),))
+        self.store.connection.execute("PRAGMA writable_schema=OFF"); self.store.connection.commit()
+        before = self.legacy_database_fingerprint()
+        with self.assertRaisesRegex(CoordinationError, "MIGRATION_CONFLICT"):
+            self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:02:00Z")
+        self.assertEqual(before, self.legacy_database_fingerprint())
 
     def legacy_database_fingerprint(self):
         schema = [tuple(row) for row in self.store.connection.execute(

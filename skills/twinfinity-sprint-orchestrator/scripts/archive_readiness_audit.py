@@ -448,6 +448,35 @@ def _routing_inventory_local_gate(
             "semantic_tag_counts": json.loads(historic["semantic_tag_counts_json"]),
             "inventory_sha256": historic["inventory_sha256"],
         }
+        object_schema_valid = isinstance(historic_objects, list) and all(
+            isinstance(item, dict) and set(item) == {"object_kind","object_number","node_id","body_sha256"}
+            and item["object_kind"] in {"issue","pull_request"} and isinstance(item["object_number"], int)
+            and item["object_number"] > 0 and isinstance(item["node_id"], str) and bool(item["node_id"])
+            and re.fullmatch(r"[0-9a-f]{64}", str(item["body_sha256"])) is not None
+            for item in historic_objects
+        )
+        expected_classification_counts = {name: sum(item["classification"] == name for item in historic_occurrences) for name in ("EXECUTABLE_ROUTE","ROUTING_REFERENCE","HISTORICAL_PROVENANCE","AMBIGUOUS_REFERENCE")}
+        expected_tag_counts = {name: sum(name in item["semantic_tags"] for item in historic_occurrences) for name in ("ACCEPTANCE","APPROVAL","DEPENDENCY","HOLD","SCOPE")}
+        occurrence_content_valid = all(
+            item["ordinal"] == ordinal and item["object_kind"] in {"issue","pull_request"}
+            and isinstance(item["object_number"], int) and item["object_number"] > 0
+            and isinstance(item["node_id"], str) and bool(item["node_id"])
+            and re.fullmatch(r"[0-9a-f]{64}", str(item["body_sha256"])) is not None
+            and item["classification"] in {"EXECUTABLE_ROUTE","ROUTING_REFERENCE","HISTORICAL_PROVENANCE","AMBIGUOUS_REFERENCE"}
+            and isinstance(item["semantic_tags"], list) and item["semantic_tags"] == sorted(set(item["semantic_tags"]))
+            and historic_occurrence_rows[ordinal]["object_updated_at"] == historic["created_at"]
+            for ordinal, item in enumerate(historic_occurrences)
+        )
+        if (historic["kind"] != "TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1" or historic["state"] != "COMPLETE"
+                or not object_schema_valid or not occurrence_content_valid
+                or len(historic_objects) != int(historic["object_count"])
+                or sum(item["object_kind"] == "issue" for item in historic_objects) != int(historic["issue_count"])
+                or sum(item["object_kind"] == "pull_request" for item in historic_objects) != int(historic["pull_request_count"])
+                or len(historic_occurrences) != int(historic["occurrence_count"])
+                or historic_inventory["classification_counts"] != expected_classification_counts
+                or historic_inventory["semantic_tag_counts"] != expected_tag_counts
+                or digest_json({key: value for key, value in historic_inventory.items() if key != "inventory_sha256"}) != historic["inventory_sha256"]):
+            return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
         preview = {
             "repository": historic["repository"], "generation": int(historic["generation"]),
             "predecessor_inventory_sha256": historic["predecessor_inventory_sha256"],
