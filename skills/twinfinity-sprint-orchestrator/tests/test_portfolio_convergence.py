@@ -379,6 +379,61 @@ class PortfolioConvergenceTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_absolute_deadline_stops_only_between_fifo_events(self) -> None:
+        self._release()
+        with self.store.transaction():
+            self.store._enqueue_portfolio_dirty_event(
+                repository=REPOSITORY,
+                issue_number=2,
+                release_item_version=99,
+                release_source_sha256=self.sources[2],
+                prior_allocation_class="ACTIVE",
+                status="DONE",
+                generation=1,
+                now="2026-08-24T10:00:04Z",
+            )
+        before = [
+            dict(row)
+            for row in self.store.connection.execute(
+                "SELECT * FROM portfolio_dirty_events ORDER BY id"
+            )
+        ]
+        changes_before = self.store.connection.total_changes
+
+        none = self._convergence().consume_due(
+            limit=2,
+            now="2026-08-24T10:00:05Z",
+            deadline=5.0,
+            monotonic=lambda: 5.0,
+        )
+
+        self.assertEqual([], none)
+        self.assertEqual(changes_before, self.store.connection.total_changes)
+        self.assertEqual(
+            before,
+            [
+                dict(row)
+                for row in self.store.connection.execute(
+                    "SELECT * FROM portfolio_dirty_events ORDER BY id"
+                )
+            ],
+        )
+        ticks = iter((4.0, 5.0))
+        one = self._convergence().consume_due(
+            limit=2,
+            now="2026-08-24T10:00:05Z",
+            deadline=5.0,
+            monotonic=lambda: next(ticks),
+        )
+        untouched_next = dict(
+            self.store.connection.execute(
+                "SELECT * FROM portfolio_dirty_events ORDER BY id LIMIT 1 OFFSET 1"
+            ).fetchone()
+        )
+
+        self.assertEqual(1, len(one))
+        self.assertEqual(before[1], untouched_next)
+
     def test_retained_to_none_release_enqueues_one_dirty_event(self) -> None:
         source = self._snapshot(3)
         retained = self.store.set_issue_status(

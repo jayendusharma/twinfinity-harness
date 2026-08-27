@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import time
 from typing import Any, Callable
 
 from coordination_store import (
@@ -768,12 +769,16 @@ class PortfolioConvergence:
         limit: int = 1,
         now: str | None = None,
         repository: str | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > MAX_CONVERGENCE_LIMIT:
             raise PortfolioConvergenceError("CONVERGENCE_LIMIT_INVALID")
         results: list[dict[str, Any]] = []
         observed_at = now or utc_now()
         for _ in range(limit):
+            if deadline is not None and monotonic() >= deadline:
+                break
             result = self.consume_one(observed_at, repository=repository)
             if result["state"] == "IDLE":
                 break

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+import fcntl
+import io
 from pathlib import Path
 import json
+import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +27,7 @@ from coordination_store import (  # noqa: E402
     terminal_publication_body,
 )
 import coordination_store as coordination_store_module  # noqa: E402
+import coordination_supervisor as coordination_supervisor_module  # noqa: E402
 from coordination_supervisor import (  # noqa: E402
     CoordinationSupervisor,
     SchedulerLaunchPolicy,
@@ -302,6 +309,79 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 "evidence": {},
             },
             now="2026-08-22T10:00:02Z",
+        )
+
+    def test_default_liveness_query_reuses_store_and_aborts_before_reservation(self) -> None:
+        message_id = self.notice(idempotency_key="liveness-query", issue_number=37)
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: 1,
+            terminal_watch_launcher=lambda _session, _watch: 1,
+        )
+        with patch(
+            "coordination_supervisor.active_attempt_for_target", return_value=None
+        ) as active_attempt:
+            self.assertFalse(
+                supervisor.process_checker(DEVELOPMENT_SESSION, "message", str(message_id))
+            )
+            self.assertFalse(
+                supervisor.process_checker(DEVELOPMENT_SESSION, "message", str(message_id))
+            )
+        self.assertEqual(2, active_attempt.call_count)
+        self.assertTrue(
+            all(
+                call.args[0] is self.store.connection
+                for call in active_attempt.call_args_list
+            )
+        )
+
+        with patch(
+            "coordination_supervisor.active_attempt_for_target",
+            side_effect=sqlite3.OperationalError("synthetic liveness failure"),
+        ), self.assertRaises(sqlite3.OperationalError):
+            supervisor.run_once("2026-08-22T10:00:03Z")
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_wakes WHERE message_id=?",
+                (message_id,),
+            ).fetchone()[0],
+        )
+
+    def test_convergence_deadline_and_pass_telemetry_are_output_only(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class EmptyConvergence:
+            def consume_due(inner_self, **kwargs):
+                calls.append(kwargs)
+                return []
+
+        ticks = iter((10.0, 12.0, 13.0))
+        monotonic = lambda: next(ticks)
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: 1,
+            terminal_watch_launcher=lambda _session, _watch: 1,
+            process_checker=lambda *_: False,
+            convergence=EmptyConvergence(),
+            monotonic=monotonic,
+        )
+        changes_before = self.store.connection.total_changes
+
+        result = supervisor.run_once("2026-08-22T10:00:03Z")
+
+        self.assertEqual(changes_before, self.store.connection.total_changes)
+        self.assertEqual(17.0, calls[0]["deadline"])
+        self.assertIs(monotonic, calls[0]["monotonic"])
+        self.assertEqual(
+            {
+                "duration_seconds": 3.0,
+                "selected": 0,
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+            },
+            result["telemetry"],
         )
 
     def claimed_admission(self) -> tuple[object, int]:
@@ -1150,6 +1230,51 @@ class CoordinationSupervisorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(("ACTIVE", 1, 2001), tuple(watch))
 
+    def test_missing_watch_two_connection_race_inserts_once_without_overwrite(self) -> None:
+        _source, message_id, key, _attempt, _token = (
+            self.bound_development_admission(complete=True)
+        )
+        self.store.connection.execute("DELETE FROM coordination_terminal_watches")
+        barrier = threading.Barrier(2)
+
+        class RacingSupervisor(CoordinationSupervisor):
+            def _terminal_watch_backfill_plan(inner_self, item):
+                plan = super()._terminal_watch_backfill_plan(item)
+                if not inner_self.store.connection.in_transaction:
+                    barrier.wait(timeout=5)
+                return plan
+
+        def backfill():
+            store = CoordinationStore(self.store.path)
+            try:
+                return RacingSupervisor(
+                    store,
+                    launcher=lambda _session, _message: 1,
+                    terminal_watch_launcher=lambda _session, _watch: 1,
+                    process_checker=lambda *_: False,
+                )._ensure_terminal_watches("2026-08-22T10:06:10Z")
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _index: backfill(), range(2)))
+
+        self.assertEqual(1, sum(key in opened for opened, _held in results))
+        watch = self.store.connection.execute(
+            "SELECT state, admission_message_id FROM coordination_terminal_watches "
+            "WHERE watch_key=?",
+            (key,),
+        ).fetchone()
+        self.assertEqual(("ACTIVE", message_id), tuple(watch))
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events "
+                "WHERE event_type='TERMINAL_WATCH_BACKFILLED' AND entity_key=?",
+                (key,),
+            ).fetchone()[0],
+        )
+
     def test_missing_watch_without_exact_admission_is_held_and_never_wakes(self) -> None:
         source = self.snapshot()
         self.store._set_issue_status_for_test_fixture(
@@ -1762,6 +1887,29 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 command[command.index("--systemd-unit") + 1],
             )
             self.assertNotIn("resume", command)
+
+    def test_lock_contention_emits_one_bounded_skip_without_opening_store(self) -> None:
+        lock_path = Path(self.temp.name) / "coordination-supervisor.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        output = io.StringIO()
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(
+                coordination_supervisor_module, "LOCK", lock_path
+            ), patch.object(
+                coordination_supervisor_module, "CoordinationStore"
+            ) as store, redirect_stdout(output):
+                result = coordination_supervisor_module.main()
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            '{"phase":"SKIPPED","reason":"LOCK_CONTENDED"}\n',
+            output.getvalue(),
+        )
+        store.assert_not_called()
 
     def test_closed_canonical_command_requires_native_capability(self) -> None:
         prompt = "exact typed row"

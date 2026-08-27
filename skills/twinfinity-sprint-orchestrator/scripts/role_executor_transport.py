@@ -24,6 +24,7 @@ BROKER_SYSTEMD_MEMORY_MAX_BYTES = 2 * 1024 * 1024 * 1024
 BROKER_SYSTEMD_TASKS_MAX = 64
 BROKER_SYSTEMD_RUNTIME_MAX_SECONDS = 660
 BROKER_SYSTEMD_CPU_QUOTA_PERCENT = 100
+SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS = 5
 
 
 def broker_systemd_properties(endpoint_id: str) -> tuple[str, ...]:
@@ -116,11 +117,15 @@ def launch_role_executor(
             prompt=prompt,
         ),
     ]
-    completed = runner(
-        command,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        completed = runner(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 1
     return int(getattr(completed, "returncode", 1))

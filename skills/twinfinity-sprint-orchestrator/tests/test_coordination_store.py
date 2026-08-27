@@ -96,6 +96,41 @@ class CoordinationStoreTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_supervisor_query_shapes_use_the_four_partial_indexes(self) -> None:
+        plans = {
+            "coordination_messages_live_id": (
+                "SELECT * FROM coordination_messages "
+                "WHERE state IN ('PREPARED', 'CLAIMED') ORDER BY id",
+                (),
+            ),
+            "coordination_messages_development_admission_recipient_id": (
+                "SELECT * FROM coordination_messages WHERE recipient_session_id=? "
+                "AND topic IN ('development.admission', 'development.recovery_commit') "
+                "ORDER BY id",
+                (SESSION,),
+            ),
+            "coordination_messages_sre_admission_recipient_id": (
+                "SELECT * FROM coordination_messages WHERE recipient_session_id=? "
+                "AND topic='sre.admission' ORDER BY id",
+                (SRE_SESSION,),
+            ),
+            "coordination_terminal_watches_active_schedule": (
+                "SELECT * FROM coordination_terminal_watches WHERE state='ACTIVE' "
+                "ORDER BY attempts, next_wake_at, repository, issue_number, generation",
+                (),
+            ),
+        }
+
+        for index_name, (query, parameters) in plans.items():
+            with self.subTest(index_name=index_name):
+                details = " ".join(
+                    row["detail"]
+                    for row in self.store.connection.execute(
+                        f"EXPLAIN QUERY PLAN {query}", parameters
+                    )
+                )
+                self.assertIn(index_name, details)
+
     def snapshot(self, updated: str = "2026-08-22T10:00:00Z", title: str = "Issue"):
         payload = {"number": 92, "title": title, "updated_at": updated}
         self.remote_issue_payloads[(REPOSITORY, 92)] = copy.deepcopy(payload)

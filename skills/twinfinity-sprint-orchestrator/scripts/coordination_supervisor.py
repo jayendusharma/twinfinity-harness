@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -68,6 +69,7 @@ MAX_TERMINAL_WATCH_LAUNCH_ATTEMPTS_PER_RUN = 1
 MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS = 3
 MAX_DUE_MESSAGE_RETRY_LAUNCH_ATTEMPTS_PER_RUN = 1
 ATTEMPT_STALE_SECONDS = 15 * 60
+CONVERGENCE_PHASE_TIMEOUT_SECONDS = 5
 LOCK = DEFAULT_DATABASE.parent / "coordination-supervisor.lock"
 
 
@@ -121,23 +123,17 @@ def _retry_seconds(attempts: int) -> int:
 
 
 def canonical_session_running(
-    identity: str, target_kind: str, target_key: str
+    connection: sqlite3.Connection,
+    identity: str,
+    target_kind: str,
+    target_key: str,
 ) -> bool:
     """Use exact-target attempt state, never process-list resume inference."""
 
-    try:
-        store = CoordinationStore(DEFAULT_DATABASE)
-    except CoordinationError:
-        return False
-    try:
-        return (
-            active_attempt_for_target(
-                store.connection, identity, target_kind, target_key
-            )
-            is not None
-        )
-    finally:
-        store.close()
+    return (
+        active_attempt_for_target(connection, identity, target_kind, target_key)
+        is not None
+    )
 
 
 def _canonical_session_command(
@@ -217,10 +213,11 @@ class CoordinationSupervisor:
         *,
         launcher: Callable[[str, int], int] = launch_canonical_session,
         terminal_watch_launcher: Callable[[str, str], int] = launch_terminal_watch_session,
-        process_checker: Callable[[str, str, str], bool] = canonical_session_running,
+        process_checker: Callable[[str, str, str], bool] | None = None,
         convergence: PortfolioConvergence | None = None,
         convergence_limit: int = DEFAULT_CONVERGENCE_LIMIT,
         launch_policy: SchedulerLaunchPolicy = DEFAULT_LAUNCH_POLICY,
+        monotonic: Callable[[], float] = time.monotonic,
         stale_attempt_evidence_reader: Callable[[str], SystemdUnitEvidence]
         | None = None,
     ) -> None:
@@ -229,130 +226,187 @@ class CoordinationSupervisor:
         self.store = store
         self.launcher = launcher
         self.terminal_watch_launcher = terminal_watch_launcher
-        self.process_checker = process_checker
+        self.process_checker = (
+            process_checker
+            if process_checker is not None
+            else lambda identity, target_kind, target_key: canonical_session_running(
+                self.store.connection, identity, target_kind, target_key
+            )
+        )
         self.convergence = convergence or PortfolioConvergence(store)
         self.convergence_limit = convergence_limit
         if not isinstance(launch_policy, SchedulerLaunchPolicy):
             raise CoordinationError("SCHEDULER_LAUNCH_POLICY_INVALID")
         self.launch_policy = launch_policy
+        self.monotonic = monotonic
         self.stale_attempt_evidence_reader = stale_attempt_evidence_reader
+
+    def _terminal_watch_backfill_plan(self, item: object) -> dict[str, object]:
+        item_snapshot = dict(item)
+        session_id = item_snapshot["accountable_session_id"]
+        lease = item_snapshot["lease_manifest_sha256"]
+        role = coordination_identity_role(self.store.connection, session_id)
+        endpoint = (
+            current_endpoint(self.store.connection, role)
+            if role in {"development", "sre"}
+            else None
+        )
+        endpoint_id = None if endpoint is None else str(endpoint["endpoint_id"])
+        messages: list[object] = []
+        if endpoint_id is not None and lease:
+            if role == "development":
+                messages = self.store.connection.execute(
+                    """
+                    SELECT * FROM coordination_messages
+                    WHERE recipient_session_id=?
+                      AND topic IN (
+                        'development.admission', 'development.recovery_commit'
+                      )
+                    ORDER BY id
+                    """,
+                    (endpoint_id,),
+                ).fetchall()
+            elif role == "sre":
+                messages = self.store.connection.execute(
+                    """
+                    SELECT * FROM coordination_messages
+                    WHERE recipient_session_id=? AND topic='sre.admission'
+                    ORDER BY id
+                    """,
+                    (endpoint_id,),
+                ).fetchall()
+        candidates: list[dict[str, object]] = []
+        for message in messages:
+            try:
+                payload = json.loads(message["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            source = payload.get("source") if isinstance(payload, dict) else None
+            if (
+                isinstance(source, dict)
+                and source.get("repository") == item_snapshot["repository"]
+                and source.get("object_kind") == "issue"
+                and source.get("object_number") == int(item_snapshot["issue_number"])
+                and payload.get("issue_number") == int(item_snapshot["issue_number"])
+                and payload.get("generation") == int(item_snapshot["generation"])
+                and payload.get("lease_manifest_sha256") == lease
+                and source.get("payload_sha256")
+                == item_snapshot["source_payload_sha256"]
+                and digest_json(payload) == message["payload_sha256"]
+            ):
+                candidates.append(dict(message))
+        bound_message = candidates[0] if len(candidates) == 1 else None
+        backfill_state = "HOLD"
+        claim_attempt_id = None
+        error = "TERMINAL_WATCH_BACKFILL_INVALID_LINEAGE"
+        if bound_message is not None and bound_message["state"] == "PREPARED":
+            backfill_state = "PENDING_CLAIM"
+            error = None
+        elif bound_message is not None and bound_message["state"] in {
+            "CLAIMED",
+            "COMPLETE",
+        }:
+            if bound_message["claimed_by"] != endpoint_id:
+                error = "TERMINAL_WATCH_BACKFILL_CLAIM_BINDING_INVALID"
+                attempts = []
+            else:
+                attempts = None
+            if attempts is None:
+                required_attempt_states = (
+                    ("RUNNING", "COMPLETE")
+                    if bound_message["state"] == "CLAIMED"
+                    else ("COMPLETE",)
+                )
+                attempts = self.store.connection.execute(
+                    """
+                    SELECT * FROM executor_attempts
+                    WHERE role=? AND endpoint_id=?
+                      AND target_kind='message' AND target_key=?
+                      AND state IN ({})
+                      AND lineage_repository=? AND lineage_issue_number=?
+                      AND lineage_generation=? AND lineage_lease_sha256=?
+                    ORDER BY created_at DESC
+                    """.format(
+                        ",".join("?" for _ in required_attempt_states)
+                    ),
+                    (
+                        role,
+                        endpoint_id,
+                        str(bound_message["id"]),
+                        *required_attempt_states,
+                        item_snapshot["repository"],
+                        item_snapshot["issue_number"],
+                        item_snapshot["generation"],
+                        lease,
+                    ),
+                ).fetchall()
+            if len(attempts) == 1:
+                backfill_state = "ACTIVE"
+                claim_attempt_id = attempts[0]["attempt_id"]
+                error = None
+            elif error != "TERMINAL_WATCH_BACKFILL_CLAIM_BINDING_INVALID":
+                error = "TERMINAL_WATCH_BACKFILL_ATTEMPT_AMBIGUOUS"
+        elif bound_message is not None:
+            error = "TERMINAL_WATCH_BACKFILL_MESSAGE_NOT_EXECUTABLE"
+        return {
+            "item": item_snapshot,
+            "watch_key": terminal_watch_key(
+                str(item_snapshot["repository"]),
+                int(item_snapshot["issue_number"]),
+                int(item_snapshot["generation"]),
+            ),
+            "session_id": session_id,
+            "lease": lease,
+            "endpoint_id": endpoint_id,
+            "bound_message": bound_message,
+            "backfill_state": backfill_state,
+            "claim_attempt_id": claim_attempt_id,
+            "error": error,
+        }
 
     def _ensure_terminal_watches(self, now: str) -> tuple[list[str], list[dict[str, object]]]:
         opened: list[str] = []
         held: list[dict[str, object]] = []
-        with self.store.transaction():
-            items = self.store.connection.execute(
-                """
-                SELECT * FROM coordination_items
-                WHERE allocation_class='ACTIVE'
-                  AND status IN (
-                    'ACTIVE', 'ACTIVE_FENCED', 'MONITOR', 'PUBLICATION_PENDING'
-                  )
-                ORDER BY repository, issue_number
-                """
-            ).fetchall()
-            for item in items:
-                key = terminal_watch_key(
-                    item["repository"], int(item["issue_number"]), int(item["generation"])
-                )
-                watch = self.store.connection.execute(
-                    "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
-                    (key,),
+        items = self.store.connection.execute(
+            """
+            SELECT * FROM coordination_items
+            WHERE allocation_class='ACTIVE'
+              AND status IN (
+                'ACTIVE', 'ACTIVE_FENCED', 'MONITOR', 'PUBLICATION_PENDING'
+              )
+            ORDER BY repository, issue_number
+            """
+        ).fetchall()
+        plans: list[dict[str, object]] = []
+        for item in items:
+            key = terminal_watch_key(
+                item["repository"], int(item["issue_number"]), int(item["generation"])
+            )
+            if self.store.connection.execute(
+                "SELECT 1 FROM coordination_terminal_watches WHERE watch_key=?",
+                (key,),
+            ).fetchone() is None:
+                plans.append(self._terminal_watch_backfill_plan(item))
+        for plan in plans:
+            item_snapshot = plan["item"]
+            with self.store.transaction():
+                item = self.store.connection.execute(
+                    "SELECT * FROM coordination_items "
+                    "WHERE repository=? AND issue_number=?",
+                    (item_snapshot["repository"], item_snapshot["issue_number"]),
                 ).fetchone()
-                if watch is not None:
+                if item is None or dict(item) != item_snapshot:
                     continue
-                session_id = item["accountable_session_id"]
-                lease = item["lease_manifest_sha256"]
-                role = coordination_identity_role(self.store.connection, session_id)
-                endpoint = (
-                    current_endpoint(self.store.connection, role)
-                    if role in {"development", "sre"} else None
-                )
-                topics = (
-                    {"development.admission", "development.recovery_commit"}
-                    if role == "development"
-                    else {"sre.admission"}
-                )
-                candidates: list[tuple[object, dict[str, object]]] = []
-                if endpoint is not None and lease:
-                    for message in self.store.connection.execute(
-                        "SELECT * FROM coordination_messages "
-                        "WHERE recipient_session_id=? ORDER BY id",
-                        (str(endpoint["endpoint_id"]),),
-                    ).fetchall():
-                        if message["topic"] not in topics:
-                            continue
-                        try:
-                            payload = json.loads(message["payload_json"])
-                        except (TypeError, json.JSONDecodeError):
-                            continue
-                        source = payload.get("source") if isinstance(payload, dict) else None
-                        if (
-                            isinstance(source, dict)
-                            and source.get("repository") == item["repository"]
-                            and source.get("object_kind") == "issue"
-                            and source.get("object_number") == int(item["issue_number"])
-                            and payload.get("issue_number") == int(item["issue_number"])
-                            and payload.get("generation") == int(item["generation"])
-                            and payload.get("lease_manifest_sha256") == lease
-                            and source.get("payload_sha256")
-                            == item["source_payload_sha256"]
-                            and digest_json(payload) == message["payload_sha256"]
-                        ):
-                            candidates.append((message, payload))
-                bound_message = candidates[0][0] if len(candidates) == 1 else None
-                backfill_state = "HOLD"
-                claim_attempt_id = None
-                error = "TERMINAL_WATCH_BACKFILL_INVALID_LINEAGE"
-                if bound_message is not None and bound_message["state"] == "PREPARED":
-                    backfill_state = "PENDING_CLAIM"
-                    error = None
-                elif bound_message is not None and bound_message["state"] in {
-                    "CLAIMED",
-                    "COMPLETE",
-                }:
-                    if bound_message["claimed_by"] != endpoint["endpoint_id"]:
-                        error = "TERMINAL_WATCH_BACKFILL_CLAIM_BINDING_INVALID"
-                        attempts = []
-                    else:
-                        attempts = None
-                    if attempts is None:
-                        required_attempt_states = (
-                            ("RUNNING", "COMPLETE")
-                            if bound_message["state"] == "CLAIMED"
-                            else ("COMPLETE",)
-                        )
-                        attempts = self.store.connection.execute(
-                            """
-                            SELECT * FROM executor_attempts
-                            WHERE role=? AND endpoint_id=?
-                              AND target_kind='message' AND target_key=?
-                              AND state IN ({})
-                              AND lineage_repository=? AND lineage_issue_number=?
-                              AND lineage_generation=? AND lineage_lease_sha256=?
-                            ORDER BY created_at DESC
-                            """.format(
-                                ",".join("?" for _ in required_attempt_states)
-                            ),
-                            (
-                                role,
-                                str(endpoint["endpoint_id"]),
-                                str(bound_message["id"]),
-                                *required_attempt_states,
-                                item["repository"],
-                                item["issue_number"],
-                                item["generation"],
-                                lease,
-                            ),
-                        ).fetchall()
-                    if len(attempts) == 1:
-                        backfill_state = "ACTIVE"
-                        claim_attempt_id = attempts[0]["attempt_id"]
-                        error = None
-                    elif error != "TERMINAL_WATCH_BACKFILL_CLAIM_BINDING_INVALID":
-                        error = "TERMINAL_WATCH_BACKFILL_ATTEMPT_AMBIGUOUS"
-                elif bound_message is not None:
-                    error = "TERMINAL_WATCH_BACKFILL_MESSAGE_NOT_EXECUTABLE"
+                key = str(plan["watch_key"])
+                if self.store.connection.execute(
+                    "SELECT 1 FROM coordination_terminal_watches WHERE watch_key=?",
+                    (key,),
+                ).fetchone() is not None:
+                    continue
+                if self._terminal_watch_backfill_plan(item) != plan:
+                    continue
+                bound_message = plan["bound_message"]
+                error = plan["error"]
                 if error is not None:
                     held.append(
                         {
@@ -383,11 +437,17 @@ class CoordinationSupervisor:
                             item["repository"],
                             item["issue_number"],
                             item["generation"],
-                            session_id if isinstance(session_id, str) and session_id else "invalid",
-                            lease if isinstance(lease, str) and lease else "0" * 64,
+                            plan["session_id"]
+                            if isinstance(plan["session_id"], str) and plan["session_id"]
+                            else "invalid",
+                            plan["lease"]
+                            if isinstance(plan["lease"], str) and plan["lease"]
+                            else "0" * 64,
                             None if bound_message is None else bound_message["id"],
-                            None if bound_message is None else bound_message["payload_sha256"],
-                            claim_attempt_id,
+                            None
+                            if bound_message is None
+                            else bound_message["payload_sha256"],
+                            plan["claim_attempt_id"],
                             now,
                             now,
                             now,
@@ -411,12 +471,12 @@ class CoordinationSupervisor:
                         item["repository"],
                         item["issue_number"],
                         item["generation"],
-                        str(endpoint["endpoint_id"]),
-                        lease,
-                        backfill_state,
+                        plan["endpoint_id"],
+                        plan["lease"],
+                        plan["backfill_state"],
                         bound_message["id"],
                         bound_message["payload_sha256"],
-                        claim_attempt_id,
+                        plan["claim_attempt_id"],
                         now,
                         now,
                         now,
@@ -427,7 +487,7 @@ class CoordinationSupervisor:
                     key,
                     {
                         "item_version": int(item["version"]),
-                        "state": backfill_state,
+                        "state": plan["backfill_state"],
                         "admission_message_id": int(bound_message["id"]),
                     },
                     now,
@@ -738,12 +798,12 @@ class CoordinationSupervisor:
 
         eligible: set[str] = set()
         watches = self.store.connection.execute(
-            "SELECT * FROM coordination_terminal_watches WHERE state='ACTIVE'"
+            "SELECT * FROM coordination_terminal_watches "
+            "WHERE state='ACTIVE' AND next_wake_at<=?",
+            (now,),
         ).fetchall()
         for watch in watches:
             try:
-                if _epoch(now) < _epoch(str(watch["next_wake_at"])):
-                    continue
                 role = coordination_identity_role(
                     self.store.connection, str(watch["accountable_session_id"])
                 )
@@ -768,13 +828,17 @@ class CoordinationSupervisor:
                     != watch["accountable_session_id"]
                     or item["lease_manifest_sha256"]
                     != watch["lease_manifest_sha256"]
-                    or self.process_checker(
-                        str(endpoint["endpoint_id"]),
-                        "terminal_watch",
-                        str(watch["watch_key"]),
-                    )
                 ):
                     continue
+            except (CoordinationError, RegistryError, TypeError, ValueError):
+                continue
+            if self.process_checker(
+                str(endpoint["endpoint_id"]),
+                "terminal_watch",
+                str(watch["watch_key"]),
+            ):
+                continue
+            try:
                 lineage = attempt_lineage_for_target(
                     self.store.connection,
                     "terminal_watch",
@@ -1454,6 +1518,7 @@ class CoordinationSupervisor:
                     self.store._event("WAKE_COMPLETED", wake["wake_key"], {}, now)
 
     def run_once(self, now: str | None = None) -> dict[str, object]:
+        pass_started_at = self.monotonic()
         observed_at = now or utc_now()
         try:
             readiness_receipt_pickup: dict[str, object] = pickup_due_receipts(
@@ -1526,8 +1591,12 @@ class CoordinationSupervisor:
         # Release events are committed by coordination_store with the item
         # transition. Consume them before housekeeping or ordinary inbox wakes;
         # a successful admission is durable before its canonical session launch.
+        convergence_deadline = self.monotonic() + CONVERGENCE_PHASE_TIMEOUT_SECONDS
         convergence_results = self.convergence.consume_due(
-            limit=self.convergence_limit, now=observed_at
+            limit=self.convergence_limit,
+            now=observed_at,
+            deadline=convergence_deadline,
+            monotonic=self.monotonic,
         )
         stale_before = timestamp_after(observed_at, -ATTEMPT_STALE_SECONDS)
         try:
@@ -1766,7 +1835,17 @@ class CoordinationSupervisor:
                     "process_id": process_id,
                 }
             )
+        successful_launches = len(launched) + len(terminal_watch_launches)
         return {
+            "telemetry": {
+                "duration_seconds": round(
+                    max(0.0, self.monotonic() - pass_started_at), 6
+                ),
+                "selected": len(rows) + len(watches),
+                "attempted": launch_attempts,
+                "succeeded": successful_launches,
+                "failed": launch_attempts - successful_launches,
+            },
             "launch_policy": self.launch_policy.as_dict(),
             "launch_policy_decision": {
                 "terminal_watch_slot_reserved": terminal_watch_slot_reserved,
@@ -1805,6 +1884,7 @@ def main() -> int:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(descriptor)
+        print(canonical_json({"phase": "SKIPPED", "reason": "LOCK_CONTENDED"}))
         return 0
     store = CoordinationStore(DEFAULT_DATABASE)
     try:
