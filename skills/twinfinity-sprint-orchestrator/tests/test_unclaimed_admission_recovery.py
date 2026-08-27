@@ -33,11 +33,14 @@ from executor_registry import (  # noqa: E402
 )
 import kanban_pull_buffer as pull_buffer  # noqa: E402
 from kanban_pull_buffer import (  # noqa: E402
+    CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA,
+    CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON,
     LEGACY_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA,
     LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON,
     PullBufferError,
     UNCLAIMED_ADMISSION_RECOVERY_SCHEMA,
     _legacy_recovery_stable_source,
+    cutover_held_unclaimed_admission_recovery_notice_payload,
     digest_json,
     legacy_unclaimed_admission_recovery_notice_payload,
     recover_unclaimed_admission,
@@ -381,11 +384,18 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
     def _apply_development_endpoint(
         self, endpoint_id: str, *, operation_key: str, now: str
     ) -> dict:
+        return self._apply_role_endpoint(
+            "development", endpoint_id, operation_key=operation_key, now=now
+        )
+
+    def _apply_role_endpoint(
+        self, role: str, endpoint_id: str, *, operation_key: str, now: str
+    ) -> dict:
         config = replace(
             self.registry_config,
             roles={
                 **self.registry_config.roles,
-                "development": self.registry_config.endpoints[endpoint_id],
+                role: self.registry_config.endpoints[endpoint_id],
             },
         )
         aliases, aliases_sha256 = load_legacy_alias_fixture(
@@ -592,6 +602,187 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
                 request, descriptor_sha256
             ),
             now="2026-08-26T10:05:03Z",
+        )
+        request["recovery_notice_message_id"] = notice_id
+        return request, descriptor
+
+    def _cutover_held_transaction(
+        self, role: str = "sre", issue: int = 830
+    ) -> tuple[dict, dict]:
+        """Build one exact never-claimed lineage retained for role cutover."""
+
+        historical_endpoint = f"role.{role}.v3"
+        current_endpoint_id = f"role.{role}.v4"
+        self._apply_role_endpoint(
+            role,
+            historical_endpoint,
+            operation_key=f"cutover-held-{role}-historical-route",
+            now="2026-08-26T09:00:00Z",
+        )
+        lineage = self._admitted(role=role, issue=issue)
+        self.assertEqual(historical_endpoint, lineage["endpoint"])
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda _session, _message: 9273,
+            terminal_watch_launcher=lambda _session, _watch: 9274,
+            process_checker=lambda *_args: False,
+        )
+        supervisor.run_once("2026-08-26T10:00:06Z")
+        wake = self.store.connection.execute(
+            "SELECT * FROM coordination_wakes WHERE message_id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        self.assertEqual(("INFLIGHT", 1), (wake["state"], int(wake["attempts"])))
+        historical_attempt, historical_token = self._reserve_running_attempt(lineage)
+        historical_attempt = transition_attempt(
+            self.store.connection,
+            attempt_id=historical_attempt["attempt_id"],
+            token=historical_token,
+            expected_version=historical_attempt["version"],
+            new_state="HOLD",
+            exit_code=0,
+            last_error="EXECUTOR_TARGET_NO_PROGRESS",
+            terminal_progress_sha256=wake["target_progress_sha256"],
+            now="2026-08-26T10:00:30Z",
+        )
+        supervisor._record_launch_failure(
+            wake["wake_key"], "2026-08-26T10:00:31Z"
+        )
+        planner = current_endpoint(self.store.connection, "planner")
+        self.store.hold_prepared_message(
+            message_id=lineage["message_id"],
+            expected_payload_sha256=lineage["message"]["payload_sha256"],
+            reason="SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER",
+            session_id=planner["endpoint_id"],
+            now="2026-08-26T10:01:00Z",
+        )
+        supervisor._complete_stale_wakes("2026-08-26T10:01:01Z")
+        held_item = self.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, issue),
+        ).fetchone()
+        change = self._apply_role_endpoint(
+            role,
+            current_endpoint_id,
+            operation_key=f"cutover-held-{role}-current-route",
+            now="2026-08-26T10:02:00Z",
+        )
+
+        message = self.store.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        payload = json.loads(message["payload_json"])
+        watch_key = (
+            f"terminal:{REPOSITORY}:issue:{issue}:"
+            f"generation:{payload['generation']}"
+        )
+        wake = self.store.connection.execute(
+            "SELECT * FROM coordination_wakes WHERE message_id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        watch = self.store.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        item = self.store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, issue),
+        ).fetchone()
+        finalization = self.store.connection.execute(
+            "SELECT * FROM portfolio_ready_finalizations "
+            "WHERE repository=? AND issue_number=? AND generation=?",
+            (REPOSITORY, issue, payload["generation"]),
+        ).fetchone()
+        events = self.store.connection.execute(
+            "SELECT id,event_type,entity_key,payload_sha256,created_at "
+            "FROM coordination_events WHERE "
+            "(event_type='MESSAGE_HELD' AND entity_key=?) OR "
+            "(event_type='WAKE_COMPLETED' AND entity_key=?) ORDER BY id",
+            (f"message:{lineage['message_id']}", wake["wake_key"]),
+        ).fetchall()
+        executor_attempt = self.store.connection.execute(
+            "SELECT attempt_id,role,endpoint_id,target_kind,target_key,"
+            "target_progress_sha256,terminal_progress_sha256,lineage_repository,"
+            "lineage_issue_number,lineage_generation,lineage_lease_sha256,"
+            "lineage_sha256,state,exit_code,updated_at,last_error "
+            "FROM executor_attempts WHERE attempt_id=?",
+            (historical_attempt["attempt_id"],),
+        ).fetchone()
+        request = {
+            "schema": UNCLAIMED_ADMISSION_RECOVERY_SCHEMA,
+            "repository": REPOSITORY,
+            "issue_number": issue,
+            "planner_session_id": planner["endpoint_id"],
+            "generation": payload["generation"],
+            "retained_item_version": int(item["version"]),
+            "source_payload_sha256": payload["source"]["payload_sha256"],
+            "current_source_payload_sha256": payload["source"]["payload_sha256"],
+            "accountable_session_id": item["accountable_session_id"],
+            "lease_manifest_sha256": item["lease_manifest_sha256"],
+            "admission_message_id": lineage["message_id"],
+            "admission_payload_sha256": message["payload_sha256"],
+            "wake_key": wake["wake_key"],
+            "wake_attempts": int(wake["attempts"]),
+            "target_progress_sha256": wake["target_progress_sha256"],
+            "watch_key": watch_key,
+            "recovery_notice_message_id": 1,
+            "recovery_reason": CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON,
+        }
+        evidence = {
+            **{key: request[key] for key in (
+                "repository", "issue_number", "generation",
+                "retained_item_version", "source_payload_sha256",
+                "current_source_payload_sha256", "accountable_session_id",
+                "lease_manifest_sha256", "admission_message_id",
+                "admission_payload_sha256", "wake_key", "wake_attempts",
+                "target_progress_sha256", "watch_key",
+            )},
+            "role": role,
+            "historical_recipient": historical_endpoint,
+            "hold_reason": "SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER",
+            "message_updated_at": message["updated_at"],
+            "wake_last_attempt_at": wake["last_attempt_at"],
+            "wake_updated_at": wake["updated_at"],
+            "watch_updated_at": watch["updated_at"],
+            "item_updated_at": item["updated_at"],
+            "capacity": {
+                key: int(item[key]) for key in (
+                    "development_units", "shared_units", "sre_units"
+                )
+            },
+            "ready_candidate_id": int(finalization["ready_candidate_id"]),
+            "ready_finalization_id": int(finalization["id"]),
+            "readiness_campaign_id": int(finalization["campaign_id"]),
+            "readiness_receipt_id": int(finalization["receipt_id"]),
+            "finalization_dirty_event_id": int(finalization["dirty_event_id"]),
+            "ready_finalization_sha256": finalization["finalization_sha256"],
+            "cutover_events": [dict(event) for event in events],
+            "endpoint_rotation": {
+                "change_id": change["change_id"],
+                "change_version": int(change["version"]),
+                "before_item_version": int(held_item["version"]),
+                "not_before": message["updated_at"],
+            },
+            "executor_attempt": dict(executor_attempt),
+        }
+        descriptor = {
+            "schema": CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA,
+            "evidence": evidence,
+            "evidence_sha256": digest_json(evidence),
+        }
+        descriptor_sha256 = digest_json(descriptor)
+        notice_id = self.store.enqueue_message(
+            idempotency_key=(
+                "cutover-held-unclaimed-admission-recovery:"
+                f"{descriptor_sha256}"
+            ),
+            recipient_session_id=request["planner_session_id"],
+            topic="coordination.notice",
+            payload=cutover_held_unclaimed_admission_recovery_notice_payload(
+                request, descriptor_sha256
+            ),
+            now="2026-08-26T10:02:01Z",
         )
         request["recovery_notice_message_id"] = notice_id
         return request, descriptor
@@ -1085,6 +1276,186 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
             (REPOSITORY, request["issue_number"]),
         ).fetchone()
         self.assertEqual(("PREPARED", "NONE", 1), tuple(item))
+
+    def test_cutover_held_development_and_sre_recover_and_replay(self) -> None:
+        for role, issue in (("development", 829), ("sre", 830)):
+            with self.subTest(role=role):
+                if role == "sre":
+                    self.tearDown()
+                    self.setUp()
+                request, descriptor = self._cutover_held_transaction(role, issue)
+                preserved = {
+                    "message": dict(self.store.connection.execute(
+                        "SELECT * FROM coordination_messages WHERE id=?",
+                        (request["admission_message_id"],),
+                    ).fetchone()),
+                    "wake": dict(self.store.connection.execute(
+                        "SELECT * FROM coordination_wakes WHERE wake_key=?",
+                        (request["wake_key"],),
+                    ).fetchone()),
+                    "watch": dict(self.store.connection.execute(
+                        "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                        (request["watch_key"],),
+                    ).fetchone()),
+                    "attempt": dict(self.store.connection.execute(
+                        "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                        (descriptor["evidence"]["executor_attempt"]["attempt_id"],),
+                    ).fetchone()),
+                }
+                units = self.store.connection.execute(
+                    "SELECT development_units,shared_units,sre_units "
+                    "FROM coordination_items WHERE repository=? AND issue_number=?",
+                    (REPOSITORY, issue),
+                ).fetchone()
+                planner_attempt, planner_token = self._claim_recovery_notice(request)
+                result = recover_unclaimed_admission(
+                    self.store,
+                    request,
+                    now="2026-08-26T10:03:00Z",
+                    attempt_id=planner_attempt["attempt_id"],
+                    executor_token=planner_token,
+                    compatibility_descriptor=descriptor,
+                )
+                item = self.store.connection.execute(
+                    "SELECT * FROM coordination_items "
+                    "WHERE repository=? AND issue_number=?",
+                    (REPOSITORY, issue),
+                ).fetchone()
+                readiness = self.store.connection.execute(
+                    "SELECT state FROM portfolio_readiness_current "
+                    "WHERE repository=? AND issue_number=?",
+                    (REPOSITORY, issue),
+                ).fetchone()
+                self.assertEqual(
+                    ("PREPARED", "NONE", request["generation"] + 1),
+                    (item["status"], item["allocation_class"], int(item["generation"])),
+                )
+                self.assertIsNone(item["accountable_session_id"])
+                self.assertIsNone(item["lease_manifest_sha256"])
+                self.assertEqual(tuple(units), (
+                    item["development_units"], item["shared_units"], item["sre_units"]
+                ))
+                self.assertEqual("STALE", readiness["state"])
+                for table, key, value, name in (
+                    (
+                        "coordination_messages", "id",
+                        request["admission_message_id"], "message",
+                    ),
+                    ("coordination_wakes", "wake_key", request["wake_key"], "wake"),
+                    (
+                        "coordination_terminal_watches", "watch_key",
+                        request["watch_key"], "watch",
+                    ),
+                    (
+                        "executor_attempts", "attempt_id",
+                        descriptor["evidence"]["executor_attempt"]["attempt_id"],
+                        "attempt",
+                    ),
+                ):
+                    observed = dict(self.store.connection.execute(
+                        f"SELECT * FROM {table} WHERE {key}=?", (value,)
+                    ).fetchone())
+                    self.assertEqual(preserved[name], observed)
+                before_replay = self._fingerprint()
+                self.assertEqual(
+                    result,
+                    recover_unclaimed_admission(
+                        self.store,
+                        request,
+                        now="2026-08-26T10:03:01Z",
+                        attempt_id=planner_attempt["attempt_id"],
+                        executor_token=planner_token,
+                        compatibility_descriptor=descriptor,
+                    ),
+                )
+                self.assertEqual(before_replay, self._fingerprint())
+
+    def test_cutover_held_drift_and_claim_evidence_are_write_free(self) -> None:
+        request, descriptor = self._cutover_held_transaction()
+        invalid = json.loads(canonical_json(descriptor))
+        invalid["evidence"]["endpoint_rotation"]["change_id"] = "f" * 64
+        invalid["evidence_sha256"] = digest_json(invalid["evidence"])
+        self._assert_recovery_rejected_without_writes(
+            request,
+            "CUTOVER_HELD_RECOVERY_FENCE_MISMATCH",
+            compatibility_descriptor=invalid,
+        )
+        mismatched = json.loads(canonical_json(descriptor))
+        mismatched["evidence"]["role"] = "development"
+        mismatched["evidence_sha256"] = digest_json(mismatched["evidence"])
+        self._assert_recovery_rejected_without_writes(
+            request,
+            "CUTOVER_HELD_RECOVERY_DESCRIPTOR_INVALID",
+            compatibility_descriptor=mismatched,
+        )
+        self.store._event(
+            "MESSAGE_CLAIMED",
+            f"message:{request['admission_message_id']}",
+            {"adversarial_fixture": True},
+            "2026-08-26T10:02:30Z",
+        )
+        self._assert_recovery_rejected_without_writes(
+            request,
+            "UNCLAIMED_ADMISSION_CLAIM_EVIDENCE_PRESENT",
+            compatibility_descriptor=descriptor,
+        )
+
+    def test_cutover_held_recovery_rolls_back_and_cli_recovers(self) -> None:
+        request, descriptor = self._cutover_held_transaction()
+        planner_attempt, planner_token = self._claim_recovery_notice(request)
+        baseline = self._fingerprint()
+        with self.assertRaisesRegex(RuntimeError, "recovery.after_item"):
+            recover_unclaimed_admission(
+                self.store,
+                request,
+                now="2026-08-26T10:03:00Z",
+                attempt_id=planner_attempt["attempt_id"],
+                executor_token=planner_token,
+                compatibility_descriptor=descriptor,
+                failpoint=lambda point: (
+                    (_ for _ in ()).throw(RuntimeError(point))
+                    if point == "recovery.after_item" else None
+                ),
+            )
+        self.assertEqual(baseline, self._fingerprint())
+
+        request_path = self.root / "cutover-held-recovery.json"
+        descriptor_path = self.root / "cutover-held-descriptor.json"
+        request_path.write_text(canonical_json(request), encoding="utf-8")
+        descriptor_path.write_text(canonical_json(descriptor), encoding="utf-8")
+        output = io.StringIO()
+        with (
+            patch.object(pull_buffer, "DEFAULT_DATABASE", self.database),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "kanban_pull_buffer.py",
+                    "recover-unclaimed-admission",
+                    "--transaction-file",
+                    str(request_path),
+                    "--compatibility-descriptor-file",
+                    str(descriptor_path),
+                ],
+            ),
+            patch.object(
+                pull_buffer, "utc_now", return_value="2026-08-26T10:03:00Z"
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "TWINFINITY_EXECUTOR_ATTEMPT_ID": planner_attempt["attempt_id"],
+                    "TWINFINITY_EXECUTOR_TOKEN": planner_token,
+                },
+                clear=False,
+            ),
+            redirect_stdout(output),
+        ):
+            return_code = pull_buffer.main()
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(0, return_code)
+        self.assertEqual("COMPLETE", receipt["phase"])
+        self.assertEqual("RECOVERED", receipt["result"]["state"])
 
     def test_synthetic_legacy_transaction_rejects_drift_and_recovers(self) -> None:
         request, descriptor = self._legacy_compatible_transaction()
