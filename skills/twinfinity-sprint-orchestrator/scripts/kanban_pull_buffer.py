@@ -76,6 +76,15 @@ LEGACY_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA = (
 )
 LEGACY_UNCLAIMED_ADMISSION_HOLD_REASON = "WAKE_RETRY_EXHAUSTED"
 LEGACY_UNCLAIMED_ADMISSION_ATTEMPT_ERROR = "EXECUTOR_TARGET_NO_PROGRESS"
+CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON = (
+    "CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY"
+)
+CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA = (
+    "twinfinity-cutover-held-unclaimed-admission-recovery-descriptor/v1"
+)
+CUTOVER_HELD_UNCLAIMED_ADMISSION_HOLD_REASON = (
+    "SUPERSEDED_BY_ROLE_ENDPOINT_CUTOVER"
+)
 UNCLAIMED_RECOVERY_REQUEST_KEYS = set("""
 schema repository issue_number planner_session_id generation retained_item_version
 source_payload_sha256 current_source_payload_sha256 accountable_session_id
@@ -102,6 +111,32 @@ LEGACY_RECOVERY_ROTATION_KEYS = {
 LEGACY_RECOVERY_ATTEMPT_KEYS = {
     "attempt_id", "role", "endpoint_id", "target_kind", "target_key",
     "state", "exit_code", "last_error",
+}
+CUTOVER_HELD_RECOVERY_DESCRIPTOR_KEYS = {
+    "schema", "evidence", "evidence_sha256"
+}
+CUTOVER_HELD_RECOVERY_EVIDENCE_KEYS = set("""
+repository issue_number generation retained_item_version source_payload_sha256
+current_source_payload_sha256 accountable_session_id lease_manifest_sha256
+admission_message_id admission_payload_sha256 wake_key wake_attempts
+target_progress_sha256 watch_key role historical_recipient hold_reason
+message_updated_at wake_last_attempt_at wake_updated_at watch_updated_at
+item_updated_at capacity ready_candidate_id ready_finalization_id
+readiness_campaign_id readiness_receipt_id finalization_dirty_event_id
+ready_finalization_sha256 cutover_events endpoint_rotation executor_attempt
+""".split())
+CUTOVER_HELD_RECOVERY_EVENT_KEYS = {
+    "id", "event_type", "entity_key", "payload_sha256", "created_at"
+}
+CUTOVER_HELD_RECOVERY_ATTEMPT_KEYS = {
+    "attempt_id", "role", "endpoint_id", "target_kind", "target_key",
+    "target_progress_sha256", "terminal_progress_sha256",
+    "lineage_repository", "lineage_issue_number", "lineage_generation",
+    "lineage_lease_sha256", "lineage_sha256", "state", "exit_code",
+    "updated_at", "last_error",
+}
+CUTOVER_HELD_RECOVERY_CAPACITY_KEYS = {
+    "development_units", "shared_units", "sre_units"
 }
 STATES = {"PREPARED_NOT_READY", "READY"}
 VERTICALITY = {"END_TO_END", "BOUNDED_ENABLER"}
@@ -3706,9 +3741,205 @@ def _validate_legacy_recovery_descriptor(
     return evidence, descriptor_sha256
 
 
+def cutover_held_unclaimed_admission_recovery_notice_payload(
+    request: dict[str, Any], descriptor_sha256: str
+) -> dict[str, Any]:
+    """Build the non-authorizing Planner notice for one cutover-held lineage."""
+
+    issue_number = int(request["issue_number"])
+    return {
+        "source": {
+            "repository": request["repository"],
+            "object_kind": "issue",
+            "object_number": issue_number,
+            "payload_sha256": request["current_source_payload_sha256"],
+        },
+        "notice_kind": "planning_request",
+        "mutation_authority": False,
+        "subject": f"Issue {issue_number} cutover-held admission recovery review",
+        "summary": (
+            "A closed digest-bound descriptor proves one never-claimed "
+            "admission was retained solely for same-role endpoint cutover."
+        ),
+        "evidence": {
+            "schema": CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA,
+            "descriptor_sha256": descriptor_sha256,
+            "recovery_reason": CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON,
+            "admission_message_id": request["admission_message_id"],
+            "wake_key": request["wake_key"],
+            "watch_key": request["watch_key"],
+            "generation": request["generation"],
+            "retained_item_version": request["retained_item_version"],
+            "lease_manifest_sha256": request["lease_manifest_sha256"],
+        },
+        "requested_evidence": [
+            "Exact relational proof of zero claims, one terminal no-progress "
+            "attempt, and the applied same-role endpoint rotation."
+        ],
+        "next_observation": (
+            "The current Planner may recover only through the claimed notice "
+            "and its exact running executor attempt."
+        ),
+    }
+
+
+def _validate_cutover_held_recovery_descriptor(
+    descriptor: Any, request: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    """Validate the distinct closed cutover-held descriptor without writes."""
+
+    if (
+        not isinstance(descriptor, dict)
+        or set(descriptor) != CUTOVER_HELD_RECOVERY_DESCRIPTOR_KEYS
+        or descriptor.get("schema")
+        != CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_DESCRIPTOR_SCHEMA
+        or not isinstance(descriptor.get("evidence"), dict)
+        or set(descriptor["evidence"]) != CUTOVER_HELD_RECOVERY_EVIDENCE_KEYS
+        or not _is_sha256(descriptor.get("evidence_sha256"))
+        or digest_json(descriptor["evidence"]) != descriptor["evidence_sha256"]
+    ):
+        raise PullBufferError("CUTOVER_HELD_RECOVERY_DESCRIPTOR_INVALID")
+    evidence = descriptor["evidence"]
+    binding_keys = (
+        "repository", "issue_number", "generation", "retained_item_version",
+        "source_payload_sha256", "current_source_payload_sha256",
+        "accountable_session_id", "lease_manifest_sha256",
+        "admission_message_id", "admission_payload_sha256", "wake_key",
+        "wake_attempts", "target_progress_sha256", "watch_key",
+    )
+    integers = (
+        "issue_number", "generation", "retained_item_version",
+        "admission_message_id", "wake_attempts", "ready_candidate_id",
+        "ready_finalization_id", "readiness_campaign_id",
+        "readiness_receipt_id", "finalization_dirty_event_id",
+    )
+    strings = (
+        "repository", "accountable_session_id", "wake_key", "watch_key",
+        "role", "historical_recipient", "hold_reason", "message_updated_at",
+        "wake_last_attempt_at", "wake_updated_at", "watch_updated_at",
+        "item_updated_at",
+    )
+    hashes = (
+        "source_payload_sha256", "current_source_payload_sha256",
+        "lease_manifest_sha256", "admission_payload_sha256",
+        "target_progress_sha256", "ready_finalization_sha256",
+    )
+    role = evidence.get("role")
+    capacity = evidence.get("capacity")
+    events = evidence.get("cutover_events")
+    rotation = evidence.get("endpoint_rotation")
+    attempt = evidence.get("executor_attempt")
+    lineage_sha256 = digest_json({
+        "generation": evidence.get("generation"),
+        "issue_number": evidence.get("issue_number"),
+        "lease_manifest_sha256": evidence.get("lease_manifest_sha256"),
+        "repository": evidence.get("repository"),
+    })
+    valid = bool(
+        all(evidence.get(key) == request.get(key) for key in binding_keys)
+        and all(type(evidence.get(key)) is int for key in integers)
+        and all(isinstance(evidence.get(key), str) and evidence[key] for key in strings)
+        and all(_is_sha256(evidence.get(key)) for key in hashes)
+        and evidence["source_payload_sha256"]
+        == evidence["current_source_payload_sha256"]
+        and role in {"development", "sre"}
+        and evidence["historical_recipient"] != evidence["accountable_session_id"]
+        and evidence["hold_reason"]
+        == CUTOVER_HELD_UNCLAIMED_ADMISSION_HOLD_REASON
+        and evidence["wake_attempts"] == 1
+        and isinstance(capacity, dict)
+        and set(capacity) == CUTOVER_HELD_RECOVERY_CAPACITY_KEYS
+        and all(type(capacity.get(key)) is int and capacity[key] >= 0
+                for key in CUTOVER_HELD_RECOVERY_CAPACITY_KEYS)
+        and sum(capacity.values()) > 0
+        and (
+            (role == "development" and capacity["sre_units"] == 0)
+            or (
+                role == "sre"
+                and capacity == {
+                    "development_units": 0,
+                    "shared_units": 0,
+                    "sre_units": capacity["sre_units"],
+                }
+                and capacity["sre_units"] > 0
+            )
+        )
+        and isinstance(events, list)
+        and len(events) == 2
+        and all(isinstance(event, dict)
+                and set(event) == CUTOVER_HELD_RECOVERY_EVENT_KEYS
+                for event in events)
+        and [event.get("event_type") for event in events]
+        == ["MESSAGE_HELD", "WAKE_COMPLETED"]
+        and all(type(event.get("id")) is int and event["id"] > 0 for event in events)
+        and events[0]["id"] < events[1]["id"]
+        and all(_is_sha256(event.get("payload_sha256")) for event in events)
+        and all(isinstance(event.get("created_at"), str) and event["created_at"]
+                for event in events)
+        and events[0]["entity_key"]
+        == f"message:{evidence['admission_message_id']}"
+        and events[0]["payload_sha256"] == digest_json({
+            "error": CUTOVER_HELD_UNCLAIMED_ADMISSION_HOLD_REASON,
+            "planner_session_id": request["planner_session_id"],
+        })
+        and events[0]["created_at"] == evidence["message_updated_at"]
+        and events[1]["entity_key"] == evidence["wake_key"]
+        and events[1]["payload_sha256"] == digest_json({})
+        and events[1]["created_at"] == evidence["wake_updated_at"]
+        and evidence["wake_last_attempt_at"] <= evidence["message_updated_at"]
+        and evidence["message_updated_at"] <= evidence["wake_updated_at"]
+        and evidence["wake_updated_at"] <= evidence["item_updated_at"]
+        and evidence["watch_updated_at"] == evidence["item_updated_at"]
+        and isinstance(rotation, dict)
+        and set(rotation) == LEGACY_RECOVERY_ROTATION_KEYS
+        and _is_sha256(rotation.get("change_id"))
+        and type(rotation.get("change_version")) is int
+        and rotation["change_version"] > 0
+        and rotation.get("before_item_version")
+        == evidence["retained_item_version"] - 1
+        and rotation.get("not_before") == events[0]["created_at"]
+        and isinstance(attempt, dict)
+        and set(attempt) == CUTOVER_HELD_RECOVERY_ATTEMPT_KEYS
+        and all(isinstance(attempt.get(key), str) and attempt[key] for key in (
+            "attempt_id", "role", "endpoint_id", "target_kind", "target_key",
+            "target_progress_sha256", "terminal_progress_sha256",
+            "lineage_repository", "lineage_lease_sha256", "lineage_sha256",
+            "state", "updated_at", "last_error",
+        ))
+        and type(attempt.get("lineage_issue_number")) is int
+        and type(attempt.get("lineage_generation")) is int
+        and type(attempt.get("exit_code")) is int
+        and attempt["role"] == role
+        and attempt["endpoint_id"] == evidence["historical_recipient"]
+        and attempt["target_kind"] == "message"
+        and attempt["target_key"] == str(evidence["admission_message_id"])
+        and attempt["target_progress_sha256"] == evidence["target_progress_sha256"]
+        and attempt["terminal_progress_sha256"] == evidence["target_progress_sha256"]
+        and attempt["lineage_repository"] == evidence["repository"]
+        and attempt["lineage_issue_number"] == evidence["issue_number"]
+        and attempt["lineage_generation"] == evidence["generation"]
+        and attempt["lineage_lease_sha256"] == evidence["lease_manifest_sha256"]
+        and attempt["lineage_sha256"] == lineage_sha256
+        and attempt["state"] == "HOLD"
+        and attempt["exit_code"] == 0
+        and attempt["last_error"] == LEGACY_UNCLAIMED_ADMISSION_ATTEMPT_ERROR
+        and attempt["updated_at"] <= evidence["message_updated_at"]
+    )
+    if not valid:
+        raise PullBufferError("CUTOVER_HELD_RECOVERY_DESCRIPTOR_INVALID")
+    descriptor_sha256 = digest_json(descriptor)
+    return evidence, descriptor_sha256
+
+
 def _validate_unclaimed_recovery_request(request: dict[str, Any]) -> bool:
     if set(request) != UNCLAIMED_RECOVERY_REQUEST_KEYS:
         return False
+    recovery_reason = request.get("recovery_reason")
+    expected_wake_attempts = (
+        1
+        if recovery_reason == CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON
+        else 3
+    )
     integers = (
         type(request.get("issue_number")) is int and request["issue_number"] > 0,
         type(request.get("generation")) is int and request["generation"] >= 0,
@@ -3716,7 +3947,7 @@ def _validate_unclaimed_recovery_request(request: dict[str, Any]) -> bool:
         and request["retained_item_version"] > 0,
         type(request.get("admission_message_id")) is int
         and request["admission_message_id"] > 0,
-        request.get("wake_attempts") == 3,
+        request.get("wake_attempts") == expected_wake_attempts,
     )
     notice_id = request.get("recovery_notice_message_id")
     notice_valid = type(notice_id) is int and notice_id > 0
@@ -3748,6 +3979,7 @@ def _validate_unclaimed_recovery_request(request: dict[str, Any]) -> bool:
         in {
             UNCLAIMED_ADMISSION_RETRY_REASON,
             LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON,
+            CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON,
         }
         and notice_valid
     )
@@ -3933,7 +4165,7 @@ def _validate_recovery_notice(
                 }),
             ),
         ).fetchone()[0]
-    else:
+    elif request["recovery_reason"] == LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON:
         expected_payload = legacy_unclaimed_admission_recovery_notice_payload(
             request, compatibility_descriptor_sha256
         )
@@ -3942,6 +4174,20 @@ def _validate_recovery_notice(
             f"{compatibility_descriptor_sha256}"
         )
         event_count = 1
+    elif (
+        request["recovery_reason"]
+        == CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON
+    ):
+        expected_payload = cutover_held_unclaimed_admission_recovery_notice_payload(
+            request, compatibility_descriptor_sha256
+        )
+        expected_idempotency_key = (
+            "cutover-held-unclaimed-admission-recovery:"
+            f"{compatibility_descriptor_sha256}"
+        )
+        event_count = 1
+    else:
+        raise PullBufferError("UNCLAIMED_ADMISSION_RECOVERY_NOTICE_DRIFT")
     valid = bool(
         notice["idempotency_key"] == expected_idempotency_key
         and observed_payload == expected_payload
@@ -4092,6 +4338,133 @@ def _legacy_recovery_fence(
         raise PullBufferError("LEGACY_RECOVERY_FENCE_MISMATCH")
 
 
+def _cutover_held_recovery_fence(
+    connection: sqlite3.Connection,
+    rows: dict[str, sqlite3.Row],
+    request: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    replay: bool,
+) -> None:
+    """Verify one never-claimed admission held for exact endpoint cutover."""
+
+    message, wake, watch = rows["message"], rows["wake"], rows["watch"]
+    item, candidate, finalization = (
+        rows["item"], rows["candidate"], rows["finalization"]
+    )
+    events_descriptor = evidence["cutover_events"]
+    event_ids = tuple(event["id"] for event in events_descriptor)
+    events = connection.execute(
+        "SELECT id,event_type,entity_key,payload_sha256,created_at "
+        "FROM coordination_events WHERE id IN (?,?) ORDER BY id",
+        event_ids,
+    ).fetchall()
+    attempt_descriptor = evidence["executor_attempt"]
+    attempts = connection.execute(
+        "SELECT attempt_id,role,endpoint_id,target_kind,target_key,"
+        "target_progress_sha256,terminal_progress_sha256,lineage_repository,"
+        "lineage_issue_number,lineage_generation,lineage_lease_sha256,"
+        "lineage_sha256,state,exit_code,updated_at,last_error "
+        "FROM executor_attempts WHERE "
+        "(target_kind='message' AND target_key=?) OR "
+        "(lineage_repository=? AND lineage_issue_number=? "
+        "AND lineage_generation=? AND lineage_lease_sha256=?) "
+        "ORDER BY attempt_id",
+        (
+            str(request["admission_message_id"]), request["repository"],
+            request["issue_number"], request["generation"],
+            request["lease_manifest_sha256"],
+        ),
+    ).fetchall()
+    role = evidence["role"]
+    capacity = evidence["capacity"]
+    exact = (
+        (
+            message["recipient_session_id"], message["topic"], message["state"],
+            message["last_error"], message["updated_at"],
+        ) == (
+            evidence["historical_recipient"], f"{role}.admission", "HOLD",
+            evidence["hold_reason"], evidence["message_updated_at"],
+        ),
+        (
+            wake["message_id"], wake["recipient_session_id"],
+            wake["message_payload_sha256"], wake["state"], int(wake["attempts"]),
+            wake["process_id"], wake["last_attempt_at"], wake["updated_at"],
+            wake["last_error"],
+        ) == (
+            request["admission_message_id"], evidence["historical_recipient"],
+            request["admission_payload_sha256"], "COMPLETE", 1, None,
+            evidence["wake_last_attempt_at"], evidence["wake_updated_at"], None,
+        ),
+        (
+            watch["state"], watch["accountable_session_id"], watch["process_id"],
+            watch["claim_attempt_id"], int(watch["attempts"]),
+            watch["updated_at"], watch["last_error"],
+        ) == (
+            "HOLD", request["accountable_session_id"], None, None, 0,
+            evidence["watch_updated_at"], evidence["hold_reason"],
+        ),
+        replay or (
+            item["status"], item["allocation_class"], item["updated_at"],
+        ) == ("HOLD", "RETAINED", evidence["item_updated_at"]),
+        (
+            int(item["development_units"]), int(item["shared_units"]),
+            int(item["sre_units"]),
+        ) == (
+            capacity["development_units"], capacity["shared_units"],
+            capacity["sre_units"],
+        ),
+        (
+            int(candidate["id"]), int(finalization["id"]),
+            int(finalization["campaign_id"]), int(finalization["receipt_id"]),
+            int(finalization["dirty_event_id"]),
+            finalization["finalization_sha256"],
+        ) == tuple(evidence[key] for key in (
+            "ready_candidate_id", "ready_finalization_id",
+            "readiness_campaign_id", "readiness_receipt_id",
+            "finalization_dirty_event_id", "ready_finalization_sha256",
+        )),
+        [dict(row) for row in events] == events_descriptor,
+        len(attempts) == 1 and dict(attempts[0]) == attempt_descriptor,
+    )
+    if not all(exact):
+        raise PullBufferError("CUTOVER_HELD_RECOVERY_FENCE_MISMATCH")
+    try:
+        require_current_endpoint_identity(
+            connection,
+            request["accountable_session_id"],
+            expected_role=role,
+        )
+    except RegistryError as exc:
+        raise PullBufferError("CUTOVER_HELD_RECOVERY_FENCE_MISMATCH") from exc
+    rotation_descriptor = evidence["endpoint_rotation"]
+    rotation = applied_endpoint_rotation_chain(
+        connection,
+        repository=request["repository"],
+        issue_number=request["issue_number"],
+        before_identity=evidence["historical_recipient"],
+        before_item_version=rotation_descriptor["before_item_version"],
+        after_identity=request["accountable_session_id"],
+        after_item_version=request["retained_item_version"],
+        watch_key=request["watch_key"],
+        expected_watch_state="HOLD",
+        not_before=rotation_descriptor["not_before"],
+        change_id=rotation_descriptor["change_id"],
+        change_version=rotation_descriptor["change_version"],
+    )
+    historical_role = identity_role(connection, evidence["historical_recipient"])
+    if (
+        rotation is None
+        or len(rotation) != 1
+        or historical_role != role
+        or identity_role(connection, request["accountable_session_id"]) != role
+        or rotation[0]["watch_transition"] is None
+        or rotation[0]["watch_transition"]["expected_updated_at"]
+        != evidence["message_updated_at"]
+    ):
+        raise PullBufferError("CUTOVER_HELD_RECOVERY_FENCE_MISMATCH")
+
+
 def recover_unclaimed_admission(
     store: CoordinationStore,
     request: dict[str, Any],
@@ -4110,11 +4483,21 @@ def recover_unclaimed_admission(
         request["recovery_reason"]
         == LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON
     )
+    cutover_held = (
+        request["recovery_reason"]
+        == CUTOVER_HELD_UNCLAIMED_ADMISSION_RECOVERY_REASON
+    )
     compatibility_evidence: dict[str, Any] | None = None
     compatibility_descriptor_sha256: str | None = None
     if legacy:
         compatibility_evidence, compatibility_descriptor_sha256 = (
             _validate_legacy_recovery_descriptor(compatibility_descriptor, request)
+        )
+    elif cutover_held:
+        compatibility_evidence, compatibility_descriptor_sha256 = (
+            _validate_cutover_held_recovery_descriptor(
+                compatibility_descriptor, request
+            )
         )
     elif compatibility_descriptor is not None:
         raise PullBufferError("LEGACY_RECOVERY_DESCRIPTOR_UNEXPECTED")
@@ -4138,7 +4521,9 @@ def recover_unclaimed_admission(
             raise PullBufferError("UNCLAIMED_ADMISSION_FINALIZATION_DRIFT") from exc
         source = payload.get("source") if isinstance(payload, dict) else None
         capacity = payload.get("capacity") if isinstance(payload, dict) else None
-        admission_item_version = request["retained_item_version"] - (2 if legacy else 1)
+        admission_item_version = request["retained_item_version"] - (
+            2 if legacy or cutover_held else 1
+        )
         expected_watch_owner = (
             message["recipient_session_id"] if legacy else request["accountable_session_id"]
         )
@@ -4255,6 +4640,16 @@ def recover_unclaimed_admission(
             if compatibility_evidence is None:
                 raise PullBufferError("LEGACY_RECOVERY_DESCRIPTOR_INVALID")
             _legacy_recovery_fence(
+                connection,
+                rows,
+                request,
+                compatibility_evidence,
+                replay=replay,
+            )
+        elif cutover_held:
+            if compatibility_evidence is None:
+                raise PullBufferError("CUTOVER_HELD_RECOVERY_DESCRIPTOR_INVALID")
+            _cutover_held_recovery_fence(
                 connection,
                 rows,
                 request,
