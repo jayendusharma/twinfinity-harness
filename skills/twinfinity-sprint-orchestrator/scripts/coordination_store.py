@@ -2467,6 +2467,24 @@ class CoordinationStore:
                 COMMIT;
                 """
             )
+        self.connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS coordination_messages_live_id
+                ON coordination_messages(id)
+                WHERE state IN ('PREPARED', 'CLAIMED');
+            CREATE INDEX IF NOT EXISTS coordination_messages_development_admission_recipient_id
+                ON coordination_messages(recipient_session_id, id)
+                WHERE topic IN ('development.admission', 'development.recovery_commit');
+            CREATE INDEX IF NOT EXISTS coordination_messages_sre_admission_recipient_id
+                ON coordination_messages(recipient_session_id, id)
+                WHERE topic='sre.admission';
+            CREATE INDEX IF NOT EXISTS coordination_terminal_watches_active_schedule
+                ON coordination_terminal_watches(
+                    attempts, next_wake_at, repository, issue_number, generation
+                )
+                WHERE state='ACTIVE';
+            """
+        )
         self.connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS coordination_unique_live_lease

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -41,7 +42,10 @@ from reconcile_routing_artifacts import (  # noqa: E402
     build_plan,
     load_legacy_alias_fixture,
 )
-from role_executor_transport import launch_role_executor  # noqa: E402
+from role_executor_transport import (  # noqa: E402
+    SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS,
+    launch_role_executor,
+)
 from tests.canonical_ready_fixture import (  # noqa: E402
     finalize_canonical_ready_candidate,
 )
@@ -639,6 +643,36 @@ class _FlowHarness:
 
 
 class CapacityDispatchFlowTests(unittest.TestCase):
+    def test_transport_submission_timeout_uses_the_existing_nonzero_contract(self) -> None:
+        observed_timeout = None
+
+        def timed_out(command, **kwargs):
+            nonlocal observed_timeout
+            observed_timeout = kwargs["timeout"]
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        timed_out_result = launch_role_executor(
+            role="development",
+            endpoint_id=DEVELOPMENT_ENDPOINT,
+            target_kind="message",
+            target_key="37",
+            prompt="Execute exact synthetic target 37",
+            runner=timed_out,
+        )
+        numeric_result = launch_role_executor(
+            role="development",
+            endpoint_id=DEVELOPMENT_ENDPOINT,
+            target_kind="message",
+            target_key="38",
+            prompt="Execute exact synthetic target 38",
+            runner=lambda _command, **_kwargs: types.SimpleNamespace(returncode=17),
+        )
+
+        self.assertEqual(SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS, observed_timeout)
+        self.assertEqual(5, observed_timeout)
+        self.assertEqual(1, timed_out_result)
+        self.assertEqual(17, numeric_result)
+
     def test_real_transport_spins_all_target_specific_writers_without_role_lock(self) -> None:
         targets = [
             *(('development', DEVELOPMENT_ENDPOINT, str(index)) for index in range(1, 7)),
