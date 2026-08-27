@@ -32,10 +32,16 @@ from coordination_transfer_ledger import (
     validate_existing_state as validate_transfer_state,
 )
 from executor_registry import RegistryError, applied_endpoint_rotation_chain, identity_role
+from repository_delivery_policy import (
+    HARNESS_REPOSITORY,
+    delivery_branch_issue_number,
+    expected_worktree_identity,
+    expected_worktree_parent,
+    worktree_identity_matches,
+)
 
 
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-BRANCH = re.compile(r"^codex/(?P<issue>[1-9][0-9]*)-[A-Za-z0-9._-]+$")
 ACTIVE_STATUSES = {"ACTIVE", "ACTIVE_FENCED"}
 REQUIRED_NODE_MAJOR = 20
 CANONICAL_REMOTE = "origin"
@@ -298,18 +304,30 @@ class PrePushControl:
         worktree_path = admission_payload.get("worktree_path")
         opaque_worktree_id = admission_payload.get("opaque_worktree_id")
         base_sha = admission_payload.get("base_sha")
-        branch_match = BRANCH.fullmatch(branch) if isinstance(branch, str) else None
+        surface_issue_number = delivery_branch_issue_number(repository, branch)
+        expected_parent = expected_worktree_parent(
+            repository, Path("/home/ubuntu/code")
+        )
         if (
-            branch_match is None
+            surface_issue_number is None
+            or expected_parent is None
             or not isinstance(worktree_path, str)
             or not Path(worktree_path).is_absolute()
-            or Path(worktree_path).parent != Path("/home/ubuntu/code")
+            or Path(worktree_path).parent != expected_parent
             or not isinstance(base_sha, str)
             or not GIT_SHA.fullmatch(base_sha)
         ):
             raise PrePushError("PREPUSH_ADMISSION_INVALID")
-        surface_issue_number = int(branch_match.group("issue"))
-        expected_surface_id = f"twinfinityapp-issue-{surface_issue_number}"
+        expected_surface_id = expected_worktree_identity(
+            repository, surface_issue_number
+        )
+        if expected_surface_id is None:
+            raise PrePushError("PREPUSH_ADMISSION_INVALID")
+        if (
+            repository == HARNESS_REPOSITORY
+            and surface_issue_number != issue_number
+        ):
+            raise PrePushError("PREPUSH_ADMISSION_INVALID")
         environment_root = admission_payload.get("environment_root")
         existing_environment_payload = admission_payload.get("existing_environment")
         existing_environment: ExistingEnvironment | None = None
@@ -358,17 +376,13 @@ class PrePushControl:
             )
             if not tagged_for_lane and not within_worktree:
                 raise PrePushError("PREPUSH_ADMISSION_ENVIRONMENT_INVALID")
-        canonical_worktree_identity = bool(
-            Path(worktree_path).name == expected_surface_id
-            and opaque_worktree_id == expected_surface_id
-        )
-        versioned_worktree_identity = bool(
-            re.fullmatch(
-                rf"{re.escape(expected_surface_id)}-v[1-9][0-9]*",
-                Path(worktree_path).name,
-            )
-            and opaque_worktree_id
-            == f"issue-{issue_number}-generation-{int(item['generation'])}"
+        valid_worktree_identity = worktree_identity_matches(
+            repository,
+            surface_issue_number=surface_issue_number,
+            owning_issue_number=issue_number,
+            generation=int(item["generation"]),
+            worktree_path=worktree_path,
+            opaque_worktree_id=opaque_worktree_id,
         )
         if surface_issue_number != issue_number:
             parent_issue_number = admission_payload.get("parent_issue_number")
@@ -415,7 +429,7 @@ class PrePushControl:
             ):
                 raise PrePushError("PREPUSH_TRANSFER_INVALID")
         elif (
-            not (canonical_worktree_identity or versioned_worktree_identity)
+            not valid_worktree_identity
             or any(
                 key in admission_payload
                 for key in (

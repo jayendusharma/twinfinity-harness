@@ -26,6 +26,7 @@ from prepush_control import (  # noqa: E402
     PrePushError,
     build_parser,
 )
+from repository_delivery_policy import HARNESS_REPOSITORY  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
@@ -303,6 +304,147 @@ class PrePushControlTests(unittest.TestCase):
             "/home/ubuntu/code/twinfinityapp-issue-328-v3",
             lineage.worktree_path,
         )
+
+    def test_harness_lineage_accepts_same_issue_and_rejects_transfer(self) -> None:
+        issue_number = 36
+        generation = 1
+        session_id = "role.development.v4"
+        lease_sha256 = "4" * 64
+        source = self.control.store.ingest_snapshot(
+            repository=HARNESS_REPOSITORY,
+            object_kind="issue",
+            object_number=issue_number,
+            payload={
+                "number": issue_number,
+                "updated_at": "2026-08-27T00:00:00Z",
+            },
+            source_updated_at="2026-08-27T00:00:00Z",
+            fetched_at="2026-08-27T00:00:01Z",
+        )
+        self.control.store._set_issue_status_for_test_fixture(
+            repository=HARNESS_REPOSITORY,
+            issue_number=issue_number,
+            status="ACTIVE",
+            allocation_class="ACTIVE",
+            generation=generation,
+            accountable_session_id=session_id,
+            lease_manifest_sha256=lease_sha256,
+            development_units=0,
+            shared_units=1,
+            sre_units=0,
+            expected_source_sha256=source.payload_sha256,
+            expected_version=0,
+            now="2026-08-27T00:00:02Z",
+        )
+        message_id = self.control.store.enqueue_message(
+            idempotency_key="issue-36-generation-1-harness-source",
+            recipient_session_id=session_id,
+            topic="development.admission",
+            payload={
+                "source": {
+                    "repository": HARNESS_REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": issue_number,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "issue_number": issue_number,
+                "generation": generation,
+                "item_version": 1,
+                "base_sha": "a" * 40,
+                "branch": "change/36-bootstrap-harness-source-lane",
+                "worktree_path": (
+                    "/home/ubuntu/code/twinfinity/"
+                    "twinfinity-harness-issue36-authorized"
+                ),
+                "opaque_worktree_id": (
+                    "twinfinity-harness-issue36-authorized"
+                ),
+                "accountable_session_id": session_id,
+                "lease_manifest_sha256": lease_sha256,
+                "authority_sha256": "9" * 64,
+                "capacity": {
+                    "development_units": 0,
+                    "shared_units": 1,
+                    "sre_units": 0,
+                },
+                "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+            },
+            now="2026-08-27T00:00:03Z",
+        )
+        message = self.control.connection.execute(
+            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches "
+            "SET admission_message_id=?,admission_payload_sha256=? "
+            "WHERE watch_key=?",
+            (
+                message_id,
+                message["payload_sha256"],
+                (
+                    f"terminal:{HARNESS_REPOSITORY}:issue:{issue_number}:"
+                    f"generation:{generation}"
+                ),
+            ),
+        )
+        self.control.store.claim_message(
+            message_id, session_id, "2026-08-27T00:00:04Z"
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+            ("2026-08-27T00:00:05Z", message_id, session_id),
+        )
+
+        lineage = self.control._lineage(HARNESS_REPOSITORY, issue_number)
+
+        self.assertEqual("change/36-bootstrap-harness-source-lane", lineage.branch)
+        self.assertEqual(
+            "/home/ubuntu/code/twinfinity/"
+            "twinfinity-harness-issue36-authorized",
+            lineage.worktree_path,
+        )
+        self.assertEqual(0, lineage.development_units)
+        self.assertEqual(1, lineage.shared_units)
+
+        row = self.control.connection.execute(
+            "SELECT payload_json FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        transferred = json.loads(row["payload_json"])
+        transferred.update(
+            {
+                "branch": "change/35-parent-lane",
+                "worktree_path": (
+                    "/home/ubuntu/code/twinfinity/"
+                    "twinfinity-harness-issue35"
+                ),
+                "opaque_worktree_id": "twinfinity-harness-issue35",
+                "parent_issue_number": 35,
+                "transfer_key": "harness-transfer-must-not-load",
+            }
+        )
+        payload_sha256 = digest_json(transferred)
+        self.control.connection.execute(
+            "DROP TRIGGER IF EXISTS coordination_message_envelope_immutable"
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_messages SET payload_json=?,payload_sha256=? "
+            "WHERE id=?",
+            (canonical_json(transferred), payload_sha256, message_id),
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches "
+            "SET admission_payload_sha256=? WHERE admission_message_id=?",
+            (payload_sha256, message_id),
+        )
+        with patch("prepush_control.load_transfer_record") as transfer_loader:
+            with self.assertRaisesRegex(
+                PrePushError, "PREPUSH_ADMISSION_INVALID"
+            ):
+                self.control._lineage(HARNESS_REPOSITORY, issue_number)
+        transfer_loader.assert_not_called()
 
     def test_non_transfer_worktree_identity_positive_and_negative_matrix(self) -> None:
         accepted = (

@@ -42,7 +42,7 @@ Any source, authority, scope, base, head, branch, worktree, lease, capacity, rec
 
 ## Deliver the admitted outcome
 
-1. Create or use only the admitted issue-owned `codex/<issue>-<slug>` branch and sibling worktree. Never work from the canonical checkout or another issue's environment.
+1. Create or use only the admitted repository-owned branch and sibling worktree: `codex/<issue>-<slug>` with the existing Twinfinity application identity, or `change/<issue>-<slug>` with the harness-owned identity for exact repository `jayendusharma/twinfinity-harness`. Never work from the canonical checkout or another issue's environment.
 2. Implement the smallest complete outcome with existing primitives. Do not absorb adjacent debt, speculative frameworks, customer-specific runtime code, or unrequested product behavior.
 3. Map each Gherkin scenario and safety invariant to the lowest useful focused evidence. Keep providers offline and data synthetic by default.
 4. Run the complete affected focused gates from the exact issue-owned environment. Record tool provenance, commands, results, and generated-file cleanliness.

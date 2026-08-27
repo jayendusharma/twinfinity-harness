@@ -41,6 +41,7 @@ from executor_registry import (  # noqa: E402
 )
 from prepush_control import PrePushControl  # noqa: E402
 from portfolio_graph import replace_graph  # noqa: E402
+from repository_delivery_policy import HARNESS_REPOSITORY  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
@@ -1297,6 +1298,157 @@ class CoordinationStoreTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM coordination_events"
             ).fetchone()[0],
         )
+
+    def test_harness_foreign_issue_branch_is_rejected_before_message_writes(
+        self,
+    ) -> None:
+        _item, message, _artifacts, _ready = self.prepare_development_admission(
+            "harness-foreign-branch"
+        )
+        payload = {
+            "number": 92,
+            "title": "Harness issue",
+            "updated_at": "2026-08-22T10:00:00Z",
+        }
+        source = self.store.ingest_snapshot(
+            repository=HARNESS_REPOSITORY,
+            object_kind="issue",
+            object_number=92,
+            payload=payload,
+            source_updated_at="2026-08-22T10:00:00Z",
+            fetched_at="2026-08-22T10:00:01Z",
+        )
+        invalid = {
+            **message,
+            "idempotency_key": "harness-foreign-branch-admission",
+            "payload": {
+                **message["payload"],
+                "source": {
+                    "repository": HARNESS_REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": 92,
+                    "payload_sha256": source.payload_sha256,
+                },
+                "branch": "change/93-foreign-issue",
+                "worktree_path": (
+                    "/home/ubuntu/code/twinfinity/"
+                    "twinfinity-harness-issue92"
+                ),
+                "opaque_worktree_id": "twinfinity-harness-issue92",
+            },
+        }
+        tables = (
+            "coordination_items",
+            "coordination_messages",
+            "coordination_terminal_watches",
+            "coordination_artifacts",
+            "coordination_events",
+        )
+        before = {
+            table: self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in tables
+        }
+
+        with self.assertRaisesRegex(CoordinationError, "MESSAGE_CONTRACT_INVALID"):
+            self.store.enqueue_message(
+                idempotency_key=invalid["idempotency_key"],
+                recipient_session_id=invalid["recipient_session_id"],
+                topic=invalid["topic"],
+                payload=invalid["payload"],
+                now="2026-08-22T10:00:05Z",
+            )
+
+        for table in tables:
+            self.assertEqual(
+                before[table],
+                self.store.connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0],
+            )
+
+    def test_harness_message_worktree_identity_rejects_without_writes(
+        self,
+    ) -> None:
+        _item, message, _artifacts, _ready = self.prepare_development_admission(
+            "harness-worktree-identity"
+        )
+        source = self.store.ingest_snapshot(
+            repository=HARNESS_REPOSITORY,
+            object_kind="issue",
+            object_number=92,
+            payload={
+                "number": 92,
+                "title": "Harness issue",
+                "updated_at": "2026-08-22T10:00:00Z",
+            },
+            source_updated_at="2026-08-22T10:00:00Z",
+            fetched_at="2026-08-22T10:00:01Z",
+        )
+        base_payload = {
+            **message["payload"],
+            "source": {
+                "repository": HARNESS_REPOSITORY,
+                "object_kind": "issue",
+                "object_number": 92,
+                "payload_sha256": source.payload_sha256,
+            },
+            "branch": "change/92-worktree-identity",
+        }
+        tables = (
+            "coordination_items",
+            "coordination_messages",
+            "coordination_terminal_watches",
+            "coordination_artifacts",
+            "coordination_events",
+        )
+        before = {
+            table: self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in tables
+        }
+        invalid = (
+            (
+                "/home/ubuntu/code/twinfinity/twinfinity-harness",
+                "twinfinity-harness",
+            ),
+            (
+                "/home/ubuntu/code/twinfinity/twinfinity-harness-issue93",
+                "twinfinity-harness-issue93",
+            ),
+            (
+                "/home/ubuntu/code/twinfinity/twinfinity-harness-issue92",
+                "caller-selected-identity",
+            ),
+        )
+        for index, (worktree_path, opaque_worktree_id) in enumerate(invalid):
+            with self.subTest(
+                worktree_path=worktree_path,
+                opaque_worktree_id=opaque_worktree_id,
+            ):
+                with self.assertRaisesRegex(
+                    CoordinationError, "MESSAGE_CONTRACT_INVALID"
+                ):
+                    self.store.enqueue_message(
+                        idempotency_key=f"harness-invalid-worktree-{index}",
+                        recipient_session_id=message["recipient_session_id"],
+                        topic=message["topic"],
+                        payload={
+                            **base_payload,
+                            "worktree_path": worktree_path,
+                            "opaque_worktree_id": opaque_worktree_id,
+                        },
+                        now="2026-08-22T10:00:05Z",
+                    )
+                for table in tables:
+                    self.assertEqual(
+                        before[table],
+                        self.store.connection.execute(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).fetchone()[0],
+                    )
 
     def test_direct_activation_rejects_every_registry_identity_substitution(
         self,

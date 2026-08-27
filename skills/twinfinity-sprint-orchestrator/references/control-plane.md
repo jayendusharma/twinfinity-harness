@@ -21,6 +21,12 @@ Canonical locations:
 - branches: `codex/<issue>-<slug>`; and
 - SQLite store: `/home/ubuntu/.codex/twinfinity-coordination/ack-transactions.sqlite3`.
 
+Those repository, checkout, worktree, and branch values are the application
+defaults. Exact repository `jayendusharma/twinfinity-harness` instead uses the
+repository-derived `change/<issue>-<slug>` and sibling harness-worktree policy
+defined in [harness-self-maintenance.md](harness-self-maintenance.md); neither
+repository may use the other's identity.
+
 Do not perform repository work from a Windows-mounted or synchronized-cloud checkout. Use native Ubuntu for controlled Git, toolchain, network, and Docker operations.
 
 ## Role and product boundaries

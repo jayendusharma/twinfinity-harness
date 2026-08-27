@@ -24,6 +24,12 @@ from executor_registry import (
     digest_json,
     identity_role,
 )
+from repository_delivery_policy import (
+    delivery_branch_matches_owning_issue,
+    expected_canonical_checkout,
+    expected_worktree_parent,
+    worktree_path_matches_owning_issue,
+)
 
 
 DEFAULT_DATABASE = Path.home() / ".codex/twinfinity-coordination/ack-transactions.sqlite3"
@@ -91,7 +97,6 @@ FORMAT_WRITE = re.compile(r"(?i)(?:^|\s)(?:--write|--fix|-w|-i)(?:\s|$)")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-BRANCH = re.compile(r"^codex/[0-9]+-[a-z0-9][a-z0-9-]*$")
 MAX_PASSIVE_WAIT_SECONDS = 60.0
 MAX_ARTIFACT_BYTES = 1024 * 1024
 LEASE_REQUIRED_KEYS = {"repository", "issue_number", "generation", "base_sha", "branch", "worktree_path", "no_additional_paths", "paths"}
@@ -374,7 +379,7 @@ def _parse_lease(raw: bytes) -> dict[str, Any]:
     if not isinstance(manifest, dict) or set(manifest) != LEASE_REQUIRED_KEYS:
         raise GuardError("DELIVERY_LEASE_INVALID")
     worktree = Path(manifest.get("worktree_path", ""))
-    if not isinstance(manifest.get("repository"), str) or type(manifest.get("issue_number")) is not int or manifest["issue_number"] <= 0 or type(manifest.get("generation")) is not int or manifest["generation"] < 0 or not isinstance(manifest.get("base_sha"), str) or GIT_SHA.fullmatch(manifest["base_sha"]) is None or not isinstance(manifest.get("branch"), str) or BRANCH.fullmatch(manifest["branch"]) is None or not worktree.is_absolute() or manifest.get("no_additional_paths") is not True or not isinstance(manifest.get("paths"), list) or not manifest["paths"]:
+    if not isinstance(manifest.get("repository"), str) or type(manifest.get("issue_number")) is not int or manifest["issue_number"] <= 0 or type(manifest.get("generation")) is not int or manifest["generation"] < 0 or not isinstance(manifest.get("base_sha"), str) or GIT_SHA.fullmatch(manifest["base_sha"]) is None or not delivery_branch_matches_owning_issue(manifest.get("repository"), manifest.get("branch"), manifest.get("issue_number")) or not worktree.is_absolute() or not worktree_path_matches_owning_issue(manifest.get("repository"), manifest.get("worktree_path"), manifest.get("issue_number")) or manifest.get("no_additional_paths") is not True or not isinstance(manifest.get("paths"), list) or not manifest["paths"]:
         raise GuardError("DELIVERY_LEASE_INVALID")
     observed: set[str] = set()
     for entry in manifest["paths"]:
@@ -411,7 +416,14 @@ def _load_lease(
     if not isinstance(repository, str) or len(repository_parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in repository_parts) or type(issue_number) is not int or issue_number <= 0 or type(generation) is not int or generation < 0 or not isinstance(digest, str) or SHA256.fullmatch(digest) is None or not isinstance(worktree_value, str):
         raise GuardError("DELIVERY_TARGET_INVALID")
     worktree = Path(worktree_value)
-    if not worktree.is_absolute() or worktree.parent != worktree_root:
+    expected_parent = expected_worktree_parent(repository, worktree_root)
+    canonical_checkout = expected_canonical_checkout(repository, worktree_root)
+    if (
+        not worktree.is_absolute()
+        or expected_parent is None
+        or canonical_checkout is None
+        or worktree.parent != expected_parent
+    ):
         raise GuardError("DELIVERY_TARGET_INVALID")
     rows = connection.execute("SELECT relative_path,content_sha256,size_bytes,device_id,inode FROM coordination_artifacts WHERE repository=? AND issue_number=? AND generation=? AND content_sha256=? AND state='REGISTERED'", (repository, issue_number, generation, digest)).fetchall()
     if len(rows) != 1:
@@ -425,7 +437,7 @@ def _load_lease(
     return (
         worktree,
         frozenset(worktree / entry["path"] for entry in manifest["paths"]),
-        worktree_root / repository_parts[1],
+        canonical_checkout,
         str(manifest["branch"]),
         str(manifest["base_sha"]),
     )
