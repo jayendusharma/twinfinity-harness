@@ -36,6 +36,7 @@ from portfolio_graph import (
     enqueue_convergence_dirty_event,
     ensure_portfolio_graph_schema,
     evaluate_graph_for_admission_lineage,
+    graph_allows_admission_source_pair,
     reserved_hosted_sre_units,
     validate_portfolio_transition,
 )
@@ -2775,6 +2776,46 @@ class CoordinationStore:
             row["source_updated_at"],
             row["fetched_at"],
             json.loads(row["payload_json"]),
+        )
+
+    def outbox_source_is_current(self, outbox_id: int, current_source_sha256: str) -> bool:
+        """Validate raw or exact admission-equivalent source for one outbox."""
+
+        row = self.connection.execute(
+            "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+        ).fetchone()
+        if row is None or not isinstance(current_source_sha256, str):
+            return False
+        if row["expected_source_sha256"] == current_source_sha256:
+            return True
+        packet = self.connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_packets WHERE outbox_id=?",
+            (outbox_id,),
+        ).fetchone()
+        if packet is None:
+            return False
+        item = self.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (packet["repository"], packet["issue_number"]),
+        ).fetchone()
+        message = self.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (packet["activation_message_id"],),
+        ).fetchone()
+        watch = self.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+            (packet["terminal_watch_key"],),
+        ).fetchone()
+        return bool(
+            item is not None and message is not None and watch is not None
+            and row["repository"] == packet["repository"]
+            and int(row["object_number"]) == int(packet["issue_number"])
+            and row["expected_source_sha256"] == packet["source_payload_sha256"]
+            and admission_lineage_source_is_current(
+                self.connection, item=item, message=message, watch=watch,
+                current_source_sha256=current_source_sha256,
+                receipt_item_version=int(packet["expected_item_version"]),
+            )
         )
 
     @property
@@ -6314,9 +6355,15 @@ class CoordinationStore:
             message = None if watch is None else self.connection.execute(
                 "SELECT * FROM coordination_messages WHERE id=?", (watch["admission_message_id"],)
             ).fetchone()
+            packet = self.connection.execute(
+                "SELECT expected_item_version FROM coordination_terminal_closeout_packets "
+                "WHERE repository=? AND issue_number=? AND source_payload_sha256=? LIMIT 1",
+                (repository, issue_number, source_payload_sha256),
+            ).fetchone()
             evaluation = None if item is None or watch is None or message is None else evaluate_graph_for_admission_lineage(
                 self.connection, repository, current_main=str(row["accepted_main_sha"]),
                 item=item, message=message, watch=watch,
+                receipt_item_version=(None if packet is None else int(packet["expected_item_version"])),
             )
             graph_current = bool(
                 row["observed_main_sha"] == row["accepted_main_sha"]
@@ -6907,6 +6954,12 @@ class CoordinationStore:
             stable_sha256 = require_stable_issue_equivalence(json.loads(bound["payload_json"]), current.payload)
         except (TypeError, json.JSONDecodeError, AdmissionSourceEquivalenceError) as exc:
             raise CoordinationError(str(exc)) from exc
+        if not graph_allows_admission_source_pair(
+            self.connection, repository=repository, issue_number=issue_number,
+            bound_source_sha256=str(source["payload_sha256"]),
+            current_source_sha256=current.payload_sha256,
+        ):
+            raise CoordinationError("SOURCE_EQUIVALENCE_GRAPH_DRIFT")
         receipt_match = re.fullmatch(r"comment:(\d+)", str(outbox["remote_receipt"] or ""))
         comment_id = int(receipt_match.group(1)) if receipt_match else 0
         event = timeline[0]
@@ -7978,6 +8031,7 @@ class CoordinationStore:
                     or not admission_lineage_source_is_current(
                         self.connection, item=item, message=activation, watch=watch,
                         current_source_sha256=current_source.payload_sha256,
+                        receipt_item_version=int(packet["expected_item_version"]),
                     )):
                 raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
             expected_publication_issue_url = (
@@ -9801,6 +9855,7 @@ class CoordinationStore:
                     and admission_lineage_source_is_current(
                         self.connection, item=item, message=message, watch=watch,
                         current_source_sha256=source.payload_sha256,
+                        receipt_item_version=int(terminal_packet["expected_item_version"]),
                     )
                 )
             if not source_current:

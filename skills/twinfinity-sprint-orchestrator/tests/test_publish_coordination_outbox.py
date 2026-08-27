@@ -15,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS))
 from coordination_store import (  # noqa: E402
     CoordinationError,
     CoordinationStore,
+    canonical_json,
     digest_json,
 )
 import publish_coordination_outbox as publisher  # noqa: E402
@@ -175,6 +176,46 @@ class PublisherTests(unittest.TestCase):
             "SELECT state FROM github_outbox WHERE id=?", (self.outbox,)
         ).fetchone()[0]
         self.assertEqual("COMPLETE", state)
+
+    @patch.object(publisher, "fetch_object")
+    @patch.object(publisher, "_gh_json")
+    def test_source_equivalent_terminal_outbox_refresh_posts_once(self, gh, fetch) -> None:
+        self.bind_terminal_packet()
+        row = self.store.connection.execute("SELECT * FROM github_outbox WHERE id=?", (self.outbox,)).fetchone()
+        current_payload = {**self.payload, "updated_at": "2026-08-22T10:00:03Z"}
+        current_sha = digest_json(current_payload)
+        message_payload_sha = "6" * 64
+        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:1"
+        self.store.connection.execute(
+            "INSERT INTO coordination_messages(id,idempotency_key,recipient_session_id,topic,payload_sha256,payload_json,state,claimed_by,created_at,updated_at) VALUES (1,'admission','role.development.v3','development.admission',?,?, 'CLAIMED','role.development.v3',?,?)",
+            (message_payload_sha, canonical_json({}), "2026-08-22T10:00:01Z", "2026-08-22T10:00:01Z"),
+        )
+        self.store.connection.execute(
+            "INSERT INTO coordination_items VALUES (?,92,'PUBLICATION_PENDING','ACTIVE',1,'role.development.v3',?,1,0,0,?,2,?)",
+            (REPOSITORY, "5" * 64, row["expected_source_sha256"], "2026-08-22T10:00:02Z"),
+        )
+        self.store.connection.execute(
+            "INSERT INTO coordination_terminal_watches(watch_key,repository,issue_number,generation,accountable_session_id,lease_manifest_sha256,state,admission_message_id,admission_payload_sha256,claim_attempt_id,last_heartbeat_at,next_wake_at,updated_at) VALUES (?,?,92,1,'role.development.v3',?,'ACTIVE',1,?,?,?, ?, ?)",
+            (watch_key, REPOSITORY, "5" * 64, message_payload_sha, "00000000-0000-4000-8000-000000000001", "2026-08-22T10:00:01Z", "2026-08-22T10:00:01Z", "2026-08-22T10:00:01Z"),
+        )
+        receipt = {"kind": "TWINFINITY_ADMISSION_SOURCE_EQUIVALENCE_RECEIPT_V1", "receipt_key": "r", "preview_sha256": "9" * 64}
+        self.store.connection.execute(
+            "INSERT INTO coordination_admission_source_equivalence VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("r", "9" * 64, REPOSITORY, 92, 1, 1, watch_key, 1, row["expected_source_sha256"], current_sha,
+             "8" * 64, "role.development.v3", "role.development.v3", "00000000-0000-4000-8000-000000000001",
+             "5" * 64, "7" * 64, self.outbox, 123, "4" * 64, digest_json(receipt), canonical_json(receipt), "2026-08-22T10:00:02Z"),
+        )
+        self.store.connection.commit()
+        fetch.return_value = current_payload
+        published = publisher._published_body(self.body, "issue-92-terminal")
+        gh.side_effect = [
+            {"login": "twinfinity-bot"},
+            {"id": 123, "body": published, "user": {"login": "twinfinity-bot"}},
+            {"id": 123, "body": published, "user": {"login": "twinfinity-bot"}},
+        ]
+        result = publisher.publish(self.store, self.outbox)
+        self.assertEqual("comment:123", result["receipt"])
+        self.assertEqual(1, len([call for call in gh.call_args_list if "POST" in call.args[0]]))
 
     @patch.object(publisher, "fetch_object")
     @patch.object(publisher, "_gh_json")

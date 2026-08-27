@@ -98,6 +98,22 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
         transition_attempt(self.store.connection, attempt_id=attempt["attempt_id"], token=token, expected_version=running["version"], new_state="COMPLETE", exit_code=0, now="2026-08-26T20:00:08Z")
         self.attempt_id = attempt["attempt_id"]
 
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_revisions VALUES (?,?,?,?,?,?,?,?)",
+            (REPOSITORY, 1, None, "b" * 40, "8" * 64,
+             canonical_json({"kind": "ISSUE_SET"}), canonical_json([]), "2026-08-26T20:00:08Z"),
+        )
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_current VALUES (?,1,?,'CURRENT',?,NULL)",
+            (REPOSITORY, "b" * 40, "2026-08-26T20:00:08Z"),
+        )
+        self.store.connection.execute(
+            "INSERT INTO portfolio_graph_nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (REPOSITORY, 1, f"issue:{ISSUE}", ISSUE, "DELIVERY", "STANDALONE", "bounded", None, None,
+             "development", 0, 1, 1, 1, 1, 1, 0, self.bound_sha, "2026-08-26T20:00:08Z"),
+        )
+        self.store.connection.commit()
+
         body = {"kind": "OWNER_CONTROL_COMMENT", "body": "receipt"}
         cursor = self.store.connection.execute(
             "INSERT INTO github_outbox(idempotency_key,repository,object_kind,object_number,operation,expected_source_sha256,payload_sha256,payload_json,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -185,6 +201,21 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
         with self.assertRaisesRegex(CoordinationError, "SOURCE_EQUIVALENCE_STATE_MISMATCH"):
             self.store.apply_source_equivalent_admission_rearm(**self.request, expected_preview_sha256=preview["preview_sha256"], now="2026-08-26T20:00:20Z")
         self.assertEqual(before, self.store.connection.execute("SELECT COUNT(*) FROM coordination_admission_source_equivalence").fetchone()[0])
+
+    def test_unrelated_graph_drift_holds_apply_with_zero_writes(self) -> None:
+        preview = self.store.preview_source_equivalent_admission_rearm(**self.request)
+        self.store.connection.execute(
+            "UPDATE portfolio_graph_current SET last_error='GRAPH_SCOPE_INVENTORY_DRIFT' WHERE repository=?",
+            (REPOSITORY,),
+        )
+        self.store.connection.commit()
+        before = list(self.store.connection.iterdump())
+        with self.assertRaisesRegex(CoordinationError, "SOURCE_EQUIVALENCE_GRAPH_DRIFT"):
+            self.store.apply_source_equivalent_admission_rearm(
+                **self.request, expected_preview_sha256=preview["preview_sha256"],
+                now="2026-08-26T20:00:20Z",
+            )
+        self.assertEqual(before, list(self.store.connection.iterdump()))
 
 
 if __name__ == "__main__":

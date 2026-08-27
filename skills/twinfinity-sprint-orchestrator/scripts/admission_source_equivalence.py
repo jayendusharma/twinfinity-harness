@@ -115,6 +115,7 @@ def admission_lineage_source_is_current(
     message: sqlite3.Row,
     watch: sqlite3.Row,
     current_source_sha256: str,
+    receipt_item_version: int | None = None,
 ) -> bool:
     """Accept raw equality or the exact current receipt for this lineage."""
 
@@ -136,7 +137,7 @@ def admission_lineage_source_is_current(
         generation=int(item["generation"]),
         message_id=int(message["id"]),
         watch_key=str(watch["watch_key"]),
-        item_version=int(item["version"]),
+        item_version=(int(item["version"]) if receipt_item_version is None else receipt_item_version),
         bound_source_sha256=str(bound),
         current_source_sha256=current_source_sha256,
         endpoint_id=str(item["accountable_session_id"]),

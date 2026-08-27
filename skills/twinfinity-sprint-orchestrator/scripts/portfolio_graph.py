@@ -1252,6 +1252,7 @@ def evaluate_graph_for_admission_lineage(
     item: sqlite3.Row,
     message: sqlite3.Row,
     watch: sqlite3.Row,
+    receipt_item_version: int | None = None,
 ) -> dict[str, Any]:
     """Permit only the exact receipt-bound source reason for one admission."""
 
@@ -1274,9 +1275,57 @@ def evaluate_graph_for_admission_lineage(
             and admission_lineage_source_is_current(
                 connection, item=item, message=message, watch=watch,
                 current_source_sha256=str(current["payload_sha256"]),
+                receipt_item_version=receipt_item_version,
             )):
         return {**result, "health": "CURRENT", "stale_reasons": [], "source_equivalence": True}
     return result
+
+
+def graph_allows_admission_source_pair(
+    connection: sqlite3.Connection,
+    *,
+    repository: str,
+    issue_number: int,
+    bound_source_sha256: str,
+    current_source_sha256: str,
+) -> bool:
+    """Accept CURRENT or source-only stale graph state for one exact source pair."""
+
+    row = connection.execute(
+        """
+        SELECT current.observed_main_sha, revision.accepted_main_sha, node.node_key,
+               node.source_payload_sha256
+        FROM portfolio_graph_current current
+        JOIN portfolio_graph_revisions revision
+          ON revision.repository=current.repository AND revision.version=current.version
+        JOIN portfolio_graph_nodes node
+          ON node.repository=current.repository AND node.graph_version=current.version
+         AND node.issue_number=?
+        WHERE current.repository=?
+        """,
+        (issue_number, repository),
+    ).fetchone()
+    current = connection.execute(
+        "SELECT payload_sha256 FROM github_current WHERE repository=? AND object_kind='issue' AND object_number=?",
+        (repository, issue_number),
+    ).fetchone()
+    if (row is None or current is None
+            or row["observed_main_sha"] != row["accepted_main_sha"]
+            or row["source_payload_sha256"] != bound_source_sha256
+            or current["payload_sha256"] != current_source_sha256):
+        return False
+    result = evaluate_graph(
+        connection, repository, current_main=str(row["accepted_main_sha"]),
+        _ensure_schema=False,
+    )
+    if result["health"] == "CURRENT":
+        return current_source_sha256 == bound_source_sha256
+    allowed = {
+        "GRAPH_SOURCE_DRIFT",
+        f"GRAPH_SOURCE_DRIFT:{row['node_key']}",
+        f"GRAPH_SOURCE_DRIFT:issue:{issue_number}",
+    }
+    return bool(result["stale_reasons"] and set(result["stale_reasons"]).issubset(allowed))
 
 
 def _capacity_policy(connection: sqlite3.Connection, repository: str) -> sqlite3.Row:
