@@ -26,7 +26,12 @@ from prepush_control import (  # noqa: E402
     PrePushError,
     build_parser,
 )
-from repository_delivery_policy import HARNESS_REPOSITORY  # noqa: E402
+from repository_delivery_policy import (  # noqa: E402
+    HARNESS_REPOSITORY,
+    HARNESS_STANDING_AUTHORITY_SCHEMA,
+    canonical_harness_standing_controls,
+    stable_issue_source_sha256,
+)
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
@@ -44,12 +49,32 @@ class PrePushControlTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
+        goal_raw = b"Pre-push control test planner goal.\n"
+        (root / "product-planner-goal.md").write_bytes(goal_raw)
+        self.goal_sha256 = hashlib.sha256(goal_raw).hexdigest()
         self.control = PrePushControl(root / "state.sqlite3")
         apply_reviewed_current_endpoint_catalog(
             self.control.connection,
             ROOT,
             operation_key="prepush-control-tests",
         )
+        bootstrap_manifest = {"kind": "prepush-control-test-bootstrap"}
+        with self.control.store.transaction():
+            self.control.store.record_bootstrap_provenance(
+                bootstrap_id="prepush-control-tests",
+                manifest_sha256=hashlib.sha256(
+                    canonical_json(bootstrap_manifest).encode("utf-8")
+                ).hexdigest(),
+                manifest=bootstrap_manifest,
+                source_harness_repository=HARNESS_REPOSITORY,
+                source_harness_main_sha="0" * 40,
+                source_registry_sha256="1" * 64,
+                approved_goal_sha256=self.goal_sha256,
+                application_repository=REPOSITORY,
+                application_main_sha="2" * 40,
+                archived_database_sha256="3" * 64,
+                now="2026-08-23T00:00:00Z",
+            )
         source = self.control.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
@@ -244,16 +269,23 @@ class PrePushControlTests(unittest.TestCase):
     def record(self, *, state: str = "PASS") -> dict:
         lineage = self.control._lineage(REPOSITORY, ISSUE)
         passed = state == "PASS"
+        manifest = LeaseManifest(
+            content_sha256=LEASE,
+            changed_paths_sha256=digest_json(["backend/example.py"]),
+            paths=("backend/example.py",),
+        )
+        gate_plan = self.control._gate_plan(
+            REPOSITORY,
+            manifest.paths,
+            run_id="p314-g2-bbbbbbbbbbbb",
+            base_sha=lineage.base_sha,
+        )
         return self.control._record(
             lineage=lineage,
             head_sha=HEAD,
-            manifest=LeaseManifest(
-                content_sha256=LEASE,
-                changed_paths_sha256=digest_json(["backend/example.py"]),
-                paths=("backend/example.py",),
-            ),
-            lower_gate='[{"argv":["./check.sh"],"cwd":"backend","name":"backend/check.sh"}]',
-            compose_gate="python3 backend/scripts/browser_e2e.py",
+            manifest=manifest,
+            lower_gate=self.control._serialize_lower_gate(gate_plan),
+            compose_gate=gate_plan.final_receipt,
             lower_exit=0 if passed else 1,
             compose_exit=0 if passed else None,
             run_id="p314-g2-bbbbbbbbbbbb",
@@ -336,6 +368,32 @@ class PrePushControlTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-27T00:00:02Z",
         )
+        controls = canonical_harness_standing_controls()
+        routine_chain = controls["routine_chain"]
+        source_scope = controls["source_scope"]
+        source_exclusions = controls["exclusions"]
+        writer = controls["writer"]
+        reviewer_plan = controls["reviewer_plan"]
+        collision_proof = controls["collision_proof"]
+        environment_rule = controls["environment_rule"]
+        hard_stops = controls["hard_stops"]
+        standing_authority = {
+            "schema": HARNESS_STANDING_AUTHORITY_SCHEMA,
+            "repository": HARNESS_REPOSITORY,
+            "issue_number": issue_number,
+            "source_payload_sha256": source.payload_sha256,
+            "stable_source_sha256": stable_issue_source_sha256(source.payload),
+            "planner_goal_sha256": self.goal_sha256,
+            "accepted_main_sha": "a" * 40,
+            "source_scope": source_scope,
+            "exclusions": source_exclusions,
+            "writer": writer,
+            "reviewer_plan": reviewer_plan,
+            "collision_proof": collision_proof,
+            "environment_rule": environment_rule,
+            "routine_chain": routine_chain,
+            "hard_stops": hard_stops,
+        }
         message_id = self.control.store.enqueue_message(
             idempotency_key="issue-36-generation-1-harness-source",
             recipient_session_id=session_id,
@@ -361,7 +419,19 @@ class PrePushControlTests(unittest.TestCase):
                 ),
                 "accountable_session_id": session_id,
                 "lease_manifest_sha256": lease_sha256,
-                "authority_sha256": "9" * 64,
+                "authority_sha256": "8" * 64,
+                "standing_source_authority": standing_authority,
+                "standing_source_authority_sha256": digest_json(
+                    standing_authority
+                ),
+                "source_scope": source_scope,
+                "source_exclusions": source_exclusions,
+                "writer": writer,
+                "reviewer_plan": reviewer_plan,
+                "collision_proof": collision_proof,
+                "environment_rule": environment_rule,
+                "routine_chain": routine_chain,
+                "hard_stops": hard_stops,
                 "capacity": {
                     "development_units": 0,
                     "shared_units": 1,
@@ -971,6 +1041,237 @@ class PrePushControlTests(unittest.TestCase):
             tuple(command[0] for command in commands),
         )
 
+    def test_repository_gate_plan_preserves_application_and_closes_harness_catalog(self) -> None:
+        application = self.control._gate_plan(
+            REPOSITORY,
+            ("backend/service.py", "frontend/src/App.tsx"),
+            run_id="p314-g2-bbbbbbbbbbbb",
+            base_sha="a" * 40,
+        )
+        self.assertEqual(
+            ("backend/check.sh", "frontend/npm-check", "frontend/npm-build"),
+            tuple(command[0] for command in application.lower_commands),
+        )
+        self.assertEqual(
+            (
+                sys.executable,
+                "backend/scripts/browser_e2e.py",
+                "--run-id",
+                "p314-g2-bbbbbbbbbbbb",
+            ),
+            application.final_argv,
+        )
+        self.assertEqual("PREPUSH_COMPOSE_GATE_FAILED", application.final_failure)
+
+        harness = self.control._gate_plan(
+            HARNESS_REPOSITORY,
+            (
+                "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
+                "skills/twinfinity-sprint-orchestrator/tests/test_prepush_control.py",
+            ),
+            run_id="p36-g1-cccccccccccc",
+            base_sha="a" * 40,
+        )
+        names = tuple(command[0] for command in harness.lower_commands)
+        self.assertEqual("harness/baseline-source-controls", names[0])
+        self.assertEqual("harness/hermetic-focused", names[1])
+        self.assertEqual(11, sum(name.startswith("harness/quick-validate/") for name in names))
+        self.assertTrue(harness.metadata["baseline_required"])
+        self.assertEqual("a" * 40, harness.metadata["base_sha"])
+        self.assertEqual(
+            (
+                sys.executable,
+                "-B",
+                "skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py",
+                "--base-sha",
+                "a" * 40,
+            ),
+            harness.lower_commands[0][2],
+        )
+        serialized = canonical_json(
+            {
+                "lower": harness.lower_commands,
+                "final": harness.final_argv,
+            }
+        )
+        for forbidden in ("backend/check.sh", "frontend/npm", "browser_e2e", "docker", "compose"):
+            self.assertNotIn(forbidden, serialized.casefold())
+        self.assertIn("tests.test_prepush_control", serialized)
+        self.assertEqual(
+            "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py",
+            harness.final_argv[-1],
+        )
+        self.assertEqual(
+            "PREPUSH_HARNESS_HERMETIC_GATE_FAILED", harness.final_failure
+        )
+        with self.assertRaisesRegex(
+            PrePushError, "PREPUSH_HARNESS_FOCUSED_SELECTOR_MISSING"
+        ):
+            self.control._gate_plan(
+                HARNESS_REPOSITORY,
+                (
+                    "skills/twinfinity-sprint-orchestrator/"
+                    "scripts/role_executor_transport.py",
+                ),
+                run_id="x",
+                base_sha="a" * 40,
+            )
+        with patch(
+            "prepush_control.HARNESS_VALIDATOR_SKILL_ROOTS",
+            ("skills/missing-validator-skill",),
+        ):
+            with self.assertRaisesRegex(
+                PrePushError, "PREPUSH_HARNESS_VALIDATOR_CATALOG_INCOMPLETE"
+            ):
+                self.control._gate_plan(
+                    HARNESS_REPOSITORY,
+                    ("skills/twinfinity-sprint-orchestrator/tests/test_prepush_control.py",),
+                    run_id="x",
+                    base_sha="a" * 40,
+                )
+        with self.assertRaisesRegex(PrePushError, "PREPUSH_REPOSITORY_UNSUPPORTED"):
+            self.control._gate_plan(
+                "other/repository",
+                ("README.md",),
+                run_id="x",
+                base_sha="a" * 40,
+            )
+        with patch("prepush_control.subprocess.run") as subprocess_run:
+            with self.assertRaisesRegex(
+                PrePushError, "PREPUSH_REPOSITORY_UNSUPPORTED"
+            ):
+                self.control._gate_plan(
+                    HARNESS_REPOSITORY.upper(),
+                    ("README.md",),
+                    run_id="x",
+                    base_sha="a" * 40,
+                )
+        subprocess_run.assert_not_called()
+
+    def test_harness_gate_run_pass_and_each_failure_stage_never_publish(self) -> None:
+        worktree = Path(self.temp.name) / "harness-worktree"
+        worktree.mkdir()
+        lineage = replace(
+            self.control._lineage(REPOSITORY, ISSUE),
+            repository=HARNESS_REPOSITORY,
+            issue_number=36,
+            surface_issue_number=36,
+            generation=1,
+            branch="change/36-complete-harness-source-lane",
+            worktree_path=str(worktree),
+            base_sha="a" * 40,
+            development_units=0,
+            shared_units=1,
+            sre_units=0,
+            admission_topic="development.admission",
+            environment_root=None,
+            existing_environment=None,
+        )
+        manifest = LeaseManifest(
+            content_sha256=LEASE,
+            changed_paths_sha256=digest_json(
+                [
+                    "skills/twinfinity-sprint-orchestrator/"
+                    "tests/test_prepush_control.py"
+                ]
+            ),
+            paths=(
+                "skills/twinfinity-sprint-orchestrator/"
+                "tests/test_prepush_control.py",
+            ),
+        )
+        plan = self.control._gate_plan(
+            HARNESS_REPOSITORY,
+            manifest.paths,
+            run_id=f"p36-g1-{HEAD[:12]}",
+            base_sha="a" * 40,
+        )
+        lower_count = len(plan.lower_commands)
+
+        def git_after_gate(_worktree: Path, *args: str) -> str:
+            return HEAD if args[-1] == "HEAD" else ""
+
+        cases = (
+            ("focused", 0, "PREPUSH_LOWER_GATE_FAILED"),
+            ("quick-validator", 1, "PREPUSH_LOWER_GATE_FAILED"),
+            ("full-hermetic", lower_count, "PREPUSH_HARNESS_HERMETIC_GATE_FAILED"),
+            ("pass", None, None),
+        )
+        for name, failed_index, expected_error in cases:
+            with self.subTest(stage=name):
+                calls: list[list[str]] = []
+
+                def run_gate(argv, **_kwargs):
+                    index = len(calls)
+                    calls.append(list(argv))
+                    return subprocess.CompletedProcess(
+                        argv, 1 if index == failed_index else 0
+                    )
+
+                recorded = {
+                    "state": "PASS" if expected_error is None else "HOLD",
+                    "last_error": expected_error,
+                }
+                with (
+                    patch.object(self.control, "_lineage", return_value=lineage),
+                    patch.object(
+                        self.control,
+                        "_validate_worktree",
+                        return_value=(worktree, HEAD),
+                    ),
+                    patch.object(
+                        self.control,
+                        "_validate_manifest_file",
+                        return_value=manifest,
+                    ),
+                    patch.object(
+                        self.control,
+                        "_validate_gate_environment",
+                        return_value={"python": sys.executable},
+                    ),
+                    patch.object(self.control, "_git", side_effect=git_after_gate),
+                    patch.object(
+                        self.control, "_record", return_value=recorded
+                    ) as record,
+                    patch("prepush_control.subprocess.run", side_effect=run_gate),
+                ):
+                    if expected_error is None:
+                        self.assertEqual(
+                            recorded,
+                            self.control.run(
+                                HARNESS_REPOSITORY,
+                                36,
+                                30,
+                                self.control.store.path.parent / "lease.json",
+                            ),
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            PrePushError, expected_error
+                        ):
+                            self.control.run(
+                                HARNESS_REPOSITORY,
+                                36,
+                                30,
+                                self.control.store.path.parent / "lease.json",
+                            )
+                self.assertEqual(expected_error, record.call_args.kwargs["error"])
+                serialized = canonical_json(calls).casefold()
+                for forbidden in (
+                    "backend/check.sh",
+                    "frontend/npm",
+                    "browser_e2e",
+                    "docker",
+                    "compose",
+                ):
+                    self.assertNotIn(forbidden, serialized)
+                self.assertEqual(
+                    0,
+                    self.control.connection.execute(
+                        "SELECT COUNT(*) FROM coordination_pre_push_publications"
+                    ).fetchone()[0],
+                )
+
     @staticmethod
     def _make_backend_environment(root: Path, *, python_symlink: bool = True) -> Path:
         bin_path = root / "bin"
@@ -1402,6 +1703,10 @@ class PrePushControlTests(unittest.TestCase):
         controlled = self.control._controlled_gate_environment(
             {
                 "PATH": "/usr/bin:/bin",
+                "TMPDIR": "/tmp/safe",
+                "PYTHONPATH": "/tmp/fake-pythonpath",
+                "PYTHONHOME": "/tmp/fake-pythonhome",
+                "NODE_PATH": "/tmp/fake-node",
                 "BASH_ENV": "/tmp/injected.sh",
                 "ENV": "/tmp/sh-injected.sh",
                 "BASHOPTS": "extdebug",
@@ -1412,6 +1717,7 @@ class PrePushControlTests(unittest.TestCase):
             }
         )
         self.assertEqual("/usr/bin:/bin", controlled["PATH"])
+        self.assertEqual("/tmp/safe", controlled["TMPDIR"])
         self.assertEqual("preserved", controlled["SAFE_VALUE"])
         self.assertEqual("1", controlled["PYTHONDONTWRITEBYTECODE"])
         for key in (
@@ -1421,6 +1727,9 @@ class PrePushControlTests(unittest.TestCase):
             "SHELLOPTS",
             "CDPATH",
             "BASH_FUNC_ruff%%",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "NODE_PATH",
         ):
             self.assertNotIn(key, controlled)
 
@@ -2008,7 +2317,12 @@ class PrePushControlTests(unittest.TestCase):
             & compose_calls[0][1].keys()
         )
         self.assertEqual(
-            "python3 backend/scripts/browser_e2e.py",
+            self.control._gate_plan(
+                REPOSITORY,
+                manifest.paths,
+                run_id=f"p{ISSUE}-g{lineage.generation}-{HEAD[:12]}",
+                base_sha=lineage.base_sha,
+            ).final_receipt,
             record.call_args.kwargs["compose_gate"],
         )
         self.assertTrue(record.call_args.kwargs["cleanup_proven"])
@@ -2218,9 +2532,16 @@ class PrePushControlTests(unittest.TestCase):
 
     def test_exact_head_pass_is_push_eligible(self) -> None:
         receipt = self.record()
-        eligible = self.control.assert_push_eligible(
-            REPOSITORY, ISSUE, "codex/314-ci-hardening", HEAD
-        )
+        with patch.object(
+            self.control, "_validate_worktree", return_value=(Path(self.temp.name), HEAD)
+        ), patch.object(
+            self.control,
+            "_current_changed_paths",
+            return_value=("backend/example.py",),
+        ):
+            eligible = self.control.assert_push_eligible(
+                REPOSITORY, ISSUE, "codex/314-ci-hardening", HEAD
+            )
         self.assertEqual(receipt["id"], eligible["id"])
         self.assertEqual(
             digest_json(
@@ -2237,8 +2558,20 @@ class PrePushControlTests(unittest.TestCase):
             "UPDATE coordination_items SET version=version+1 WHERE repository=? AND issue_number=?",
             (REPOSITORY, ISSUE),
         )
-        with self.assertRaisesRegex(
-            PrePushError, "PREPUSH_COMPLETED_ADMISSION_ABSENT"
+        with (
+            patch.object(
+                self.control,
+                "_validate_worktree",
+                return_value=(Path(self.temp.name), HEAD),
+            ),
+            patch.object(
+                self.control,
+                "_current_changed_paths",
+                return_value=("backend/example.py",),
+            ),
+            self.assertRaisesRegex(
+                PrePushError, "PREPUSH_COMPLETED_ADMISSION_ABSENT"
+            ),
         ):
             self.control.assert_push_eligible(
                 REPOSITORY, ISSUE, "codex/314-ci-hardening", HEAD
@@ -2247,25 +2580,73 @@ class PrePushControlTests(unittest.TestCase):
             "UPDATE coordination_items SET version=version-1, sre_units=sre_units+1 WHERE repository=? AND issue_number=?",
             (REPOSITORY, ISSUE),
         )
-        with self.assertRaisesRegex(
-            PrePushError, "PREPUSH_COMPLETED_ADMISSION_ABSENT"
+        with (
+            patch.object(
+                self.control,
+                "_validate_worktree",
+                return_value=(Path(self.temp.name), HEAD),
+            ),
+            patch.object(
+                self.control,
+                "_current_changed_paths",
+                return_value=("backend/example.py",),
+            ),
+            self.assertRaisesRegex(
+                PrePushError, "PREPUSH_COMPLETED_ADMISSION_ABSENT"
+            ),
         ):
             self.control.assert_push_eligible(
                 REPOSITORY, ISSUE, "codex/314-ci-hardening", HEAD
             )
 
     def test_missing_wrong_head_and_newer_hold_fail_closed(self) -> None:
-        with self.assertRaisesRegex(PrePushError, "PREPUSH_EXACT_HEAD_GATE_ABSENT"):
+        with (
+            patch.object(
+                self.control,
+                "_validate_worktree",
+                return_value=(Path(self.temp.name), HEAD),
+            ),
+            patch.object(
+                self.control,
+                "_current_changed_paths",
+                return_value=("backend/example.py",),
+            ),
+            self.assertRaisesRegex(PrePushError, "PREPUSH_EXACT_HEAD_GATE_ABSENT"),
+        ):
             self.control.assert_push_eligible(
                 REPOSITORY, ISSUE, "codex/314-ci-hardening", HEAD
             )
         self.record()
-        with self.assertRaisesRegex(PrePushError, "PREPUSH_EXACT_HEAD_GATE_ABSENT"):
+        with (
+            patch.object(
+                self.control,
+                "_validate_worktree",
+                return_value=(Path(self.temp.name), HEAD),
+            ),
+            patch.object(
+                self.control,
+                "_current_changed_paths",
+                return_value=("backend/example.py",),
+            ),
+            self.assertRaisesRegex(PrePushError, "PREPUSH_HEAD_INVALID"),
+        ):
             self.control.assert_push_eligible(
                 REPOSITORY, ISSUE, "codex/314-ci-hardening", "c" * 40
             )
         self.record(state="HOLD")
-        with self.assertRaisesRegex(PrePushError, "PREPUSH_EXACT_HEAD_GATE_ABSENT"):
+        with (
+            patch.object(
+                self.control,
+                "_validate_worktree",
+                return_value=(Path(self.temp.name), HEAD),
+            ),
+            patch.object(
+                self.control,
+                "_current_changed_paths",
+                return_value=("backend/example.py",),
+            ),
+            self.assertRaisesRegex(PrePushError, "PREPUSH_EXACT_HEAD_GATE_ABSENT"),
+        ):
             self.control.assert_push_eligible(
                 REPOSITORY, ISSUE, "codex/314-ci-hardening", HEAD
             )
@@ -2280,7 +2661,19 @@ class PrePushControlTests(unittest.TestCase):
             source_updated_at="2026-08-23T01:00:00Z",
             fetched_at="2026-08-23T01:00:01Z",
         )
-        with self.assertRaisesRegex(PrePushError, "PREPUSH_SOURCE_DRIFT"):
+        with (
+            patch.object(
+                self.control,
+                "_validate_worktree",
+                return_value=(Path(self.temp.name), HEAD),
+            ),
+            patch.object(
+                self.control,
+                "_current_changed_paths",
+                return_value=("backend/example.py",),
+            ),
+            self.assertRaisesRegex(PrePushError, "PREPUSH_SOURCE_DRIFT"),
+        ):
             self.control.assert_push_eligible(
                 REPOSITORY, ISSUE, "codex/314-ci-hardening", HEAD
             )

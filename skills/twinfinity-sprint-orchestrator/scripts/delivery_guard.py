@@ -25,6 +25,7 @@ from executor_registry import (
     identity_role,
 )
 from repository_delivery_policy import (
+    delivery_branch_issue_number,
     delivery_branch_matches_owning_issue,
     expected_canonical_checkout,
     expected_worktree_parent,
@@ -1332,17 +1333,36 @@ def _enforce_outbound_command(
     if not tokens:
         return _deny("DELIVERY_OUTBOUND_COMMAND_UNDETERMINED")
     executable = tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    guarded_push_arguments: tuple[str, ...] | None = None
     if executable in {"prepush_control", "prepush_control.py"}:
+        if Path(tokens[0]) == CANONICAL_PREPUSH_CONTROL:
+            guarded_push_arguments = tokens[1:]
+    elif executable in {"python", "python3"} and len(tokens) >= 2:
+        if Path(tokens[1]) == CANONICAL_PREPUSH_CONTROL:
+            guarded_push_arguments = tokens[2:]
+    if guarded_push_arguments is not None:
+        owning_issue = (
+            delivery_branch_issue_number(context.repository, context.branch)
+            if context.repository is not None and context.branch is not None
+            else None
+        )
+        expected_arguments = (
+            "guarded-push",
+            "--repository",
+            context.repository,
+            "--issue",
+            str(owning_issue),
+        ) if context.repository is not None and owning_issue is not None else ()
         if (
-            Path(tokens[0]) == CANONICAL_PREPUSH_CONTROL
-            and len(tokens) >= 2
-            and tokens[1] == "guarded-push"
+            guarded_push_arguments == expected_arguments
             and context.repository_writes
             and context.worktree is not None
             and cwd == context.worktree
             and _stable_descriptor_path(cwd, context.worktree, allow_missing_leaf=False)
         ):
             return {}
+        return _deny("DELIVERY_PREPUSH_CONTROLLER_NOT_APPROVED")
+    if executable in {"prepush_control", "prepush_control.py"}:
         return _deny("DELIVERY_PREPUSH_CONTROLLER_NOT_APPROVED")
     if executable == "gh":
         return _enforce_gh_command(tokens, context, cwd)

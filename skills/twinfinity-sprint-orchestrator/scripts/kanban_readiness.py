@@ -35,7 +35,12 @@ from coordination_store import (
     timestamp_after,
 )
 from executor_registry import current_endpoint, identities_role_equivalent, identity_role
-from portfolio_graph import PortfolioGraphError, evaluate_graph, replace_graph
+from portfolio_graph import (
+    PortfolioGraphError,
+    evaluate_graph,
+    graph_payload,
+    replace_graph,
+)
 
 
 PLAN_SCHEMA = "twinfinity-kanban-readiness-phase/v1"
@@ -1459,6 +1464,37 @@ def _graph_stale_only_for_equivalent_source(
         or graph["observed_main_sha"] != campaign["accepted_main_sha"]
     ):
         return False
+    revision = connection.execute(
+        "SELECT scope_json, exclusions_json FROM portfolio_graph_revisions "
+        "WHERE repository=? AND version=?",
+        (campaign["repository"], int(campaign["graph_version"])),
+    ).fetchone()
+    if revision is None:
+        return False
+    try:
+        scope = json.loads(revision["scope_json"], object_pairs_hook=_strict_object)
+        exclusions = json.loads(
+            revision["exclusions_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, ReadinessError):
+        return False
+    if isinstance(scope, dict) and scope.get("kind") == "ISSUE_SET":
+        if not isinstance(exclusions, list):
+            return False
+        for exclusion in exclusions:
+            if not isinstance(exclusion, dict):
+                return False
+            current = connection.execute(
+                "SELECT payload_sha256 FROM github_current "
+                "WHERE repository=? AND object_kind='issue' AND object_number=?",
+                (campaign["repository"], exclusion.get("issue_number")),
+            ).fetchone()
+            if (
+                current is None
+                or current["payload_sha256"]
+                != exclusion.get("source_payload_sha256")
+            ):
+                return False
     mismatches = connection.execute(
         """
         SELECT node.issue_number, node.source_payload_sha256,
@@ -1737,8 +1773,8 @@ def discover(
         projections,
         key=lambda key: (
             int(nodes[key]["priority_rank"]),
-            str(nodes[key]["ready_at"]),
             int(nodes[key]["lane_order"]),
+            str(nodes[key]["ready_at"]),
             -int(projections[key]["critical_path_units"]),
             -int(projections[key]["immediate_unlocks"]),
             -int(projections[key]["descendant_count"]),
@@ -3300,14 +3336,11 @@ def execute_readiness_resolution_action(
                 action_input["plan"], dict
             ):
                 raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_INVALID")
-            graph_payload = {
-                key: action_input["plan"].get(key)
-                for key in (
-                    "repository", "scope_milestones", "excluded_issues",
-                    "nodes", "relations",
-                )
-            }
-            if digest_json(graph_payload) != action["desired_digest"]:
+            try:
+                immutable_graph_payload = graph_payload(action_input["plan"])
+            except (KeyError, TypeError):
+                raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_INVALID")
+            if digest_json(immutable_graph_payload) != action["desired_digest"]:
                 raise ReadinessError("READINESS_RESOLUTION_ACTION_INPUT_DRIFT")
             try:
                 replace_graph(store.connection, action_input["plan"], now=now)
@@ -4680,7 +4713,7 @@ def dispatch(
              AND node.graph_version=campaign.graph_version
              AND node.issue_number=campaign.issue_number
             WHERE campaign.repository=? AND current.state='PENDING'
-            ORDER BY node.priority_rank, node.ready_at, node.lane_order, campaign.issue_number
+            ORDER BY node.priority_rank, node.lane_order, node.ready_at, campaign.issue_number
             """,
             (repository,),
         ).fetchall()

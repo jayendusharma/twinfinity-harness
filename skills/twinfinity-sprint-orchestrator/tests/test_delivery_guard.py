@@ -87,11 +87,23 @@ class DeliveryGuardTests(unittest.TestCase):
                 self.assert_denied(pre_tool(event))
 
     def test_allows_guarded_command_and_read_only_mentions(self) -> None:
+        self.load_context.return_value = DeliveryContext(
+            role="development",
+            endpoint_id="role.development.v4",
+            target_kind="message",
+            target_key="1",
+            topic="development.admission",
+            worktree=Path.cwd(),
+            lease_paths=frozenset({Path.cwd() / "docs" / "allowed.md"}),
+            repository_writes=True,
+            branch="codex/1-guarded-publication",
+            repository="twinfinityai/twinfinityapp",
+        )
         safe = (
             self.event(
                 "exec_command",
                 {
-                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository x/y --issue 1"
+                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 1"
                 },
             ),
             self.event("exec_command", {"cmd": "rg -n 'git push' docs"}),
@@ -100,6 +112,59 @@ class DeliveryGuardTests(unittest.TestCase):
         for event in safe:
             with self.subTest(event=event):
                 self.assertEqual({}, pre_tool(event))
+
+    def test_harness_guarded_push_is_bound_to_repository_issue_and_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            worktree = Path(temporary) / "twinfinity-harness-issue-36"
+            worktree.mkdir()
+            self.load_context.return_value = DeliveryContext(
+                role="development",
+                endpoint_id="role.development.v4",
+                target_kind="message",
+                target_key="36",
+                topic="development.admission",
+                worktree=worktree,
+                lease_paths=frozenset({worktree / "docs" / "allowed.md"}),
+                repository_writes=True,
+                branch="change/36-complete-harness-source-lane",
+                repository="jayendusharma/twinfinity-harness",
+            )
+            exact = (
+                f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push "
+                "--repository jayendusharma/twinfinity-harness --issue 36"
+            )
+            self.assertEqual(
+                {},
+                pre_tool(
+                    self.event(
+                        "exec_command",
+                        {"cmd": exact, "workdir": str(worktree)},
+                    )
+                ),
+            )
+            denied = (
+                exact.replace("jayendusharma/twinfinity-harness", "twinfinityai/twinfinityapp"),
+                exact.replace("--issue 36", "--issue 35"),
+                exact.replace(" --issue 36", ""),
+            )
+            for command in denied:
+                with self.subTest(command=command):
+                    self.assert_denied(
+                        pre_tool(
+                            self.event(
+                                "exec_command",
+                                {"cmd": command, "workdir": str(worktree)},
+                            )
+                        )
+                    )
+            self.assert_denied(
+                pre_tool(
+                    self.event(
+                        "exec_command",
+                        {"cmd": exact, "workdir": str(worktree.parent)},
+                    )
+                )
+            )
 
     def test_exact_admitted_git_metadata_can_reach_auto_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -276,7 +341,7 @@ class DeliveryGuardTests(unittest.TestCase):
             guarded = self.event(
                 "exec_command",
                 {
-                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository x/y --issue 328",
+                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 328",
                     "workdir": str(worktree),
                     **escalation,
                 },
@@ -567,9 +632,9 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "9b11ffe3778a0386776c67c3f891d0945bf42854d23584825666da461bb5a338",
+                "8035184120118d25f19cb9f794cdeb4ff4eb055e188d2875f90cc80fc2b7b949",
             SCRIPTS / "repository_delivery_policy.py":
-                "2f675e0b34f706350af99dab30fdd2c9f9fa843f8cb93676eb66ca409dbed08b",
+                "d2e29d35bee26ef4d343ec845f8b33785cbff7f65a423b9684998dbe8f754ab8",
         }
         for path, digest in expected.items():
             with self.subTest(path=path):

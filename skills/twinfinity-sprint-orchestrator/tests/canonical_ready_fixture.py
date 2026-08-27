@@ -34,6 +34,15 @@ from kanban_readiness import (
     stage_receipt,
     transition_evidence_sha256,
 )
+from repository_delivery_policy import (
+    HARNESS_REPOSITORY,
+    HARNESS_STANDING_AUTHORITY_SCHEMA,
+    canonical_harness_standing_controls,
+    expected_worktree_identity,
+    expected_worktree_parent,
+    policy_for_repository,
+    stable_issue_source_sha256,
+)
 
 
 def finalize_canonical_ready_candidate(
@@ -335,11 +344,72 @@ def finalize_canonical_ready_item(
         "shared_units": int(item["shared_units"]),
         "sre_units": int(item["sre_units"]),
     }
+    harness_prepared_packet: dict[str, Any] | None = None
+    if repository == HARNESS_REPOSITORY:
+        prepared_row = store.connection.execute(
+            """
+            SELECT candidate.artifact_relative_path
+            FROM portfolio_pull_buffer_current pointer
+            JOIN portfolio_pull_buffer_candidates candidate
+              ON candidate.id=pointer.candidate_id
+            WHERE pointer.repository=? AND pointer.issue_number=?
+              AND candidate.state='PREPARED_NOT_READY'
+            """,
+            (repository, issue_number),
+        ).fetchone()
+        if prepared_row is not None:
+            prepared_source_path = database.parent / prepared_row["artifact_relative_path"]
+            harness_prepared_packet = json.loads(
+                prepared_source_path.read_text(encoding="utf-8")
+            )
+    collision_matrix = [
+        {
+            "other_issue": int(row["other_issue"]),
+            "disposition": "COLLISION",
+            "reason": str(row["reason"]),
+        }
+        for row in store.connection.execute(
+            """
+            SELECT other.issue_number AS other_issue, relation.reason
+            FROM portfolio_graph_nodes target
+            JOIN portfolio_graph_relations relation
+              ON relation.repository=target.repository
+             AND relation.graph_version=target.graph_version
+             AND (relation.left_node_key=target.node_key
+                  OR relation.right_node_key=target.node_key)
+            JOIN portfolio_graph_nodes other
+              ON other.repository=target.repository
+             AND other.graph_version=target.graph_version
+             AND other.node_key=CASE
+                 WHEN relation.left_node_key=target.node_key
+                 THEN relation.right_node_key ELSE relation.left_node_key END
+            WHERE target.repository=? AND target.graph_version=?
+              AND target.issue_number=? AND relation.relation_kind='COLLISION'
+            ORDER BY other.issue_number
+            """,
+            (repository, int(graph["version"]), issue_number),
+        )
+    ]
+    if repository != HARNESS_REPOSITORY:
+        collision_matrix = [
+            {
+                "other_issue": 999999,
+                "disposition": "DISJOINT",
+                "reason": "Canonical fixture paths are issue-specific.",
+            }
+        ]
     topic = "sre.admission" if worker_role == "sre" else "development.admission"
     plans = artifact_root / "plans"
     plans.mkdir(exist_ok=True)
-    branch = f"codex/{issue_number}-{suffix}"
-    worktree = f"/home/ubuntu/code/twinfinityapp-issue-{issue_number}-{suffix}"
+    repository_policy = policy_for_repository(repository)
+    if repository_policy is None:
+        raise AssertionError("canonical READY fixture repository unsupported")
+    branch = f"{repository_policy.branch_namespace}/{issue_number}-{suffix}"
+    worktree_parent = expected_worktree_parent(repository, Path("/home/ubuntu/code"))
+    worktree_identity = expected_worktree_identity(repository, issue_number)
+    if worktree_parent is None or worktree_identity is None:
+        raise AssertionError("canonical READY fixture worktree policy missing")
+    worktree = str(worktree_parent / f"{worktree_identity}-{suffix}")
     lease_path = plans / f"issue-{issue_number}-{suffix}-lease.json"
     lease_payload = {
         "repository": repository,
@@ -377,7 +447,11 @@ def finalize_canonical_ready_item(
         "base_sha": accepted_main_sha,
         "branch": branch,
         "worktree_path": worktree,
-        "opaque_worktree_id": f"canonical-ready-{issue_number}-{suffix}",
+        "opaque_worktree_id": (
+            Path(worktree).name
+            if repository == HARNESS_REPOSITORY
+            else f"canonical-ready-{issue_number}-{suffix}"
+        ),
         "accountable_session_id": worker_endpoint_id,
         "lease_manifest_sha256": lease_sha,
         "authority_sha256": hashlib.sha256(
@@ -394,10 +468,70 @@ def finalize_canonical_ready_item(
                 "collision_proof": ["The canonical fixture lease is disjoint."],
                 "environment_rule": "Use only the issue-owned environment.",
                 "routine_chain": ["Run bounded gates and routine closeout."],
-                "hard_stops": ["Stop on source, lease, or capacity drift."],
+                "hard_stops": (
+                    harness_prepared_packet["hard_stops"]
+                    if harness_prepared_packet is not None
+                    else (
+                        ["Stop on any controlling-state drift."]
+                        if repository == HARNESS_REPOSITORY
+                        else ["Stop on source, lease, or capacity drift."]
+                    )
+                ),
             }
         )
-    prepared_packet = {
+    if repository == HARNESS_REPOSITORY:
+        provenance = store.connection.execute(
+            "SELECT source_harness_repository,approved_goal_sha256 "
+            "FROM coordination_bootstrap_provenance"
+        ).fetchall()
+        if (
+            len(provenance) != 1
+            or provenance[0]["source_harness_repository"] != HARNESS_REPOSITORY
+        ):
+            raise ValueError("HARNESS_STANDING_AUTHORITY_PROVENANCE_REQUIRED")
+        controls = canonical_harness_standing_controls()
+        source_scope = controls["source_scope"]
+        source_exclusions = controls["exclusions"]
+        admission_payload.update(
+            {
+                "writer": controls["writer"],
+                "reviewer_plan": controls["reviewer_plan"],
+                "collision_proof": controls["collision_proof"],
+                "environment_rule": controls["environment_rule"],
+                "routine_chain": controls["routine_chain"],
+                "hard_stops": controls["hard_stops"],
+            }
+        )
+        standing_authority = {
+            "schema": HARNESS_STANDING_AUTHORITY_SCHEMA,
+            "repository": repository,
+            "issue_number": issue_number,
+            "source_payload_sha256": source_payload_sha256,
+            "stable_source_sha256": stable_issue_source_sha256(
+                store.current_snapshot(repository, "issue", issue_number).payload
+            ),
+            "planner_goal_sha256": provenance[0]["approved_goal_sha256"],
+            "accepted_main_sha": accepted_main_sha,
+            "source_scope": source_scope,
+            "exclusions": source_exclusions,
+            "writer": admission_payload["writer"],
+            "reviewer_plan": admission_payload["reviewer_plan"],
+            "collision_proof": admission_payload["collision_proof"],
+            "environment_rule": admission_payload["environment_rule"],
+            "routine_chain": admission_payload["routine_chain"],
+            "hard_stops": admission_payload["hard_stops"],
+        }
+        admission_payload.update(
+            {
+                "standing_source_authority": standing_authority,
+                "standing_source_authority_sha256": hashlib.sha256(
+                    canonical_json(standing_authority).encode("utf-8")
+                ).hexdigest(),
+                "source_scope": source_scope,
+                "source_exclusions": source_exclusions,
+            }
+        )
+    prepared_packet = harness_prepared_packet or {
         "schema": "twinfinity-kanban-pull-buffer/v2",
         "repository": repository,
         "issue_number": issue_number,
@@ -416,16 +550,14 @@ def finalize_canonical_ready_item(
             "sre_limit": int(policy["sre_limit"]),
         },
         "capacity_on_activation": units,
-        "precomputed_collision_matrix": [
-            {
-                "other_issue": 999999,
-                "disposition": "DISJOINT",
-                "reason": "Canonical fixture paths are issue-specific.",
-            }
-        ],
+        "precomputed_collision_matrix": collision_matrix,
         "preparation_complete": ["The canonical admission envelope is complete."],
         "promotion_checks_after_predecessor": ["Revalidate every local guard."],
-        "hard_stops": ["Stop on any controlling-state drift."],
+        "hard_stops": (
+            admission_payload["hard_stops"]
+            if repository == HARNESS_REPOSITORY
+            else ["Stop on any controlling-state drift."]
+        ),
         "promotion_trigger": "All canonical readiness gates pass.",
     }
     admission_transaction = {

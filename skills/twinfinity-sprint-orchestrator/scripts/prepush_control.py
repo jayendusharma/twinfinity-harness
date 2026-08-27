@@ -37,6 +37,9 @@ from repository_delivery_policy import (
     delivery_branch_issue_number,
     expected_worktree_identity,
     expected_worktree_parent,
+    harness_standing_authority_error,
+    harness_standing_authority_provenance_error,
+    policy_for_repository,
     worktree_identity_matches,
 )
 
@@ -128,6 +131,59 @@ class LeaseManifest:
     paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class GatePlan:
+    """Closed, repository-derived local validation plan."""
+
+    profile: str
+    lower_commands: tuple[tuple[str, str, tuple[str, ...]], ...]
+    final_name: str
+    final_cwd: str
+    final_argv: tuple[str, ...]
+    final_receipt: str
+    final_failure: str
+    metadata: dict[str, Any]
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+HARNESS_VALIDATOR_SKILL_ROOTS = (
+    "skills/.system/imagegen",
+    "skills/.system/openai-docs",
+    "skills/.system/plugin-creator",
+    "skills/.system/review-agent",
+    "skills/.system/skill-creator",
+    "skills/.system/skill-installer",
+    "skills/twinfinity-development-executor",
+    "skills/twinfinity-devops-sre",
+    "skills/twinfinity-product-strategist",
+    "skills/twinfinity-skill-governor",
+    "skills/twinfinity-sprint-orchestrator",
+)
+HARNESS_BASELINE_TRIGGER_PREFIXES = (
+    ".github/workflows/",
+    "skills/.system/skill-creator/",
+    "skills/twinfinity-skill-governor/",
+    "skills/twinfinity-development-executor/SKILL.md",
+    "skills/twinfinity-sprint-orchestrator/SKILL.md",
+    "skills/twinfinity-sprint-orchestrator/references/control-plane.md",
+    "skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md",
+    "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py",
+)
+HARNESS_GATE_CONTROL_PATHS = (
+    "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py",
+    "skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml",
+)
+
+
 class PrePushControl:
     """A separate policy module over the shared ACID coordination database."""
 
@@ -185,6 +241,14 @@ class PrePushControl:
         if admission is not None and isinstance(admission_payload, dict):
             if digest_json(admission_payload) != admission["payload_sha256"]:
                 raise PrePushError("PREPUSH_ADMISSION_INVALID")
+            standing_error = harness_standing_authority_error(admission_payload)
+            if standing_error is not None:
+                raise PrePushError(standing_error)
+            provenance_error = harness_standing_authority_provenance_error(
+                self.connection, admission_payload
+            )
+            if provenance_error is not None:
+                raise PrePushError(provenance_error)
             capacity = admission_payload.get("capacity")
             payload_item_version = admission_payload.get("item_version")
             historical_before_version = (
@@ -802,6 +866,232 @@ class PrePushControl:
         return tuple(commands)
 
     @staticmethod
+    def _source_digest(relative_path: str) -> str:
+        path = REPOSITORY_ROOT / relative_path
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise PrePushError("PREPUSH_GATE_PROFILE_UNSUPPORTED") from exc
+
+    @staticmethod
+    def _require_harness_validator_catalog() -> tuple[str, ...]:
+        for skill_root in HARNESS_VALIDATOR_SKILL_ROOTS:
+            root = REPOSITORY_ROOT / skill_root
+            skill = root / "SKILL.md"
+            if (
+                not root.is_dir()
+                or root.is_symlink()
+                or not skill.is_file()
+                or skill.is_symlink()
+            ):
+                raise PrePushError("PREPUSH_HARNESS_VALIDATOR_CATALOG_INCOMPLETE")
+        return HARNESS_VALIDATOR_SKILL_ROOTS
+
+    @staticmethod
+    def _require_harness_focused_selectors(paths: tuple[str, ...]) -> tuple[str, ...]:
+        orchestrator_prefix = "skills/twinfinity-sprint-orchestrator/"
+        selectors: set[str] = set()
+        for path in paths:
+            relative = path.removeprefix(orchestrator_prefix)
+            if relative.startswith("tests/test_") and relative.endswith(".py"):
+                selectors.add("tests." + Path(relative).stem)
+            elif relative.startswith("scripts/") and relative.endswith(".py"):
+                selector = "tests.test_" + Path(relative).stem
+                test_path = (
+                    REPOSITORY_ROOT
+                    / "skills"
+                    / "twinfinity-sprint-orchestrator"
+                    / "tests"
+                    / f"test_{Path(relative).stem}.py"
+                )
+                if not test_path.is_file() or test_path.is_symlink():
+                    raise PrePushError("PREPUSH_HARNESS_FOCUSED_SELECTOR_MISSING")
+                selectors.add(selector)
+        return tuple(sorted(selectors))
+
+    @staticmethod
+    def _harness_baseline_required(paths: tuple[str, ...]) -> bool:
+        return any(
+            path == prefix or path.startswith(prefix)
+            for path in paths
+            for prefix in HARNESS_BASELINE_TRIGGER_PREFIXES
+        )
+
+    @staticmethod
+    def _serialize_lower_gate(gate_plan: GatePlan) -> str:
+        return canonical_json(
+            {
+                "profile": gate_plan.profile,
+                "metadata": gate_plan.metadata,
+                "commands": [
+                    {"name": name, "cwd": cwd, "argv": list(argv)}
+                    for name, cwd, argv in gate_plan.lower_commands
+                ],
+            }
+        )
+
+    @staticmethod
+    def _serialize_final_gate(gate_plan: GatePlan) -> str:
+        return canonical_json(
+            {
+                "profile": gate_plan.profile,
+                "metadata": gate_plan.metadata,
+                "final_name": gate_plan.final_name,
+                "final_cwd": gate_plan.final_cwd,
+                "final_argv": list(gate_plan.final_argv),
+            }
+        )
+
+    @staticmethod
+    def _current_changed_paths(
+        worktree: Path, base_sha: str, head_sha: str
+    ) -> tuple[str, ...]:
+        if not GIT_SHA.fullmatch(base_sha) or not GIT_SHA.fullmatch(head_sha):
+            raise PrePushError("PREPUSH_HEAD_INVALID")
+        changed = tuple(
+            line
+            for line in PrePushControl._git(
+                worktree,
+                "diff",
+                "--name-only",
+                "--diff-filter=ACDMRTUXB",
+                f"{base_sha}...{head_sha}",
+                "--",
+            ).splitlines()
+            if line
+        )
+        if not changed:
+            raise PrePushError("PREPUSH_EXACT_HEAD_GATE_ABSENT")
+        return changed
+
+    def _gate_plan(
+        self,
+        repository: str,
+        paths: tuple[str, ...],
+        *,
+        run_id: str,
+        base_sha: str,
+    ) -> GatePlan:
+        """Select the complete gate plan from exact repository identity only."""
+
+        policy = policy_for_repository(repository)
+        if policy is None:
+            raise PrePushError("PREPUSH_REPOSITORY_UNSUPPORTED")
+        if policy.prepush_gate_profile == "application-compose-v1":
+            metadata = {
+                "profile": policy.prepush_gate_profile,
+                "controller_sha256": self._source_digest(
+                    "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py"
+                ),
+            }
+            return GatePlan(
+                profile=policy.prepush_gate_profile,
+                lower_commands=self._lower_gate_commands(paths),
+                final_name="application/browser-e2e",
+                final_cwd=".",
+                final_argv=(
+                    sys.executable,
+                    "backend/scripts/browser_e2e.py",
+                    "--run-id",
+                    run_id,
+                ),
+                final_receipt=canonical_json(
+                    {
+                        "profile": policy.prepush_gate_profile,
+                        "metadata": metadata,
+                        "final_argv": [
+                            sys.executable,
+                            "backend/scripts/browser_e2e.py",
+                            "--run-id",
+                            run_id,
+                        ],
+                    }
+                ),
+                final_failure="PREPUSH_COMPOSE_GATE_FAILED",
+                metadata=metadata,
+            )
+        if policy.prepush_gate_profile == "harness-source-v1":
+            validator = "skills/.system/skill-creator/scripts/quick_validate.py"
+            validator_catalog = self._require_harness_validator_catalog()
+            selectors = self._require_harness_focused_selectors(paths)
+            baseline_required = self._harness_baseline_required(paths)
+            metadata = {
+                "profile": policy.prepush_gate_profile,
+                "base_sha": base_sha,
+                "baseline_required": baseline_required,
+                "validator_catalog": list(validator_catalog),
+                "control_sha256": {
+                    relative: self._source_digest(relative)
+                    for relative in HARNESS_GATE_CONTROL_PATHS
+                },
+            }
+            baseline_commands: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
+            if baseline_required:
+                baseline_commands = (
+                    (
+                        "harness/baseline-source-controls",
+                        ".",
+                        (
+                            sys.executable,
+                            "-B",
+                            "skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py",
+                            "--base-sha",
+                            base_sha,
+                        ),
+                    ),
+                )
+            focused_commands: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
+            if selectors:
+                focused_commands = (
+                    (
+                        "harness/hermetic-focused",
+                        ".",
+                        (
+                            sys.executable,
+                            "-B",
+                            "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py",
+                            *selectors,
+                        ),
+                    ),
+                )
+            validation_commands = tuple(
+                (
+                    f"harness/quick-validate/{Path(skill_root).name}",
+                    ".",
+                    (sys.executable, validator, skill_root),
+                )
+                for skill_root in validator_catalog
+            )
+            lower_commands = baseline_commands + focused_commands + validation_commands
+            final_argv = (
+                sys.executable,
+                "-B",
+                "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py",
+            )
+            return GatePlan(
+                profile=policy.prepush_gate_profile,
+                lower_commands=lower_commands,
+                final_name="harness/hermetic-full-suite",
+                final_cwd=".",
+                final_argv=final_argv,
+                final_receipt=self._serialize_final_gate(
+                    GatePlan(
+                        profile=policy.prepush_gate_profile,
+                        lower_commands=lower_commands,
+                        final_name="harness/hermetic-full-suite",
+                        final_cwd=".",
+                        final_argv=final_argv,
+                        final_receipt="",
+                        final_failure="PREPUSH_HARNESS_HERMETIC_GATE_FAILED",
+                        metadata=metadata,
+                    )
+                ),
+                final_failure="PREPUSH_HARNESS_HERMETIC_GATE_FAILED",
+                metadata=metadata,
+            )
+        raise PrePushError("PREPUSH_GATE_PROFILE_UNSUPPORTED")
+
+    @staticmethod
     def _normalized_remote_repository(remote_url: str) -> str:
         for pattern in (GITHUB_HTTPS_REMOTE, GITHUB_SCP_REMOTE, GITHUB_SSH_REMOTE):
             match = pattern.fullmatch(remote_url)
@@ -1009,6 +1299,15 @@ class PrePushControl:
                     raise PrePushError("PREPUSH_FOREIGN_ENVIRONMENT")
 
         provenance: dict[str, str] = {}
+        if any(name.startswith("harness/") for name, _cwd, _argv in lower_commands):
+            try:
+                interpreter = Path(sys.executable).resolve(strict=True)
+            except OSError as exc:
+                raise PrePushError("PREPUSH_GATE_TOOL_MISSING") from exc
+            for match in ISSUE_OWNED_PATH.finditer(str(interpreter)):
+                if int(match.group("issue")) != lineage.surface_issue_number:
+                    raise PrePushError("PREPUSH_FOREIGN_ENVIRONMENT")
+            provenance["python"] = str(interpreter)
         if any(name == "backend/check.sh" for name, _cwd, _argv in lower_commands):
             search_path = current.get("PATH")
             worktree = Path(lineage.worktree_path)
@@ -1290,6 +1589,8 @@ class PrePushControl:
                 "BASH_FUNC_"
             ):
                 controlled.pop(key)
+            elif key in GATE_ENVIRONMENT_KEYS - {"PATH", "TMPDIR"}:
+                controlled.pop(key)
         controlled["PYTHONDONTWRITEBYTECODE"] = "1"
         return controlled
 
@@ -1426,15 +1727,13 @@ class PrePushControl:
         manifest = self._validate_manifest_file(
             lineage, worktree, head_sha, manifest_path
         )
-        lower_commands = self._lower_gate_commands(manifest.paths)
-        lower_gate = canonical_json(
-            [
-                {"name": name, "cwd": cwd, "argv": list(argv)}
-                for name, cwd, argv in lower_commands
-            ]
-        )
         run_id = f"p{issue_number}-g{lineage.generation}-{head_sha[:12]}"
-        compose_gate = "python3 backend/scripts/browser_e2e.py"
+        gate_plan = self._gate_plan(
+            lineage.repository, manifest.paths, run_id=run_id, base_sha=lineage.base_sha
+        )
+        lower_commands = gate_plan.lower_commands
+        lower_gate = self._serialize_lower_gate(gate_plan)
+        compose_gate = gate_plan.final_receipt
         started_at = utc_now()
         lower_exit: int | None = None
         compose_exit: int | None = None
@@ -1470,15 +1769,9 @@ class PrePushControl:
                 if lower_exit != 0:
                     break
             if lower_exit == 0:
-                compose_argv = [
-                    sys.executable,
-                    "backend/scripts/browser_e2e.py",
-                    "--run-id",
-                    run_id,
-                ]
                 compose = subprocess.run(
-                    compose_argv,
-                    cwd=worktree,
+                    list(gate_plan.final_argv),
+                    cwd=worktree / gate_plan.final_cwd,
                     timeout=timeout_seconds,
                     check=False,
                     env=gate_environment,
@@ -1503,7 +1796,7 @@ class PrePushControl:
         if error is None and lower_exit != 0:
             error = "PREPUSH_LOWER_GATE_FAILED"
         if error is None and compose_exit != 0:
-            error = "PREPUSH_COMPOSE_GATE_FAILED"
+            error = gate_plan.final_failure
         if error is None and not head_unchanged:
             error = "PREPUSH_HEAD_OR_WORKTREE_CHANGED"
         if error is None and lineage.existing_environment is not None:
@@ -1549,6 +1842,19 @@ class PrePushControl:
         lineage = self._lineage(repository, issue_number)
         if branch != lineage.branch:
             raise PrePushError("PREPUSH_BRANCH_MISMATCH")
+        worktree, observed_head = self._validate_worktree(lineage)
+        if observed_head != head_sha:
+            raise PrePushError("PREPUSH_HEAD_INVALID")
+        changed_paths = self._current_changed_paths(
+            worktree, lineage.base_sha, observed_head
+        )
+        run_id = f"p{issue_number}-g{lineage.generation}-{head_sha[:12]}"
+        gate_plan = self._gate_plan(
+            lineage.repository,
+            changed_paths,
+            run_id=run_id,
+            base_sha=lineage.base_sha,
+        )
         receipt = self.connection.execute(
             """
             SELECT * FROM coordination_pre_push_gates
@@ -1568,9 +1874,10 @@ class PrePushControl:
             or receipt["admission_payload_sha256"] != lineage.admission_payload_sha256
             or receipt["worktree_path"] != lineage.worktree_path
             or receipt["base_sha"] != lineage.base_sha
-            or not isinstance(receipt["changed_paths_sha256"], str)
-            or len(receipt["changed_paths_sha256"]) != 64
-            or int(receipt["changed_path_count"]) <= 0
+            or receipt["changed_paths_sha256"] != digest_json(list(changed_paths))
+            or int(receipt["changed_path_count"]) != len(changed_paths)
+            or receipt["lower_gate"] != self._serialize_lower_gate(gate_plan)
+            or receipt["compose_gate"] != gate_plan.final_receipt
             or not isinstance(receipt["environment_provenance_sha256"], str)
             or len(receipt["environment_provenance_sha256"]) != 64
             or int(receipt["lower_gate_exit_code"]) != 0

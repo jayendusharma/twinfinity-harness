@@ -277,8 +277,10 @@ compile_cache=/tmp/twinfinity-sprint-orchestrator-pycompile
 PYTHONPYCACHEPREFIX="$compile_cache" python3 -m py_compile scripts/*.py tests/*.py
 python3 /home/ubuntu/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
   /home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator
-python3 scripts/reconcile_routing_artifacts.py \
-  --config references/twinfinity-executor-registry.toml audit
+python3 scripts/executor_registry.py \
+  --config references/twinfinity-executor-registry.toml \
+  --profile-root "$(pwd -P)/references" \
+  audit-config
 ```
 
 Also validate all Markdown links and scan installed Markdown for stale routing and historical executable terminology.
@@ -303,10 +305,10 @@ Archive readiness never authorizes deletion. Deleting archives or other data req
 | `attempt_responses_proxy.py` | Dormant credential-free attempt proxy contract, hashed owner ledger, framed relay, Responses request limits, and fail-closed replay states. |
 | `executor_registry.py` | Endpoint config, pointers, aliases, attempts, migration ledger, and recovery. |
 | `coordination_store.py` | Shared source, item, allocation, lease, inbox, outbox, watch, event, admission, closeout, and artifact transactions. |
-| `portfolio_graph.py` / `portfolio_graph_supervisor.py` | Dependency graph, coverage, collisions, scheduling decisions, refresh, and recovery. |
+| `portfolio_graph.py` / `portfolio_graph_supervisor.py` | Milestone- or issue-set-scoped dependency graph, coverage, collisions, scheduling decisions, refresh, and recovery. |
 | `kanban_pull_buffer.py` / `kanban_readiness.py` / `portfolio_convergence.py` | Zero-WIP candidates, one-phase all-gates readiness, bounded resolution, READY binding, dirty events, and atomic successor admission. |
 | `approval_ledger.py` / `approval_guard.py` | Material proposal, user decision, delivery, revocation, and execution-effectivity checks. |
-| `prepush_control.py` / `delivery_guard.py` | Exact-head gate receipts, guarded publication, and native delivery command enforcement. |
+| `prepush_control.py` / `delivery_guard.py` | Repository-derived exact-head gate receipts, guarded publication, and native delivery command enforcement. |
 | `hosted_operation_control.py` / `hosted_operation_clearance.py` | Exact SRE provider-operation lifecycle and clearance. |
 | `coordination_supervisor.py` | Due work selection, wake ledger, and fresh role-attempt scheduling. |
 | `role_executor_transport.py` / `run_role_executor.py` | Target-specific transient systemd transport and attempt process lifecycle. |

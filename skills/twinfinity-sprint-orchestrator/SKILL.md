@@ -77,7 +77,7 @@ After an applied role-endpoint rotation, preserve the claimed admission as immut
 
 ## Route execution through fresh endpoints
 
-A Development admission conditionally covers the complete authorized routine chain: current-main preflight, implementation, focused gates, applicable final-head local Docker Compose acceptance, commit, guarded private push, PR and natural CI, independent exact-head review, one bounded repair cycle, routine merge, cleanup, terminal receipt, and capacity release. Native repository, network, Docker, GitHub, and cleanup operations belong to the fresh Development attempt under its strict profile and controlled escalation.
+A Development admission conditionally covers the complete authorized routine chain: current-main preflight, implementation, focused gates, repository-applicable final-head acceptance, commit, guarded private push, PR and natural CI, independent exact-head review, one bounded repair cycle, routine merge, cleanup, terminal receipt, and capacity release. Native repository, network, applicable Docker, GitHub, and cleanup operations belong to the fresh Development attempt under its strict profile and controlled escalation.
 
 An SRE admission covers only its exact maintenance, release-engineering, readiness, incident, provider, or hosted-operation boundary. Native provider, deployment, database, IAM, secret, billing, access, traffic, or production work belongs to the fresh SRE attempt and still requires exact user authority and the hosted-operation controls. Development cannot absorb it.
 
@@ -87,7 +87,7 @@ For repository toolchain isolation and cleanup, read [references/environment-iso
 
 - Every changed path and test group must map to the owning issue or a named safety invariant.
 - Use exact current base/head evidence. Earlier-head gates, stale review, stale CI, or local-only success never authorize merge or release.
-- Require issue-owned tool provenance, focused evidence, applicable final-head Compose evidence, guarded publication, natural CI, independent exact-head review, and resolved material threads.
+- Require issue-owned tool provenance, focused evidence, repository-applicable final-head gate evidence, guarded publication, natural CI, independent exact-head review, and resolved material threads.
 - User-visible changes require privacy-safe exact-head visual and interaction evidence.
 - Keep providers offline and data synthetic by default. Never use shared, staging, or production databases for schema tests.
 - Never place private/customer data, credentials, secrets, restricted content, or sensitive local topology in GitHub artifacts.

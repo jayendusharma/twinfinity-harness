@@ -345,6 +345,8 @@ class KanbanPullBufferTests(unittest.TestCase):
             self.store.connection,
             REPOSITORY,
             "2" * 40,
+            expected_version=1,
+            expected_observed_main_sha=MAIN,
             now="2026-08-24T02:00:06Z",
         )
         audit = audit_pull_buffer(

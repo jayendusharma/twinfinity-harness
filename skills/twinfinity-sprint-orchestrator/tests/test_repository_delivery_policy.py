@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -15,14 +17,22 @@ from coordination_store import (  # noqa: E402
     parse_structured_lease_manifest,
 )
 from delivery_guard import GuardError, _parse_lease  # noqa: E402
+from approval_guard import (  # noqa: E402
+    admission_execution_scope_sha256,
+    execution_scope_sha256,
+)
 from repository_delivery_policy import (  # noqa: E402
     APPLICATION_REPOSITORY,
     HARNESS_REPOSITORY,
+    HARNESS_STANDING_AUTHORITY_SCHEMA,
+    canonical_harness_standing_controls,
     delivery_branch_matches_owning_issue,
     delivery_branch_issue_number,
     expected_canonical_checkout,
     expected_worktree_parent,
+    harness_standing_authority_error,
     message_worktree_identity_matches,
+    policy_for_repository,
     strict_delivery_branch_matches,
     worktree_identity_matches,
     worktree_path_matches_owning_issue,
@@ -324,6 +334,196 @@ class RepositoryDeliveryPolicyTests(unittest.TestCase):
         ):
             parse_structured_lease_manifest(raw.encode("utf-8"))
 
+    def test_gate_profile_and_writer_mutex_are_derived_only_from_repository(self) -> None:
+        application = policy_for_repository(APPLICATION_REPOSITORY)
+        harness = policy_for_repository(HARNESS_REPOSITORY)
+        self.assertEqual("application-compose-v1", application.prepush_gate_profile)
+        self.assertFalse(application.exclusive_repository_writer)
+        self.assertEqual("harness-source-v1", harness.prepush_gate_profile)
+        self.assertTrue(harness.exclusive_repository_writer)
+        self.assertIsNone(policy_for_repository(HARNESS_REPOSITORY.upper()))
+
+    def test_harness_standing_authority_binds_complete_source_envelope(self) -> None:
+        controls = canonical_harness_standing_controls()
+        binding = {
+            "schema": HARNESS_STANDING_AUTHORITY_SCHEMA,
+            "repository": HARNESS_REPOSITORY,
+            "issue_number": 36,
+            "source_payload_sha256": "1" * 64,
+            "stable_source_sha256": "7" * 64,
+            "planner_goal_sha256": "2" * 64,
+            "accepted_main_sha": "3" * 40,
+            **controls,
+        }
+        payload = {
+            "source": {
+                "repository": HARNESS_REPOSITORY,
+                "object_kind": "issue",
+                "object_number": 36,
+                "payload_sha256": "1" * 64,
+            },
+            "issue_number": 36,
+            "base_sha": "3" * 40,
+            "standing_source_authority": binding,
+            "standing_source_authority_sha256": hashlib.sha256(
+                canonical_json(binding).encode("utf-8")
+            ).hexdigest(),
+            "source_scope": binding["source_scope"],
+            "source_exclusions": binding["exclusions"],
+            "writer": binding["writer"],
+            "reviewer_plan": binding["reviewer_plan"],
+            "collision_proof": binding["collision_proof"],
+            "environment_rule": binding["environment_rule"],
+            "routine_chain": binding["routine_chain"],
+            "hard_stops": binding["hard_stops"],
+            "authority_sha256": "8" * 64,
+        }
+        self.assertIsNone(harness_standing_authority_error(payload))
+        for field, replacement in (
+            ("source_payload_sha256", "4" * 64),
+            ("stable_source_sha256", "6" * 64),
+            ("planner_goal_sha256", "5" * 64),
+            ("accepted_main_sha", "6" * 40),
+            ("source_scope", ["Different scope."]),
+            ("exclusions", ["Different exclusion."]),
+            ("writer", "Different writer."),
+            ("reviewer_plan", ["Different reviewer."]),
+            ("collision_proof", ["Different collision proof."]),
+            ("environment_rule", "Different environment."),
+            ("routine_chain", ["Different routine."]),
+            ("hard_stops", ["Different stop."]),
+        ):
+            with self.subTest(field=field):
+                drifted = copy.deepcopy(payload)
+                drifted["standing_source_authority"][field] = replacement
+                self.assertEqual(
+                    "HARNESS_STANDING_AUTHORITY_DRIFT",
+                    harness_standing_authority_error(drifted),
+                )
+
+    def test_application_approval_scope_is_unchanged_and_harness_scope_is_complete(self) -> None:
+        application = {
+            "source": {
+                "repository": APPLICATION_REPOSITORY,
+                "object_kind": "issue",
+                "object_number": 36,
+                "payload_sha256": "1" * 64,
+            },
+            "issue_number": 36,
+            "generation": 1,
+            "item_version": 2,
+            "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+            "base_sha": "3" * 40,
+            "branch": "codex/36-example",
+            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-36",
+            "lease_manifest_sha256": "4" * 64,
+            "capacity": {
+                "development_units": 1,
+                "shared_units": 0,
+                "sre_units": 0,
+            },
+        }
+        legacy_scope = {
+            "kind": "ADMISSION",
+            "repository": APPLICATION_REPOSITORY,
+            "issue_number": 36,
+            "generation": 1,
+            "item_version": 2,
+            "action": application["action"],
+            "base_sha": application["base_sha"],
+            "branch": application["branch"],
+            "worktree_path": application["worktree_path"],
+            "lease_manifest_sha256": application["lease_manifest_sha256"],
+            "capacity": application["capacity"],
+        }
+        self.assertEqual(
+            execution_scope_sha256(legacy_scope),
+            admission_execution_scope_sha256(application),
+        )
+        harness = copy.deepcopy(application)
+        harness["source"]["repository"] = HARNESS_REPOSITORY
+        harness.update(
+            {
+                "source_scope": ["source"],
+                "source_exclusions": ["runtime"],
+                "writer": "writer",
+                "reviewer_plan": ["review"],
+                "collision_proof": ["collision"],
+                "environment_rule": "environment",
+                "routine_chain": ["validate"],
+                "hard_stops": ["stop"],
+                "standing_source_authority": {"schema": "bound"},
+            }
+        )
+        original = admission_execution_scope_sha256(harness)
+        harness["source_scope"] = ["drifted"]
+        self.assertNotEqual(original, admission_execution_scope_sha256(harness))
+
+    def test_harness_approval_scope_ignores_caller_mirrors_when_standing_authority_is_stable(self) -> None:
+        controls = canonical_harness_standing_controls()
+        standing = {
+            "schema": HARNESS_STANDING_AUTHORITY_SCHEMA,
+            "repository": HARNESS_REPOSITORY,
+            "issue_number": 36,
+            "source_payload_sha256": "1" * 64,
+            "stable_source_sha256": "2" * 64,
+            "planner_goal_sha256": "3" * 64,
+            "accepted_main_sha": "4" * 40,
+            **controls,
+        }
+        payload = {
+            "source": {
+                "repository": HARNESS_REPOSITORY,
+                "object_kind": "issue",
+                "object_number": 36,
+                "payload_sha256": "1" * 64,
+            },
+            "issue_number": 36,
+            "generation": 1,
+            "item_version": 2,
+            "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+            "base_sha": "4" * 40,
+            "branch": "change/36-complete-harness-source-lane",
+            "worktree_path": (
+                "/home/ubuntu/code/twinfinity/"
+                "twinfinity-harness-issue36-authorized"
+            ),
+            "lease_manifest_sha256": "5" * 64,
+            "capacity": {
+                "development_units": 0,
+                "shared_units": 1,
+                "sre_units": 0,
+            },
+            "standing_source_authority": standing,
+            "standing_source_authority_sha256": hashlib.sha256(
+                canonical_json(standing).encode("utf-8")
+            ).hexdigest(),
+            "source_scope": ["caller-supplied drift"],
+            "source_exclusions": [],
+            "writer": "caller drift",
+            "reviewer_plan": ["caller drift"],
+            "collision_proof": ["caller drift"],
+            "environment_rule": "caller drift",
+            "routine_chain": ["caller drift"],
+            "hard_stops": ["caller drift"],
+        }
+        original = admission_execution_scope_sha256(payload)
+        payload.update(
+            {
+                "source_scope": ["different caller scope"],
+                "source_exclusions": ["different caller exclusion"],
+                "writer": "different caller writer",
+                "reviewer_plan": ["different caller reviewer"],
+                "collision_proof": ["different caller collision"],
+                "environment_rule": "different caller environment",
+                "routine_chain": ["different caller routine"],
+                "hard_stops": ["different caller stop"],
+            }
+        )
+        self.assertEqual(original, admission_execution_scope_sha256(payload))
+
 
 if __name__ == "__main__":
     unittest.main()
+    harness_standing_authority_error,
+    policy_for_repository,

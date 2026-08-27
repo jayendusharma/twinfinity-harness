@@ -54,9 +54,13 @@ from executor_registry import (
     target_progress_digest,
 )
 from repository_delivery_policy import (
+    HARNESS_REPOSITORY,
     delivery_branch_matches_owning_issue,
     expected_worktree_parent,
+    harness_standing_authority_error,
+    harness_standing_authority_provenance_error,
     message_worktree_identity_matches,
+    policy_for_repository,
     worktree_path_matches_owning_issue,
 )
 
@@ -3718,6 +3722,15 @@ class CoordinationStore:
         if lease_manifest_sha256 is not None:
             _validate_sha256(lease_manifest_sha256)
         if (
+            repository == HARNESS_REPOSITORY
+            and allocation_class == "NONE"
+            and (
+                accountable_session_id is not None
+                or lease_manifest_sha256 is not None
+            )
+        ):
+            raise CoordinationError("HARNESS_ZERO_WIP_LINEAGE_INVALID")
+        if (
             development_units < 0
             or shared_units < 0
             or sre_units < 0
@@ -3750,6 +3763,36 @@ class CoordinationStore:
             actual_version = 0 if current is None else int(current["version"])
             if actual_version != expected_version:
                 raise CoordinationError("ITEM_VERSION_CONFLICT")
+            repository_policy = policy_for_repository(repository)
+            if repository == HARNESS_REPOSITORY:
+                current_reserved = bool(
+                    current is not None
+                    and current["allocation_class"] in {"ACTIVE", "RETAINED"}
+                )
+                proposed_reserved = allocation_class in {"ACTIVE", "RETAINED"}
+                if proposed_reserved and (
+                    development_units,
+                    shared_units,
+                    sre_units,
+                ) != (0, 1, 0):
+                    raise CoordinationError("HARNESS_SOURCE_CAPACITY_INVALID")
+                if gateway is _TRANSFER_ACTIVATION_GATEWAY:
+                    raise CoordinationError("HARNESS_SOURCE_TRANSFER_FORBIDDEN")
+                if gateway is None and (current_reserved or proposed_reserved):
+                    raise CoordinationError("HARNESS_RESERVATION_GATEWAY_REQUIRED")
+            if (
+                repository_policy is not None
+                and repository_policy.exclusive_repository_writer
+                and allocation_class in {"ACTIVE", "RETAINED"}
+                and self.connection.execute(
+                    "SELECT 1 FROM coordination_items "
+                    "WHERE repository=? AND issue_number<>? "
+                    "AND allocation_class IN ('ACTIVE','RETAINED') LIMIT 1",
+                    (repository, issue_number),
+                ).fetchone()
+                is not None
+            ):
+                raise CoordinationError("ADMISSION_REPOSITORY_WRITER_MUTEX")
             if (
                 current is not None
                 and current["allocation_class"] in {"ACTIVE", "RETAINED"}
@@ -4226,6 +4269,14 @@ class CoordinationStore:
             raise CoordinationError("MESSAGE_CONTRACT_INVALID")
         _validate_sha256(payload["lease_manifest_sha256"])
         _validate_sha256(payload["authority_sha256"])
+        standing_authority_error = harness_standing_authority_error(payload)
+        if standing_authority_error is not None:
+            raise CoordinationError(standing_authority_error)
+        provenance_error = harness_standing_authority_provenance_error(
+            self.connection, payload
+        )
+        if provenance_error is not None:
+            raise CoordinationError(provenance_error)
         issue_number = payload.get("issue_number")
         generation = payload.get("generation")
         item_version = payload.get("item_version")
@@ -4468,6 +4519,18 @@ class CoordinationStore:
             raise CoordinationError("MESSAGE_CONTRACT_INVALID")
         if topic == "development.admission" and sre_units != 0:
             raise CoordinationError("MESSAGE_CAPACITY_CLASS_MISMATCH")
+        if (
+            payload["source"].get("repository") == HARNESS_REPOSITORY
+            and (
+                not topic.startswith("development.")
+                or development_units != 0
+                or shared_units != 1
+                or sre_units != 0
+                or payload.get("environment_root") is not None
+                or payload.get("existing_environment") is not None
+            )
+        ):
+            raise CoordinationError("MESSAGE_HARNESS_SOURCE_CLASS_MISMATCH")
         if topic == "sre.admission" and (
             development_units != 0 or shared_units != 0 or sre_units <= 0
         ):
@@ -5435,6 +5498,19 @@ class CoordinationStore:
                 or manifest.get("worktree_path") != payload.get("worktree_path")
             ):
                 raise CoordinationError("ADMISSION_LEASE_LINEAGE_MISMATCH")
+            repository_policy = policy_for_repository(item.get("repository"))
+            if (
+                repository_policy is not None
+                and repository_policy.exclusive_repository_writer
+                and self.connection.execute(
+                    "SELECT 1 FROM coordination_items "
+                    "WHERE repository=? AND issue_number<>? "
+                    "AND allocation_class IN ('ACTIVE','RETAINED') LIMIT 1",
+                    (item.get("repository"), item.get("issue_number")),
+                ).fetchone()
+                is not None
+            ):
+                raise CoordinationError("ADMISSION_REPOSITORY_WRITER_MUTEX")
             activated = self._set_issue_status_from_admission(
                 **item,
                 now=now,
@@ -5621,6 +5697,64 @@ class CoordinationStore:
             )
             if item is None:
                 raise CoordinationError("MESSAGE_ITEM_STATE_MISMATCH")
+            repository_policy = policy_for_repository(str(repository))
+            if (
+                repository_policy is not None
+                and repository_policy.exclusive_repository_writer
+                and self.connection.execute(
+                    "SELECT 1 FROM coordination_items "
+                    "WHERE repository=? AND issue_number<>? "
+                    "AND allocation_class IN ('ACTIVE','RETAINED') LIMIT 1",
+                    (repository, issue_number),
+                ).fetchone()
+                is not None
+            ):
+                raise CoordinationError("RECOVERY_REPOSITORY_WRITER_MUTEX")
+            if repository == HARNESS_REPOSITORY:
+                if (
+                    int(item["development_units"]),
+                    int(item["shared_units"]),
+                    int(item["sre_units"]),
+                ) != (0, 1, 0):
+                    raise CoordinationError("HARNESS_SOURCE_CAPACITY_INVALID")
+                provenance = self.connection.execute(
+                    """
+                    SELECT message.payload_json
+                    FROM coordination_terminal_watches original_watch
+                    JOIN coordination_messages message
+                      ON message.id=original_watch.admission_message_id
+                    WHERE original_watch.repository=?
+                      AND original_watch.issue_number=?
+                      AND original_watch.generation=?
+                      AND original_watch.lease_manifest_sha256=?
+                      AND original_watch.state IN ('HOLD','COMPLETE')
+                      AND message.topic='development.admission'
+                      AND message.state IN ('HOLD','COMPLETE')
+                    """,
+                    (
+                        repository,
+                        issue_number,
+                        generation,
+                        payload["lease_manifest_sha256"],
+                    ),
+                ).fetchall()
+                if len(provenance) != 1:
+                    raise CoordinationError("HARNESS_RECOVERY_PROVENANCE_MISSING")
+                try:
+                    original_payload = json.loads(provenance[0]["payload_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CoordinationError(
+                        "HARNESS_RECOVERY_PROVENANCE_INVALID"
+                    ) from exc
+                if (
+                    original_payload.get("source") != payload.get("source")
+                    or original_payload.get("issue_number") != issue_number
+                    or original_payload.get("generation") != generation
+                    or original_payload.get("lease_manifest_sha256")
+                    != payload.get("lease_manifest_sha256")
+                    or original_payload.get("capacity") != payload.get("capacity")
+                ):
+                    raise CoordinationError("HARNESS_RECOVERY_PROVENANCE_DRIFT")
             new_version = int(item["version"]) + 1
             updated = self.connection.execute(
                 """
@@ -6475,6 +6609,7 @@ class CoordinationStore:
                 else {"sre.admission"}
             )
             activation_payload = json.loads(activation["payload_json"])
+            self._validate_harness_activation_authority(activation_payload)
             source = activation_payload.get("source", {})
             activation_endpoint_id = str(activation["recipient_session_id"])
             activation_role = coordination_identity_role(
@@ -7108,6 +7243,22 @@ class CoordinationStore:
             raise CoordinationError("TERMINAL_LIVE_EVIDENCE_STALE")
         return evidence_sha256, canonical_json(evidence)
 
+    def _validate_harness_activation_authority(
+        self, activation_payload: dict[str, Any]
+    ) -> None:
+        if activation_payload.get("source", {}).get("repository") != HARNESS_REPOSITORY:
+            return
+        standing_authority_error = harness_standing_authority_error(
+            activation_payload
+        )
+        if standing_authority_error is not None:
+            raise CoordinationError(standing_authority_error)
+        provenance_error = harness_standing_authority_provenance_error(
+            self.connection, activation_payload
+        )
+        if provenance_error is not None:
+            raise CoordinationError(provenance_error)
+
     def commit_terminal_closeout(
         self,
         *,
@@ -7289,6 +7440,8 @@ class CoordinationStore:
                 )
             except (TypeError, json.JSONDecodeError):
                 activation_payload = None
+            if activation_payload is not None:
+                self._validate_harness_activation_authority(activation_payload)
             claim_binding = (
                 None
                 if watch is None
@@ -9065,6 +9218,15 @@ class CoordinationStore:
                 or item["lease_manifest_sha256"] != watch["lease_manifest_sha256"]
             ):
                 raise CoordinationError("TERMINAL_WATCH_ITEM_DRIFT")
+            activation = self.connection.execute(
+                "SELECT payload_json FROM coordination_messages WHERE id=?",
+                (watch["admission_message_id"],),
+            ).fetchone()
+            if activation is None:
+                raise CoordinationError("TERMINAL_WATCH_ITEM_DRIFT")
+            self._validate_harness_activation_authority(
+                json.loads(activation["payload_json"])
+            )
             next_wake_at = timestamp_after(now, delay_seconds)
             self.connection.execute(
                 """

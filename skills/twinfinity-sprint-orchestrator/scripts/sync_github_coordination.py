@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import re
 import subprocess
 from typing import Any
 
@@ -15,7 +16,8 @@ from coordination_store import (
     DEFAULT_DATABASE,
     canonical_json,
 )
-from portfolio_graph import PortfolioGraphError, sync_head
+from portfolio_graph import PortfolioGraphError, issue_set_scope_numbers, sync_head
+from repository_delivery_policy import HARNESS_REPOSITORY
 
 
 PROJECTION_VERSION = 3
@@ -277,10 +279,14 @@ def main() -> int:
         issue_numbers = set(args.issue)
         prefetched_issues: dict[int, dict[str, Any]] = {}
         milestone_numbers = set(args.milestone_number)
+        bootstrap_main_sha: str | None = None
+        graph_expected_version: int | None = None
+        graph_expected_main: str | None = None
+        graph_main_sha: str | None = None
         if args.portfolio_graph:
             current = store.connection.execute(
                 """
-                SELECT c.version, r.scope_json
+                SELECT c.version, c.observed_main_sha, r.scope_json
                 FROM portfolio_graph_current c
                 JOIN portfolio_graph_revisions r
                   ON r.repository=c.repository AND r.version=c.version
@@ -288,43 +294,57 @@ def main() -> int:
                 """,
                 (args.repository,),
             ).fetchone()
-            if current is None:
+            if current is None and (
+                args.repository != HARNESS_REPOSITORY or not issue_numbers
+            ):
                 raise PortfolioGraphError("GRAPH_NOT_FOUND")
-            scope = json.loads(current["scope_json"])
-            scoped_titles = set(scope.get("milestones", []))
-            graph_nodes = list(
-                store.connection.execute(
-                    """
-                    SELECT DISTINCT n.issue_number, s.payload_json
-                    FROM portfolio_graph_nodes n
-                    JOIN github_current c
-                      ON c.repository=n.repository
-                     AND c.object_kind='issue'
-                     AND c.object_number=n.issue_number
-                    JOIN github_snapshots s
-                      ON s.repository=c.repository
-                     AND s.object_kind=c.object_kind
-                     AND s.object_number=c.object_number
-                     AND s.payload_sha256=c.payload_sha256
-                    WHERE n.repository=? AND n.graph_version=?
-                    """,
-                    (args.repository, current["version"]),
+            if current is not None:
+                graph_expected_version = int(current["version"])
+                graph_expected_main = str(current["observed_main_sha"])
+                scope = json.loads(current["scope_json"])
+                scoped_titles = set(scope.get("milestones", []))
+                if scope.get("kind") == "ISSUE_SET":
+                    issue_numbers.update(
+                        issue_set_scope_numbers(args.repository, scope)
+                    )
+                graph_nodes = list(
+                    store.connection.execute(
+                        """
+                        SELECT DISTINCT n.issue_number, s.payload_json
+                        FROM portfolio_graph_nodes n
+                        JOIN github_current c
+                          ON c.repository=n.repository
+                         AND c.object_kind='issue'
+                         AND c.object_number=n.issue_number
+                        JOIN github_snapshots s
+                          ON s.repository=c.repository
+                         AND s.object_kind=c.object_kind
+                         AND s.object_number=n.issue_number
+                         AND s.payload_sha256=c.payload_sha256
+                        WHERE n.repository=? AND n.graph_version=?
+                        """,
+                        (args.repository, current["version"]),
+                    )
                 )
-            )
-            issue_numbers.update(int(row["issue_number"]) for row in graph_nodes)
-            for row in graph_nodes:
-                milestone = json.loads(row["payload_json"]).get("milestone")
-                if isinstance(milestone, dict) and isinstance(
-                    milestone.get("number"), int
-                ) and milestone.get("title") in scoped_titles:
-                    milestone_numbers.add(int(milestone["number"]))
+                issue_numbers.update(int(row["issue_number"]) for row in graph_nodes)
+                for row in graph_nodes:
+                    milestone = json.loads(row["payload_json"]).get("milestone")
+                    if isinstance(milestone, dict) and isinstance(
+                        milestone.get("number"), int
+                    ) and milestone.get("title") in scoped_titles:
+                        milestone_numbers.add(int(milestone["number"]))
             main_ref = _run_gh(
                 ["api", f"repos/{args.repository}/git/ref/heads/main"]
             )
             main_sha = (main_ref.get("object") or {}).get("sha")
-            if not isinstance(main_sha, str):
+            if not isinstance(main_sha, str) or re.fullmatch(
+                r"[0-9a-f]{40}", main_sha
+            ) is None:
                 raise CoordinationError("GITHUB_RESPONSE_INVALID")
-            sync_head(store.connection, args.repository, main_sha, now=utc_now())
+            if current is not None:
+                graph_main_sha = main_sha
+            else:
+                bootstrap_main_sha = main_sha
 
         for milestone_number in sorted(milestone_numbers):
             milestone_issues = _flatten_pages(
@@ -345,6 +365,7 @@ def main() -> int:
                 issue_numbers.add(number)
                 prefetched_issues[number] = normalize_issue(raw)
 
+        pending_snapshots: list[dict[str, Any]] = []
         for kind, numbers in (
             ("issue", sorted(issue_numbers)),
             ("pull_request", args.pull_request),
@@ -360,24 +381,65 @@ def main() -> int:
                 )
                 if not isinstance(source_updated_at, str) or not source_updated_at:
                     raise CoordinationError("GITHUB_RESPONSE_INVALID")
-                snapshot = store.ingest_snapshot(
-                    repository=args.repository,
-                    object_kind=kind,
-                    object_number=number,
-                    payload=payload,
-                    source_updated_at=source_updated_at,
-                    fetched_at=utc_now(),
-                )
-                results.append(
+                pending_snapshots.append(
                     {
                         "kind": kind,
                         "number": number,
-                        "payload_sha256": snapshot.payload_sha256,
+                        "payload": payload,
                         "source_updated_at": source_updated_at,
+                        "fetched_at": utc_now(),
                     }
                 )
+        bracketed_main_sha = graph_main_sha or bootstrap_main_sha
+        if bracketed_main_sha is not None:
+            final_main_ref = _run_gh(
+                ["api", f"repos/{args.repository}/git/ref/heads/main"]
+            )
+            final_main_sha = (final_main_ref.get("object") or {}).get("sha")
+            if final_main_sha != bracketed_main_sha:
+                raise CoordinationError("GITHUB_MAIN_CHANGED_DURING_REFRESH")
+        with store.transaction():
+            for pending in pending_snapshots:
+                snapshot = store.ingest_snapshot_in_transaction(
+                    repository=args.repository,
+                    object_kind=pending["kind"],
+                    object_number=pending["number"],
+                    payload=pending["payload"],
+                    source_updated_at=pending["source_updated_at"],
+                    fetched_at=pending["fetched_at"],
+                )
+                results.append(
+                    {
+                        "kind": pending["kind"],
+                        "number": pending["number"],
+                        "payload_sha256": snapshot.payload_sha256,
+                        "source_updated_at": pending["source_updated_at"],
+                    }
+                )
+            if graph_main_sha is not None:
+                if graph_expected_version is None or graph_expected_main is None:
+                    raise PortfolioGraphError("GRAPH_MAIN_CAS_DRIFT")
+                sync_head(
+                    store.connection,
+                    args.repository,
+                    graph_main_sha,
+                    expected_version=graph_expected_version,
+                    expected_observed_main_sha=graph_expected_main,
+                    now=utc_now(),
+                    _ensure_schema=False,
+                    _transaction=False,
+                )
         store.close()
-        print(canonical_json({"phase": "COMPLETE", "refreshed": results}))
+        output = {"phase": "COMPLETE", "refreshed": results}
+        if bootstrap_main_sha is not None:
+            output.update(
+                {
+                    "phase": "BOOTSTRAP_INPUTS_REFRESHED",
+                    "repository": args.repository,
+                    "observed_main_sha": bootstrap_main_sha,
+                }
+            )
+        print(canonical_json(output))
         return 0
     except (CoordinationError, PortfolioGraphError) as exc:
         print(canonical_json({"phase": "HOLD", "error": str(exc)}))
