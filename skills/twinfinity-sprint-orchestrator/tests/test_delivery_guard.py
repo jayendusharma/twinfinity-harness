@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import hashlib
 import sys
@@ -14,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS))
 import delivery_guard  # noqa: E402
 from delivery_guard import (  # noqa: E402
     CANONICAL_PREPUSH_CONTROL,
+    TRUSTED_PREPUSH_INTERPRETER,
     DeliveryContext,
     pre_tool,
 )
@@ -98,12 +100,13 @@ class DeliveryGuardTests(unittest.TestCase):
             repository_writes=True,
             branch="codex/1-guarded-publication",
             repository="twinfinityai/twinfinityapp",
+            owning_issue_number=1,
         )
         safe = (
             self.event(
                 "exec_command",
                 {
-                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 1"
+                    "cmd": f"{TRUSTED_PREPUSH_INTERPRETER} {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 1"
                 },
             ),
             self.event("exec_command", {"cmd": "rg -n 'git push' docs"}),
@@ -128,9 +131,10 @@ class DeliveryGuardTests(unittest.TestCase):
                 repository_writes=True,
                 branch="change/36-complete-harness-source-lane",
                 repository="jayendusharma/twinfinity-harness",
+                owning_issue_number=36,
             )
             exact = (
-                f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push "
+                f"{TRUSTED_PREPUSH_INTERPRETER} {CANONICAL_PREPUSH_CONTROL} guarded-push "
                 "--repository jayendusharma/twinfinity-harness --issue 36"
             )
             self.assertEqual(
@@ -166,6 +170,114 @@ class DeliveryGuardTests(unittest.TestCase):
                 )
             )
 
+    def test_guarded_push_requires_direct_trusted_interpreter_and_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            worktree = Path(temporary) / "twinfinity-harness-issue36"
+            worktree.mkdir()
+            self.load_context.return_value = DeliveryContext(
+                role="development",
+                endpoint_id="role.development.v6",
+                target_kind="message",
+                target_key="36",
+                topic="development.admission",
+                worktree=worktree,
+                lease_paths=frozenset({worktree / "allowed.py"}),
+                repository_writes=True,
+                branch="change/36-guarded-push-boundary-repair",
+                repository="jayendusharma/twinfinity-harness",
+                owning_issue_number=36,
+            )
+            arguments = (
+                f"{CANONICAL_PREPUSH_CONTROL} guarded-push "
+                "--repository jayendusharma/twinfinity-harness --issue 36"
+            )
+            exact = f"{TRUSTED_PREPUSH_INTERPRETER} {arguments}"
+            self.assertEqual(
+                {},
+                pre_tool(
+                    self.event(
+                        "exec_command",
+                        {"cmd": exact, "workdir": str(worktree)},
+                    )
+                ),
+            )
+            denied = (
+                f"/tmp/python3 {arguments}",
+                f"python3 {arguments}",
+                str(arguments),
+                f"PATH=/tmp {exact}",
+                f"PYTHONPATH=/tmp/evil {exact}",
+                f"PATH=/tmp PYTHONPATH=/tmp/evil {exact}",
+                f"env PATH=/tmp PYTHONPATH=/tmp/evil {exact}",
+                f"export PYTHONPATH=/tmp/evil && {exact}",
+                f"PATH=/tmp; {exact}",
+                f"command {exact}",
+                f"exec {exact}",
+                f"xargs {TRUSTED_PREPUSH_INTERPRETER} {arguments}",
+            )
+            for command in denied:
+                with self.subTest(command=command):
+                    self.assert_denied(
+                        pre_tool(
+                            self.event(
+                                "exec_command",
+                                {"cmd": command, "workdir": str(worktree)},
+                            )
+                        )
+                    )
+
+    def test_guarded_push_uses_transferred_owning_issue_not_surface_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            worktree = Path(temporary) / "twinfinityapp-issue-314"
+            worktree.mkdir()
+            context = DeliveryContext(
+                role="sre",
+                endpoint_id="role.sre.v6",
+                target_kind="terminal_watch",
+                target_key="terminal:twinfinityai/twinfinityapp:issue:320:generation:1",
+                topic=None,
+                worktree=worktree,
+                lease_paths=frozenset({worktree / "allowed.py"}),
+                repository_writes=True,
+                branch="codex/314-ci-hardening",
+                repository="twinfinityai/twinfinityapp",
+                owning_issue_number=320,
+            )
+            self.load_context.return_value = context
+            prefix = (
+                f"{TRUSTED_PREPUSH_INTERPRETER} {CANONICAL_PREPUSH_CONTROL} "
+                "guarded-push --repository twinfinityai/twinfinityapp --issue "
+            )
+            self.assertEqual(
+                {},
+                pre_tool(
+                    self.event(
+                        "exec_command",
+                        {"cmd": f"{prefix}320", "workdir": str(worktree)},
+                    )
+                ),
+            )
+            for owning_issue, command_issue in ((320, 314), (320, 321), (None, 320)):
+                with self.subTest(
+                    owning_issue=owning_issue,
+                    command_issue=command_issue,
+                ):
+                    self.load_context.return_value = replace(
+                        context,
+                        owning_issue_number=owning_issue,
+                    )
+                    self.assert_denied(
+                        pre_tool(
+                            self.event(
+                                "exec_command",
+                                {
+                                    "cmd": f"{prefix}{command_issue}",
+                                    "workdir": str(worktree),
+                                },
+                            )
+                        )
+                    )
+
     def test_exact_admitted_git_metadata_can_reach_auto_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -187,6 +299,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 branch=branch,
                 base_sha=base_sha,
                 repository="twinfinityai/twinfinityapp",
+                owning_issue_number=328,
             )
             escalation = {
                 "sandbox_permissions": "require_escalated",
@@ -263,6 +376,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 branch=branch,
                 base_sha=base_sha,
                 repository="twinfinityai/twinfinityapp",
+                owning_issue_number=328,
             )
             escalation = {
                 "sandbox_permissions": "require_escalated",
@@ -341,7 +455,7 @@ class DeliveryGuardTests(unittest.TestCase):
             guarded = self.event(
                 "exec_command",
                 {
-                    "cmd": f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 328",
+                    "cmd": f"{TRUSTED_PREPUSH_INTERPRETER} {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 328",
                     "workdir": str(worktree),
                     **escalation,
                 },
@@ -386,6 +500,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 branch=branch,
                 base_sha=base_sha,
                 repository="twinfinityai/twinfinityapp",
+                owning_issue_number=328,
             )
             denied = (
                 f"git --git-dir={unrelated}/.git --work-tree={worktree} commit -m redirected",
@@ -434,7 +549,7 @@ class DeliveryGuardTests(unittest.TestCase):
                 "gh api --method GET repos/twinfinityai/twinfinityapp/issues/328",
                 "gh issue view 328 --repo twinfinityai/twinfinityapp",
                 "curl --head https://example.invalid",
-                f"python3 {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 328",
+                f"{TRUSTED_PREPUSH_INTERPRETER} {CANONICAL_PREPUSH_CONTROL} guarded-push --repository twinfinityai/twinfinityapp --issue 328",
                 f"gh pr create --draft --head {branch} --base main --repo twinfinityai/twinfinityapp",
                 f"gh pr create --draft -H {branch} -B main -R twinfinityai/twinfinityapp",
                 f"gh pr create --draft -H{branch} -Bmain -Rtwinfinityai/twinfinityapp",
@@ -632,7 +747,7 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "8035184120118d25f19cb9f794cdeb4ff4eb055e188d2875f90cc80fc2b7b949",
+                "c30b58e5272da4fd02d7c296bf98348f20a86d45b11aa35717ff4a31f68a1453",
             SCRIPTS / "repository_delivery_policy.py":
                 "d2e29d35bee26ef4d343ec845f8b33785cbff7f65a423b9684998dbe8f754ab8",
         }

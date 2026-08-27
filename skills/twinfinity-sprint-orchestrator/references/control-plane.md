@@ -159,7 +159,7 @@ For a repository head:
 2. use the issue-owned toolchain and run the complete affected lower gate;
 3. run the closed repository-derived final-head gate profile and prove its applicable cleanup contract; application or workflow heads retain local Docker Compose acceptance, while a harness source head runs only its focused hermetic selectors, complete fixed quick-validator catalog, and full hermetic suite;
 4. require a canonical exact-head PASS receipt;
-5. publish only with `scripts/prepush_control.py guarded-push`; and
+5. publish only by invoking the canonical installed `prepush_control.py guarded-push` directly through `/usr/bin/python3`, without a shell wrapper or leading environment assignment, and pass the active owning issue rather than a retained transfer surface issue; and
 6. wait for natural exact-head CI and independent exact-head review.
 
 The shared pre-push hook revalidates the live reserved publication, canonical remote, branch, head, and sole ref update. Raw or bypassed publication is prohibited. Ambiguous transport is readback-only recovery. A changed head invalidates prior head-bound evidence.
