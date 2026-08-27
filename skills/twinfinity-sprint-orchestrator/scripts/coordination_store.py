@@ -8624,10 +8624,116 @@ class CoordinationStore:
         now: str,
     ) -> dict[str, Any]:
         """Recognize the one reviewed v1 row as generation 1 without changing its values."""
+        def normalized_sql(value: str | None) -> str:
+            compact = " ".join((value or "").split()).lower().rstrip(";")
+            return re.sub(r"\s*([(),;=<>])\s*", r"\1", compact)
+
+        def table_info(name: str) -> list[tuple[Any, ...]]:
+            return [tuple(row) for row in self.connection.execute(f"PRAGMA table_info({name})")]
+
+        def index_shapes(name: str) -> set[tuple[Any, ...]]:
+            shapes = set()
+            for item in self.connection.execute(f"PRAGMA index_list({name})"):
+                columns = tuple(row[2] for row in self.connection.execute(f"PRAGMA index_info({item[1]})"))
+                shapes.add((int(item[2]), item[3], int(item[4]), columns))
+            return shapes
+
+        def foreign_keys(name: str) -> set[tuple[Any, ...]]:
+            return {tuple(row[2:8]) for row in self.connection.execute(f"PRAGMA foreign_key_list({name})")}
+
+        legacy_inventory_info = [
+            (0,"inventory_sha256","TEXT",0,None,1),(1,"repository","TEXT",1,None,0),
+            (2,"kind","TEXT",1,None,0),(3,"alias_source_sha256","TEXT",1,None,0),
+            (4,"endpoint_state_sha256","TEXT",1,None,0),(5,"issue_179_source_sha256","TEXT",1,None,0),
+            (6,"object_manifest_sha256","TEXT",1,None,0),(7,"occurrence_manifest_sha256","TEXT",1,None,0),
+            (8,"object_manifest_json","TEXT",1,None,0),(9,"object_count","INTEGER",1,None,0),
+            (10,"issue_count","INTEGER",1,None,0),(11,"pull_request_count","INTEGER",1,None,0),
+            (12,"occurrence_count","INTEGER",1,None,0),(13,"classification_counts_json","TEXT",1,None,0),
+            (14,"semantic_tag_counts_json","TEXT",1,None,0),(15,"outbox_id","INTEGER",1,None,0),
+            (16,"state","TEXT",1,None,0),(17,"created_at","TEXT",1,None,0),
+        ]
+        legacy_occurrence_info = [
+            (0,"inventory_sha256","TEXT",1,None,1),(1,"ordinal","INTEGER",1,None,2),
+            (2,"object_kind","TEXT",1,None,0),(3,"object_number","INTEGER",1,None,0),
+            (4,"node_id","TEXT",1,None,0),(5,"object_updated_at","TEXT",1,None,0),
+            (6,"body_sha256","TEXT",1,None,0),(7,"alias","TEXT",1,None,0),
+            (8,"byte_start","INTEGER",1,None,0),(9,"byte_end","INTEGER",1,None,0),
+            (10,"line_number","INTEGER",1,None,0),(11,"byte_column","INTEGER",1,None,0),
+            (12,"classification","TEXT",1,None,0),(13,"semantic_tags_json","TEXT",1,None,0),
+        ]
+        current_info = [(0,"repository","TEXT",0,None,1),(1,"generation","INTEGER",1,None,0),(2,"inventory_sha256","TEXT",1,None,0),(3,"version","INTEGER",1,None,0),(4,"promoted_at","TEXT",1,None,0)]
+        promotion_info = [(0,"repository","TEXT",1,None,1),(1,"generation","INTEGER",1,None,2),(2,"prior_generation","INTEGER",0,None,0),(3,"inventory_sha256","TEXT",1,None,0),(4,"preview_sha256","TEXT",1,None,0),(5,"remote_receipt","TEXT",1,None,0),(6,"promoted_at","TEXT",1,None,0)]
+        v2_inventory_info = [
+            (0,"inventory_sha256","TEXT",0,None,1),(1,"repository","TEXT",1,None,0),(2,"generation","INTEGER",1,None,0),
+            (3,"predecessor_inventory_sha256","TEXT",0,None,0),(4,"preview_sha256","TEXT",1,None,0),(5,"kind","TEXT",1,None,0),
+        ] + [(index + 3, name, kind, notnull, default, primary) for index,name,kind,notnull,default,primary in legacy_inventory_info[3:]]
+        expected_inventory_indexes = {(1,"pk",0,("inventory_sha256",)),(1,"u",0,("repository",)),(1,"u",0,("outbox_id",))}
+        expected_occurrence_indexes = {(1,"pk",0,("inventory_sha256","ordinal")),(1,"u",0,("inventory_sha256","object_kind","object_number","byte_start","alias"))}
+        expected_inventory_fk = {("github_outbox","outbox_id","id","NO ACTION","NO ACTION","NONE")}
+        expected_occurrence_fk = {("routing_deprecation_inventories","inventory_sha256","inventory_sha256","NO ACTION","NO ACTION","NONE")}
+        legacy_inventory_create = """CREATE TABLE routing_deprecation_inventories (
+                inventory_sha256 TEXT PRIMARY KEY, repository TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL CHECK(kind='TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1'),
+                alias_source_sha256 TEXT NOT NULL, endpoint_state_sha256 TEXT NOT NULL,
+                issue_179_source_sha256 TEXT NOT NULL, object_manifest_sha256 TEXT NOT NULL,
+                occurrence_manifest_sha256 TEXT NOT NULL, object_manifest_json TEXT NOT NULL,
+                object_count INTEGER NOT NULL CHECK(object_count >= 0), issue_count INTEGER NOT NULL CHECK(issue_count >= 0),
+                pull_request_count INTEGER NOT NULL CHECK(pull_request_count >= 0), occurrence_count INTEGER NOT NULL CHECK(occurrence_count >= 0),
+                classification_counts_json TEXT NOT NULL, semantic_tag_counts_json TEXT NOT NULL,
+                outbox_id INTEGER NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state='COMPLETE'), created_at TEXT NOT NULL,
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id))"""
+        legacy_occurrence_create = """CREATE TABLE routing_deprecation_occurrences (
+                inventory_sha256 TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                object_kind TEXT NOT NULL CHECK(object_kind IN ('issue', 'pull_request')),
+                object_number INTEGER NOT NULL CHECK(object_number > 0), node_id TEXT NOT NULL,
+                object_updated_at TEXT NOT NULL, body_sha256 TEXT NOT NULL, alias TEXT NOT NULL,
+                byte_start INTEGER NOT NULL CHECK(byte_start >= 0), byte_end INTEGER NOT NULL CHECK(byte_end > byte_start),
+                line_number INTEGER NOT NULL CHECK(line_number > 0), byte_column INTEGER NOT NULL CHECK(byte_column > 0),
+                classification TEXT NOT NULL CHECK(classification IN ('EXECUTABLE_ROUTE','ROUTING_REFERENCE','HISTORICAL_PROVENANCE','AMBIGUOUS_REFERENCE')),
+                semantic_tags_json TEXT NOT NULL, PRIMARY KEY(inventory_sha256, ordinal),
+                UNIQUE(inventory_sha256, object_kind, object_number, byte_start, alias),
+                FOREIGN KEY(inventory_sha256) REFERENCES routing_deprecation_inventories(inventory_sha256))"""
+        trigger_sql = {
+            "routing_deprecation_inventory_immutable_update": "CREATE TRIGGER routing_deprecation_inventory_immutable_update BEFORE UPDATE ON routing_deprecation_inventories BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_INVENTORY_IMMUTABLE'); END",
+            "routing_deprecation_inventory_immutable_delete": "CREATE TRIGGER routing_deprecation_inventory_immutable_delete BEFORE DELETE ON routing_deprecation_inventories BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_INVENTORY_IMMUTABLE'); END",
+            "routing_deprecation_occurrence_immutable_update": "CREATE TRIGGER routing_deprecation_occurrence_immutable_update BEFORE UPDATE ON routing_deprecation_occurrences BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE'); END",
+            "routing_deprecation_occurrence_immutable_delete": "CREATE TRIGGER routing_deprecation_occurrence_immutable_delete BEFORE DELETE ON routing_deprecation_occurrences BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE'); END",
+            "routing_deprecation_occurrence_append_fenced": "CREATE TRIGGER routing_deprecation_occurrence_append_fenced BEFORE INSERT ON routing_deprecation_occurrences WHEN (SELECT COUNT(*) FROM routing_deprecation_occurrences WHERE inventory_sha256=NEW.inventory_sha256) >= (SELECT occurrence_count FROM routing_deprecation_inventories WHERE inventory_sha256=NEW.inventory_sha256) BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE'); END",
+            "routing_deprecation_outbox_envelope_immutable": "CREATE TRIGGER routing_deprecation_outbox_envelope_immutable BEFORE UPDATE OF idempotency_key, repository, object_kind, object_number, operation, expected_source_sha256, payload_sha256, payload_json, created_at ON github_outbox WHEN EXISTS (SELECT 1 FROM routing_deprecation_inventories WHERE outbox_id=OLD.id) BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_OUTBOX_IMMUTABLE'); END",
+        }
+        generation_trigger_sql = {
+            "routing_deprecation_current_no_delete": "CREATE TRIGGER routing_deprecation_current_no_delete BEFORE DELETE ON routing_deprecation_current BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_CURRENT_IMMUTABLE'); END",
+            "routing_deprecation_current_monotonic": "CREATE TRIGGER routing_deprecation_current_monotonic BEFORE UPDATE ON routing_deprecation_current WHEN NEW.repository != OLD.repository OR NEW.generation != OLD.generation + 1 OR NEW.version != OLD.version + 1 BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_CURRENT_CAS_INVALID'); END",
+            "routing_deprecation_promotion_immutable_update": "CREATE TRIGGER routing_deprecation_promotion_immutable_update BEFORE UPDATE ON routing_deprecation_promotions BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_PROMOTION_IMMUTABLE'); END",
+            "routing_deprecation_promotion_immutable_delete": "CREATE TRIGGER routing_deprecation_promotion_immutable_delete BEFORE DELETE ON routing_deprecation_promotions BEGIN SELECT RAISE(ABORT, 'ROUTING_DEPRECATION_PROMOTION_IMMUTABLE'); END",
+        }
         columns = [row[1] for row in self.connection.execute("PRAGMA table_info(routing_deprecation_inventories)")]
         if "generation" in columns:
             row = self.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE inventory_sha256=? AND generation=1", (expected_inventory_sha256,)).fetchone()
-            if row is None:
+            current = self.connection.execute("SELECT * FROM routing_deprecation_current WHERE repository=?", (None if row is None else row["repository"],)).fetchone()
+            promotion = self.connection.execute("SELECT * FROM routing_deprecation_promotions WHERE inventory_sha256=?", (expected_inventory_sha256,)).fetchone()
+            outbox = self.connection.execute("SELECT * FROM github_outbox WHERE id=?", (-1 if row is None else row["outbox_id"],)).fetchone()
+            occurrences = self.connection.execute("SELECT COUNT(*) FROM routing_deprecation_occurrences WHERE inventory_sha256=?", (expected_inventory_sha256,)).fetchone()[0]
+            relevant = {item[0]: normalized_sql(item[1]) for item in self.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'routing_deprecation_%'")}
+            if (row is None or current is None or promotion is None or outbox is None
+                    or int(occurrences) != expected_occurrence_count
+                    or (current["generation"], current["inventory_sha256"], current["version"]) != (1, expected_inventory_sha256, 1)
+                    or (promotion["generation"], promotion["prior_generation"], promotion["inventory_sha256"], promotion["preview_sha256"], promotion["remote_receipt"]) != (1, None, expected_inventory_sha256, row["preview_sha256"], outbox["remote_receipt"])
+                    or outbox["state"] != "COMPLETE" or REMOTE_COMMENT_RECEIPT.fullmatch(str(outbox["remote_receipt"])) is None
+                    or relevant != {name: normalized_sql(sql) for name, sql in {**trigger_sql, **generation_trigger_sql}.items()}
+                    or table_info("routing_deprecation_inventories") != v2_inventory_info
+                    or table_info("routing_deprecation_occurrences") != legacy_occurrence_info
+                    or table_info("routing_deprecation_current") != current_info
+                    or table_info("routing_deprecation_promotions") != promotion_info
+                    or index_shapes("routing_deprecation_occurrences") != expected_occurrence_indexes
+                    or index_shapes("routing_deprecation_inventories") != {(1,"pk",0,("inventory_sha256",)),(1,"u",0,("outbox_id",)),(1,"u",0,("repository","generation")),(1,"u",0,("repository","predecessor_inventory_sha256"))}
+                    or index_shapes("routing_deprecation_current") != {(1,"pk",0,("repository",)),(1,"u",0,("inventory_sha256",)),(1,"u",0,("repository","generation"))}
+                    or index_shapes("routing_deprecation_promotions") != {(1,"pk",0,("repository","generation")),(1,"u",0,("inventory_sha256",))}
+                    or foreign_keys("routing_deprecation_occurrences") != expected_occurrence_fk
+                    or foreign_keys("routing_deprecation_inventories") != {("github_outbox","outbox_id","id","NO ACTION","NO ACTION","NONE"),("routing_deprecation_inventories","predecessor_inventory_sha256","inventory_sha256","NO ACTION","NO ACTION","NONE")}
+                    or foreign_keys("routing_deprecation_current") != {("routing_deprecation_inventories","inventory_sha256","inventory_sha256","NO ACTION","NO ACTION","NONE")}
+                    or foreign_keys("routing_deprecation_promotions")
+                    or self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None):
                 raise CoordinationError("ROUTING_DEPRECATION_LEGACY_MIGRATION_CONFLICT")
             return {"inventory_sha256": expected_inventory_sha256, "generation": 1, "replay": True}
         required_triggers = {
@@ -8638,9 +8744,24 @@ class CoordinationStore:
             "routing_deprecation_occurrence_append_fenced",
             "routing_deprecation_outbox_envelope_immutable",
         }
-        actual_triggers = {row[0] for row in self.connection.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'routing_deprecation_%')")}
+        actual_trigger_sql = {row[0]: normalized_sql(row[1]) for row in self.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('routing_deprecation_inventories','routing_deprecation_occurrences','github_outbox') AND name LIKE 'routing_deprecation_%'")}
+        actual_table_sql = {row[0]: normalized_sql(row[1]) for row in self.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('routing_deprecation_inventories','routing_deprecation_occurrences')")}
+        schema_exact = (
+            table_info("routing_deprecation_inventories") == legacy_inventory_info
+            and table_info("routing_deprecation_occurrences") == legacy_occurrence_info
+            and index_shapes("routing_deprecation_inventories") == expected_inventory_indexes
+            and index_shapes("routing_deprecation_occurrences") == expected_occurrence_indexes
+            and foreign_keys("routing_deprecation_inventories") == expected_inventory_fk
+            and foreign_keys("routing_deprecation_occurrences") == expected_occurrence_fk
+            and actual_table_sql == {
+                "routing_deprecation_inventories": normalized_sql(legacy_inventory_create),
+                "routing_deprecation_occurrences": normalized_sql(legacy_occurrence_create),
+            }
+            and actual_trigger_sql == {name: normalized_sql(sql) for name, sql in trigger_sql.items()}
+            and self.connection.execute("PRAGMA foreign_key_check").fetchone() is None
+        )
         rows = self.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchall()
-        if len(rows) != 1 or rows[0]["inventory_sha256"] != expected_inventory_sha256 or required_triggers - actual_triggers:
+        if not schema_exact or len(rows) != 1 or rows[0]["inventory_sha256"] != expected_inventory_sha256:
             raise CoordinationError("ROUTING_DEPRECATION_LEGACY_SHAPE_INVALID")
         legacy = dict(rows[0])
         occurrences = [dict(row) for row in self.connection.execute("SELECT * FROM routing_deprecation_occurrences ORDER BY ordinal")]
@@ -8649,9 +8770,16 @@ class CoordinationStore:
             raise CoordinationError("ROUTING_DEPRECATION_LEGACY_SHAPE_INVALID")
         preview = {"repository": legacy["repository"], "generation": 1, "predecessor_inventory_sha256": None, "inventory_sha256": legacy["inventory_sha256"], "alias_source_sha256": legacy["alias_source_sha256"], "endpoint_state_sha256": legacy["endpoint_state_sha256"], "issue_179_source_sha256": legacy["issue_179_source_sha256"], "object_manifest_sha256": legacy["object_manifest_sha256"], "occurrence_manifest_sha256": legacy["occurrence_manifest_sha256"]}
         preview_sha256 = digest_json(preview)
+        prior_foreign_keys = int(self.connection.execute("PRAGMA foreign_keys").fetchone()[0])
         self.connection.execute("PRAGMA foreign_keys=OFF")
         try:
             with self.transaction():
+                if self.connection.execute("SELECT COUNT(*) FROM routing_deprecation_current").fetchone()[0] != 0 or self.connection.execute("SELECT COUNT(*) FROM routing_deprecation_promotions").fetchone()[0] != 0:
+                    raise CoordinationError("ROUTING_DEPRECATION_LEGACY_PARTIAL_MIGRATION")
+                for name in generation_trigger_sql:
+                    self.connection.execute(f"DROP TRIGGER {name}")
+                self.connection.execute("DROP TABLE routing_deprecation_promotions")
+                self.connection.execute("DROP TABLE routing_deprecation_current")
                 for name in required_triggers:
                     self.connection.execute(f"DROP TRIGGER {name}")
                 self.connection.execute("ALTER TABLE routing_deprecation_occurrences RENAME TO routing_deprecation_occurrences_legacy_v1")
@@ -8681,6 +8809,15 @@ class CoordinationStore:
                   semantic_tags_json TEXT NOT NULL, PRIMARY KEY(inventory_sha256,ordinal),
                   UNIQUE(inventory_sha256,object_kind,object_number,byte_start,alias),
                   FOREIGN KEY(inventory_sha256) REFERENCES routing_deprecation_inventories(inventory_sha256));
+                CREATE TABLE routing_deprecation_current (
+                  repository TEXT PRIMARY KEY, generation INTEGER NOT NULL CHECK(generation > 0),
+                  inventory_sha256 TEXT NOT NULL UNIQUE, version INTEGER NOT NULL CHECK(version > 0),
+                  promoted_at TEXT NOT NULL, FOREIGN KEY(inventory_sha256) REFERENCES routing_deprecation_inventories(inventory_sha256),
+                  UNIQUE(repository,generation));
+                CREATE TABLE routing_deprecation_promotions (
+                  repository TEXT NOT NULL, generation INTEGER NOT NULL, prior_generation INTEGER,
+                  inventory_sha256 TEXT NOT NULL UNIQUE, preview_sha256 TEXT NOT NULL,
+                  remote_receipt TEXT NOT NULL, promoted_at TEXT NOT NULL, PRIMARY KEY(repository,generation));
                 """
                 for statement in migration_schema.split(";"):
                     if statement.strip():
@@ -8696,15 +8833,28 @@ class CoordinationStore:
                 self.connection.execute("INSERT INTO routing_deprecation_promotions VALUES (?,?,?,?,?,?,?)", (legacy["repository"],1,None,legacy["inventory_sha256"],preview_sha256,outbox["remote_receipt"],now))
                 self.connection.execute("DROP TABLE routing_deprecation_occurrences_legacy_v1")
                 self.connection.execute("DROP TABLE routing_deprecation_inventories_legacy_v1")
-            # Re-running schema installation reinstalls the reviewed immutable triggers.
-            self._create_schema()
+                for sql in trigger_sql.values():
+                    self.connection.execute(sql)
+                for sql in generation_trigger_sql.values():
+                    self.connection.execute(sql)
+                migrated = dict(self.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone())
+                for key, value in legacy.items():
+                    if migrated[key] != value:
+                        raise CoordinationError("ROUTING_DEPRECATION_LEGACY_BYTE_DRIFT")
+                if [dict(row) for row in self.connection.execute("SELECT * FROM routing_deprecation_occurrences ORDER BY ordinal")] != occurrences:
+                    raise CoordinationError("ROUTING_DEPRECATION_LEGACY_BYTE_DRIFT")
+                installed_triggers = {row[0]: normalized_sql(row[1]) for row in self.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN (%s)" % ",".join("?" for _ in trigger_sql), tuple(trigger_sql))}
+                if installed_triggers != {name: normalized_sql(sql) for name, sql in trigger_sql.items()}:
+                    raise CoordinationError("ROUTING_DEPRECATION_MIGRATION_SCHEMA_INVALID")
+                self._routing_deprecation_migration_postcopy_check()
         finally:
-            self.connection.execute("PRAGMA foreign_keys=ON")
-        migrated = dict(self.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone())
-        for key, value in legacy.items():
-            if migrated[key] != value:
-                raise CoordinationError("ROUTING_DEPRECATION_LEGACY_BYTE_DRIFT")
+            self.connection.execute(f"PRAGMA foreign_keys={prior_foreign_keys}")
         return {"inventory_sha256": expected_inventory_sha256, "generation": 1, "preview_sha256": preview_sha256, "replay": False}
+
+    def _routing_deprecation_migration_postcopy_check(self) -> None:
+        """Final in-transaction migration check; isolated for fault-injection tests."""
+        if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise CoordinationError("ROUTING_DEPRECATION_MIGRATION_FOREIGN_KEY_INVALID")
 
     def terminal_outbox_context(self, outbox_id: int) -> dict[str, Any] | None:
         row = self.connection.execute(

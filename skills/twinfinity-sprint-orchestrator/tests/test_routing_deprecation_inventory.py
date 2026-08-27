@@ -506,27 +506,58 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         self.assertEqual(old_inventory, dict(self.store.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE generation=1").fetchone()))
         self.assertEqual(old_occurrences, [tuple(row) for row in self.store.connection.execute("SELECT * FROM routing_deprecation_occurrences WHERE inventory_sha256=? ORDER BY ordinal", (first["inventory_sha256"],))])
 
-    def test_legacy_v1_migration_preserves_inventory_bytes_and_fails_closed(self) -> None:
-        inventory, outbox_id = self.prepare()
-        self.complete_outbox(outbox_id)
+    def downgrade_to_exact_legacy_v1(self):
         legacy = dict(self.store.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchone())
+        legacy = {key: value for key, value in legacy.items() if key not in {"generation", "predecessor_inventory_sha256", "preview_sha256"}}
+        occurrences = [dict(row) for row in self.store.connection.execute("SELECT * FROM routing_deprecation_occurrences ORDER BY ordinal")]
+        trigger_rows = list(self.store.connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN ('routing_deprecation_inventory_immutable_update','routing_deprecation_inventory_immutable_delete','routing_deprecation_occurrence_immutable_update','routing_deprecation_occurrence_immutable_delete','routing_deprecation_occurrence_append_fenced','routing_deprecation_outbox_envelope_immutable')"))
         self.store.connection.commit()
         self.store.connection.execute("PRAGMA foreign_keys=OFF")
         self.store.connection.execute("DROP TRIGGER routing_deprecation_promotion_immutable_delete")
         self.store.connection.execute("DELETE FROM routing_deprecation_promotions")
         self.store.connection.execute("DROP TRIGGER routing_deprecation_current_no_delete")
         self.store.connection.execute("DELETE FROM routing_deprecation_current")
-        self.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_update")
-        self.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_delete")
-        self.store.connection.execute("ALTER TABLE routing_deprecation_inventories RENAME TO routing_deprecation_inventories_v2_fixture")
-        self.store.connection.execute("CREATE TABLE routing_deprecation_inventories AS SELECT inventory_sha256,repository,kind,alias_source_sha256,endpoint_state_sha256,issue_179_source_sha256,object_manifest_sha256,occurrence_manifest_sha256,object_manifest_json,object_count,issue_count,pull_request_count,occurrence_count,classification_counts_json,semantic_tag_counts_json,outbox_id,state,created_at FROM routing_deprecation_inventories_v2_fixture")
-        self.store.connection.execute("CREATE UNIQUE INDEX routing_legacy_repository_unique ON routing_deprecation_inventories(repository)")
-        self.store.connection.execute("DROP TABLE routing_deprecation_inventories_v2_fixture")
-        for name in ("routing_deprecation_inventory_immutable_update", "routing_deprecation_inventory_immutable_delete"):
-            action = "UPDATE" if name.endswith("update") else "DELETE"
-            self.store.connection.execute(f"CREATE TRIGGER {name} BEFORE {action} ON routing_deprecation_inventories BEGIN SELECT RAISE(ABORT,'IMMUTABLE'); END")
+        self.store._create_schema()
+        for row in trigger_rows:
+            self.store.connection.execute(f"DROP TRIGGER {row['name']}")
+        self.store.connection.execute("DROP TABLE routing_deprecation_occurrences")
+        self.store.connection.execute("DROP TABLE routing_deprecation_inventories")
+        self.store.connection.executescript("""
+        CREATE TABLE routing_deprecation_inventories (
+          inventory_sha256 TEXT PRIMARY KEY, repository TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL CHECK(kind='TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1'), alias_source_sha256 TEXT NOT NULL,
+          endpoint_state_sha256 TEXT NOT NULL, issue_179_source_sha256 TEXT NOT NULL, object_manifest_sha256 TEXT NOT NULL,
+          occurrence_manifest_sha256 TEXT NOT NULL, object_manifest_json TEXT NOT NULL,
+          object_count INTEGER NOT NULL CHECK(object_count >= 0), issue_count INTEGER NOT NULL CHECK(issue_count >= 0),
+          pull_request_count INTEGER NOT NULL CHECK(pull_request_count >= 0), occurrence_count INTEGER NOT NULL CHECK(occurrence_count >= 0),
+          classification_counts_json TEXT NOT NULL, semantic_tag_counts_json TEXT NOT NULL, outbox_id INTEGER NOT NULL UNIQUE,
+          state TEXT NOT NULL CHECK(state='COMPLETE'), created_at TEXT NOT NULL, FOREIGN KEY(outbox_id) REFERENCES github_outbox(id));
+        CREATE TABLE routing_deprecation_occurrences (
+          inventory_sha256 TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+          object_kind TEXT NOT NULL CHECK(object_kind IN ('issue', 'pull_request')), object_number INTEGER NOT NULL CHECK(object_number > 0),
+          node_id TEXT NOT NULL, object_updated_at TEXT NOT NULL, body_sha256 TEXT NOT NULL, alias TEXT NOT NULL,
+          byte_start INTEGER NOT NULL CHECK(byte_start >= 0), byte_end INTEGER NOT NULL CHECK(byte_end > byte_start),
+          line_number INTEGER NOT NULL CHECK(line_number > 0), byte_column INTEGER NOT NULL CHECK(byte_column > 0),
+          classification TEXT NOT NULL CHECK(classification IN ('EXECUTABLE_ROUTE','ROUTING_REFERENCE','HISTORICAL_PROVENANCE','AMBIGUOUS_REFERENCE')),
+          semantic_tags_json TEXT NOT NULL, PRIMARY KEY(inventory_sha256, ordinal),
+          UNIQUE(inventory_sha256, object_kind, object_number, byte_start, alias),
+          FOREIGN KEY(inventory_sha256) REFERENCES routing_deprecation_inventories(inventory_sha256));
+        """)
+        columns = list(legacy)
+        self.store.connection.execute(f"INSERT INTO routing_deprecation_inventories({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", [legacy[key] for key in columns])
+        occurrence_columns = list(occurrences[0]) if occurrences else []
+        if occurrences:
+            self.store.connection.executemany(f"INSERT INTO routing_deprecation_occurrences({','.join(occurrence_columns)}) VALUES ({','.join('?' for _ in occurrence_columns)})", [[item[key] for key in occurrence_columns] for item in occurrences])
+        for row in trigger_rows:
+            self.store.connection.execute(row["sql"])
         self.store.connection.commit()
         self.store.connection.execute("PRAGMA foreign_keys=ON")
+        return legacy, occurrences
+
+    def test_legacy_v1_migration_preserves_inventory_bytes_and_fails_closed(self) -> None:
+        inventory, outbox_id = self.prepare()
+        self.complete_outbox(outbox_id)
+        legacy, _ = self.downgrade_to_exact_legacy_v1()
         result = self.store.migrate_legacy_routing_deprecation_inventory(
             expected_inventory_sha256=inventory["inventory_sha256"],
             expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:00:00Z",
@@ -534,10 +565,101 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         self.assertFalse(result["replay"])
         migrated = dict(self.store.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchone())
         for key, value in legacy.items():
-            if key not in {"generation", "predecessor_inventory_sha256", "preview_sha256"}:
-                self.assertEqual(value, migrated[key])
+            self.assertEqual(value, migrated[key])
         replay = self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:00:01Z")
         self.assertTrue(replay["replay"])
+
+    def legacy_database_fingerprint(self):
+        schema = [tuple(row) for row in self.store.connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name LIKE 'routing_deprecation_%' ORDER BY type,name"
+        )]
+        data = {}
+        for table in ("routing_deprecation_inventories", "routing_deprecation_occurrences", "routing_deprecation_current", "routing_deprecation_promotions", "github_outbox"):
+            data[table] = [tuple(row) for row in self.store.connection.execute(f"SELECT * FROM {table}")]
+        return schema, data, int(self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0])
+
+    def assert_legacy_migration_hold_is_zero_write(self, inventory, error="LEGACY_SHAPE_INVALID"):
+        before = self.legacy_database_fingerprint()
+        with self.assertRaisesRegex(CoordinationError, error):
+            self.store.migrate_legacy_routing_deprecation_inventory(
+                expected_inventory_sha256=inventory["inventory_sha256"],
+                expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:10:00Z",
+            )
+        self.assertEqual(before, self.legacy_database_fingerprint())
+
+    def test_legacy_migration_rejects_ctas_missing_pk_unique_fk_not_null_and_checks(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        self.store.connection.commit(); self.store.connection.execute("PRAGMA foreign_keys=OFF")
+        self.store.connection.execute("ALTER TABLE routing_deprecation_inventories RENAME TO routing_deprecation_inventories_exact")
+        self.store.connection.execute("CREATE TABLE routing_deprecation_inventories AS SELECT * FROM routing_deprecation_inventories_exact")
+        self.store.connection.execute("DROP TABLE routing_deprecation_inventories_exact")
+        self.store.connection.commit(); self.store.connection.execute("PRAGMA foreign_keys=ON")
+        info = list(self.store.connection.execute("PRAGMA table_info(routing_deprecation_inventories)"))
+        self.assertFalse(any(row[5] for row in info)); self.assertFalse(any(row[3] for row in info))
+        self.assertEqual([], list(self.store.connection.execute("PRAGMA index_list(routing_deprecation_inventories)")))
+        self.assertEqual([], list(self.store.connection.execute("PRAGMA foreign_key_list(routing_deprecation_inventories)")))
+        self.assertNotIn("CHECK", self.store.connection.execute("SELECT sql FROM sqlite_master WHERE name='routing_deprecation_inventories'").fetchone()[0])
+        self.assert_legacy_migration_hold_is_zero_write(inventory)
+
+    def test_legacy_migration_rejects_altered_or_unexpected_trigger(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_inventory_immutable_update")
+        self.store.connection.execute("CREATE TRIGGER routing_deprecation_inventory_immutable_update BEFORE UPDATE ON routing_deprecation_inventories BEGIN SELECT RAISE(ABORT,'CHANGED'); END")
+        self.store.connection.execute("CREATE TRIGGER routing_deprecation_unexpected BEFORE INSERT ON routing_deprecation_inventories BEGIN SELECT 1; END")
+        self.store.connection.commit()
+        self.assert_legacy_migration_hold_is_zero_write(inventory)
+
+    def test_legacy_migration_rejects_unexpected_relevant_index(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        self.store.connection.execute("CREATE INDEX routing_deprecation_unexpected_index ON routing_deprecation_inventories(created_at)")
+        self.store.connection.commit()
+        self.assert_legacy_migration_hold_is_zero_write(inventory)
+
+    def test_legacy_migration_rejects_partial_generation_state_atomically(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        legacy, _ = self.downgrade_to_exact_legacy_v1()
+        self.store.connection.execute("INSERT INTO routing_deprecation_current VALUES (?,?,?,?,?)", (legacy["repository"],1,legacy["inventory_sha256"],1,"2026-08-24T11:09:00Z"))
+        self.store.connection.commit()
+        self.assert_legacy_migration_hold_is_zero_write(inventory, "LEGACY_PARTIAL_MIGRATION")
+
+    def test_legacy_migration_rejects_orphan_occurrence_with_zero_writes(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        row = dict(self.store.connection.execute("SELECT * FROM routing_deprecation_occurrences LIMIT 1").fetchone())
+        row["inventory_sha256"] = "f" * 64
+        self.store.connection.commit(); self.store.connection.execute("PRAGMA foreign_keys=OFF")
+        columns = list(row)
+        self.store.connection.execute(f"INSERT INTO routing_deprecation_occurrences({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", [row[key] for key in columns])
+        self.store.connection.commit(); self.store.connection.execute("PRAGMA foreign_keys=ON")
+        self.assert_legacy_migration_hold_is_zero_write(inventory)
+
+    def test_legacy_migration_rolls_back_postcopy_failure_and_restores_foreign_keys(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        before = self.legacy_database_fingerprint()
+        with patch.object(self.store, "_routing_deprecation_migration_postcopy_check", side_effect=RuntimeError("injected-postcopy")):
+            with self.assertRaisesRegex(RuntimeError, "injected-postcopy"):
+                self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:20:00Z")
+        self.assertEqual(before, self.legacy_database_fingerprint())
+        self.store.connection.execute("PRAGMA foreign_keys=OFF")
+        result = self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:20:01Z")
+        self.assertFalse(result["replay"])
+        self.assertEqual(0, self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0])
+        self.assertEqual([], list(self.store.connection.execute("PRAGMA foreign_key_check")))
+
+    def test_legacy_migration_replay_revalidates_receipt_and_occurrence_count(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=inventory["occurrence_count"], now="2026-08-24T11:30:00Z")
+        self.store.connection.execute("UPDATE github_outbox SET state='PREPARED' WHERE id=?", (outbox_id,))
+        self.store.connection.commit()
+        before = self.legacy_database_fingerprint()
+        with self.assertRaisesRegex(CoordinationError, "MIGRATION_CONFLICT"):
+            self.store.migrate_legacy_routing_deprecation_inventory(expected_inventory_sha256=inventory["inventory_sha256"], expected_occurrence_count=999, now="2026-08-24T11:30:01Z")
+        self.assertEqual(before, self.legacy_database_fingerprint())
 
     def test_two_successor_prepares_have_one_winner_and_no_orphan_outbox(self) -> None:
         self.prepare()
