@@ -48,6 +48,7 @@ from role_executor_broker import (
     BrokerRuntimePaths,
     execute_brokered_readiness,
 )
+from admission_source_equivalence import admission_lineage_source_is_current
 
 
 HEARTBEAT_SECONDS = 30
@@ -290,6 +291,9 @@ def _validate_target(
             """,
             (row["repository"], row["issue_number"]),
         ).fetchone()
+        admission = connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (row["admission_message_id"],)
+        ).fetchone()
         expected_watch_key = terminal_watch_key(
             str(row["repository"]), int(row["issue_number"]), int(row["generation"])
         )
@@ -297,7 +301,11 @@ def _validate_target(
             target_key != expected_watch_key
             or item is None
             or current_source is None
-            or current_source["payload_sha256"] != item["source_payload_sha256"]
+            or admission is None
+            or not admission_lineage_source_is_current(
+                connection, item=item, message=admission, watch=row,
+                current_source_sha256=str(current_source["payload_sha256"]),
+            )
             or item["allocation_class"] != "ACTIVE"
             or item["status"] not in ACTIVE_EXECUTION_STATUSES
             or int(item["generation"]) != int(row["generation"])
@@ -413,7 +421,10 @@ def _historical_rotated_admission_target_valid(
         or item["accountable_session_id"] != current_endpoint_id
         or item["lease_manifest_sha256"] != payload.get("lease_manifest_sha256")
         or item["source_payload_sha256"] != source.get("payload_sha256")
-        or current_source["payload_sha256"] != item["source_payload_sha256"]
+        or not admission_lineage_source_is_current(
+            connection, item=item, message=message, watch=watch,
+            current_source_sha256=str(current_source["payload_sha256"]),
+        )
         or int(item["development_units"]) != capacity.get("development_units")
         or int(item["shared_units"]) != capacity.get("shared_units")
         or int(item["sre_units"]) != capacity.get("sre_units")

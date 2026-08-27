@@ -272,7 +272,7 @@ def publish(store: CoordinationStore, outbox_id: int) -> dict[str, Any]:
         ),
         fetched_at=utc_now(),
     )
-    if refreshed.payload_sha256 != row["expected_source_sha256"]:
+    if not store.outbox_source_is_current(outbox_id, refreshed.payload_sha256):
         store.hold_outbox(outbox_id, "SOURCE_SNAPSHOT_DRIFT", utc_now())
         raise CoordinationError("SOURCE_SNAPSHOT_DRIFT")
 

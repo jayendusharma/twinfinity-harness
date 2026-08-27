@@ -42,6 +42,7 @@ from repository_delivery_policy import (
     policy_for_repository,
     worktree_identity_matches,
 )
+from admission_source_equivalence import admission_lineage_source_is_current
 
 
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -214,7 +215,7 @@ class PrePushControl:
             """,
             (repository, issue_number),
         ).fetchone()
-        if current is None or current["payload_sha256"] != item["source_payload_sha256"]:
+        if current is None:
             raise PrePushError("PREPUSH_SOURCE_DRIFT")
 
         watch = self.connection.execute(
@@ -329,6 +330,15 @@ class PrePushControl:
                 and claim_attempt["lineage_lease_sha256"]
                 == item["lease_manifest_sha256"]
             )
+            source_current = bool(
+                watch is not None
+                and admission_lineage_source_is_current(
+                    self.connection, item=item, message=admission, watch=watch,
+                    current_source_sha256=str(current["payload_sha256"]),
+                )
+            )
+            if not source_current:
+                raise PrePushError("PREPUSH_SOURCE_DRIFT")
             valid = bool(
                 admission["topic"] in ADMISSION_TOPICS
                 and admission["state"] in {"CLAIMED", "COMPLETE"}
@@ -358,6 +368,7 @@ class PrePushControl:
                 and int(watch["admission_message_id"] or 0) == int(admission["id"])
                 and watch["admission_payload_sha256"]
                 == admission["payload_sha256"]
+                and source_current
             )
             if not valid:
                 admission = None

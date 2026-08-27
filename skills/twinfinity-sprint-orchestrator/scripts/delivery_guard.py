@@ -30,6 +30,7 @@ from repository_delivery_policy import (
     expected_worktree_parent,
     worktree_path_matches_owning_issue,
 )
+from admission_source_equivalence import admission_lineage_source_is_current
 
 
 DEFAULT_DATABASE = Path.home() / ".codex/twinfinity-coordination/ack-transactions.sqlite3"
@@ -594,7 +595,7 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         payload = json.loads(row["payload_json"])
     except json.JSONDecodeError as exc:
         raise GuardError("DELIVERY_TARGET_INVALID") from exc
-    if not isinstance(payload, dict) or not _source_is_current(connection, payload):
+    if not isinstance(payload, dict):
         raise GuardError("DELIVERY_TARGET_INVALID")
     if (
         topic
@@ -603,6 +604,8 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
     ):
         raise GuardError("DELIVERY_TARGET_INVALID")
     if topic == "coordination.notice":
+        if not _source_is_current(connection, payload):
+            raise GuardError("DELIVERY_TARGET_INVALID")
         if payload.get("mutation_authority") is not False:
             raise GuardError("DELIVERY_TARGET_INVALID")
         return DeliveryContext(role, endpoint_id, "message", target_key, topic, None, frozenset(), False)
@@ -621,6 +624,23 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         connection, payload, endpoint_id, exact_version=True
     )
     if topic not in {"development.admission", "development.recovery_commit", "sre.admission"} or not exact_current:
+        raise GuardError("DELIVERY_TARGET_INVALID")
+    item = connection.execute(
+        "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+        (payload["source"]["repository"], payload["issue_number"]),
+    ).fetchone()
+    current = connection.execute(
+        "SELECT payload_sha256 FROM github_current WHERE repository=? AND object_kind='issue' AND object_number=?",
+        (payload["source"]["repository"], payload["issue_number"]),
+    ).fetchone()
+    equivalent_current = bool(
+        item is not None and current is not None and watch is not None
+        and admission_lineage_source_is_current(
+            connection, item=item, message=row, watch=watch,
+            current_source_sha256=str(current["payload_sha256"]),
+        )
+    )
+    if not _source_is_current(connection, payload) and not equivalent_current:
         raise GuardError("DELIVERY_TARGET_INVALID")
     worktree, paths, canonical_checkout, branch, base_sha = _load_lease(
         connection, database, payload, worktree_root
@@ -684,7 +704,22 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
             watch=watch,
         )
     )
-    if not isinstance(payload, dict) or not _source_is_current(connection, payload) or not (exact_current or rotated_current):
+    item = None if not isinstance(payload, dict) else connection.execute(
+        "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+        (payload.get("source", {}).get("repository"), payload.get("issue_number")),
+    ).fetchone()
+    current = None if item is None else connection.execute(
+        "SELECT payload_sha256 FROM github_current WHERE repository=? AND object_kind='issue' AND object_number=?",
+        (item["repository"], item["issue_number"]),
+    ).fetchone()
+    source_current = bool(
+        item is not None and current is not None and candidate is not None
+        and admission_lineage_source_is_current(
+            connection, item=item, message=candidate, watch=watch,
+            current_source_sha256=str(current["payload_sha256"]),
+        )
+    )
+    if not isinstance(payload, dict) or not source_current or not (exact_current or rotated_current):
         raise GuardError("DELIVERY_TARGET_INVALID")
     worktree, paths, canonical_checkout, branch, base_sha = _load_lease(
         connection, database, payload, worktree_root

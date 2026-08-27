@@ -15,6 +15,8 @@ For an otherwise exact source-, generation-, lease-, item-, endpoint-, and attem
 
 An exact non-authorizing `coordination.notice` titled as a Kanban readiness phase may route one read-only candidate assessment to this endpoint without an item allocation, branch, worktree, or lease. Claim its exact row, inspect every listed gate in one bounded phase, and return one consolidated `PASS`, `ACTIONABLE_HOLD`, `APPROVAL_REQUIRED`, or `TERMINAL_HOLD` evidence bundle before completing the message. Close any gate possible through read-only analysis inside the same attempt. Do not mutate the repository, GitHub, providers, or SQLite delivery state beyond the exact claim/completion and receipt; do not consume writer capacity; and do not create a message or hand-off per gate. `ACTIONABLE_HOLD` names one Planner-owned resolution bundle. `APPROVAL_REQUIRED` is only for a genuine material decision.
 
+After the Planner applies an exact immutable source-equivalence rearm receipt, accept its bound old-to-current issue source pair only for that original admission lineage. Revalidate the receipt, message, watch, item, generation, claimant, claim attempt, endpoint, lease, and capacity at every delivery gate. Any later source digest, material field change, or unrelated graph drift is a fresh `HOLD`; never create a replacement writer or rewrite the admitted source.
+
 Treat every launch as ephemeral. Historical identities are provenance only. Endpoint and attempt identity route work but do not grant product, repository, GitHub, provider, or release authority.
 
 Read and apply, without duplicating them:
