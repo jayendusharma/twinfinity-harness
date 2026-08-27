@@ -35,6 +35,7 @@ from portfolio_graph import (
     PortfolioGraphError,
     enqueue_convergence_dirty_event,
     ensure_portfolio_graph_schema,
+    evaluate_graph_for_admission_lineage,
     reserved_hosted_sre_units,
     validate_portfolio_transition,
 )
@@ -67,6 +68,12 @@ from routing_inventory_contract import (
     RoutingInventoryContractError,
     validate_inventory_payload,
     validate_inventory_record,
+)
+from admission_source_equivalence import (
+    AdmissionSourceEquivalenceError,
+    active_admission_source_equivalence,
+    admission_lineage_source_is_current,
+    require_stable_issue_equivalence,
 )
 
 
@@ -1911,6 +1918,40 @@ class CoordinationStore:
             CREATE TRIGGER IF NOT EXISTS coordination_endpoint_rotation_rearm_immutable_delete
             BEFORE DELETE ON coordination_endpoint_rotation_rearms
             BEGIN SELECT RAISE(ABORT, 'ENDPOINT_ROTATION_REARM_IMMUTABLE'); END;
+            CREATE TABLE IF NOT EXISTS coordination_admission_source_equivalence (
+                receipt_key TEXT PRIMARY KEY,
+                preview_sha256 TEXT NOT NULL UNIQUE,
+                repository TEXT NOT NULL,
+                issue_number INTEGER NOT NULL CHECK(issue_number > 0),
+                generation INTEGER NOT NULL CHECK(generation >= 0),
+                message_id INTEGER NOT NULL,
+                watch_key TEXT NOT NULL,
+                item_version INTEGER NOT NULL CHECK(item_version > 0),
+                bound_source_sha256 TEXT NOT NULL,
+                current_source_sha256 TEXT NOT NULL,
+                stable_source_sha256 TEXT NOT NULL,
+                endpoint_id TEXT NOT NULL,
+                claimant TEXT NOT NULL,
+                claim_attempt_id TEXT NOT NULL,
+                lease_manifest_sha256 TEXT NOT NULL,
+                capacity_sha256 TEXT NOT NULL,
+                outbox_id INTEGER NOT NULL,
+                comment_id INTEGER NOT NULL CHECK(comment_id > 0),
+                timeline_evidence_sha256 TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL UNIQUE,
+                receipt_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(repository, issue_number, generation, message_id, watch_key,
+                       bound_source_sha256, current_source_sha256),
+                FOREIGN KEY(message_id) REFERENCES coordination_messages(id),
+                FOREIGN KEY(outbox_id) REFERENCES github_outbox(id)
+            );
+            CREATE TRIGGER IF NOT EXISTS coordination_admission_source_equivalence_immutable_update
+            BEFORE UPDATE ON coordination_admission_source_equivalence
+            BEGIN SELECT RAISE(ABORT, 'ADMISSION_SOURCE_EQUIVALENCE_IMMUTABLE'); END;
+            CREATE TRIGGER IF NOT EXISTS coordination_admission_source_equivalence_immutable_delete
+            BEFORE DELETE ON coordination_admission_source_equivalence
+            BEGIN SELECT RAISE(ABORT, 'ADMISSION_SOURCE_EQUIVALENCE_IMMUTABLE'); END;
             CREATE TABLE IF NOT EXISTS coordination_terminal_closeout_packets (
                 closeout_key TEXT PRIMARY KEY,
                 packet_sha256 TEXT NOT NULL UNIQUE,
@@ -6256,11 +6297,34 @@ class CoordinationStore:
         if len(rows) != 1:
             raise CoordinationError("TERMINAL_GRAPH_BINDING_UNAVAILABLE")
         row = rows[0]
-        if (
-            row["health"] != "CURRENT"
-            or row["observed_main_sha"] != row["accepted_main_sha"]
-            or row["source_payload_sha256"] != source_payload_sha256
-        ):
+        graph_current = bool(
+            row["health"] == "CURRENT"
+            and row["observed_main_sha"] == row["accepted_main_sha"]
+            and row["source_payload_sha256"] == source_payload_sha256
+        )
+        if not graph_current:
+            item = self.connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            watch = None if item is None else self.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE repository=? AND issue_number=? AND generation=?",
+                (repository, issue_number, item["generation"]),
+            ).fetchone()
+            message = None if watch is None else self.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (watch["admission_message_id"],)
+            ).fetchone()
+            evaluation = None if item is None or watch is None or message is None else evaluate_graph_for_admission_lineage(
+                self.connection, repository, current_main=str(row["accepted_main_sha"]),
+                item=item, message=message, watch=watch,
+            )
+            graph_current = bool(
+                row["observed_main_sha"] == row["accepted_main_sha"]
+                and row["source_payload_sha256"] == source_payload_sha256
+                and evaluation is not None and evaluation["health"] == "CURRENT"
+                and evaluation.get("source_equivalence") is True
+            )
+        if not graph_current:
             raise CoordinationError("TERMINAL_GRAPH_BINDING_DRIFT")
         descriptor = {
             "repository": repository,
@@ -6747,6 +6811,219 @@ class CoordinationStore:
             )
         return {**receipt, "receipt_sha256": receipt_sha256}
 
+    @staticmethod
+    def _source_equivalence_rearm_key(
+        *, repository: str, issue_number: int, message_id: int,
+        expected_message_updated_at: str, watch_key: str,
+        expected_watch_updated_at: str, outbox_id: int,
+        timeline: list[dict[str, Any]], expected_owner_login: str,
+    ) -> str:
+        return digest_json({
+            "kind": "TWINFINITY_ADMISSION_SOURCE_EQUIVALENCE_REQUEST_V1",
+            "repository": repository, "issue_number": issue_number,
+            "message_id": message_id,
+            "expected_message_updated_at": expected_message_updated_at,
+            "watch_key": watch_key,
+            "expected_watch_updated_at": expected_watch_updated_at,
+            "outbox_id": outbox_id, "timeline": timeline,
+            "expected_owner_login": expected_owner_login,
+        })
+
+    def _source_equivalence_preview_locked(self, **request: Any) -> dict[str, Any]:
+        repository = request.get("repository")
+        issue_number = request.get("issue_number")
+        message_id = request.get("message_id")
+        watch_key = request.get("watch_key")
+        outbox_id = request.get("outbox_id")
+        timeline = request.get("timeline")
+        owner = request.get("expected_owner_login")
+        if isinstance(repository, str):
+            _validate_repository(repository)
+        if (not isinstance(repository, str) or type(issue_number) is not int or issue_number <= 0
+                or type(message_id) is not int or message_id <= 0
+                or not isinstance(watch_key, str) or not watch_key
+                or type(outbox_id) is not int or outbox_id <= 0
+                or not isinstance(request.get("expected_message_updated_at"), str)
+                or not isinstance(request.get("expected_watch_updated_at"), str)
+                or not isinstance(owner, str) or not owner
+                or not isinstance(timeline, list) or len(timeline) != 1
+                or not isinstance(timeline[0], dict)):
+            raise CoordinationError("SOURCE_EQUIVALENCE_INPUT_INVALID")
+        item = self.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        message = self.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        ).fetchone()
+        watch = self.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?", (watch_key,)
+        ).fetchone()
+        outbox = self.connection.execute(
+            "SELECT * FROM github_outbox WHERE id=?", (outbox_id,)
+        ).fetchone()
+        try:
+            payload = None if message is None else json.loads(message["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        source = payload.get("source") if isinstance(payload, dict) else None
+        capacity = payload.get("capacity") if isinstance(payload, dict) else None
+        if (item is None or message is None or watch is None or outbox is None
+                or not isinstance(payload, dict) or not isinstance(source, dict)
+                or not isinstance(capacity, dict)
+                or message["topic"] not in {"development.admission", "sre.admission"}
+                or message["state"] != "HOLD" or message["last_error"] != "SOURCE_SNAPSHOT_DRIFT"
+                or message["updated_at"] != request["expected_message_updated_at"]
+                or message["claimed_by"] != message["recipient_session_id"]
+                or digest_json(payload) != message["payload_sha256"]
+                or source.get("repository") != repository or source.get("object_kind") != "issue"
+                or source.get("object_number") != issue_number or payload.get("issue_number") != issue_number
+                or type(payload.get("generation")) is not int or type(payload.get("item_version")) is not int
+                or item["status"] not in {"ACTIVE", "ACTIVE_FENCED"} or item["allocation_class"] != "ACTIVE"
+                or int(item["generation"]) != payload["generation"] or int(item["version"]) != payload["item_version"]
+                or item["accountable_session_id"] != message["recipient_session_id"]
+                or item["lease_manifest_sha256"] != payload.get("lease_manifest_sha256")
+                or item["source_payload_sha256"] != source.get("payload_sha256")
+                or {"development_units": int(item["development_units"]), "shared_units": int(item["shared_units"]), "sre_units": int(item["sre_units"])} != capacity
+                or watch["repository"] != repository or int(watch["issue_number"]) != issue_number
+                or int(watch["generation"]) != payload["generation"]
+                or watch["accountable_session_id"] != message["recipient_session_id"]
+                or watch["lease_manifest_sha256"] != item["lease_manifest_sha256"]
+                or watch["state"] != "HOLD" or watch["process_id"] is not None
+                or watch["last_error"] != "TERMINAL_WATCH_ADMISSION_BINDING_DRIFT"
+                or watch["updated_at"] != request["expected_watch_updated_at"]
+                or int(watch["admission_message_id"] or 0) != message_id
+                or watch["admission_payload_sha256"] != message["payload_sha256"]
+                or not isinstance(watch["claim_attempt_id"], str)):
+            raise CoordinationError("SOURCE_EQUIVALENCE_STATE_MISMATCH")
+        bound = self.connection.execute(
+            "SELECT payload_json,source_updated_at FROM github_snapshots WHERE repository=? AND object_kind='issue' AND object_number=? AND payload_sha256=?",
+            (repository, issue_number, source["payload_sha256"]),
+        ).fetchone()
+        current = self.current_snapshot(repository, "issue", issue_number)
+        if bound is None or current is None or current.payload_sha256 == source["payload_sha256"]:
+            raise CoordinationError("SOURCE_EQUIVALENCE_SOURCE_MISMATCH")
+        try:
+            stable_sha256 = require_stable_issue_equivalence(json.loads(bound["payload_json"]), current.payload)
+        except (TypeError, json.JSONDecodeError, AdmissionSourceEquivalenceError) as exc:
+            raise CoordinationError(str(exc)) from exc
+        receipt_match = re.fullmatch(r"comment:(\d+)", str(outbox["remote_receipt"] or ""))
+        comment_id = int(receipt_match.group(1)) if receipt_match else 0
+        event = timeline[0]
+        actor = event.get("actor", event.get("user"))
+        actor_login = actor.get("login") if isinstance(actor, dict) else None
+        if (outbox["state"] != "COMPLETE" or outbox["repository"] != repository
+                or outbox["object_kind"] != "issue" or int(outbox["object_number"]) != issue_number
+                or outbox["operation"] != "comment" or outbox["expected_source_sha256"] != source["payload_sha256"]
+                or comment_id <= 0 or event.get("event") != "commented"
+                or event.get("id") != comment_id or actor_login != owner
+                or event.get("created_at") != current.source_updated_at):
+            raise CoordinationError("SOURCE_EQUIVALENCE_PROVENANCE_INVALID")
+        if self.connection.execute(
+            "SELECT 1 FROM executor_attempts WHERE state IN ('RESERVED','LAUNCHING','RUNNING') AND ("
+            "(target_kind='message' AND target_key=?) OR (target_kind='terminal_watch' AND target_key=?) OR "
+            "(lineage_repository=? AND lineage_issue_number=? AND lineage_generation=?)) LIMIT 1",
+            (str(message_id), watch_key, repository, issue_number, payload["generation"]),
+        ).fetchone() is not None:
+            raise CoordinationError("SOURCE_EQUIVALENCE_ACTIVE_ATTEMPT")
+        if self.connection.execute(
+            "SELECT 1 FROM coordination_terminal_closeout_packets WHERE activation_message_id=? OR terminal_watch_key=? LIMIT 1",
+            (message_id, watch_key),
+        ).fetchone() is not None or self.connection.execute(
+            "SELECT 1 FROM coordination_pre_push_gates WHERE admission_message_id=? LIMIT 1", (message_id,)
+        ).fetchone() is not None:
+            raise CoordinationError("SOURCE_EQUIVALENCE_DELIVERY_CONFLICT")
+        attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?", (watch["claim_attempt_id"],)
+        ).fetchone()
+        role = "development" if message["topic"] == "development.admission" else "sre"
+        if (attempt is None or attempt["role"] != role or attempt["endpoint_id"] != message["recipient_session_id"]
+                or attempt["state"] not in {"COMPLETE", "HOLD"} or attempt["target_kind"] != "message"
+                or attempt["target_key"] != str(message_id)):
+            raise CoordinationError("SOURCE_EQUIVALENCE_ATTEMPT_MISMATCH")
+        timeline_sha256 = digest_json(timeline)
+        preview = {
+            "kind": "TWINFINITY_ADMISSION_SOURCE_EQUIVALENCE_PREVIEW_V1",
+            "repository": repository, "issue_number": issue_number,
+            "generation": int(item["generation"]), "message_id": message_id,
+            "message_payload_sha256": str(message["payload_sha256"]),
+            "expected_message_updated_at": request["expected_message_updated_at"],
+            "watch_key": watch_key, "expected_watch_updated_at": request["expected_watch_updated_at"],
+            "item_version": int(item["version"]), "endpoint_id": str(item["accountable_session_id"]),
+            "claimant": str(message["claimed_by"]), "claim_attempt_id": str(watch["claim_attempt_id"]),
+            "lease_manifest_sha256": str(item["lease_manifest_sha256"]),
+            "capacity": capacity, "capacity_sha256": digest_json(capacity),
+            "bound_source_sha256": str(source["payload_sha256"]),
+            "current_source_sha256": current.payload_sha256,
+            "stable_source_sha256": stable_sha256,
+            "outbox_id": outbox_id, "comment_id": comment_id,
+            "timeline_evidence_sha256": timeline_sha256,
+        }
+        preview["receipt_key"] = self._source_equivalence_rearm_key(**request)
+        preview["preview_sha256"] = digest_json(preview)
+        return preview
+
+    def preview_source_equivalent_admission_rearm(self, **request: Any) -> dict[str, Any]:
+        with self.transaction():
+            return self._source_equivalence_preview_locked(**request)
+
+    def apply_source_equivalent_admission_rearm(
+        self, *, expected_preview_sha256: str, now: str, **request: Any,
+    ) -> dict[str, Any]:
+        _validate_sha256(expected_preview_sha256)
+        _utc_timestamp(now, error="SOURCE_EQUIVALENCE_INPUT_INVALID")
+        receipt_key = self._source_equivalence_rearm_key(**request)
+        with self.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM coordination_admission_source_equivalence WHERE receipt_key=?", (receipt_key,)
+            ).fetchone()
+            if existing is not None:
+                try:
+                    receipt = json.loads(existing["receipt_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CoordinationError("SOURCE_EQUIVALENCE_REPLAY_CONFLICT") from exc
+                if (existing["preview_sha256"] != expected_preview_sha256
+                        or canonical_json(receipt) != existing["receipt_json"]
+                        or digest_json(receipt) != existing["receipt_sha256"]
+                        or receipt.get("receipt_key") != receipt_key):
+                    raise CoordinationError("SOURCE_EQUIVALENCE_REPLAY_CONFLICT")
+                return {**receipt, "receipt_sha256": str(existing["receipt_sha256"])}
+            preview = self._source_equivalence_preview_locked(**request)
+            if preview["preview_sha256"] != expected_preview_sha256:
+                raise CoordinationError("SOURCE_EQUIVALENCE_PREVIEW_DRIFT")
+            message = self.connection.execute(
+                "UPDATE coordination_messages SET state='CLAIMED', updated_at=?, last_error=NULL "
+                "WHERE id=? AND state='HOLD' AND last_error='SOURCE_SNAPSHOT_DRIFT' AND updated_at=?",
+                (now, request["message_id"], request["expected_message_updated_at"]),
+            )
+            watch = self.connection.execute(
+                "UPDATE coordination_terminal_watches SET state='ACTIVE', attempts=0, process_id=NULL, "
+                "target_progress_sha256=NULL, last_heartbeat_at=?, next_wake_at=?, updated_at=?, last_error=NULL "
+                "WHERE watch_key=? AND state='HOLD' AND process_id IS NULL "
+                "AND last_error='TERMINAL_WATCH_ADMISSION_BINDING_DRIFT' AND updated_at=?",
+                (now, now, now, request["watch_key"], request["expected_watch_updated_at"]),
+            )
+            if message.rowcount != 1 or watch.rowcount != 1:
+                raise CoordinationError("SOURCE_EQUIVALENCE_CAS_CONFLICT")
+            receipt = {**preview, "kind": "TWINFINITY_ADMISSION_SOURCE_EQUIVALENCE_RECEIPT_V1", "rearmed_at": now}
+            receipt_sha256 = digest_json(receipt)
+            self.connection.execute(
+                """INSERT INTO coordination_admission_source_equivalence(
+                receipt_key,preview_sha256,repository,issue_number,generation,message_id,watch_key,item_version,
+                bound_source_sha256,current_source_sha256,stable_source_sha256,endpoint_id,claimant,claim_attempt_id,
+                lease_manifest_sha256,capacity_sha256,outbox_id,comment_id,timeline_evidence_sha256,
+                receipt_sha256,receipt_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (receipt_key, expected_preview_sha256, preview["repository"], preview["issue_number"], preview["generation"],
+                 preview["message_id"], preview["watch_key"], preview["item_version"], preview["bound_source_sha256"],
+                 preview["current_source_sha256"], preview["stable_source_sha256"], preview["endpoint_id"],
+                 preview["claimant"], preview["claim_attempt_id"], preview["lease_manifest_sha256"],
+                 preview["capacity_sha256"], preview["outbox_id"], preview["comment_id"],
+                 preview["timeline_evidence_sha256"], receipt_sha256, canonical_json(receipt), now),
+            )
+            self._event("ADMISSION_SOURCE_EQUIVALENCE_REARMED", f"message:{request['message_id']}",
+                        {"receipt_sha256": receipt_sha256, "watch_key": request["watch_key"]}, now)
+        return {**receipt, "receipt_sha256": receipt_sha256}
+
     def prepare_terminal_closeout(
         self,
         *,
@@ -7005,7 +7282,10 @@ class CoordinationStore:
                     str(attempt["endpoint_id"]),
                 )
                 or current_source is None
-                or current_source.payload_sha256 != source_payload_sha256
+                or not admission_lineage_source_is_current(
+                    self.connection, item=item, message=activation, watch=watch,
+                    current_source_sha256=current_source.payload_sha256,
+                )
                 or activation["state"] != "CLAIMED"
                 or watch["state"] != "ACTIVE"
                 or watch["accountable_session_id"] != attempt["endpoint_id"]
@@ -7025,6 +7305,7 @@ class CoordinationStore:
                 body=outbox["body"],
                 now=now,
                 _transaction=False,
+                _allow_source_equivalence=True,
             )
             self._terminal_failpoint(_test_failpoint, "prepare.after_outbox")
             outbox_row = self.connection.execute(
@@ -7693,9 +7974,11 @@ class CoordinationStore:
             current_source = self.current_snapshot(
                 str(packet["repository"]), "issue", int(packet["issue_number"])
             )
-            if current_source is None or (
-                current_source.payload_sha256 != packet["source_payload_sha256"]
-            ):
+            if (current_source is None or item is None or activation is None or watch is None
+                    or not admission_lineage_source_is_current(
+                        self.connection, item=item, message=activation, watch=watch,
+                        current_source_sha256=current_source.payload_sha256,
+                    )):
                 raise CoordinationError("TERMINAL_CLOSEOUT_SOURCE_DRIFT")
             expected_publication_issue_url = (
                 f"https://api.github.com/repos/{packet['repository']}"
@@ -8412,6 +8695,7 @@ class CoordinationStore:
         body: str,
         now: str,
         _transaction: bool = True,
+        _allow_source_equivalence: bool = False,
     ) -> int:
         _validate_repository(repository)
         _validate_sha256(expected_source_sha256)
@@ -8422,7 +8706,10 @@ class CoordinationStore:
         payload_sha256 = digest_json(payload)
         with (self.transaction() if _transaction else nullcontext()):
             source = self.current_snapshot(repository, object_kind, object_number)
-            if source is None or source.payload_sha256 != expected_source_sha256:
+            if source is None or (
+                source.payload_sha256 != expected_source_sha256
+                and not _allow_source_equivalence
+            ):
                 raise CoordinationError("SOURCE_SNAPSHOT_DRIFT")
             current = self.connection.execute(
                 "SELECT id, repository, object_kind, object_number, expected_source_sha256, payload_sha256 FROM github_outbox WHERE idempotency_key=?",
@@ -9492,13 +9779,32 @@ class CoordinationStore:
             source = self.current_snapshot(
                 row["repository"], row["object_kind"], row["object_number"]
             )
-            if source is None or source.payload_sha256 != row["expected_source_sha256"]:
-                raise CoordinationError("SOURCE_SNAPSHOT_DRIFT")
             terminal_packet = self.connection.execute(
                 "SELECT * FROM coordination_terminal_closeout_packets "
                 "WHERE outbox_id=?",
                 (outbox_id,),
             ).fetchone()
+            source_current = bool(source is not None and source.payload_sha256 == row["expected_source_sha256"])
+            if not source_current and source is not None and terminal_packet is not None:
+                item = self.connection.execute(
+                    "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+                    (terminal_packet["repository"], terminal_packet["issue_number"]),
+                ).fetchone()
+                message = self.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=?", (terminal_packet["activation_message_id"],)
+                ).fetchone()
+                watch = self.connection.execute(
+                    "SELECT * FROM coordination_terminal_watches WHERE watch_key=?", (terminal_packet["terminal_watch_key"],)
+                ).fetchone()
+                source_current = bool(
+                    item is not None and message is not None and watch is not None
+                    and admission_lineage_source_is_current(
+                        self.connection, item=item, message=message, watch=watch,
+                        current_source_sha256=source.payload_sha256,
+                    )
+                )
+            if not source_current:
+                raise CoordinationError("SOURCE_SNAPSHOT_DRIFT")
             if terminal_packet is not None:
                 publisher = self.connection.execute(
                     "SELECT closeout_key FROM coordination_terminal_outbox_publishers "
@@ -9937,6 +10243,21 @@ def main() -> int:
     )
     add_endpoint_rotation_rearm_arguments(apply_rotation_rearm)
     apply_rotation_rearm.add_argument("--expected-preview-sha256", required=True)
+    def add_source_equivalence_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--repository", required=True)
+        command.add_argument("--issue-number", type=int, required=True)
+        command.add_argument("--message-id", type=int, required=True)
+        command.add_argument("--expected-message-updated-at", required=True)
+        command.add_argument("--watch-key", required=True)
+        command.add_argument("--expected-watch-updated-at", required=True)
+        command.add_argument("--outbox-id", type=int, required=True)
+        command.add_argument("--timeline-file", type=Path, required=True)
+        command.add_argument("--expected-owner-login", required=True)
+    preview_source_rearm = subparsers.add_parser("preview-source-equivalent-admission-rearm")
+    add_source_equivalence_arguments(preview_source_rearm)
+    apply_source_rearm = subparsers.add_parser("apply-source-equivalent-admission-rearm")
+    add_source_equivalence_arguments(apply_source_rearm)
+    apply_source_rearm.add_argument("--expected-preview-sha256", required=True)
     register_artifacts = subparsers.add_parser("register-artifacts")
     register_artifacts.add_argument("--manifest-file", type=Path, required=True)
     hold_artifact = subparsers.add_parser("hold-drifted-artifact")
@@ -10135,6 +10456,31 @@ def main() -> int:
                 result = store.apply_endpoint_rotation_admission_rearm(
                     **request,
                     expected_preview_sha256=args.expected_preview_sha256,
+                    now=utc_now(),
+                )
+                print(canonical_json({"phase": "COMPLETE", "rearm": result}))
+        elif args.command in {
+            "preview-source-equivalent-admission-rearm",
+            "apply-source-equivalent-admission-rearm",
+        }:
+            timeline = json.loads(args.timeline_file.read_text(encoding="utf-8"))
+            request = {
+                "repository": args.repository,
+                "issue_number": args.issue_number,
+                "message_id": args.message_id,
+                "expected_message_updated_at": args.expected_message_updated_at,
+                "watch_key": args.watch_key,
+                "expected_watch_updated_at": args.expected_watch_updated_at,
+                "outbox_id": args.outbox_id,
+                "timeline": timeline,
+                "expected_owner_login": args.expected_owner_login,
+            }
+            if args.command == "preview-source-equivalent-admission-rearm":
+                result = store.preview_source_equivalent_admission_rearm(**request)
+                print(canonical_json({"phase": "PREVIEW", "rearm": result}))
+            else:
+                result = store.apply_source_equivalent_admission_rearm(
+                    **request, expected_preview_sha256=args.expected_preview_sha256,
                     now=utc_now(),
                 )
                 print(canonical_json({"phase": "COMPLETE", "rearm": result}))

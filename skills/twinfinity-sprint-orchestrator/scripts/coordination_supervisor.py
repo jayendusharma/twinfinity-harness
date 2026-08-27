@@ -51,6 +51,7 @@ from portfolio_convergence import (
     PortfolioConvergence,
 )
 from approval_ledger import enqueue_published_readiness_decision_notices
+from admission_source_equivalence import admission_lineage_source_is_current
 from kanban_readiness import (
     ReadinessError,
     enqueue_due_readiness_revisits,
@@ -639,8 +640,10 @@ class CoordinationSupervisor:
                 or item["source_payload_sha256"]
                 != admission_source.get("payload_sha256")
                 or current_source is None
-                or current_source["payload_sha256"]
-                != item["source_payload_sha256"]
+                or not admission_lineage_source_is_current(
+                    self.store.connection, item=item, message=admission, watch=watch,
+                    current_source_sha256=str(current_source["payload_sha256"]),
+                )
                 or int(item["development_units"])
                 != admission_capacity.get("development_units")
                 or int(item["shared_units"])

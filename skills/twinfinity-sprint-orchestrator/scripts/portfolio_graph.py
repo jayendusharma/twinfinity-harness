@@ -17,6 +17,7 @@ from typing import Any
 
 from owner_safe_sqlite import UnsafeSQLitePathError, prepare_owner_database
 from repository_delivery_policy import HARNESS_REPOSITORY, policy_for_repository
+from admission_source_equivalence import admission_lineage_source_is_current
 
 
 DEFAULT_DATABASE = (
@@ -1241,6 +1242,41 @@ def evaluate_graph(
         ],
         "nodes": projections,
     }
+
+
+def evaluate_graph_for_admission_lineage(
+    connection: sqlite3.Connection,
+    repository: str,
+    *,
+    current_main: str,
+    item: sqlite3.Row,
+    message: sqlite3.Row,
+    watch: sqlite3.Row,
+) -> dict[str, Any]:
+    """Permit only the exact receipt-bound source reason for one admission."""
+
+    result = evaluate_graph(connection, repository, current_main=current_main, _ensure_schema=False)
+    if result["health"] == "CURRENT":
+        return result
+    current = connection.execute(
+        "SELECT payload_sha256 FROM github_current WHERE repository=? AND object_kind='issue' AND object_number=?",
+        (repository, item["issue_number"]),
+    ).fetchone()
+    node = connection.execute(
+        "SELECT node_key FROM portfolio_graph_nodes WHERE repository=? AND graph_version=? AND issue_number=?",
+        (repository, result["version"], item["issue_number"]),
+    ).fetchone()
+    allowed = {"GRAPH_SOURCE_DRIFT", f"GRAPH_SOURCE_DRIFT:issue:{int(item['issue_number'])}"}
+    if node is not None:
+        allowed.add(f"GRAPH_SOURCE_DRIFT:{node['node_key']}")
+    if (current is not None and result["stale_reasons"]
+            and set(result["stale_reasons"]).issubset(allowed)
+            and admission_lineage_source_is_current(
+                connection, item=item, message=message, watch=watch,
+                current_source_sha256=str(current["payload_sha256"]),
+            )):
+        return {**result, "health": "CURRENT", "stale_reasons": [], "source_equivalence": True}
+    return result
 
 
 def _capacity_policy(connection: sqlite3.Connection, repository: str) -> sqlite3.Row:

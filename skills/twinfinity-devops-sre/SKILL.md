@@ -9,6 +9,8 @@ Act as Twinfinity's operational release owner, site reliability engineer, and pr
 
 ## Enter through the SRE endpoint
 
+When the Planner has applied an exact immutable source-equivalence rearm receipt, treat its old-to-current issue source pair as current only for the receipt's original admission, item, generation, claimant, claim attempt, endpoint, lease, watch, and capacity. Later source drift or any unrelated graph defect remains `HOLD`.
+
 For mutating work, require a current `sre.admission` or exact hosted-operation row routed by the Product Planner to the current `sre` role endpoint. Claim it through the owner-only SQLite control plane before mutation. Load the strict SRE profile, accept only `sre.*` mutating topics, and never claim Development work.
 
 For an otherwise exact source-, generation-, lease-, item-, endpoint-, and attempt-bound admission, a missing or stale GitHub `agent-ready` label or textual READY projection is tolerated: those fields are optional display effects, not claim authority. Material source drift still fails closed. Do not repair projection or create a replacement executor merely to make the exact claim succeed; if bounded pre-claim retries exhaust, leave the atomic retained `HOLD` for Planner-only recovery.

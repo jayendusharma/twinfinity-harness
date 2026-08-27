@@ -77,6 +77,8 @@ After an applied role-endpoint rotation, preserve the claimed admission as immut
 
 ## Route execution through fresh endpoints
 
+For a claimed active admission held solely by owner-comment projection drift, use the owner-only `preview-source-equivalent-admission-rearm` and digest-fenced `apply-source-equivalent-admission-rearm` edge. Require exact stable-source, outbox/timeline, message/watch, claim, endpoint, lease, capacity, and graph fences; never use it for material or unrelated graph drift.
+
 A Development admission conditionally covers the complete authorized routine chain: current-main preflight, implementation, focused gates, repository-applicable final-head acceptance, commit, guarded private push, PR and natural CI, independent exact-head review, one bounded repair cycle, routine merge, cleanup, terminal receipt, and capacity release. Native repository, network, applicable Docker, GitHub, and cleanup operations belong to the fresh Development attempt under its strict profile and controlled escalation.
 
 An SRE admission covers only its exact maintenance, release-engineering, readiness, incident, provider, or hosted-operation boundary. Native provider, deployment, database, IAM, secret, billing, access, traffic, or production work belongs to the fresh SRE attempt and still requires exact user authority and the hosted-operation controls. Development cannot absorb it.
