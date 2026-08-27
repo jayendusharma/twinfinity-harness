@@ -166,6 +166,7 @@ def _validate_controller_contract(packet: dict[str, Any]) -> None:
         "coordination_supervisor_sha256": scripts / "coordination_supervisor.py",
         "environment_rebuild_control_sha256": Path(__file__).resolve(),
         "prepush_control_sha256": scripts / "prepush_control.py",
+        "repository_delivery_policy_sha256": scripts / "repository_delivery_policy.py",
     }
     for field, path in expected_paths.items():
         expected = contract.get(field)

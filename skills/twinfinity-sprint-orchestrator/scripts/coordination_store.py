@@ -53,6 +53,12 @@ from executor_registry import (
     select_role_equivalent_identity,
     target_progress_digest,
 )
+from repository_delivery_policy import (
+    delivery_branch_matches_owning_issue,
+    expected_worktree_parent,
+    message_worktree_identity_matches,
+    worktree_path_matches_owning_issue,
+)
 
 
 DEFAULT_DATABASE = (
@@ -308,7 +314,6 @@ TERMINAL_CAPACITY_STATE_KEY = re.compile(
     r"^issue_[1-9][0-9]*_(allocation_class|status)$"
 )
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-BRANCH = re.compile(r"^codex/[0-9]+-[a-z0-9][a-z0-9-]*$")
 REMOTE_COMMENT_RECEIPT = re.compile(r"^comment:[1-9][0-9]*$")
 
 STRUCTURED_LEASE_REQUIRED_KEYS = {
@@ -608,10 +613,18 @@ def parse_structured_lease_manifest(raw: bytes) -> dict[str, Any]:
         or manifest["generation"] < 0
         or not isinstance(manifest["base_sha"], str)
         or not GIT_SHA.fullmatch(manifest["base_sha"])
-        or not isinstance(manifest["branch"], str)
-        or not BRANCH.fullmatch(manifest["branch"])
+        or not delivery_branch_matches_owning_issue(
+            manifest["repository"],
+            manifest["branch"],
+            manifest["issue_number"],
+        )
         or not isinstance(manifest["worktree_path"], str)
         or not Path(manifest["worktree_path"]).is_absolute()
+        or not worktree_path_matches_owning_issue(
+            manifest["repository"],
+            manifest["worktree_path"],
+            manifest["issue_number"],
+        )
         or manifest["no_additional_paths"] is not True
         or not isinstance(manifest["paths"], list)
         or not manifest["paths"]
@@ -4189,10 +4202,27 @@ class CoordinationStore:
             raise CoordinationError("MESSAGE_RECIPIENT_MISMATCH")
         if not GIT_SHA.fullmatch(payload["base_sha"]):
             raise CoordinationError("MESSAGE_CONTRACT_INVALID")
-        if not BRANCH.fullmatch(payload["branch"]):
+        if not delivery_branch_matches_owning_issue(
+            payload["source"].get("repository"),
+            payload["branch"],
+            payload.get("issue_number"),
+        ):
             raise CoordinationError("MESSAGE_CONTRACT_INVALID")
         worktree = Path(payload["worktree_path"])
-        if not worktree.is_absolute() or worktree.parent != Path("/home/ubuntu/code"):
+        expected_parent = expected_worktree_parent(
+            payload["source"].get("repository"), Path("/home/ubuntu/code")
+        )
+        if (
+            not worktree.is_absolute()
+            or expected_parent is None
+            or worktree.parent != expected_parent
+            or not message_worktree_identity_matches(
+                payload["source"].get("repository"),
+                payload["worktree_path"],
+                payload["opaque_worktree_id"],
+                payload.get("issue_number"),
+            )
+        ):
             raise CoordinationError("MESSAGE_CONTRACT_INVALID")
         _validate_sha256(payload["lease_manifest_sha256"])
         _validate_sha256(payload["authority_sha256"])

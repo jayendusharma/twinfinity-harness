@@ -4,7 +4,16 @@ Use this contract only to maintain the versioned Twinfinity Codex harness reposi
 
 ## Preserve one bounded lane
 
-Run at most one active harness-maintenance lane. Charge it to Shared writer WIP, reserve one exact `change/*` branch and sibling worktree from a fetched starting-main SHA, and reject collisions with any open branch, pull request, lease, or changed path. Re-fetch exact main, open branches, open pull requests, and collisions at each decision boundary; cached or chat-only state is insufficient.
+Run at most one active harness-maintenance lane. Charge it to Shared writer WIP,
+reserve one exact `change/<issue>-<slug>` branch and sibling worktree from a
+fetched starting-main SHA, and reject collisions with any open branch, pull
+request, lease, or changed path. For exact repository
+`jayendusharma/twinfinity-harness`, the worktree basename is
+`twinfinity-harness-issue<issue>` or that prefix plus one lowercase hyphenated
+owner suffix, and its opaque worktree ID equals the basename. Application
+repositories retain their existing `codex/*` and `twinfinityapp` identities.
+Re-fetch exact main, open branches, open pull requests, and collisions at each
+decision boundary; cached or chat-only state is insufficient.
 
 Keep the workflow coarse:
 
