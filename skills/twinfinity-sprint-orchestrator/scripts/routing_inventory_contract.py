@@ -36,7 +36,7 @@ def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequen
         raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     for item in objects:
         if (type(item) is not dict or set(item) != {"object_kind","object_number","node_id","body_sha256"}
-                or item["object_kind"] not in {"issue","pull_request"} or not _integer(item["object_number"], minimum=1)
+                or type(item["object_kind"]) is not str or item["object_kind"] not in {"issue","pull_request"} or not _integer(item["object_number"], minimum=1)
                 or type(item["node_id"]) is not str or not item["node_id"] or type(item["body_sha256"]) is not str or SHA256.fullmatch(item["body_sha256"]) is None):
             raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     canonical_occurrences: list[dict[str, Any]] = []
@@ -50,12 +50,12 @@ def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequen
         )
         if (type(item) is not dict or set(item) != {"ordinal","object_kind","object_number","node_id","body_sha256","alias","byte_start","byte_end","line_number","byte_column","classification","semantic_tags"}
                 or not _integer(item["ordinal"]) or item["ordinal"] != ordinal
-                or item["object_kind"] not in {"issue","pull_request"} or not _integer(item["object_number"], minimum=1)
+                or type(item["object_kind"]) is not str or item["object_kind"] not in {"issue","pull_request"} or not _integer(item["object_number"], minimum=1)
                 or type(item["node_id"]) is not str or not item["node_id"] or type(item["body_sha256"]) is not str or SHA256.fullmatch(item["body_sha256"]) is None
                 or type(item["alias"]) is not str or not item["alias"] or not _integer(item["byte_start"])
                 or not _integer(item["byte_end"], minimum=1) or item["byte_end"] <= item["byte_start"]
                 or not _integer(item["line_number"], minimum=1) or not _integer(item["byte_column"], minimum=1)
-                or item["classification"] not in CLASSIFICATIONS or not tags_valid):
+                or type(item["classification"]) is not str or item["classification"] not in CLASSIFICATIONS or not tags_valid):
             raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
         canonical_occurrences.append(dict(item))
     counts = (inventory["object_count"],inventory["issue_count"],inventory["pull_request_count"],inventory["occurrence_count"])

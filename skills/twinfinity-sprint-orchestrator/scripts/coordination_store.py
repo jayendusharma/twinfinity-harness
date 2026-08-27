@@ -8345,29 +8345,6 @@ class CoordinationStore:
     ) -> tuple[str, int]:
         """Freeze one repository inventory and its #179 receipt in one transaction."""
 
-        inventory_fields = {
-            "kind",
-            "repository",
-            "alias_source_sha256",
-            "endpoint_state_sha256",
-            "issue_179_source_sha256",
-            "object_manifest_sha256",
-            "occurrence_manifest_sha256",
-            "object_manifest",
-            "object_count",
-            "issue_count",
-            "pull_request_count",
-            "occurrence_count",
-            "classification_counts",
-            "semantic_tag_counts",
-            "inventory_sha256",
-        }
-        object_fields = {
-            "object_kind",
-            "object_number",
-            "node_id",
-            "body_sha256",
-        }
         occurrence_fields = {
             "ordinal",
             "object_kind",
@@ -8382,76 +8359,15 @@ class CoordinationStore:
             "classification",
             "semantic_tags",
         }
-        if (
-            not isinstance(inventory, dict)
-            or set(inventory) != inventory_fields
-            or inventory.get("kind")
-            != "TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1"
-            or not isinstance(occurrences, list)
-            or not outbox_idempotency_key
-            or not receipt_body
-        ):
-            raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_INVALID")
-        repository = inventory.get("repository")
-        if not isinstance(repository, str):
-            raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_INVALID")
-        _validate_repository(repository)
-        for field in (
-            "alias_source_sha256",
-            "endpoint_state_sha256",
-            "issue_179_source_sha256",
-            "object_manifest_sha256",
-            "occurrence_manifest_sha256",
-            "inventory_sha256",
-        ):
-            value = inventory.get(field)
-            if not isinstance(value, str):
-                raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_INVALID")
-            _validate_sha256(value)
-        objects = inventory.get("object_manifest")
-        if (
-            not isinstance(objects, list)
-            or any(not isinstance(item, dict) or set(item) != object_fields for item in objects)
-            or any(not isinstance(item.get("body_sha256"), str) for item in objects)
-            or any(not isinstance(item, dict) or set(item) != occurrence_fields for item in occurrences)
-        ):
-            raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_INVALID")
-        for item in objects:
-            _validate_sha256(item["body_sha256"])
-        if (
-            digest_json(objects) != inventory["object_manifest_sha256"]
-            or digest_json(occurrences) != inventory["occurrence_manifest_sha256"]
-            or digest_json({key: inventory[key] for key in inventory_fields - {"inventory_sha256"}})
-            != inventory["inventory_sha256"]
-            or inventory.get("object_count") != len(objects)
-            or inventory.get("occurrence_count") != len(occurrences)
-            or inventory.get("issue_count")
-            != sum(item["object_kind"] == "issue" for item in objects)
-            or inventory.get("pull_request_count")
-            != sum(item["object_kind"] == "pull_request" for item in objects)
-        ):
-            raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_DIGEST_MISMATCH")
-        for ordinal, item in enumerate(occurrences):
-            semantic_tags = item.get("semantic_tags")
-            if (
-                item.get("ordinal") != ordinal
-                or item.get("classification")
-                not in {
-                    "EXECUTABLE_ROUTE",
-                    "ROUTING_REFERENCE",
-                    "HISTORICAL_PROVENANCE",
-                    "AMBIGUOUS_REFERENCE",
-                }
-                or type(semantic_tags) is not list
-                or any(type(tag) is not str for tag in semantic_tags)
-                or semantic_tags != sorted(set(semantic_tags))
-            ):
-                raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_INVALID")
-            _validate_sha256(str(item.get("body_sha256", "")))
         try:
             validate_inventory_payload(inventory, occurrences)
         except RoutingInventoryContractError as exc:
             raise CoordinationError(str(exc)) from exc
+        if type(outbox_idempotency_key) is not str or not outbox_idempotency_key or type(receipt_body) is not str or not receipt_body:
+            raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_INVALID")
+        repository = inventory["repository"]
+        _validate_repository(repository)
+        objects = inventory["object_manifest"]
 
         issue_179 = next(
             (

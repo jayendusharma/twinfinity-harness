@@ -566,6 +566,31 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             after = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories","routing_deprecation_occurrences","github_outbox"))
             self.assertEqual(before, after)
 
+    def test_prepare_malformed_leaf_matrix_is_typed_zero_write(self) -> None:
+        fields = {
+            "object": ("object_kind", "node_id", "body_sha256"),
+            "occurrence": ("object_kind", "node_id", "body_sha256", "alias", "classification"),
+        }
+        for surface, names in fields.items():
+            for name in names:
+                values = (None, True, [], {}, 1.5, "INVALID") if name in {"object_kind", "body_sha256", "classification"} else (None, True, [], {}, 1.5, "")
+                for value in values:
+                    inventory, occurrences = self.candidate()
+                    inventory = copy.deepcopy(inventory); occurrences = copy.deepcopy(occurrences)
+                    target = inventory["object_manifest"][0] if surface == "object" else occurrences[0]
+                    target[name] = value
+                    inventory["object_manifest_sha256"] = digest_json(inventory["object_manifest"])
+                    inventory["occurrence_manifest_sha256"] = digest_json(occurrences)
+                    inventory["inventory_sha256"] = digest_json({key: item for key, item in inventory.items() if key != "inventory_sha256"})
+                    before = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories","routing_deprecation_occurrences","github_outbox"))
+                    with self.subTest(surface=surface, name=name, value=value), self.assertRaisesRegex(CoordinationError, "INVENTORY_INVALID"):
+                        self.store.prepare_routing_deprecation_inventory(inventory=inventory, occurrences=occurrences,
+                            alias_source_path=ALIASES, outbox_idempotency_key="invalid-leaf", receipt_body="invalid",
+                            expected_preview_sha256="0" * 64, expected_prior_generation=None,
+                            now="2026-08-24T09:00:02Z")
+                    after = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories","routing_deprecation_occurrences","github_outbox"))
+                    self.assertEqual(before, after)
+
     def test_first_generation_prepare_is_non_authorizing_until_real_receipt_promotion(self) -> None:
         inventory, outbox_id = self.prepare()
         self.assertIsNone(self.store.connection.execute("SELECT * FROM routing_deprecation_current").fetchone())
@@ -771,6 +796,8 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             "semantic_tag_malformed": ("inventory", "semantic_tag_counts_json='{'"),
             "occurrence_updated": ("occurrence", "object_updated_at='2099-01-01T00:00:00Z'"),
             "occurrence_mixed_tags": ("occurrence", "semantic_tags_json='[1,\"ACCEPTANCE\"]'"),
+            "occurrence_bad_category": ("occurrence", "classification='[]'"),
+            "occurrence_bad_hash": ("occurrence", "body_sha256='[]'"),
         }
         for name, (surface, assignment) in cases.items():
             case = RoutingInventoryStoreTests(); case.setUp()
