@@ -222,16 +222,14 @@ def run_tests(selectors: Sequence[str], *, verbose: bool = False) -> int:
             install_reviewed_profiles(codex_home)
             validate_test_registry(codex_home)
 
-            environment = os.environ.copy()
-            environment.pop("PYTHONHOME", None)
-            environment.update(
-                {
-                    "CODEX_HOME": os.fspath(codex_home),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "PYTHONPATH": os.fspath(TEST_ROOT),
-                    "TMPDIR": os.fspath(test_tmp),
-                }
-            )
+            environment = {
+                "HOME": os.fspath(temporary_root),
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "CODEX_HOME": os.fspath(codex_home),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": os.fspath(TEST_ROOT),
+                "TMPDIR": os.fspath(test_tmp),
+            }
             completed = subprocess.run(
                 _test_command(selectors, verbose),
                 cwd=SKILL_ROOT,

@@ -279,6 +279,35 @@ class PortfolioGraphTests(unittest.TestCase):
                 self.store.connection, plan, now="2026-08-22T10:02:00Z"
             )
 
+    def test_application_repository_rejects_issue_set_scope(self) -> None:
+        plan = self._plan()
+        del plan["scope_milestones"]
+        plan["scope"] = {"kind": "ISSUE_SET", "issue_numbers": [58, 115, 320]}
+        with self.assertRaisesRegex(
+            PortfolioGraphError, "GRAPH_ISSUE_SET_REPOSITORY_FORBIDDEN"
+        ):
+            replace_graph(
+                self.store.connection, plan, now="2026-08-22T10:02:00Z"
+            )
+
+    def test_legacy_milestone_scope_preserves_multiple_nodes_for_one_issue(self) -> None:
+        plan = self._plan()
+        duplicate_projection = dict(plan["nodes"][2])
+        duplicate_projection.update(
+            {
+                "node_key": "issue:320:secondary",
+                "lane_key": "sre-secondary",
+                "lane_order": 0,
+            }
+        )
+        plan["nodes"].append(duplicate_projection)
+
+        result = replace_graph(
+            self.store.connection, plan, now="2026-08-22T10:02:00Z"
+        )
+
+        self.assertEqual(4, result["node_count"])
+
     def test_adjacent_unmilestoned_issue_can_be_represented(self) -> None:
         self._issue(298, "Adjacent", updated_at="2026-08-22T09:00:00Z")
         payload = json.loads(
@@ -345,6 +374,44 @@ class PortfolioGraphTests(unittest.TestCase):
             "SELECT COUNT(*) FROM portfolio_scheduler_events"
         ).fetchone()[0]
         self.assertGreaterEqual(events, 2)
+
+    def test_equal_priority_lane_order_precedes_earlier_ready_timestamp(self) -> None:
+        plan = self._plan()
+        plan["nodes"] = plan["nodes"][:2]
+        plan["relations"] = []
+        plan["excluded_issues"] = [
+            {
+                "issue_number": 320,
+                "reason": "Exclude unrelated scoped issue so the FIFO test stays complete.",
+            }
+        ]
+        for node in plan["nodes"]:
+            node.update(
+                {
+                    "root_kind": "STANDALONE",
+                    "root_reason": "Independent FIFO test work.",
+                    "priority_rank": 1,
+                    "development_units": 0,
+                    "shared_units": 1,
+                }
+            )
+        plan["nodes"][0]["ready_at"] = "2026-08-22T10:10:00Z"
+        plan["nodes"][1]["ready_at"] = "2026-08-22T10:00:00Z"
+        self._status(58, "PREPARED", development=0, shared=1)
+        self._status(115, "PREPARED", development=0, shared=1)
+        replace_graph(self.store.connection, plan, now="2026-08-22T10:02:00Z")
+        self._status(58, "READY", development=0, shared=1)
+        self._status(115, "READY", development=0, shared=1)
+
+        decision = schedule(
+            self.store.connection,
+            REPOSITORY,
+            current_main=MAIN,
+            record=False,
+            now="2026-08-22T10:11:00Z",
+        )
+
+        self.assertEqual(["issue:58", "issue:115"], decision["selected"])
 
     def test_recorded_schedule_reads_and_writes_under_one_immediate_transaction(self) -> None:
         self._status(58, "PREPARED", shared=1)
@@ -566,7 +633,12 @@ class PortfolioGraphTests(unittest.TestCase):
         self._issue(251, "Sprint 1", updated_at="2026-08-22T10:05:00Z")
 
         result = sync_head(
-            self.store.connection, REPOSITORY, MAIN, now="2026-08-22T10:06:00Z"
+            self.store.connection,
+            REPOSITORY,
+            MAIN,
+            expected_version=1,
+            expected_observed_main_sha=MAIN,
+            now="2026-08-22T10:06:00Z",
         )
         current = self.store.connection.execute(
             "SELECT health,last_error FROM portfolio_graph_current WHERE repository=?",
@@ -588,6 +660,8 @@ class PortfolioGraphTests(unittest.TestCase):
             self.store.connection,
             REPOSITORY,
             advanced,
+            expected_version=1,
+            expected_observed_main_sha=MAIN,
             now="2026-08-22T10:03:00Z",
         )
         evaluation = evaluate_graph(

@@ -10,8 +10,10 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
+import tempfile
 from typing import Any, Callable
 
 from coordination_store import (
@@ -44,7 +46,18 @@ from portfolio_graph import (
     PortfolioGraphError,
     _schedule_decision,
     enqueue_convergence_dirty_event,
+    ensure_portfolio_graph_schema,
     evaluate_graph,
+    graph_payload,
+    replace_graph,
+    reserved_hosted_sre_units,
+    validate_graph_plan,
+)
+from repository_delivery_policy import (
+    HARNESS_REPOSITORY,
+    canonical_harness_standing_controls,
+    harness_standing_authority_error,
+    harness_standing_authority_provenance_error,
 )
 
 
@@ -54,6 +67,7 @@ FINALIZATION_SCHEMA = "twinfinity-kanban-ready-finalization/v1"
 DRIFT_RECOVERY_SCHEMA = "twinfinity-kanban-ready-drift-recovery/v1"
 UNCLAIMED_ADMISSION_RECOVERY_SCHEMA = "twinfinity-unclaimed-admission-recovery/v1"
 UNCLAIMED_ADMISSION_REFILL_TRIGGER = "UNCLAIMED_ADMISSION_RECOVERY_REFILL"
+ZERO_WIP_PREPARATION_SCHEMA = "twinfinity-repository-zero-wip-prepare/v1"
 LEGACY_UNCLAIMED_ADMISSION_RECOVERY_REASON = (
     "LEGACY_UNCLAIMED_ADMISSION_RECOVERY"
 )
@@ -340,6 +354,8 @@ def _open_packet(database: Path, packet_path: Path) -> tuple[int, str]:
 
 
 def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
+    if connection.in_transaction:
+        raise PullBufferError("PULL_BUFFER_SCHEMA_TRANSACTION_CONFLICT")
     try:
         connection.executescript(
             """
@@ -447,7 +463,6 @@ def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS portfolio_ready_finalizations_immutable_delete
         BEFORE DELETE ON portfolio_ready_finalizations
         BEGIN SELECT RAISE(ABORT, 'READY_FINALIZATION_IMMUTABLE'); END;
-        COMMIT;
             """
         )
         candidate_columns = {
@@ -468,7 +483,8 @@ def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
                     f"ALTER TABLE portfolio_pull_buffer_candidates "
                     f"ADD COLUMN {column} {declaration}"
                 )
-    except Exception:
+        connection.execute("COMMIT")
+    except BaseException:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
@@ -613,7 +629,10 @@ def _validate_packet(packet: Any) -> None:
     )
     _require_nonempty_strings(packet.get("hard_stops"), "PULL_BUFFER_HARD_STOPS_MISSING")
     collisions = packet.get("precomputed_collision_matrix")
-    if not isinstance(collisions, list) or not collisions or any(
+    if (
+        not isinstance(collisions, list)
+        or (not collisions and packet.get("repository") != HARNESS_REPOSITORY)
+        or any(
         not isinstance(item, dict)
         or set(item) != {"other_issue", "disposition", "reason"}
         or type(item.get("other_issue")) is not int
@@ -621,8 +640,95 @@ def _validate_packet(packet: Any) -> None:
         or not str(item.get("disposition") or "").strip()
         or not str(item.get("reason") or "").strip()
         for item in collisions
+        )
     ):
         raise PullBufferError("PULL_BUFFER_COLLISION_MATRIX_MISSING")
+
+
+_PREPARED_PROMOTION_FIELDS = (
+    "repository",
+    "issue_number",
+    "generation",
+    "item_version_at_preparation",
+    "source_payload_sha256",
+    "accepted_main_at_preparation",
+    "portfolio_graph_version",
+    "capacity_policy",
+    "capacity_on_activation",
+)
+
+_HARNESS_PREPARED_PROMOTION_FIELDS = (
+    "verticality",
+    "owner_visible_outcome",
+    "precomputed_collision_matrix",
+    "preparation_complete",
+    "promotion_checks_after_predecessor",
+    "hard_stops",
+    "promotion_trigger",
+)
+
+
+def _require_prepared_promotion_preserved(
+    prepared_packet: Any, ready_packet: dict[str, Any]
+) -> None:
+    strict_fields = _PREPARED_PROMOTION_FIELDS
+    if ready_packet.get("repository") == HARNESS_REPOSITORY:
+        strict_fields = strict_fields + _HARNESS_PREPARED_PROMOTION_FIELDS
+    if (
+        not isinstance(prepared_packet, dict)
+        or prepared_packet.get("schema") != SCHEMA
+        or prepared_packet.get("state") != "PREPARED_NOT_READY"
+        or any(
+            prepared_packet.get(field) != ready_packet.get(field)
+            for field in strict_fields
+        )
+        or (
+            ready_packet.get("repository") == HARNESS_REPOSITORY
+            and prepared_packet.get("immediate_product_consumer")
+            != ready_packet.get("immediate_product_consumer")
+        )
+    ):
+        raise PullBufferError("PULL_BUFFER_PREPARED_PROMOTION_DRIFT")
+
+
+def _graph_collision_matrix(
+    connection: sqlite3.Connection,
+    repository: str,
+    graph_version: int,
+    issue_number: int,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT other.issue_number AS other_issue, relation.reason
+        FROM portfolio_graph_nodes target
+        JOIN portfolio_graph_relations relation
+          ON relation.repository=target.repository
+         AND relation.graph_version=target.graph_version
+         AND (relation.left_node_key=target.node_key
+              OR relation.right_node_key=target.node_key)
+        JOIN portfolio_graph_nodes other
+          ON other.repository=target.repository
+         AND other.graph_version=target.graph_version
+         AND other.node_key=CASE
+             WHEN relation.left_node_key=target.node_key
+             THEN relation.right_node_key ELSE relation.left_node_key END
+        WHERE target.repository=? AND target.graph_version=?
+          AND target.issue_number=? AND relation.relation_kind='COLLISION'
+        ORDER BY other.issue_number
+        """,
+        (repository, graph_version, issue_number),
+    ).fetchall()
+    matrix = [
+        {
+            "other_issue": int(row["other_issue"]),
+            "disposition": "COLLISION",
+            "reason": str(row["reason"]),
+        }
+        for row in rows
+    ]
+    if len({entry["other_issue"] for entry in matrix}) != len(matrix):
+        raise PullBufferError("PULL_BUFFER_GRAPH_COLLISION_AMBIGUOUS")
+    return matrix
 
 
 def _registered_artifact(
@@ -850,6 +956,15 @@ def admission_binding_error(
         validate_admission_dispatch_bindings(payload, topic=topic)
     except CoordinationError as exc:
         return str(exc)
+    standing_authority_error = harness_standing_authority_error(payload)
+    if standing_authority_error is not None:
+        return standing_authority_error
+    if connection is not None:
+        provenance_error = harness_standing_authority_provenance_error(
+            connection, payload
+        )
+        if provenance_error is not None:
+            return provenance_error
     units = ("development_units", "shared_units", "sre_units")
     if any(type(item.get(field)) is not int or item.get(field) != capacity.get(field) for field in units):
         return "ADMISSION_CAPACITY_DRIFT"
@@ -865,6 +980,18 @@ def admission_binding_error(
         )
     ):
         return "ADMISSION_CAPACITY_DRIFT"
+    if (
+        candidate.get("repository") == HARNESS_REPOSITORY
+        and (
+            topic != "development.admission"
+            or int(item["development_units"]) != 0
+            or int(item["shared_units"]) != 1
+            or int(item["sre_units"]) != 0
+            or payload.get("environment_root") is not None
+            or payload.get("existing_environment") is not None
+        )
+    ):
+        return "ADMISSION_HARNESS_SOURCE_CLASS_MISMATCH"
     lease_sha = payload.get("lease_manifest_sha256")
     if (
         not isinstance(lease_sha, str)
@@ -1036,14 +1163,1244 @@ def ready_attestation_error(
     return None if expected else "READINESS_ATTESTATION_DRIFT"
 
 
+def _validate_zero_wip_preparation_request(request: Any) -> None:
+    if not isinstance(request, dict) or set(request) != {
+        "schema",
+        "repository",
+        "observed_main_sha",
+        "expected_graph_version",
+        "expected_item_version",
+        "expected_capacity_policy",
+        "issue_sources",
+        "scope",
+        "graph",
+        "candidate",
+    }:
+        raise PullBufferError("ZERO_WIP_PREPARATION_INVALID")
+    if (
+        request.get("schema") != ZERO_WIP_PREPARATION_SCHEMA
+        or request.get("repository") != HARNESS_REPOSITORY
+        or not isinstance(request.get("observed_main_sha"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", request["observed_main_sha"])
+        or type(request.get("expected_graph_version")) is not int
+        or request["expected_graph_version"] < 0
+        or type(request.get("expected_item_version")) is not int
+        or request["expected_item_version"] < 0
+    ):
+        raise PullBufferError("ZERO_WIP_PREPARATION_INVALID")
+    expected_policy = request.get("expected_capacity_policy")
+    if (
+        not isinstance(expected_policy, dict)
+        or set(expected_policy)
+        != {
+            "version",
+            "development_limit",
+            "shared_limit",
+            "sre_limit",
+            "authority_sha256",
+        }
+        or any(
+            type(expected_policy.get(key)) is not int or expected_policy[key] < 0
+            for key in (
+                "version",
+                "development_limit",
+                "shared_limit",
+                "sre_limit",
+            )
+        )
+        or expected_policy["version"] <= 0
+        or not isinstance(expected_policy.get("authority_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_policy["authority_sha256"])
+        is None
+    ):
+        raise PullBufferError("ZERO_WIP_CAPACITY_POLICY_INVALID")
+    scope = request.get("scope")
+    if (
+        not isinstance(scope, dict)
+        or set(scope) != {"kind", "issue_numbers"}
+        or scope.get("kind") != "ISSUE_SET"
+        or not isinstance(scope.get("issue_numbers"), list)
+        or not scope["issue_numbers"]
+        or scope["issue_numbers"] != sorted(scope["issue_numbers"])
+        or len(set(scope["issue_numbers"])) != len(scope["issue_numbers"])
+        or any(type(number) is not int or number <= 0 for number in scope["issue_numbers"])
+    ):
+        raise PullBufferError("ZERO_WIP_SCOPE_INVALID")
+    sources = request.get("issue_sources")
+    if (
+        not isinstance(sources, list)
+        or any(
+            not isinstance(source, dict)
+            or set(source) != {"issue_number", "payload_sha256"}
+            or type(source.get("issue_number")) is not int
+            or source["issue_number"] <= 0
+            or not isinstance(source.get("payload_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source["payload_sha256"])
+            for source in sources
+        )
+        or sorted(source["issue_number"] for source in sources)
+        != scope["issue_numbers"]
+    ):
+        raise PullBufferError("ZERO_WIP_SOURCE_INVENTORY_INVALID")
+    graph = request.get("graph")
+    if not isinstance(graph, dict) or set(graph) != {
+        "nodes",
+        "relations",
+        "excluded_issues",
+    }:
+        raise PullBufferError("ZERO_WIP_GRAPH_INVALID")
+    node_keys = {
+        "node_key",
+        "issue_number",
+        "role",
+        "root_kind",
+        "root_reason",
+        "lane_key",
+        "lane_order",
+        "dispatchable",
+        "priority_rank",
+        "estimate_units",
+        "development_units",
+        "shared_units",
+        "sre_units",
+    }
+    if (
+        not isinstance(graph["nodes"], list)
+        or not graph["nodes"]
+        or any(not isinstance(node, dict) or set(node) != node_keys for node in graph["nodes"])
+        or not isinstance(graph["relations"], list)
+        or any(
+            not isinstance(relation, dict)
+            or set(relation)
+            != {
+                "left_node_key",
+                "right_node_key",
+                "relation_kind",
+                "reason",
+                "source_issue_number",
+            }
+            or type(relation.get("source_issue_number")) is not int
+            or relation["source_issue_number"] <= 0
+            for relation in graph["relations"]
+        )
+        or not isinstance(graph["excluded_issues"], list)
+        or any(
+            not isinstance(exclusion, dict)
+            or set(exclusion) != {"issue_number", "reason"}
+            for exclusion in graph["excluded_issues"]
+        )
+    ):
+        raise PullBufferError("ZERO_WIP_GRAPH_INVALID")
+    candidate = request.get("candidate")
+    expected_candidate = {
+        "issue_number",
+        "generation",
+        "verticality",
+        "owner_visible_outcome",
+        "preparation_complete",
+        "promotion_checks_after_predecessor",
+        "hard_stops",
+        "promotion_trigger",
+    }
+    if isinstance(candidate, dict) and candidate.get("verticality") == "BOUNDED_ENABLER":
+        expected_candidate.add("immediate_product_consumer")
+    if (
+        not isinstance(candidate, dict)
+        or set(candidate) != expected_candidate
+        or type(candidate.get("issue_number")) is not int
+        or candidate["issue_number"] <= 0
+        or type(candidate.get("generation")) is not int
+        or candidate["generation"] < 0
+        or candidate.get("verticality") not in VERTICALITY
+        or not isinstance(candidate.get("owner_visible_outcome"), str)
+        or not candidate["owner_visible_outcome"].strip()
+    ):
+        raise PullBufferError("ZERO_WIP_CANDIDATE_INVALID")
+    if candidate["verticality"] == "BOUNDED_ENABLER" and not isinstance(
+        candidate.get("immediate_product_consumer"), str
+    ):
+        raise PullBufferError("ZERO_WIP_CANDIDATE_INVALID")
+    for field in (
+        "preparation_complete",
+        "promotion_checks_after_predecessor",
+        "hard_stops",
+    ):
+        _require_nonempty_strings(candidate.get(field), "ZERO_WIP_CANDIDATE_INVALID")
+    if candidate["hard_stops"] != canonical_harness_standing_controls()["hard_stops"]:
+        raise PullBufferError("ZERO_WIP_HARNESS_CONTROL_DRIFT")
+    if not isinstance(candidate.get("promotion_trigger"), str) or not candidate[
+        "promotion_trigger"
+    ].strip():
+        raise PullBufferError("ZERO_WIP_CANDIDATE_INVALID")
+
+
+def _zero_wip_packet_path(store: CoordinationStore, request_sha256: str, issue: int) -> Path:
+    root = store.path.parent / "preparations"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    else:
+        _fsync_zero_wip_directory(root.parent)
+    metadata = root.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or root.is_symlink()
+    ):
+        raise PullBufferError("ZERO_WIP_ARTIFACT_ROOT_UNSAFE")
+    return root / f"harness-issue-{issue}-{request_sha256}.json"
+
+
+def _fsync_zero_wip_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise PullBufferError("ZERO_WIP_ARTIFACT_ROOT_UNSAFE")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _zero_wip_directory_identity(directory: Path) -> tuple[int, int, int, int]:
+    """Capture the owner namespace inode used by later destructive cleanup."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError as exc:
+        raise PullBufferError("ZERO_WIP_ARTIFACT_ROOT_UNSAFE") from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = directory.lstat()
+        identity = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or identity
+            != (current.st_dev, current.st_ino, current.st_mode, current.st_uid)
+        ):
+            raise PullBufferError("ZERO_WIP_ARTIFACT_ROOT_UNSAFE")
+        return identity
+    finally:
+        os.close(descriptor)
+
+
+def _zero_wip_packet_is_exact(path: Path, raw: bytes) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT") from exc
+    try:
+        before = os.fstat(descriptor)
+        observed = _read_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        path_metadata = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or path.is_symlink()
+            or (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (path_metadata.st_dev, path_metadata.st_ino, path_metadata.st_size)
+            or observed != raw
+        ):
+            raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT")
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _recover_linked_zero_wip_packet(path: Path, raw: bytes) -> bool:
+    """Finish the durable-link sequence left by a process interruption."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT") from exc
+    try:
+        before = os.fstat(descriptor)
+        if before.st_nlink == 1:
+            return False
+        observed = _read_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        path_metadata = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 2
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or path.is_symlink()
+            or (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (path_metadata.st_dev, path_metadata.st_ino, path_metadata.st_size)
+            or observed != raw
+        ):
+            raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT")
+        linked_temporaries = []
+        prefix = f".{path.name}."
+        with os.scandir(path.parent) as entries:
+            for entry in entries:
+                if not entry.name.startswith(prefix):
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and (metadata.st_dev, metadata.st_ino)
+                    == (before.st_dev, before.st_ino)
+                ):
+                    linked_temporaries.append(path.parent / entry.name)
+        if len(linked_temporaries) != 1:
+            raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT")
+        try:
+            os.unlink(linked_temporaries[0])
+            _fsync_zero_wip_directory(path.parent)
+        except OSError as exc:
+            raise PullBufferError("ZERO_WIP_ARTIFACT_RECOVERY_FAILED") from exc
+        final = os.fstat(descriptor)
+        if (
+            final.st_nlink != 1
+            or (final.st_dev, final.st_ino, final.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            raise PullBufferError("ZERO_WIP_ARTIFACT_RECOVERY_FAILED")
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _clean_unlinked_zero_wip_temporaries(path: Path, _raw: bytes) -> None:
+    """Remove owner-created unlinked remnants while the owner DB lock is held.
+
+    A process can die before, during, or after writing the temporary.  Its
+    contents therefore are not evidence of ownership.  The deterministic
+    packet-specific prefix, owner-only preparation directory, owner UID,
+    regular-file type, single link, and mode are the ownership boundary.
+    """
+
+    removed = False
+    prefix = f".{path.name}."
+    with os.scandir(path.parent) as entries:
+        candidates = [path.parent / entry.name for entry in entries if entry.name.startswith(prefix)]
+    for candidate in candidates:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(candidate, flags)
+        except OSError as exc:
+            raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT") from exc
+        try:
+            before = os.fstat(descriptor)
+            after = os.fstat(descriptor)
+            path_metadata = candidate.lstat()
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or (after.st_dev, after.st_ino, after.st_size, after.st_nlink)
+                != (before.st_dev, before.st_ino, before.st_size, before.st_nlink)
+                or (path_metadata.st_dev, path_metadata.st_ino, path_metadata.st_size)
+                != (after.st_dev, after.st_ino, after.st_size)
+            ):
+                raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT")
+            os.unlink(candidate)
+            removed = True
+        finally:
+            os.close(descriptor)
+    if removed:
+        _fsync_zero_wip_directory(path.parent)
+
+
+def _materialize_zero_wip_packet(path: Path, raw: bytes) -> bool:
+    if _recover_linked_zero_wip_packet(path, raw):
+        return True
+    _clean_unlinked_zero_wip_temporaries(path, raw)
+    if _zero_wip_packet_is_exact(path, raw):
+        return False
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    linked = False
+    linked_identity: tuple[int, int] | None = None
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+            linked = True
+            linked_metadata = os.fstat(descriptor)
+            linked_identity = (linked_metadata.st_dev, linked_metadata.st_ino)
+        except FileExistsError:
+            if not _zero_wip_packet_is_exact(path, raw):
+                raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT")
+            os.unlink(temporary)
+            _fsync_zero_wip_directory(path.parent)
+            return False
+        _fsync_zero_wip_directory(path.parent)
+        os.unlink(temporary)
+        _fsync_zero_wip_directory(path.parent)
+        if not _zero_wip_packet_is_exact(path, raw):
+            raise PullBufferError("ZERO_WIP_ARTIFACT_CONFLICT")
+        return True
+    except BaseException as exc:
+        cleanup_failed = False
+        try:
+            if linked and linked_identity is not None:
+                final_metadata = path.lstat()
+                if (final_metadata.st_dev, final_metadata.st_ino) == linked_identity:
+                    os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            cleanup_failed = True
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            cleanup_failed = True
+        try:
+            _fsync_zero_wip_directory(path.parent)
+        except (OSError, PullBufferError):
+            cleanup_failed = True
+        if cleanup_failed:
+            raise PullBufferError("ZERO_WIP_ARTIFACT_CLEANUP_FAILED") from exc
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def _retire_stale_zero_wip_orphans(
+    store: CoordinationStore,
+    keep_path: Path,
+    expected_directory_identity: tuple[int, int, int, int],
+) -> None:
+    """Retire unregistered owner packet remnants across the preparation namespace."""
+
+    directory = keep_path.parent
+    final_pattern = re.compile(
+        r"^harness-issue-[1-9][0-9]*-[0-9a-f]{64}\.json$"
+    )
+    temporary_pattern = re.compile(
+        r"^\.harness-issue-[1-9][0-9]*-[0-9a-f]{64}\.json\..+$"
+    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(directory, flags)
+    except OSError as exc:
+        raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE") from exc
+    try:
+        opened = os.fstat(directory_descriptor)
+        try:
+            current_directory = directory.lstat()
+        except OSError as exc:
+            raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE") from exc
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid)
+            != expected_directory_identity
+            or (
+                current_directory.st_dev,
+                current_directory.st_ino,
+                current_directory.st_mode,
+                current_directory.st_uid,
+            )
+            != expected_directory_identity
+        ):
+            raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE")
+        with os.scandir(directory_descriptor) as entries:
+            candidates = [
+                entry.name
+                for entry in entries
+                if (
+                    final_pattern.fullmatch(entry.name) is not None
+                    or temporary_pattern.fullmatch(entry.name) is not None
+                )
+                and entry.name != keep_path.name
+                and not entry.name.startswith(f".{keep_path.name}.")
+            ]
+        groups: dict[tuple[int, int], list[tuple[str, os.stat_result]]] = {}
+        for name in candidates:
+            try:
+                path_metadata = os.stat(
+                    name, dir_fd=directory_descriptor, follow_symlinks=False
+                )
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as exc:
+                raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE") from exc
+            try:
+                descriptor_metadata = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            identity = (
+                path_metadata.st_dev,
+                path_metadata.st_ino,
+                path_metadata.st_mode,
+                path_metadata.st_uid,
+                path_metadata.st_size,
+                path_metadata.st_nlink,
+                path_metadata.st_mtime_ns,
+                path_metadata.st_ctime_ns,
+            )
+            if (
+                not stat.S_ISREG(path_metadata.st_mode)
+                or path_metadata.st_uid != os.getuid()
+                or stat.S_IMODE(path_metadata.st_mode) != 0o600
+                or identity
+                != (
+                    descriptor_metadata.st_dev,
+                    descriptor_metadata.st_ino,
+                    descriptor_metadata.st_mode,
+                    descriptor_metadata.st_uid,
+                    descriptor_metadata.st_size,
+                    descriptor_metadata.st_nlink,
+                    descriptor_metadata.st_mtime_ns,
+                    descriptor_metadata.st_ctime_ns,
+                )
+            ):
+                raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE")
+            groups.setdefault((path_metadata.st_dev, path_metadata.st_ino), []).append(
+                (name, path_metadata)
+            )
+        removed = False
+        relative_directory = directory.relative_to(store.path.parent)
+        for group in groups.values():
+            if int(group[0][1].st_nlink) != len(group):
+                raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE")
+            if any(
+                store.connection.execute(
+                    "SELECT 1 FROM coordination_artifacts WHERE relative_path=?",
+                    ((relative_directory / name).as_posix(),),
+                ).fetchone()
+                is not None
+                for name, _metadata in group
+            ):
+                continue
+            verified: list[tuple[str, os.stat_result, int]] = []
+            try:
+                for name, metadata in group:
+                    descriptor = os.open(
+                        name,
+                        os.O_RDONLY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_descriptor,
+                    )
+                    descriptor_metadata = os.fstat(descriptor)
+                    current = os.stat(
+                        name, dir_fd=directory_descriptor, follow_symlinks=False
+                    )
+                    expected = (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_uid,
+                        metadata.st_size,
+                        metadata.st_nlink,
+                        metadata.st_mtime_ns,
+                        metadata.st_ctime_ns,
+                    )
+                    observed = (
+                        current.st_dev,
+                        current.st_ino,
+                        current.st_mode,
+                        current.st_uid,
+                        current.st_size,
+                        current.st_nlink,
+                        current.st_mtime_ns,
+                        current.st_ctime_ns,
+                    )
+                    descriptor_observed = (
+                        descriptor_metadata.st_dev,
+                        descriptor_metadata.st_ino,
+                        descriptor_metadata.st_mode,
+                        descriptor_metadata.st_uid,
+                        descriptor_metadata.st_size,
+                        descriptor_metadata.st_nlink,
+                        descriptor_metadata.st_mtime_ns,
+                        descriptor_metadata.st_ctime_ns,
+                    )
+                    if observed != expected or descriptor_observed != expected:
+                        os.close(descriptor)
+                        raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE")
+                    verified.append((name, metadata, descriptor))
+                for index, (name, _metadata, descriptor) in enumerate(verified):
+                    current = os.stat(
+                        name, dir_fd=directory_descriptor, follow_symlinks=False
+                    )
+                    descriptor_metadata = os.fstat(descriptor)
+                    current_identity = (
+                        current.st_dev,
+                        current.st_ino,
+                        current.st_mode,
+                        current.st_uid,
+                        current.st_size,
+                        current.st_nlink,
+                        current.st_mtime_ns,
+                        current.st_ctime_ns,
+                    )
+                    descriptor_identity = (
+                        descriptor_metadata.st_dev,
+                        descriptor_metadata.st_ino,
+                        descriptor_metadata.st_mode,
+                        descriptor_metadata.st_uid,
+                        descriptor_metadata.st_size,
+                        descriptor_metadata.st_nlink,
+                        descriptor_metadata.st_mtime_ns,
+                        descriptor_metadata.st_ctime_ns,
+                    )
+                    if current_identity != descriptor_identity:
+                        raise PullBufferError("ZERO_WIP_STALE_ARTIFACT_UNSAFE")
+                    os.unlink(name, dir_fd=directory_descriptor)
+                    removed = True
+            finally:
+                for _name, _metadata, descriptor in verified:
+                    os.close(descriptor)
+        if removed:
+            os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _retire_zero_wip_orphans_after_commit(
+    store: CoordinationStore,
+    keep_path: Path,
+    expected_directory_identity: tuple[int, int, int, int],
+) -> str:
+    """Run best-effort orphan retirement only after candidate durability."""
+
+    try:
+        with store.transaction():
+            _retire_stale_zero_wip_orphans(
+                store, keep_path, expected_directory_identity
+            )
+    except (OSError, PullBufferError, sqlite3.Error):
+        return "HOLD"
+    return "COMPLETE"
+
+
+def _remove_zero_wip_packet(path: Path, raw: bytes) -> None:
+    if not _zero_wip_packet_is_exact(path, raw):
+        raise PullBufferError("ZERO_WIP_ARTIFACT_CLEANUP_FAILED")
+    try:
+        os.unlink(path)
+        _fsync_zero_wip_directory(path.parent)
+    except (OSError, PullBufferError) as exc:
+        raise PullBufferError("ZERO_WIP_ARTIFACT_CLEANUP_FAILED") from exc
+
+
+def _commit_zero_wip(connection: sqlite3.Connection) -> None:
+    """Named seam for proving ambiguous post-COMMIT interruption behavior."""
+
+    connection.execute("COMMIT")
+
+
+def prepare_zero_wip_candidate(
+    store: CoordinationStore,
+    request: dict[str, Any],
+    *,
+    now: str,
+    canonical_main_reader: Callable[[str], str] | None = None,
+    failpoint: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Atomically prepare one harness graph/item/candidate without writer WIP."""
+
+    _validate_zero_wip_preparation_request(request)
+    if store.connection.in_transaction:
+        raise PullBufferError("ZERO_WIP_TRANSACTION_CONFLICT")
+    if canonical_main_reader is None:
+        from portfolio_convergence import read_canonical_local_main
+
+        canonical_main_reader = read_canonical_local_main
+    try:
+        main_before = canonical_main_reader(request["repository"])
+    except Exception as exc:
+        raise PullBufferError("ZERO_WIP_MAIN_EVIDENCE_INVALID") from exc
+    if main_before != request["observed_main_sha"]:
+        raise PullBufferError("ZERO_WIP_MAIN_DRIFT")
+    ensure_portfolio_graph_schema(store.connection)
+    ensure_pull_buffer_schema(store.connection)
+    repository = request["repository"]
+    sources = {entry["issue_number"]: entry["payload_sha256"] for entry in request["issue_sources"]}
+    snapshots = {
+        issue: store.current_snapshot(repository, "issue", issue)
+        for issue in sources
+    }
+    if any(
+        snapshot is None or snapshot.payload_sha256 != sources[issue]
+        for issue, snapshot in snapshots.items()
+    ):
+        raise PullBufferError("ZERO_WIP_SOURCE_DRIFT")
+    graph_request = request["graph"]
+    node_by_key = {node["node_key"]: node for node in graph_request["nodes"]}
+    if len(node_by_key) != len(graph_request["nodes"]):
+        raise PullBufferError("ZERO_WIP_GRAPH_INVALID")
+    nodes = [
+        {
+            **node,
+            "source_payload_sha256": sources[node["issue_number"]],
+            "ready_at": snapshots[node["issue_number"]].source_updated_at,
+        }
+        for node in graph_request["nodes"]
+        if node.get("issue_number") in sources
+    ]
+    if len(nodes) != len(graph_request["nodes"]):
+        raise PullBufferError("ZERO_WIP_GRAPH_INVALID")
+    exclusions = [
+        {
+            **exclusion,
+            "source_payload_sha256": sources[exclusion["issue_number"]],
+        }
+        for exclusion in graph_request["excluded_issues"]
+        if exclusion.get("issue_number") in sources
+    ]
+    if len(exclusions) != len(graph_request["excluded_issues"]):
+        raise PullBufferError("ZERO_WIP_GRAPH_INVALID")
+    relations: list[dict[str, Any]] = []
+    for relation in graph_request["relations"]:
+        left = node_by_key.get(relation["left_node_key"])
+        right = node_by_key.get(relation["right_node_key"])
+        source_issue = relation["source_issue_number"]
+        if (
+            left is None
+            or right is None
+            or source_issue not in {left["issue_number"], right["issue_number"]}
+            or source_issue not in sources
+        ):
+            raise PullBufferError("ZERO_WIP_RELATION_SOURCE_INVALID")
+        relations.append(
+            {
+                key: relation[key]
+                for key in (
+                    "left_node_key",
+                    "right_node_key",
+                    "relation_kind",
+                    "reason",
+                )
+            }
+            | {"source_payload_sha256": sources[source_issue]}
+        )
+    graph_plan = {
+        "repository": repository,
+        "accepted_main_sha": request["observed_main_sha"],
+        "expected_current_version": request["expected_graph_version"],
+        "scope": request["scope"],
+        "excluded_issues": exclusions,
+        "nodes": nodes,
+        "relations": relations,
+    }
+    try:
+        validate_graph_plan(graph_plan)
+    except PortfolioGraphError as exc:
+        raise PullBufferError(str(exc)) from exc
+    dispatchable_keys = sorted(
+        node["node_key"] for node in nodes if node["dispatchable"]
+    )
+    required_collision_pairs = {
+        (left, right)
+        for index, left in enumerate(dispatchable_keys)
+        for right in dispatchable_keys[index + 1 :]
+    }
+    observed_collision_pairs = {
+        tuple(sorted((relation["left_node_key"], relation["right_node_key"])))
+        for relation in relations
+        if relation["relation_kind"] == "COLLISION"
+    }
+    if observed_collision_pairs != required_collision_pairs:
+        raise PullBufferError("ZERO_WIP_HARNESS_COLLISION_INCOMPLETE")
+    candidate_issue = int(request["candidate"]["issue_number"])
+    candidate_nodes = [
+        node for node in nodes if int(node["issue_number"]) == candidate_issue
+    ]
+    if len(candidate_nodes) != 1 or not candidate_nodes[0]["dispatchable"]:
+        raise PullBufferError("ZERO_WIP_CANDIDATE_NODE_INVALID")
+    candidate_node_key = str(candidate_nodes[0]["node_key"])
+    for relation in relations:
+        if (
+            relation["relation_kind"] != "HARD_BLOCK"
+            or relation["right_node_key"] != candidate_node_key
+        ):
+            continue
+        predecessor = node_by_key[relation["left_node_key"]]
+        predecessor_issue = int(predecessor["issue_number"])
+        predecessor_item = store.connection.execute(
+            "SELECT status, allocation_class FROM coordination_items "
+            "WHERE repository=? AND issue_number=?",
+            (repository, predecessor_issue),
+        ).fetchone()
+        predecessor_payload = snapshots[predecessor_issue].payload
+        terminal = bool(
+            (
+                predecessor_item is not None
+                and predecessor_item["status"] == "DONE"
+                and predecessor_item["allocation_class"] == "NONE"
+            )
+            or predecessor_payload.get("state") == "closed"
+        )
+        if not terminal:
+            raise PullBufferError("ZERO_WIP_CANDIDATE_HARD_BLOCKED")
+    candidate_request = request["candidate"]
+    candidate_nodes = [
+        node for node in nodes if node["issue_number"] == candidate_request["issue_number"]
+    ]
+    source_units = {
+        "development_units": 0,
+        "shared_units": 1,
+        "sre_units": 0,
+    }
+    if any(
+        node["dispatchable"]
+        and {
+            key: int(node[key])
+            for key in ("development_units", "shared_units", "sre_units")
+        }
+        != source_units
+        for node in nodes
+    ):
+        raise PullBufferError("ZERO_WIP_HARNESS_CAPACITY_INVALID")
+    if len(candidate_nodes) != 1 or not candidate_nodes[0]["dispatchable"]:
+        raise PullBufferError("ZERO_WIP_CANDIDATE_NODE_INVALID")
+    candidate_node = candidate_nodes[0]
+    units = {
+        key: int(candidate_node[key])
+        for key in ("development_units", "shared_units", "sre_units")
+    }
+    if units != source_units:
+        raise PullBufferError("ZERO_WIP_HARNESS_CAPACITY_INVALID")
+    policy = store.connection.execute(
+        """
+        SELECT p.* FROM coordination_capacity_current c
+        JOIN coordination_capacity_policies p
+          ON p.repository=c.repository AND p.version=c.version
+        WHERE c.repository=?
+        """,
+        (repository,),
+    ).fetchone()
+    if (
+        policy is None
+        or not isinstance(policy["authority_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", policy["authority_sha256"]) is None
+    ):
+        raise PullBufferError("ZERO_WIP_CAPACITY_POLICY_MISSING")
+    expected_policy = request["expected_capacity_policy"]
+    if any(
+        policy[key] != expected_policy[key]
+        for key in (
+            "version",
+            "development_limit",
+            "shared_limit",
+            "sre_limit",
+            "authority_sha256",
+        )
+    ):
+        raise PullBufferError("ZERO_WIP_CAPACITY_POLICY_DRIFT")
+    collisions = []
+    for relation in relations:
+        if relation["relation_kind"] != "COLLISION" or candidate_node["node_key"] not in {
+            relation["left_node_key"], relation["right_node_key"]
+        }:
+            continue
+        other_key = (
+            relation["right_node_key"]
+            if relation["left_node_key"] == candidate_node["node_key"]
+            else relation["left_node_key"]
+        )
+        collisions.append(
+            {
+                "other_issue": int(node_by_key[other_key]["issue_number"]),
+                "disposition": "COLLISION",
+                "reason": relation["reason"],
+            }
+        )
+    collisions.sort(key=lambda item: item["other_issue"])
+    graph_version = int(request["expected_graph_version"]) + 1
+    item_version = int(request["expected_item_version"]) + 1
+    packet = {
+        "schema": SCHEMA,
+        "repository": repository,
+        "issue_number": int(candidate_request["issue_number"]),
+        "generation": int(candidate_request["generation"]),
+        "item_version_at_preparation": item_version,
+        "source_payload_sha256": sources[candidate_request["issue_number"]],
+        "accepted_main_at_preparation": request["observed_main_sha"],
+        "portfolio_graph_version": graph_version,
+        "state": "PREPARED_NOT_READY",
+        "verticality": candidate_request["verticality"],
+        "owner_visible_outcome": candidate_request["owner_visible_outcome"],
+        "capacity_policy": {
+            key: int(policy[key])
+            for key in ("version", "development_limit", "shared_limit", "sre_limit")
+        },
+        "capacity_on_activation": units,
+        "precomputed_collision_matrix": collisions,
+        "preparation_complete": candidate_request["preparation_complete"],
+        "promotion_checks_after_predecessor": candidate_request[
+            "promotion_checks_after_predecessor"
+        ],
+        "hard_stops": candidate_request["hard_stops"],
+        "promotion_trigger": candidate_request["promotion_trigger"],
+    }
+    if candidate_request["verticality"] == "BOUNDED_ENABLER":
+        packet["immediate_product_consumer"] = candidate_request[
+            "immediate_product_consumer"
+        ]
+    _validate_packet(packet)
+    request_sha256 = digest_json(request)
+    packet_raw = (canonical_json(packet) + "\n").encode("utf-8")
+    packet_path = _zero_wip_packet_path(
+        store, request_sha256, int(candidate_request["issue_number"])
+    )
+    preparation_directory_identity = _zero_wip_directory_identity(packet_path.parent)
+    graph_sha256 = digest_json(graph_payload(graph_plan))
+    candidate_sha256 = digest_json(packet)
+    created_packet = False
+    cleanup_packet = False
+    try:
+        store.connection.execute("BEGIN IMMEDIATE")
+        registered_packet = store.connection.execute(
+            "SELECT 1 FROM coordination_artifacts WHERE relative_path=?",
+            (packet_path.relative_to(store.path.parent).as_posix(),),
+        ).fetchone()
+        # Any exact file at this request-specific path that is not registered
+        # belongs to this preparation attempt (including a crash remnant).
+        cleanup_packet = registered_packet is None or not _zero_wip_packet_is_exact(
+            packet_path, packet_raw
+        )
+        created_packet = _materialize_zero_wip_packet(packet_path, packet_raw)
+        if registered_packet is None:
+            # Adopt an exact unregistered artifact left by a process death
+            # after its durable link but before the SQLite transaction.
+            cleanup_packet = True
+        try:
+            main_after = canonical_main_reader(repository)
+        except Exception as exc:
+            raise PullBufferError("ZERO_WIP_MAIN_EVIDENCE_INVALID") from exc
+        if main_after != main_before:
+            raise PullBufferError("ZERO_WIP_MAIN_DRIFT")
+        current_policy = store.connection.execute(
+            """
+            SELECT p.* FROM coordination_capacity_current c
+            JOIN coordination_capacity_policies p
+              ON p.repository=c.repository AND p.version=c.version
+            WHERE c.repository=?
+            """,
+            (repository,),
+        ).fetchone()
+        if current_policy is None or any(
+            int(current_policy[key]) != int(policy[key])
+            for key in (
+                "version",
+                "development_limit",
+                "shared_limit",
+                "sre_limit",
+            )
+        ):
+            raise PullBufferError("ZERO_WIP_CAPACITY_POLICY_DRIFT")
+        before_counts = {
+            table: int(
+                store.connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+            )
+            for table in (
+                "coordination_messages",
+                "coordination_terminal_watches",
+                "executor_attempts",
+                "coordination_pre_push_gates",
+                "coordination_pre_push_publications",
+                "portfolio_dirty_events",
+            )
+        }
+        occupied = store.connection.execute(
+            "SELECT 1 FROM coordination_items WHERE repository=? "
+            "AND allocation_class IN ('ACTIVE','RETAINED') LIMIT 1",
+            (repository,),
+        ).fetchone()
+        if occupied is not None:
+            raise PullBufferError("ZERO_WIP_ALLOCATION_PRESENT")
+        if reserved_hosted_sre_units(store.connection, repository) != 0:
+            raise PullBufferError("ZERO_WIP_HOSTED_SRE_PRESENT")
+        residual_queries = (
+            (
+                "coordination_messages",
+                "SELECT 1 FROM coordination_messages "
+                "WHERE (json_extract(payload_json, '$.source.repository')=? "
+                "OR json_extract(payload_json, '$.repository')=?) "
+                "AND topic IN ('development.admission',"
+                "'development.recovery_prepare','development.recovery_commit',"
+                "'development.terminal_closeout') "
+                "AND state IN ('PREPARED','CLAIMED') LIMIT 1",
+                2,
+            ),
+            (
+                "coordination_terminal_watches",
+                "SELECT 1 FROM coordination_terminal_watches "
+                "WHERE repository=? AND state IN ('PENDING_CLAIM','ACTIVE') LIMIT 1",
+                1,
+            ),
+            (
+                "executor_attempts",
+                "SELECT 1 FROM executor_attempts attempt "
+                "WHERE attempt.lineage_repository=? "
+                "AND attempt.state IN ('RESERVED','LAUNCHING','RUNNING') "
+                "AND (attempt.target_kind='terminal_watch' OR EXISTS ("
+                "SELECT 1 FROM coordination_messages message "
+                "WHERE attempt.target_kind='message' "
+                "AND CAST(message.id AS TEXT)=attempt.target_key "
+                "AND message.topic IN ('development.admission',"
+                "'development.recovery_prepare','development.recovery_commit',"
+                "'development.terminal_closeout'))) LIMIT 1",
+                1,
+            ),
+            (
+                "coordination_pre_push_publications",
+                "SELECT 1 FROM coordination_pre_push_publications "
+                "WHERE repository=? AND state='RESERVED' LIMIT 1",
+                1,
+            ),
+        )
+        for table, query, parameter_count in residual_queries:
+            if store.connection.execute(
+                query, (repository,) * parameter_count
+            ).fetchone() is not None:
+                raise PullBufferError(f"ZERO_WIP_RESIDUAL_STATE:{table}")
+        current_graph = store.connection.execute(
+            "SELECT current.version, current.health, current.observed_main_sha, "
+            "revision.graph_sha256 "
+            "FROM portfolio_graph_current current "
+            "JOIN portfolio_graph_revisions revision "
+            "ON revision.repository=current.repository AND revision.version=current.version "
+            "WHERE current.repository=?",
+            (repository,),
+        ).fetchone()
+        current_item = store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (repository, candidate_request["issue_number"]),
+        ).fetchone()
+        current_candidate = store.connection.execute(
+            "SELECT candidate.* FROM portfolio_pull_buffer_current pointer "
+            "JOIN portfolio_pull_buffer_candidates candidate ON candidate.id=pointer.candidate_id "
+            "WHERE pointer.repository=? AND pointer.issue_number=?",
+            (repository, candidate_request["issue_number"]),
+        ).fetchone()
+        exact_replay = (
+            current_graph is not None
+            and int(current_graph["version"]) == graph_version
+            and current_graph["health"] == "CURRENT"
+            and current_graph["observed_main_sha"] == request["observed_main_sha"]
+            and current_graph["graph_sha256"] == graph_sha256
+            and current_item is not None
+            and int(current_item["version"]) == item_version
+            and current_item["status"] == "PREPARED"
+            and current_item["allocation_class"] == "NONE"
+            and current_item["accountable_session_id"] is None
+            and current_item["lease_manifest_sha256"] is None
+            and current_item["source_payload_sha256"]
+            == sources[candidate_request["issue_number"]]
+            and tuple(int(current_item[key]) for key in units) == tuple(units.values())
+            and current_candidate is not None
+            and current_candidate["candidate_sha256"] == candidate_sha256
+            and current_candidate["state"] == "PREPARED_NOT_READY"
+            and int(current_candidate["graph_version"]) == graph_version
+            and int(current_candidate["capacity_policy_version"])
+            == int(policy["version"])
+            and current_candidate["artifact_content_sha256"]
+            == hashlib.sha256(packet_raw).hexdigest()
+            and current_candidate["artifact_relative_path"]
+            == packet_path.relative_to(store.path.parent).as_posix()
+        )
+        if exact_replay:
+            replay_descriptor = -1
+            try:
+                replay_descriptor, replay_relative = _open_packet(
+                    store.path, packet_path
+                )
+                replay_artifact_sha = _registered_artifact(
+                    store.connection,
+                    replay_descriptor,
+                    replay_relative,
+                    repository=repository,
+                    issue_number=int(candidate_request["issue_number"]),
+                    generation=int(candidate_request["generation"]),
+                )
+                if (
+                    replay_relative != current_candidate["artifact_relative_path"]
+                    or replay_artifact_sha
+                    != current_candidate["artifact_content_sha256"]
+                ):
+                    raise PullBufferError("ZERO_WIP_REPLAY_ARTIFACT_DRIFT")
+            except PullBufferError as exc:
+                raise PullBufferError("ZERO_WIP_REPLAY_ARTIFACT_DRIFT") from exc
+            finally:
+                if replay_descriptor >= 0:
+                    os.close(replay_descriptor)
+            try:
+                main_final = canonical_main_reader(repository)
+            except Exception as exc:
+                raise PullBufferError("ZERO_WIP_MAIN_EVIDENCE_INVALID") from exc
+            if main_final != main_before:
+                raise PullBufferError("ZERO_WIP_MAIN_DRIFT")
+            _commit_zero_wip(store.connection)
+            orphan_retirement = _retire_zero_wip_orphans_after_commit(
+                store, packet_path, preparation_directory_identity
+            )
+            return {
+                "repository": repository,
+                "issue_number": int(candidate_request["issue_number"]),
+                "request_sha256": request_sha256,
+                "graph_version": graph_version,
+                "graph_sha256": graph_sha256,
+                "item_version": item_version,
+                "candidate_sha256": candidate_sha256,
+                "artifact_relative_path": str(packet_path.relative_to(store.path.parent)),
+                "state": "PREPARED_NOT_READY",
+                "replay": True,
+                "orphan_retirement": orphan_retirement,
+            }
+        try:
+            replace_graph(
+                store.connection,
+                graph_plan,
+                now=now,
+                _transaction=False,
+                _ensure_schema=False,
+            )
+        except PortfolioGraphError as exc:
+            raise PullBufferError(str(exc)) from exc
+        if failpoint is not None:
+            failpoint("after_graph")
+        item = store.set_issue_status(
+            repository=repository,
+            issue_number=int(candidate_request["issue_number"]),
+            status="PREPARED",
+            allocation_class="NONE",
+            generation=int(candidate_request["generation"]),
+            accountable_session_id=None,
+            lease_manifest_sha256=None,
+            development_units=units["development_units"],
+            shared_units=units["shared_units"],
+            sre_units=units["sre_units"],
+            expected_source_sha256=sources[candidate_request["issue_number"]],
+            expected_version=int(request["expected_item_version"]),
+            now=now,
+            _transaction=False,
+        )
+        if failpoint is not None:
+            failpoint("after_item")
+        store.register_artifacts(
+            [
+                {
+                    "repository": repository,
+                    "issue_number": int(candidate_request["issue_number"]),
+                    "generation": int(candidate_request["generation"]),
+                    "path": str(packet_path),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            ],
+            now=now,
+            _transaction=False,
+        )
+        if failpoint is not None:
+            failpoint("after_artifact")
+        candidate = register_candidate(
+            store.connection,
+            store.path,
+            packet_path,
+            now=now,
+            _transaction=False,
+            _ensure_schema=False,
+        )
+        if failpoint is not None:
+            failpoint("after_candidate")
+        after_counts = {
+            table: int(store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in before_counts
+        }
+        if after_counts != before_counts:
+            raise PullBufferError("ZERO_WIP_WRITER_SIDE_EFFECT")
+        try:
+            main_final = canonical_main_reader(repository)
+        except Exception as exc:
+            raise PullBufferError("ZERO_WIP_MAIN_EVIDENCE_INVALID") from exc
+        if main_final != main_before:
+            raise PullBufferError("ZERO_WIP_MAIN_DRIFT")
+        _commit_zero_wip(store.connection)
+    except BaseException as exc:
+        cleanup_error = None
+        # Only a provably live transaction owns rollback cleanup.  If COMMIT
+        # completed but the interpreter was interrupted before sqlite returned,
+        # the registered evidence must remain durable.
+        rollback_live = store.connection.in_transaction
+        if cleanup_packet and rollback_live and packet_path.exists():
+            try:
+                _remove_zero_wip_packet(packet_path, packet_raw)
+            except PullBufferError as error:
+                cleanup_error = error
+        if rollback_live and store.connection.in_transaction:
+            store.connection.execute("ROLLBACK")
+        if cleanup_error is not None:
+            raise cleanup_error from exc
+        raise
+    orphan_retirement = _retire_zero_wip_orphans_after_commit(
+        store, packet_path, preparation_directory_identity
+    )
+    return {
+        "repository": repository,
+        "issue_number": int(candidate_request["issue_number"]),
+        "request_sha256": request_sha256,
+        "graph_version": graph_version,
+        "graph_sha256": graph_sha256,
+        "item_version": int(item["version"]),
+        "candidate_sha256": candidate["candidate_sha256"],
+        "artifact_relative_path": str(packet_path.relative_to(store.path.parent)),
+        "state": "PREPARED_NOT_READY",
+        "replay": False,
+        "orphan_retirement": orphan_retirement,
+    }
+
+
 def register_candidate(
     connection: sqlite3.Connection,
     database: Path,
     packet_path: Path,
     *,
     now: str,
+    _transaction: bool = True,
+    _ensure_schema: bool = True,
 ) -> dict[str, Any]:
-    ensure_pull_buffer_schema(connection)
+    if not _transaction and (_ensure_schema or not connection.in_transaction):
+        raise PullBufferError("PULL_BUFFER_TRANSACTION_REQUIRED")
+    if _ensure_schema:
+        ensure_pull_buffer_schema(connection)
     descriptor, relative_path = _open_packet(database, packet_path)
     admission_observations: list[dict[str, Any]] = []
     try:
@@ -1061,7 +2418,8 @@ def register_candidate(
             database,
             packet.get("admission_transaction"),
         )
-        connection.execute("BEGIN IMMEDIATE")
+        if _transaction:
+            connection.execute("BEGIN IMMEDIATE")
         repository = packet["repository"]
         issue_number = int(packet["issue_number"])
         current = connection.execute(
@@ -1249,9 +2607,10 @@ def register_candidate(
             or int(commit_metadata.st_ino) != int(final_metadata.st_ino)
         ):
             raise PullBufferError("PULL_BUFFER_ARTIFACT_DRIFT")
-        connection.execute("COMMIT")
+        if _transaction:
+            connection.execute("COMMIT")
     except Exception:
-        if connection.in_transaction:
+        if _transaction and connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
     finally:
@@ -1319,6 +2678,17 @@ def finalize_ready(
             database=store.path,
             keep_descriptors=True,
             candidate_ids={int(prepared_binding["candidate_id"])},
+        )
+        prepared_observation = prepared_observations.get(
+            int(prepared_binding["candidate_id"])
+        )
+        if (
+            not isinstance(prepared_observation, dict)
+            or prepared_observation.get("error") is not None
+        ):
+            raise PullBufferError("PULL_BUFFER_PREPARED_ARTIFACT_DRIFT")
+        _require_prepared_promotion_preserved(
+            prepared_observation.get("packet"), packet
         )
 
         with store.transaction():
@@ -1518,6 +2888,15 @@ def finalize_ready(
             graph_equivalent = readiness_graph_equivalent(
                 connection, current_phase, graph
             )
+            if repository == HARNESS_REPOSITORY and packet[
+                "precomputed_collision_matrix"
+            ] != _graph_collision_matrix(
+                connection,
+                repository,
+                int(graph["version"]),
+                issue_number,
+            ):
+                raise PullBufferError("PULL_BUFFER_GRAPH_COLLISION_DRIFT")
             if (
                 (graph["health"] != "CURRENT" and not graph_equivalent)
                 or int(graph["version"]) != int(phase["graph_version"])
@@ -1582,6 +2961,10 @@ def finalize_ready(
                 raise PullBufferError(binding_error)
             message = admission["message"]
             payload = message["payload"]
+            if repository == HARNESS_REPOSITORY and payload.get(
+                "hard_stops"
+            ) != packet["hard_stops"]:
+                raise PullBufferError("PULL_BUFFER_ADMISSION_CONTROL_DRIFT")
             projected_active = {
                 "repository": repository,
                 "issue_number": issue_number,
@@ -3235,7 +4618,7 @@ def audit_pull_buffer(
             LEFT JOIN coordination_artifacts a
               ON a.relative_path=c.artifact_relative_path
             WHERE pointer.repository=?
-            ORDER BY n.priority_rank, n.ready_at, n.lane_order, c.issue_number
+            ORDER BY n.priority_rank, n.lane_order, n.ready_at, c.issue_number
             """,
             (graph_version, repository),
         ).fetchall()
@@ -3354,6 +4737,10 @@ def audit_pull_buffer(
                         and attestation_error is None
                         and observation_authentic
                         and not recovery_forbidden.intersection(normalized)
+                        and not any(
+                            reason.startswith("HARNESS_STANDING_AUTHORITY_")
+                            for reason in normalized
+                        )
                     ):
                         recovery = _recover_finalized_ready_candidate(
                             store,
@@ -3503,6 +4890,8 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     register = subparsers.add_parser("register")
     register.add_argument("--packet", type=Path, required=True)
+    prepare = subparsers.add_parser("prepare-zero-wip")
+    prepare.add_argument("--request", type=Path, required=True)
     finalize = subparsers.add_parser("finalize-ready")
     finalize.add_argument("--packet", type=Path, required=True)
     recover = subparsers.add_parser("recover-unclaimed-admission")
@@ -3711,6 +5100,22 @@ def main() -> int:
                 )
             else:
                 result = show_readiness(connection, args.repository)
+        elif args.command == "prepare-zero-wip":
+            descriptor, _relative = _open_packet(DEFAULT_DATABASE, args.request)
+            try:
+                request = json.loads(
+                    _read_descriptor(descriptor).decode("utf-8"),
+                    object_pairs_hook=_strict_object,
+                )
+            finally:
+                os.close(descriptor)
+            preparation_store = CoordinationStore(DEFAULT_DATABASE)
+            try:
+                result = prepare_zero_wip_candidate(
+                    preparation_store, request, now=utc_now()
+                )
+            finally:
+                preparation_store.close()
         elif args.command == "register":
             result = register_candidate(connection, DEFAULT_DATABASE, args.packet, now=utc_now())
         elif args.command == "finalize-ready":
@@ -3772,7 +5177,13 @@ def main() -> int:
             result = show_pull_buffer(connection, args.repository)
         print(canonical_json({"phase": "COMPLETE", "result": result}))
         return 0
-    except (PullBufferError, OSError, sqlite3.Error, ValueError) as exc:
+    except (
+        CoordinationError,
+        PullBufferError,
+        OSError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
         print(canonical_json({"phase": "HOLD", "error": str(exc)}))
         return 1
     finally:

@@ -31,6 +31,7 @@ from kanban_pull_buffer import (  # noqa: E402
 from portfolio_convergence import (  # noqa: E402
     PortfolioConvergence,
     PortfolioConvergenceError,
+    read_canonical_local_main,
 )
 from portfolio_graph import replace_graph  # noqa: E402
 from executor_registry import load_registry_config  # noqa: E402
@@ -45,6 +46,7 @@ from tests.canonical_ready_fixture import (  # noqa: E402
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
+HARNESS_REPOSITORY = "jayendusharma/twinfinity-harness"
 MAIN = "a" * 40
 DEVELOPMENT_SESSION = "role.development.v4"
 
@@ -464,7 +466,7 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual([False, False], observations)
         self.assertEqual("RETRY", result["state"])
 
-    def test_main_advance_retires_old_base_packet_without_admission(self) -> None:
+    def test_local_main_cannot_overwrite_provider_cursor(self) -> None:
         self._register_ready_candidate()
         self._release()
         advanced = "c" * 40
@@ -485,9 +487,9 @@ class PortfolioConvergenceTests(unittest.TestCase):
             )
         ]
         self.assertEqual("RETRY", result["state"])
-        self.assertIn("MAIN_DRIFT:issue:2", result["blockers"])
-        self.assertEqual(("PREPARED", "NONE"), tuple(candidate))
-        self.assertIn("MAIN_CURSOR_ADVANCED", triggers)
+        self.assertEqual("CANONICAL_MAIN_PROVIDER_CURSOR_DRIFT", result["error"])
+        self.assertEqual(("READY", "NONE"), tuple(candidate))
+        self.assertNotIn("MAIN_CURSOR_ADVANCED", triggers)
 
     def test_dispatchable_depth_requires_complete_admission_binding(self) -> None:
         self._register_ready_candidate()
@@ -873,6 +875,52 @@ class PortfolioConvergenceTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_final_main_fence_rolls_back_activated_admission(self) -> None:
+        self._register_ready_candidate()
+        self._release()
+        main = [MAIN]
+
+        def drift_before_event_complete(name: str) -> None:
+            if name == "before_event_complete":
+                main[0] = "d" * 40
+
+        result = PortfolioConvergence(
+            self.store,
+            canonical_main_reader=lambda _repository: main[0],
+            failpoint=drift_before_event_complete,
+        ).consume_one("2026-08-24T10:00:04Z")
+
+        candidate = self.store.connection.execute(
+            "SELECT status, allocation_class FROM coordination_items "
+            "WHERE repository=? AND issue_number=2",
+            (REPOSITORY,),
+        ).fetchone()
+        self.assertEqual("RETRY", result["state"])
+        self.assertEqual(
+            "CANONICAL_MAIN_CHANGED_BEFORE_ADMISSION_COMMIT", result["error"]
+        )
+        self.assertEqual(("READY", "NONE"), tuple(candidate))
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE topic IN ('development.admission','sre.admission')"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_terminal_watches WHERE issue_number=2"
+            ).fetchone()[0],
+        )
+        event = self.store.connection.execute(
+            "SELECT state, attempts, last_error FROM portfolio_dirty_events ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            ("RETRY", 1, "CANONICAL_MAIN_CHANGED_BEFORE_ADMISSION_COMMIT"),
+            tuple(event),
+        )
+
     def test_two_consumers_are_fenced_after_external_reads(self) -> None:
         self._register_ready_candidate()
         self._release()
@@ -1098,6 +1146,81 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self.assertEqual([("COMPLETE", "ACTIVE", "ACTIVE")], launch_observations)
         self.assertEqual(1, len(result["launched"]))
         self.assertEqual(0, audit["executable_ready_depth"])
+
+
+class CanonicalMainRepositoryPolicyTests(unittest.TestCase):
+    def test_application_harness_and_unknown_repository_paths_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkouts = {
+                REPOSITORY: root / "application",
+                HARNESS_REPOSITORY: root / "harness",
+            }
+            expected = {
+                REPOSITORY: "a" * 40,
+                HARNESS_REPOSITORY: "b" * 40,
+            }
+            for repository, checkout in checkouts.items():
+                ref = checkout / ".git" / "refs" / "remotes" / "origin" / "main"
+                ref.parent.mkdir(parents=True)
+                ref.write_text(expected[repository] + "\n", encoding="ascii")
+
+            with patch(
+                "portfolio_convergence.expected_canonical_checkout",
+                side_effect=lambda repository, _root: checkouts.get(repository),
+            ):
+                self.assertEqual(
+                    expected[REPOSITORY], read_canonical_local_main(REPOSITORY)
+                )
+                self.assertEqual(
+                    expected[HARNESS_REPOSITORY],
+                    read_canonical_local_main(HARNESS_REPOSITORY),
+                )
+                with self.assertRaisesRegex(
+                    PortfolioConvergenceError,
+                    "CANONICAL_REPOSITORY_UNSUPPORTED",
+                ):
+                    read_canonical_local_main("other/repository")
+
+                harness_ref = (
+                    checkouts[HARNESS_REPOSITORY]
+                    / ".git"
+                    / "refs"
+                    / "remotes"
+                    / "origin"
+                    / "main"
+                )
+                harness_ref.unlink()
+                with self.assertRaisesRegex(
+                    PortfolioConvergenceError, "CANONICAL_MAIN_REF_MISSING"
+                ):
+                    read_canonical_local_main(HARNESS_REPOSITORY)
+                harness_ref.write_text("B" * 40 + "\n", encoding="ascii")
+                with self.assertRaisesRegex(
+                    PortfolioConvergenceError, "CANONICAL_MAIN_REF_INVALID"
+                ):
+                    read_canonical_local_main(HARNESS_REPOSITORY)
+
+                worktree = root / "linked-worktree"
+                worktree.mkdir()
+                (worktree / ".git").write_text(
+                    "gitdir: ../harness/.git/worktrees/linked\n", encoding="ascii"
+                )
+                checkouts[HARNESS_REPOSITORY] = worktree
+                with self.assertRaisesRegex(
+                    PortfolioConvergenceError,
+                    "CANONICAL_CHECKOUT_WORKTREE_FORBIDDEN",
+                ):
+                    read_canonical_local_main(HARNESS_REPOSITORY)
+                checkouts[HARNESS_REPOSITORY] = root / "harness"
+                harness_ref.unlink()
+                symlink_target = root / "outside-main"
+                symlink_target.write_text(expected[HARNESS_REPOSITORY], encoding="ascii")
+                harness_ref.symlink_to(symlink_target)
+                with self.assertRaisesRegex(
+                    PortfolioConvergenceError, "CANONICAL_MAIN_REF_INVALID"
+                ):
+                    read_canonical_local_main(HARNESS_REPOSITORY)
 
 
 if __name__ == "__main__":

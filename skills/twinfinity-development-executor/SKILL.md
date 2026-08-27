@@ -1,6 +1,6 @@
 ---
 name: twinfinity-development-executor
-description: Execute one fresh bounded Planner-admitted Twinfinity repository delivery attempt from exact claim through implementation, focused tests, applicable final-head local Docker Compose acceptance, guarded push, CI, independent exact-head review, bounded repair, merge, cleanup, terminal receipt, and capacity release. Use only for a current Development admission or terminal-watch wake. Do not plan the portfolio, set product scope, or perform SRE/hosted work.
+description: Execute one fresh bounded Planner-admitted Twinfinity repository delivery attempt from exact claim through implementation, focused tests, repository-applicable final-head acceptance, guarded push, CI, independent exact-head review, bounded repair, merge, cleanup, terminal receipt, and capacity release. Use only for a current Development admission or terminal-watch wake. Do not plan the portfolio, set product scope, or perform SRE/hosted work.
 ---
 
 # Twinfinity Development Executor
@@ -46,7 +46,7 @@ Any source, authority, scope, base, head, branch, worktree, lease, capacity, rec
 2. Implement the smallest complete outcome with existing primitives. Do not absorb adjacent debt, speculative frameworks, customer-specific runtime code, or unrequested product behavior.
 3. Map each Gherkin scenario and safety invariant to the lowest useful focused evidence. Keep providers offline and data synthetic by default.
 4. Run the complete affected focused gates from the exact issue-owned environment. Record tool provenance, commands, results, and generated-file cleanliness.
-5. Commit the bounded change locally. For every applicable application or workflow final head, run the shared pre-push controller's full local Docker Compose acceptance and verify exact owned-resource cleanup. Earlier-head, static-only, unit-only, or sandbox Docker results do not substitute.
+5. Commit the bounded change locally. Run the shared pre-push controller's repository-derived final-head gate profile and verify its applicable cleanup contract. Application or workflow heads retain the full local Docker Compose acceptance. A harness source head runs its root-local focused hermetic selectors, the fixed complete quick-validator catalog, and the full hermetic suite; it must not invoke application, browser, Docker, environment-rebuild, installation, or runtime-activation gates. Earlier-head or partial evidence does not substitute.
 6. Publish only with `scripts/prepush_control.py guarded-push` after its exact-head PASS receipt. Raw `git push`, hook bypass, alternate publication, no-op commits, and unchanged-head CI reruns are prohibited.
 7. Open or update the bounded draft PR, preserve the exact issue contract, and wait for natural CI and the configured review path. Bind every acceptance decision to the exact head.
 8. Commission an independent exact-head reviewer. Resolve material findings and threads through at most one normal bounded same-failure-class repair cycle, then rerun affected final-head evidence and guarded publication.
@@ -79,6 +79,6 @@ Only the Product Planner asks the user for approval and creates a fresh or super
 
 ## Close the attempt
 
-The terminal owning-issue receipt must bind the issue and PR, exact public head, delivered scenarios, focused and final-head Compose evidence, guarded publication, natural CI, independent review, repair disposition, merge or safe HOLD state, cleanup categories and verdict, capacity/lease release, residual risks, and next Planner action. Keep exhaustive local paths and hashes owner-local and publish only the validated GitHub-safe projection. Preparing or publishing this receipt is not terminal completion: exact publication readback and `commit-terminal-closeout` are required before reporting capacity or lease release.
+The terminal owning-issue receipt must bind the issue and PR, exact public head, delivered scenarios, focused and repository-applicable final-head gate evidence, guarded publication, natural CI, independent review, repair disposition, merge or safe HOLD state, cleanup categories and verdict, capacity/lease release, residual risks, and next Planner action. Keep exhaustive local paths and hashes owner-local and publish only the validated GitHub-safe projection. Preparing or publishing this receipt is not terminal completion: exact publication readback and `commit-terminal-closeout` are required before reporting capacity or lease release.
 
 Do not update #44, #61, #120, #131, or #179 unless an exact narrower Planner instruction names that mutation. End the attempt after terminal receipt and capacity release, or at a durable `HOLD` with preserved evidence and an exact blocker. Later work requires a fresh current endpoint attempt.

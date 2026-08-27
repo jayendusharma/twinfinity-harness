@@ -54,13 +54,13 @@ The coordination root must be an owner-owned nonsymlink directory with mode `070
 - `coordination_store.py`: GitHub snapshots, delivery items, allocations, leases, typed inbox, outbox, terminal watches, events, atomic admissions/recovery/closeout, and registered-artifact lifecycle.
 - `executor_registry.py`: immutable role endpoint versions, current pointers, aliases used only for historical compatibility, migration ledger, and target-bound attempts.
 - `role_executor_broker.py`: dormant experimental v5 readiness isolation; it is not current routing or a production prerequisite.
-- `portfolio_graph.py`: immutable graph revisions, hard dependencies, ranking order, collisions, source coverage, and dependency-aware scheduling decisions.
+- `portfolio_graph.py`: immutable milestone- or issue-set-scoped graph revisions, hard dependencies, ranking order, collisions, source coverage, and dependency-aware scheduling decisions.
 - `portfolio_graph_supervisor.py`: bounded graph refresh, accepted-main cursor reconciliation, and scheduler recovery.
 - `kanban_pull_buffer.py`: zero-WIP prepared and ready candidate packets bound to current source, graph, policy, artifacts, and admission checks.
 - `kanban_readiness.py`: one candidate-level PREPARED-to-READY phase, immutable all-gates receipts, bounded resolution cycles, and approval-only waits.
 - `portfolio_convergence.py`: dirty-event consumption and atomic selection of an already-reviewed READY candidate.
 - `approval_ledger.py`: immutable material proposals, user decisions, revocations, recipient deliveries, and effectivity guards.
-- `prepush_control.py`: exact-head lower/Compose gate receipt, guarded-publication reservation, and push readback.
+- `prepush_control.py`: repository-derived exact-head gate receipt, guarded-publication reservation, and push readback. Existing lower/Compose receipt slots remain compatibility fields for repository-specific profiles.
 - `hosted_operation_control.py`: exact provider-operation preparation, claim, capacity, verification, and receipt lifecycle.
 - `publish_coordination_outbox.py`: sparse idempotent GitHub publication with exact readback and readback-only ambiguity recovery.
 - `coordination_supervisor.py`: due local work selection and fresh role-attempt wakeup.
@@ -94,11 +94,11 @@ Scale a capacity policy only from exact reviewed authority and measured readines
 
 Milestones are projections over one repository-wide graph. Store only true acceptance precedence as `HARD_BLOCK`, ranking preference as `ORDER_AFTER`, and symmetric overlap as `COLLISION`. Only hard edges affect topological readiness.
 
-Every covered open issue must be a node or a reasoned exclusion. Mark intentional roots and independently valuable standalone outcomes explicitly. Source, milestone membership, coverage, dependency, or relation drift makes the graph stale and blocks graph-derived admission until a reviewed replacement is applied.
+Every covered open issue must be a node or a reasoned exclusion. A normal application graph uses exact milestone scope. An unmilestoned harness source portfolio may instead use the explicit `ISSUE_SET` scope, which binds the full member inventory, digest-bound exclusions, and current endpoint issue evidence for every relation without inventing milestone truth. Mark intentional roots and independently valuable standalone outcomes explicitly. Source, scope membership, coverage, dependency, exclusion, or relation drift makes the graph stale and blocks graph-derived admission until a reviewed replacement is applied.
 
 Derive the queue by releasing only nodes whose hard predecessors are accepted, preserving lane order among equal priority, selecting the earliest collision-free set that fits current policy, recording skip reasons, and continuing independent lanes so one blocked head does not block the portfolio.
 
-The prepared buffer may hold reviewed zero-WIP candidates. A distinct READY packet must bind the exact candidate artifact, source digest, issue generation/version, observed main, graph revision, capacity policy, lane, allocation demand, collision matrix, activation contract, lease manifest, and complete atomic-admission transaction. Any source, main, graph, policy, item, artifact, lease, or admission drift retires the current packet without changing historical evidence.
+The prepared buffer may hold reviewed zero-WIP candidates. For the exact harness repository, the owner preparation operation composes one repository-local graph revision, `PREPARED/NONE` item, registered owner-only artifact, and `PREPARED_NOT_READY` pointer under one `BEGIN IMMEDIATE`; exact replay creates no row or event growth and no message, watch, attempt, branch, worktree, publication, lease, allocation, or writer WIP. It requires bracketed current-main evidence, an existing reviewed capacity policy, exact issue-set sources and exclusions, graph-derived collisions, and the harness source demand `{Development: 0, Shared: 1, SRE: 0}`. A distinct READY packet must bind the exact candidate artifact, source digest, issue generation/version, observed main, graph revision, capacity policy, lane, allocation demand, collision matrix, activation contract, lease manifest, and complete atomic-admission transaction. Any source, main, graph, policy, item, artifact, lease, or admission drift retires the current packet without changing historical evidence.
 
 Kanban owns the missing middle between a prepared candidate and a READY packet. Discover structurally ready, current-main, zero-WIP candidates; register one immutable readiness campaign per candidate; and dispatch at most one fresh read-only Development or SRE attempt for the campaign. That attempt evaluates the complete source, dependency, lease, collision, scope/boundary, scenario/evidence, and operational checklist and returns one all-gates receipt. Gates are checklist entries, never independently queued micro-handoffs. Parallelism is across disjoint candidates. Readiness attempts consume no Development, Shared, or SRE writer allocation.
 
@@ -153,11 +153,11 @@ Development and SRE native actions run only through their fresh endpoint skills 
 
 ## Repository publication and exact-head evidence
 
-For an application or workflow head:
+For a repository head:
 
 1. confirm current source, item, admission, lease, branch, worktree, and clean exact head;
 2. use the issue-owned toolchain and run the complete affected lower gate;
-3. run applicable final-head local Docker Compose acceptance and prove owned-resource cleanup;
+3. run the closed repository-derived final-head gate profile and prove its applicable cleanup contract; application or workflow heads retain local Docker Compose acceptance, while a harness source head runs only its focused hermetic selectors, complete fixed quick-validator catalog, and full hermetic suite;
 4. require a canonical exact-head PASS receipt;
 5. publish only with `scripts/prepush_control.py guarded-push`; and
 6. wait for natural exact-head CI and independent exact-head review.

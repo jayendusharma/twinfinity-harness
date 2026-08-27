@@ -8,6 +8,7 @@ import sqlite3
 from typing import Any
 
 from executor_registry import identities_role_equivalent, identity_role
+from repository_delivery_policy import HARNESS_REPOSITORY, HARNESS_STANDING_AUTHORITY_SCHEMA
 
 
 SHA256_LENGTH = 64
@@ -161,21 +162,105 @@ def execution_scope_sha256(scope: dict[str, Any]) -> str:
 
 
 def admission_execution_scope_sha256(payload: dict[str, Any]) -> str:
-    return execution_scope_sha256(
-        {
-            "kind": "ADMISSION",
-            "repository": payload["source"]["repository"],
-            "issue_number": payload["issue_number"],
-            "generation": payload["generation"],
-            "item_version": payload["item_version"],
-            "action": payload["action"],
-            "base_sha": payload["base_sha"],
-            "branch": payload["branch"],
-            "worktree_path": payload["worktree_path"],
-            "lease_manifest_sha256": payload["lease_manifest_sha256"],
-            "capacity": payload["capacity"],
-        }
-    )
+    scope = {
+        "kind": "ADMISSION",
+        "repository": payload["source"]["repository"],
+        "issue_number": payload["issue_number"],
+        "generation": payload["generation"],
+        "item_version": payload["item_version"],
+        "action": payload["action"],
+        "base_sha": payload["base_sha"],
+        "branch": payload["branch"],
+        "worktree_path": payload["worktree_path"],
+        "lease_manifest_sha256": payload["lease_manifest_sha256"],
+        "capacity": payload["capacity"],
+    }
+    if payload["source"]["repository"] == HARNESS_REPOSITORY:
+        standing = payload.get("standing_source_authority")
+        standing_complete = (
+            isinstance(standing, dict)
+            and standing.get("schema") == HARNESS_STANDING_AUTHORITY_SCHEMA
+            and all(
+                key in standing
+                for key in (
+                    "stable_source_sha256",
+                    "planner_goal_sha256",
+                    "source_scope",
+                    "exclusions",
+                    "writer",
+                    "reviewer_plan",
+                    "collision_proof",
+                    "environment_rule",
+                    "routine_chain",
+                    "hard_stops",
+                )
+            )
+        )
+        scope.update(
+            {
+                "source_identity": {
+                    key: payload["source"].get(key)
+                    for key in ("repository", "object_kind", "object_number")
+                },
+                "stable_source_sha256": (
+                    standing.get("stable_source_sha256")
+                    if standing_complete
+                    else None
+                ),
+                "planner_goal_sha256": (
+                    standing.get("planner_goal_sha256")
+                    if standing_complete
+                    else None
+                ),
+                "standing_source_authority_schema": (
+                    standing.get("schema") if isinstance(standing, dict) else None
+                ),
+                "standing_source_authority_sha256": payload.get(
+                    "standing_source_authority_sha256"
+                ),
+                "source_scope": (
+                    standing.get("source_scope")
+                    if standing_complete
+                    else payload.get("source_scope")
+                ),
+                "source_exclusions": (
+                    standing.get("exclusions")
+                    if standing_complete
+                    else payload.get("source_exclusions")
+                ),
+                "writer": (
+                    standing.get("writer")
+                    if standing_complete
+                    else payload.get("writer")
+                ),
+                "reviewer_plan": (
+                    standing.get("reviewer_plan")
+                    if standing_complete
+                    else payload.get("reviewer_plan")
+                ),
+                "collision_proof": (
+                    standing.get("collision_proof")
+                    if standing_complete
+                    else payload.get("collision_proof")
+                ),
+                "environment_rule": (
+                    standing.get("environment_rule")
+                    if standing_complete
+                    else payload.get("environment_rule")
+                ),
+                "routine_chain": (
+                    standing.get("routine_chain")
+                    if standing_complete
+                    else payload.get("routine_chain")
+                ),
+                "hard_stops": (
+                    standing.get("hard_stops")
+                    if standing_complete
+                    else payload.get("hard_stops")
+                ),
+            }
+        )
+    return execution_scope_sha256(scope)
 
 
 def capacity_policy_execution_scope_sha256(

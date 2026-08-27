@@ -16,6 +16,7 @@ import sqlite3
 from typing import Any
 
 from owner_safe_sqlite import UnsafeSQLitePathError, prepare_owner_database
+from repository_delivery_policy import HARNESS_REPOSITORY, policy_for_repository
 
 
 DEFAULT_DATABASE = (
@@ -133,8 +134,12 @@ def enqueue_convergence_dirty_event(
 
 
 def ensure_portfolio_graph_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(
-        """
+    if connection.in_transaction:
+        raise PortfolioGraphError("GRAPH_SCHEMA_TRANSACTION_CONFLICT")
+    try:
+        connection.executescript(
+            """
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS portfolio_graph_revisions (
             repository TEXT NOT NULL,
             version INTEGER NOT NULL CHECK(version > 0),
@@ -263,6 +268,23 @@ def ensure_portfolio_graph_schema(connection: sqlite3.Connection) -> None:
                             AND n.issue_number=NEW.object_number
                       )
                   )
+                  OR (
+                      EXISTS (
+                          SELECT 1
+                          FROM portfolio_graph_revisions r,
+                               json_each(json_extract(r.scope_json, '$.issue_numbers')) scoped
+                          WHERE r.repository=NEW.repository
+                            AND r.version=portfolio_graph_current.version
+                            AND json_extract(r.scope_json, '$.kind')='ISSUE_SET'
+                            AND CAST(scoped.value AS INTEGER)=NEW.object_number
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM portfolio_graph_nodes n
+                          WHERE n.repository=NEW.repository
+                            AND n.graph_version=portfolio_graph_current.version
+                            AND n.issue_number=NEW.object_number
+                      )
+                  )
               );
         END;
         DROP TRIGGER IF EXISTS portfolio_graph_stale_on_scoped_issue_insert;
@@ -273,19 +295,30 @@ def ensure_portfolio_graph_schema(connection: sqlite3.Connection) -> None:
             UPDATE portfolio_graph_current
             SET health='STALE', updated_at=NEW.fetched_at, last_error='GRAPH_SCOPE_INVENTORY_DRIFT'
             WHERE repository=NEW.repository
-              AND EXISTS (
-                  SELECT 1
-                  FROM portfolio_graph_revisions r,
-                       json_each(json_extract(r.scope_json, '$.milestones')) scoped
-                  JOIN github_snapshots s
-                    ON s.repository=NEW.repository
-                   AND s.object_kind=NEW.object_kind
-                   AND s.object_number=NEW.object_number
-                   AND s.payload_sha256=NEW.payload_sha256
-                  WHERE r.repository=NEW.repository
-                    AND r.version=portfolio_graph_current.version
-                    AND scoped.value=json_extract(s.payload_json, '$.milestone.title')
-                    AND json_extract(s.payload_json, '$.state')='open'
+              AND (
+                  EXISTS (
+                      SELECT 1
+                      FROM portfolio_graph_revisions r,
+                           json_each(json_extract(r.scope_json, '$.milestones')) scoped
+                      JOIN github_snapshots s
+                        ON s.repository=NEW.repository
+                       AND s.object_kind=NEW.object_kind
+                       AND s.object_number=NEW.object_number
+                       AND s.payload_sha256=NEW.payload_sha256
+                      WHERE r.repository=NEW.repository
+                        AND r.version=portfolio_graph_current.version
+                        AND scoped.value=json_extract(s.payload_json, '$.milestone.title')
+                        AND json_extract(s.payload_json, '$.state')='open'
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM portfolio_graph_revisions r,
+                           json_each(json_extract(r.scope_json, '$.issue_numbers')) scoped
+                      WHERE r.repository=NEW.repository
+                        AND r.version=portfolio_graph_current.version
+                        AND json_extract(r.scope_json, '$.kind')='ISSUE_SET'
+                        AND CAST(scoped.value AS INTEGER)=NEW.object_number
+                  )
               )
               AND NOT EXISTS (
                   SELECT 1 FROM portfolio_graph_nodes n
@@ -294,8 +327,40 @@ def ensure_portfolio_graph_schema(connection: sqlite3.Connection) -> None:
                     AND n.issue_number=NEW.object_number
               );
         END;
+        DROP TRIGGER IF EXISTS portfolio_graph_stale_on_issue_delete;
+        CREATE TRIGGER portfolio_graph_stale_on_issue_delete
+        AFTER DELETE ON github_current
+        WHEN OLD.object_kind='issue'
+        BEGIN
+            UPDATE portfolio_graph_current
+            SET health='STALE', updated_at=OLD.fetched_at,
+                last_error='GRAPH_SOURCE_MISSING'
+            WHERE repository=OLD.repository
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM portfolio_graph_nodes n
+                      WHERE n.repository=OLD.repository
+                        AND n.graph_version=portfolio_graph_current.version
+                        AND n.issue_number=OLD.object_number
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM portfolio_graph_revisions r,
+                           json_each(json_extract(r.scope_json, '$.issue_numbers')) scoped
+                      WHERE r.repository=OLD.repository
+                        AND r.version=portfolio_graph_current.version
+                        AND json_extract(r.scope_json, '$.kind')='ISSUE_SET'
+                        AND CAST(scoped.value AS INTEGER)=OLD.object_number
+                  )
+              );
+        END;
+        COMMIT;
         """
-    )
+        )
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
 
 
 def _validate_repository(repository: str) -> None:
@@ -324,6 +389,15 @@ def _snapshot(
     return row
 
 
+def _require_issue_set_snapshot(snapshot: sqlite3.Row) -> None:
+    try:
+        payload = json.loads(snapshot["payload_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise PortfolioGraphError("GRAPH_SOURCE_INVALID") from exc
+    if not isinstance(payload, dict) or payload.get("milestone") is not None:
+        raise PortfolioGraphError("GRAPH_ISSUE_SET_MILESTONE_CONFLICT")
+
+
 def _current_version(connection: sqlite3.Connection, repository: str) -> int:
     row = connection.execute(
         "SELECT version FROM portfolio_graph_current WHERE repository=?",
@@ -332,16 +406,93 @@ def _current_version(connection: sqlite3.Connection, repository: str) -> int:
     return 0 if row is None else int(row["version"])
 
 
+def _scope_details(
+    plan: dict[str, Any],
+) -> tuple[str, dict[str, int], set[int]]:
+    """Return one validated legacy milestone or explicit issue-set scope."""
+
+    if "scope_milestones" in plan:
+        if not isinstance(plan["scope_milestones"], list) or not plan["scope_milestones"]:
+            raise PortfolioGraphError("GRAPH_SCOPE_INVALID")
+        milestone_titles: set[str] = set()
+        milestone_ranks: set[int] = set()
+        milestones: dict[str, int] = {}
+        for milestone in plan["scope_milestones"]:
+            if (
+                not isinstance(milestone, dict)
+                or set(milestone) != {"title", "rank"}
+                or not isinstance(milestone["title"], str)
+                or not milestone["title"]
+                or type(milestone["rank"]) is not int
+                or milestone["rank"] < 0
+                or milestone["title"] in milestone_titles
+                or milestone["rank"] in milestone_ranks
+            ):
+                raise PortfolioGraphError("GRAPH_SCOPE_INVALID")
+            milestone_titles.add(milestone["title"])
+            milestone_ranks.add(milestone["rank"])
+            milestones[milestone["title"]] = milestone["rank"]
+        return "MILESTONE", milestones, set()
+    scope = plan.get("scope")
+    if plan.get("repository") != HARNESS_REPOSITORY:
+        raise PortfolioGraphError("GRAPH_ISSUE_SET_REPOSITORY_FORBIDDEN")
+    if (
+        not isinstance(scope, dict)
+        or set(scope) != {"kind", "issue_numbers"}
+        or scope.get("kind") != "ISSUE_SET"
+        or not isinstance(scope.get("issue_numbers"), list)
+        or not scope["issue_numbers"]
+        or any(type(number) is not int or number <= 0 for number in scope["issue_numbers"])
+        or len(set(scope["issue_numbers"])) != len(scope["issue_numbers"])
+        or scope["issue_numbers"] != sorted(scope["issue_numbers"])
+    ):
+        raise PortfolioGraphError("GRAPH_SCOPE_INVALID")
+    return "ISSUE_SET", {}, set(scope["issue_numbers"])
+
+
+def issue_set_scope_numbers(repository: str, scope: Any) -> list[int]:
+    """Validate and return the exact repository-local issue-set scope."""
+
+    plan = {"repository": repository, "scope": scope}
+    kind, _milestones, numbers = _scope_details(plan)
+    if kind != "ISSUE_SET":  # defensive: the synthetic plan cannot select legacy scope
+        raise PortfolioGraphError("GRAPH_SCOPE_INVALID")
+    return sorted(numbers)
+
+
+def graph_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    """Return the immutable graph bytes while preserving legacy digests."""
+
+    scope_key = "scope_milestones" if "scope_milestones" in plan else "scope"
+    payload = {
+        key: plan[key]
+        for key in (
+            "repository",
+            scope_key,
+            "excluded_issues",
+            "nodes",
+            "relations",
+        )
+    }
+    if scope_key == "scope":
+        # The harness issue-set plan is a point-in-time bootstrap envelope.
+        # Binding main here prevents readiness recomputation from substituting
+        # topology accepted against another head.  Legacy milestone graph bytes
+        # remain exactly unchanged.
+        payload["accepted_main_sha"] = plan["accepted_main_sha"]
+    return payload
+
+
 def _validate_plan(plan: dict[str, Any]) -> None:
-    if set(plan) != {
+    common = {
         "repository",
         "accepted_main_sha",
         "expected_current_version",
-        "scope_milestones",
         "excluded_issues",
         "nodes",
         "relations",
-    }:
+    }
+    if set(plan) not in {frozenset(common | {"scope_milestones"}), frozenset(common | {"scope"})}:
         raise PortfolioGraphError("GRAPH_PLAN_INVALID")
     _validate_repository(plan["repository"])
     if not isinstance(plan["accepted_main_sha"], str) or not GIT_SHA.fullmatch(
@@ -350,31 +501,19 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         raise PortfolioGraphError("GRAPH_MAIN_INVALID")
     if type(plan["expected_current_version"]) is not int or plan["expected_current_version"] < 0:
         raise PortfolioGraphError("GRAPH_PLAN_INVALID")
-    if not isinstance(plan["scope_milestones"], list) or not plan["scope_milestones"]:
-        raise PortfolioGraphError("GRAPH_SCOPE_INVALID")
-    milestone_titles: set[str] = set()
-    milestone_ranks: set[int] = set()
-    for milestone in plan["scope_milestones"]:
-        if (
-            not isinstance(milestone, dict)
-            or set(milestone) != {"title", "rank"}
-            or not isinstance(milestone["title"], str)
-            or not milestone["title"]
-            or type(milestone["rank"]) is not int
-            or milestone["rank"] < 0
-            or milestone["title"] in milestone_titles
-            or milestone["rank"] in milestone_ranks
-        ):
-            raise PortfolioGraphError("GRAPH_SCOPE_INVALID")
-        milestone_titles.add(milestone["title"])
-        milestone_ranks.add(milestone["rank"])
+    scope_kind, _milestones, scoped_issue_numbers = _scope_details(plan)
     if not isinstance(plan["excluded_issues"], list):
         raise PortfolioGraphError("GRAPH_EXCLUSION_INVALID")
     excluded: set[int] = set()
     for exclusion in plan["excluded_issues"]:
         if (
             not isinstance(exclusion, dict)
-            or set(exclusion) != {"issue_number", "reason"}
+            or set(exclusion)
+            != (
+                {"issue_number", "reason", "source_payload_sha256"}
+                if scope_kind == "ISSUE_SET"
+                else {"issue_number", "reason"}
+            )
             or type(exclusion["issue_number"]) is not int
             or exclusion["issue_number"] <= 0
             or not isinstance(exclusion["reason"], str)
@@ -382,10 +521,16 @@ def _validate_plan(plan: dict[str, Any]) -> None:
             or exclusion["issue_number"] in excluded
         ):
             raise PortfolioGraphError("GRAPH_EXCLUSION_INVALID")
+        if scope_kind == "ISSUE_SET" and (
+            not isinstance(exclusion["source_payload_sha256"], str)
+            or not SHA256.fullmatch(exclusion["source_payload_sha256"])
+        ):
+            raise PortfolioGraphError("GRAPH_EXCLUSION_INVALID")
         excluded.add(exclusion["issue_number"])
     if not isinstance(plan["nodes"], list) or not plan["nodes"]:
         raise PortfolioGraphError("GRAPH_NODE_INVALID")
     node_keys: set[str] = set()
+    node_issues: set[int] = set()
     lane_positions: set[tuple[str, int]] = set()
     required_node_keys = {
         "node_key",
@@ -434,6 +579,8 @@ def _validate_plan(plan: dict[str, Any]) -> None:
             or not node["ready_at"]
         ):
             raise PortfolioGraphError("GRAPH_NODE_INVALID")
+        if scope_kind == "ISSUE_SET" and node["issue_number"] in node_issues:
+            raise PortfolioGraphError("GRAPH_NODE_ISSUE_DUPLICATE")
         if node["root_kind"] in {"INTENTIONAL", "STANDALONE"} and (
             not isinstance(node["root_reason"], str) or not node["root_reason"]
         ):
@@ -445,6 +592,7 @@ def _validate_plan(plan: dict[str, Any]) -> None:
             raise PortfolioGraphError("GRAPH_LANE_POSITION_DUPLICATE")
         lane_positions.add(position)
         node_keys.add(node["node_key"])
+        node_issues.add(node["issue_number"])
     if not isinstance(plan["relations"], list):
         raise PortfolioGraphError("GRAPH_RELATION_INVALID")
     relations: set[tuple[str, str, str]] = set()
@@ -480,6 +628,18 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         if key in relations:
             raise PortfolioGraphError("GRAPH_RELATION_DUPLICATE")
         relations.add(key)
+    if scope_kind == "ISSUE_SET":
+        represented = {int(node["issue_number"]) for node in plan["nodes"]}
+        if represented & excluded:
+            raise PortfolioGraphError("GRAPH_SCOPE_CONFLICT")
+        if represented | excluded != scoped_issue_numbers:
+            raise PortfolioGraphError("GRAPH_SCOPE_INCOMPLETE")
+
+
+def validate_graph_plan(plan: dict[str, Any]) -> None:
+    """Validate a complete graph plan without writing repository state."""
+
+    _validate_plan(plan)
 
 
 def _topological_order(
@@ -507,15 +667,23 @@ def _topological_order(
 
 
 def replace_graph(
-    connection: sqlite3.Connection, plan: dict[str, Any], *, now: str
+    connection: sqlite3.Connection,
+    plan: dict[str, Any],
+    *,
+    now: str,
+    _transaction: bool = True,
+    _ensure_schema: bool = True,
 ) -> dict[str, Any]:
-    ensure_portfolio_graph_schema(connection)
+    if not _transaction and (_ensure_schema or not connection.in_transaction):
+        raise PortfolioGraphError("GRAPH_TRANSACTION_REQUIRED")
+    if _ensure_schema:
+        ensure_portfolio_graph_schema(connection)
     _validate_plan(plan)
     repository = plan["repository"]
     expected = plan["expected_current_version"]
     if _current_version(connection, repository) != expected:
         raise PortfolioGraphError("GRAPH_VERSION_CONFLICT")
-    milestones = {item["title"]: item["rank"] for item in plan["scope_milestones"]}
+    scope_kind, milestones, scoped_issue_numbers = _scope_details(plan)
     nodes = {node["node_key"]: node for node in plan["nodes"]}
     represented_issues = {node["issue_number"] for node in plan["nodes"]}
     excluded = {item["issue_number"] for item in plan["excluded_issues"]}
@@ -523,29 +691,38 @@ def replace_graph(
         source = _snapshot(connection, repository, node["issue_number"])
         if source["payload_sha256"] != node["source_payload_sha256"]:
             raise PortfolioGraphError("GRAPH_SOURCE_DRIFT")
-        payload = json.loads(source["payload_json"])
-        milestone = payload.get("milestone")
-        milestone_title = milestone.get("title") if isinstance(milestone, dict) else None
-    scoped_open = {
-        int(row["object_number"])
-        for row in connection.execute(
-            """
-            SELECT c.object_number
-            FROM github_current c
-            JOIN github_snapshots s
-              ON s.repository=c.repository
-             AND s.object_kind=c.object_kind
-             AND s.object_number=c.object_number
-             AND s.payload_sha256=c.payload_sha256
-            WHERE c.repository=? AND c.object_kind='issue'
-              AND json_extract(s.payload_json, '$.state')='open'
-              AND json_extract(s.payload_json, '$.milestone.title') IN (
-                  SELECT value FROM json_each(?)
-              )
-            """,
-            (repository, canonical_json(list(milestones))),
-        )
-    }
+        if scope_kind == "ISSUE_SET":
+            _require_issue_set_snapshot(source)
+    for exclusion in plan["excluded_issues"]:
+        if scope_kind == "ISSUE_SET":
+            source = _snapshot(connection, repository, exclusion["issue_number"])
+            if source["payload_sha256"] != exclusion["source_payload_sha256"]:
+                raise PortfolioGraphError("GRAPH_SOURCE_DRIFT")
+            _require_issue_set_snapshot(source)
+    scoped_open = (
+        {
+            int(row["object_number"])
+            for row in connection.execute(
+                """
+                SELECT c.object_number
+                FROM github_current c
+                JOIN github_snapshots s
+                  ON s.repository=c.repository
+                 AND s.object_kind=c.object_kind
+                 AND s.object_number=c.object_number
+                 AND s.payload_sha256=c.payload_sha256
+                WHERE c.repository=? AND c.object_kind='issue'
+                  AND json_extract(s.payload_json, '$.state')='open'
+                  AND json_extract(s.payload_json, '$.milestone.title') IN (
+                      SELECT value FROM json_each(?)
+                  )
+                """,
+                (repository, canonical_json(list(milestones))),
+            )
+        }
+        if scope_kind == "MILESTONE"
+        else set(scoped_issue_numbers)
+    )
     if scoped_open - represented_issues - excluded:
         raise PortfolioGraphError(
             "GRAPH_SCOPE_INCOMPLETE:"
@@ -567,50 +744,58 @@ def replace_graph(
             raise PortfolioGraphError("GRAPH_ACTIONABLE_ORPHAN:" + key)
         if node["root_kind"] == "STANDALONE" and (incoming[key] or outgoing[key]):
             raise PortfolioGraphError("GRAPH_STANDALONE_HAS_EDGES:" + key)
-    graph_payload = {
-        key: plan[key]
-        for key in (
-            "repository",
-            "scope_milestones",
-            "excluded_issues",
-            "nodes",
-            "relations",
-        )
-    }
-    graph_sha256 = digest_json(graph_payload)
+    if scope_kind == "ISSUE_SET":
+        for relation in plan["relations"]:
+            endpoint_digests = {
+                nodes[relation["left_node_key"]]["source_payload_sha256"],
+                nodes[relation["right_node_key"]]["source_payload_sha256"],
+            }
+            if relation["source_payload_sha256"] not in endpoint_digests:
+                raise PortfolioGraphError("GRAPH_RELATION_SOURCE_DRIFT")
+    immutable_graph_payload = graph_payload(plan)
+    graph_sha256 = digest_json(immutable_graph_payload)
     version = expected + 1
-    connection.execute("BEGIN IMMEDIATE")
+    if _transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         if _current_version(connection, repository) != expected:
             raise PortfolioGraphError("GRAPH_VERSION_CONFLICT")
         for node in plan["nodes"]:
-            if (
-                _snapshot(connection, repository, node["issue_number"])[
-                    "payload_sha256"
-                ]
-                != node["source_payload_sha256"]
-            ):
+            source = _snapshot(connection, repository, node["issue_number"])
+            if source["payload_sha256"] != node["source_payload_sha256"]:
                 raise PortfolioGraphError("GRAPH_SOURCE_DRIFT")
-        scoped_open_in_transaction = {
-            int(row["object_number"])
-            for row in connection.execute(
-                """
-                SELECT c.object_number
-                FROM github_current c
-                JOIN github_snapshots s
-                  ON s.repository=c.repository
-                 AND s.object_kind=c.object_kind
-                 AND s.object_number=c.object_number
-                 AND s.payload_sha256=c.payload_sha256
-                WHERE c.repository=? AND c.object_kind='issue'
-                  AND json_extract(s.payload_json, '$.state')='open'
-                  AND json_extract(s.payload_json, '$.milestone.title') IN (
-                      SELECT value FROM json_each(?)
-                  )
-                """,
-                (repository, canonical_json(list(milestones))),
-            )
-        }
+            if scope_kind == "ISSUE_SET":
+                _require_issue_set_snapshot(source)
+        for exclusion in plan["excluded_issues"]:
+            if scope_kind == "ISSUE_SET":
+                source = _snapshot(connection, repository, exclusion["issue_number"])
+                if source["payload_sha256"] != exclusion["source_payload_sha256"]:
+                    raise PortfolioGraphError("GRAPH_SOURCE_DRIFT")
+                _require_issue_set_snapshot(source)
+        scoped_open_in_transaction = (
+            {
+                int(row["object_number"])
+                for row in connection.execute(
+                    """
+                    SELECT c.object_number
+                    FROM github_current c
+                    JOIN github_snapshots s
+                      ON s.repository=c.repository
+                     AND s.object_kind=c.object_kind
+                     AND s.object_number=c.object_number
+                     AND s.payload_sha256=c.payload_sha256
+                    WHERE c.repository=? AND c.object_kind='issue'
+                      AND json_extract(s.payload_json, '$.state')='open'
+                      AND json_extract(s.payload_json, '$.milestone.title') IN (
+                          SELECT value FROM json_each(?)
+                      )
+                    """,
+                    (repository, canonical_json(list(milestones))),
+                )
+            }
+            if scope_kind == "MILESTONE"
+            else set(scoped_issue_numbers)
+        )
         if scoped_open_in_transaction - represented_issues - excluded:
             raise PortfolioGraphError("GRAPH_SCOPE_INCOMPLETE")
         connection.execute(
@@ -626,7 +811,11 @@ def replace_graph(
                 expected or None,
                 plan["accepted_main_sha"],
                 graph_sha256,
-                canonical_json({"milestones": list(milestones)}),
+                canonical_json(
+                    {"milestones": list(milestones)}
+                    if scope_kind == "MILESTONE"
+                    else {"kind": "ISSUE_SET", "issue_numbers": sorted(scoped_issue_numbers)}
+                ),
                 canonical_json(plan["excluded_issues"]),
                 now,
             ),
@@ -693,9 +882,11 @@ def replace_graph(
             """,
             (repository, version, plan["accepted_main_sha"], now),
         )
-        connection.execute("COMMIT")
+        if _transaction:
+            connection.execute("COMMIT")
     except Exception:
-        connection.execute("ROLLBACK")
+        if _transaction and connection.in_transaction:
+            connection.execute("ROLLBACK")
         raise
     return {
         "repository": repository,
@@ -711,74 +902,130 @@ def sync_head(
     repository: str,
     sha: str,
     *,
+    expected_version: int,
+    expected_observed_main_sha: str,
     now: str,
     _ensure_schema: bool = True,
+    _transaction: bool = True,
 ) -> dict[str, Any]:
     _validate_repository(repository)
-    if not GIT_SHA.fullmatch(sha):
+    if (
+        not GIT_SHA.fullmatch(sha)
+        or type(expected_version) is not int
+        or expected_version <= 0
+        or not GIT_SHA.fullmatch(expected_observed_main_sha)
+    ):
         raise PortfolioGraphError("GRAPH_MAIN_INVALID")
     if _ensure_schema:
         ensure_portfolio_graph_schema(connection)
-    row = connection.execute(
-        """
-        SELECT c.version, c.observed_main_sha, c.health, c.last_error,
-               r.accepted_main_sha
-        FROM portfolio_graph_current c
-        JOIN portfolio_graph_revisions r
-          ON r.repository=c.repository AND r.version=c.version
-        WHERE c.repository=?
-        """,
-        (repository,),
-    ).fetchone()
-    if row is None:
-        raise PortfolioGraphError("GRAPH_NOT_FOUND")
-    # accepted_main_sha is immutable review provenance for this topology.
-    # observed_main_sha is the mutable scheduling cursor. Code-only main
-    # movement therefore advances the cursor without invalidating topology.
-    legacy_main_stale = (
-        row["health"] == "STALE" and row["last_error"] == "GRAPH_MAIN_DRIFT"
-    )
-    health = "CURRENT" if legacy_main_stale else row["health"]
-    error = None if legacy_main_stale else row["last_error"]
-    previous_main_sha = str(row["observed_main_sha"])
-    connection.execute(
-        """
-        UPDATE portfolio_graph_current
-        SET observed_main_sha=?, health=?, updated_at=?, last_error=?
-        WHERE repository=?
-        """,
-        (sha, health, now, error, repository),
-    )
-    dirty_event_id = None
-    if previous_main_sha != sha:
-        trigger_issue = connection.execute(
-            "SELECT MIN(issue_number) FROM portfolio_graph_nodes "
-            "WHERE repository=? AND graph_version=?",
-            (repository, int(row["version"])),
-        ).fetchone()[0]
-        if trigger_issue is None:
-            raise PortfolioGraphError("GRAPH_NODE_INVALID")
-        dirty_event_id = enqueue_convergence_dirty_event(
-            connection,
-            repository=repository,
-            trigger_kind="MAIN_CURSOR_ADVANCED",
-            issue_number=int(trigger_issue),
-            item_version=int(row["version"]),
-            source_sha256=digest_json({"observed_main_sha": sha}),
-            status="CURSOR",
-            generation=int(row["version"]),
-            now=now,
-            details={
-                "previous_main_sha": previous_main_sha,
-                "observed_main_sha": sha,
-            },
+    if _transaction:
+        if connection.in_transaction:
+            raise PortfolioGraphError("GRAPH_TRANSACTION_CONFLICT")
+        connection.execute("BEGIN IMMEDIATE")
+    elif not connection.in_transaction:
+        raise PortfolioGraphError("GRAPH_TRANSACTION_REQUIRED")
+    try:
+        row = connection.execute(
+            """
+            SELECT c.version, c.observed_main_sha, c.health, c.last_error,
+                   r.accepted_main_sha, r.scope_json
+            FROM portfolio_graph_current c
+            JOIN portfolio_graph_revisions r
+              ON r.repository=c.repository AND r.version=c.version
+            WHERE c.repository=?
+            """,
+            (repository,),
+        ).fetchone()
+        if row is None:
+            raise PortfolioGraphError("GRAPH_NOT_FOUND")
+        if (
+            int(row["version"]) != expected_version
+            or row["observed_main_sha"] != expected_observed_main_sha
+        ):
+            raise PortfolioGraphError("GRAPH_MAIN_CAS_DRIFT")
+        try:
+            scope = json.loads(row["scope_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise PortfolioGraphError("GRAPH_SCOPE_INVALID") from exc
+        issue_set_scope = isinstance(scope, dict) and scope.get("kind") == "ISSUE_SET"
+        # accepted_main_sha is immutable review provenance. Legacy milestone
+        # graphs keep their historical mutable scheduling cursor, while
+        # ISSUE_SET graphs are point-in-time inputs replaced after main moves.
+        legacy_main_stale = (
+            not issue_set_scope
+            and row["health"] == "STALE"
+            and row["last_error"] == "GRAPH_MAIN_DRIFT"
         )
-    return {
-        "repository": repository,
-        "version": int(row["version"]),
-        "health": health,
-        "portfolio_dirty_event_id": dirty_event_id,
-    }
+        if issue_set_scope and sha != row["accepted_main_sha"]:
+            health = "STALE"
+            error = (
+                row["last_error"]
+                if row["health"] == "STALE"
+                and row["last_error"] not in {None, "GRAPH_MAIN_DRIFT"}
+                else "GRAPH_MAIN_DRIFT"
+            )
+        elif issue_set_scope and row["last_error"] == "GRAPH_MAIN_DRIFT":
+            health = "CURRENT"
+            error = None
+        else:
+            health = "CURRENT" if legacy_main_stale else row["health"]
+            error = None if legacy_main_stale else row["last_error"]
+        previous_main_sha = str(row["observed_main_sha"])
+        changed = connection.execute(
+            """
+            UPDATE portfolio_graph_current
+            SET observed_main_sha=?, health=?, updated_at=?, last_error=?
+            WHERE repository=? AND version=? AND observed_main_sha=?
+            """,
+            (
+                sha,
+                health,
+                now,
+                error,
+                repository,
+                expected_version,
+                expected_observed_main_sha,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise PortfolioGraphError("GRAPH_MAIN_CAS_DRIFT")
+        dirty_event_id = None
+        if previous_main_sha != sha:
+            trigger_issue = connection.execute(
+                "SELECT MIN(issue_number) FROM portfolio_graph_nodes "
+                "WHERE repository=? AND graph_version=?",
+                (repository, int(row["version"])),
+            ).fetchone()[0]
+            if trigger_issue is None:
+                raise PortfolioGraphError("GRAPH_NODE_INVALID")
+            dirty_event_id = enqueue_convergence_dirty_event(
+                connection,
+                repository=repository,
+                trigger_kind="MAIN_CURSOR_ADVANCED",
+                issue_number=int(trigger_issue),
+                item_version=int(row["version"]),
+                source_sha256=digest_json({"observed_main_sha": sha}),
+                status="CURSOR",
+                generation=int(row["version"]),
+                now=now,
+                details={
+                    "previous_main_sha": previous_main_sha,
+                    "observed_main_sha": sha,
+                },
+            )
+        result = {
+            "repository": repository,
+            "version": int(row["version"]),
+            "health": health,
+            "portfolio_dirty_event_id": dirty_event_id,
+        }
+        if _transaction:
+            connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if _transaction and connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
 
 
 def _load_graph(
@@ -788,7 +1035,8 @@ def _load_graph(
         ensure_portfolio_graph_schema(connection)
     current = connection.execute(
         """
-        SELECT c.*, r.accepted_main_sha, r.graph_sha256, r.scope_json
+        SELECT c.*, r.accepted_main_sha, r.graph_sha256, r.scope_json,
+               r.exclusions_json
         FROM portfolio_graph_current c
         JOIN portfolio_graph_revisions r
           ON r.repository=c.repository AND r.version=c.version
@@ -832,7 +1080,11 @@ def _terminal(
     ).fetchone()
     if item is not None:
         return item["status"] in TERMINAL_STATUSES
-    payload = json.loads(_snapshot(connection, repository, issue_number)["payload_json"])
+    try:
+        snapshot = _snapshot(connection, repository, issue_number)
+    except PortfolioGraphError:
+        return False
+    payload = json.loads(snapshot["payload_json"])
     return payload.get("state") == "closed"
 
 
@@ -855,9 +1107,37 @@ def evaluate_graph(
     if current["observed_main_sha"] != current_main:
         stale_reasons.append("GRAPH_CURSOR_DRIFT")
     for node in nodes.values():
-        source = _snapshot(connection, repository, int(node["issue_number"]))
+        try:
+            source = _snapshot(connection, repository, int(node["issue_number"]))
+        except PortfolioGraphError:
+            stale_reasons.append(f"GRAPH_SOURCE_MISSING:{node['node_key']}")
+            continue
         if source["payload_sha256"] != node["source_payload_sha256"]:
             stale_reasons.append(f"GRAPH_SOURCE_DRIFT:{node['node_key']}")
+    try:
+        scope = json.loads(current["scope_json"])
+        exclusions = json.loads(current["exclusions_json"])
+    except (TypeError, json.JSONDecodeError):
+        stale_reasons.append("GRAPH_SCOPE_INVALID")
+        scope = {}
+        exclusions = []
+    if isinstance(scope, dict) and scope.get("kind") == "ISSUE_SET":
+        if not isinstance(exclusions, list):
+            stale_reasons.append("GRAPH_SCOPE_INVALID")
+            exclusions = []
+        for exclusion in exclusions:
+            if not isinstance(exclusion, dict):
+                stale_reasons.append("GRAPH_SCOPE_INVALID")
+                continue
+            issue_number = exclusion.get("issue_number")
+            expected_source = exclusion.get("source_payload_sha256")
+            try:
+                source = _snapshot(connection, repository, int(issue_number))
+            except (PortfolioGraphError, TypeError, ValueError):
+                stale_reasons.append(f"GRAPH_SOURCE_MISSING:issue:{issue_number}")
+                continue
+            if source["payload_sha256"] != expected_source:
+                stale_reasons.append(f"GRAPH_SOURCE_DRIFT:issue:{issue_number}")
     hard_edges = [
         (row["left_node_key"], row["right_node_key"])
         for row in relations
@@ -1047,6 +1327,7 @@ def _schedule_decision(
         ),
     }
     active_keys: set[str] = set()
+    active_allocation_count = 0
     for row in connection.execute(
         """
         SELECT issue_number FROM coordination_items
@@ -1054,7 +1335,13 @@ def _schedule_decision(
         """,
         (repository,),
     ):
+        active_allocation_count += 1
         active_keys.update(issue_to_keys.get(int(row["issue_number"]), []))
+    repository_policy = policy_for_repository(repository)
+    exclusive_repository_writer = bool(
+        repository_policy is not None
+        and repository_policy.exclusive_repository_writer
+    )
     candidates = [
         key for key, projection in projections.items()
         if projection["executable_ready"]
@@ -1062,8 +1349,8 @@ def _schedule_decision(
     candidates.sort(
         key=lambda key: (
             int(nodes[key]["priority_rank"]),
-            str(nodes[key]["ready_at"]),
             int(nodes[key]["lane_order"]),
+            str(nodes[key]["ready_at"]),
             -int(projections[key]["critical_path_units"]),
             -int(projections[key]["immediate_unlocks"]),
             -int(projections[key]["descendant_count"]),
@@ -1075,7 +1362,9 @@ def _schedule_decision(
     for key in candidates:
         node = nodes[key]
         reason = None
-        if any(frozenset((key, other)) in collisions for other in active_keys | set(selected)):
+        if exclusive_repository_writer and (active_allocation_count or selected):
+            reason = "REPOSITORY_WRITER_MUTEX"
+        elif any(frozenset((key, other)) in collisions for other in active_keys | set(selected)):
             reason = "COLLISION"
         elif int(node["development_units"]) > remaining["development"]:
             reason = "DEVELOPMENT_CAPACITY"
@@ -1362,6 +1651,8 @@ def main() -> int:
     sync = commands.add_parser("sync-head")
     sync.add_argument("--repository", required=True)
     sync.add_argument("--sha", required=True)
+    sync.add_argument("--expected-version", required=True, type=int)
+    sync.add_argument("--expected-observed-main-sha", required=True)
     check = commands.add_parser("check")
     check.add_argument("--repository", required=True)
     check.add_argument("--current-main", required=True)
@@ -1387,7 +1678,14 @@ def main() -> int:
             plan = json.loads(args.file.read_text(encoding="utf-8"))
             result = replace_graph(connection, plan, now=utc_now())
         elif args.command == "sync-head":
-            result = sync_head(connection, args.repository, args.sha, now=utc_now())
+            result = sync_head(
+                connection,
+                args.repository,
+                args.sha,
+                expected_version=args.expected_version,
+                expected_observed_main_sha=args.expected_observed_main_sha,
+                now=utc_now(),
+            )
         elif args.command == "check":
             result = evaluate_graph(
                 connection, args.repository, current_main=args.current_main
