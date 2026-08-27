@@ -53,6 +53,7 @@ from routing_deprecation_inventory import (
     receipt_body,
     stable_scan_repository,
 )
+from routing_inventory_contract import RoutingInventoryContractError, validate_inventory_record
 
 
 EXECUTABLE_TOPICS = {
@@ -91,6 +92,8 @@ LOCAL_DIGEST_TABLES = (
     "portfolio_pull_buffer_current",
     "routing_deprecation_inventories",
     "routing_deprecation_occurrences",
+    "routing_deprecation_current",
+    "routing_deprecation_promotions",
 )
 
 
@@ -360,13 +363,13 @@ def _current_kanban_routing(
 def github_comment_reader(
     repository: str, issue_number: int, comment_id: int
 ) -> dict[str, Any]:
-    completed = subprocess.run(
-        ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InventoryError("ROUTING_DEPRECATION_RECEIPT_READ_FAILED") from exc
     if completed.returncode != 0:
         raise InventoryError("ROUTING_DEPRECATION_RECEIPT_READ_FAILED")
     try:
@@ -386,16 +389,77 @@ def _routing_inventory_local_gate(
     required = {
         "routing_deprecation_inventories",
         "routing_deprecation_occurrences",
+        "routing_deprecation_current",
+        "routing_deprecation_promotions",
         "github_outbox",
     }
     if not all(_table_exists(connection, table) for table in required):
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_REQUIRED"}], None
     rows = connection.execute(
-        "SELECT * FROM routing_deprecation_inventories ORDER BY repository"
+        "SELECT * FROM routing_deprecation_inventories ORDER BY repository,generation"
     ).fetchall()
-    if len(rows) != 1:
+    currents = connection.execute("SELECT * FROM routing_deprecation_current").fetchall()
+    if not rows or len(currents) != 1:
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
-    row = rows[0]
+    current = currents[0]
+    if type(current["generation"]) is not int or type(current["version"]) is not int or current["generation"] < 1 or current["version"] != current["generation"]:
+        return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
+    matching = [item for item in rows if item["repository"] == current["repository"] and int(item["generation"]) == int(current["generation"]) and item["inventory_sha256"] == current["inventory_sha256"]]
+    if len(matching) != 1 or int(current["generation"]) != len(rows):
+        return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
+    expected_generation = 1
+    predecessor = None
+    for historic in rows:
+        if int(historic["generation"]) != expected_generation or historic["predecessor_inventory_sha256"] != predecessor:
+            return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
+        promotion = connection.execute("SELECT * FROM routing_deprecation_promotions WHERE repository=? AND generation=? AND inventory_sha256=?", (historic["repository"], historic["generation"], historic["inventory_sha256"])).fetchone()
+        expected_prior = None if expected_generation == 1 else expected_generation - 1
+        if promotion is None or promotion["prior_generation"] != expected_prior:
+            return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
+        historic_occurrence_rows = connection.execute(
+            "SELECT * FROM routing_deprecation_occurrences WHERE inventory_sha256=? ORDER BY ordinal",
+            (historic["inventory_sha256"],),
+        ).fetchall()
+        try:
+            historic_inventory, historic_occurrences = validate_inventory_record(historic, historic_occurrence_rows)
+            historic_objects = historic_inventory["object_manifest"]
+        except RoutingInventoryContractError:
+            return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
+        if (digest_json(historic_objects) != historic["object_manifest_sha256"]
+                or digest_json(historic_occurrences) != historic["occurrence_manifest_sha256"]
+                or len(historic_occurrences) != int(historic["occurrence_count"])):
+            return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
+        preview = {
+            "repository": historic["repository"], "generation": int(historic["generation"]),
+            "predecessor_inventory_sha256": historic["predecessor_inventory_sha256"],
+            "inventory_sha256": historic["inventory_sha256"],
+            "alias_source_sha256": historic["alias_source_sha256"],
+            "endpoint_state_sha256": historic["endpoint_state_sha256"],
+            "issue_179_source_sha256": historic["issue_179_source_sha256"],
+            "object_manifest_sha256": historic["object_manifest_sha256"],
+            "occurrence_manifest_sha256": historic["occurrence_manifest_sha256"],
+        }
+        preview_sha256 = digest_json(preview)
+        outbox = connection.execute("SELECT * FROM github_outbox WHERE id=?", (historic["outbox_id"],)).fetchone()
+        try:
+            payload = None if outbox is None else json.loads(outbox["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if (historic["preview_sha256"] != preview_sha256
+                or promotion["preview_sha256"] != preview_sha256
+                or outbox is None or outbox["state"] != "COMPLETE"
+                or outbox["repository"] != historic["repository"] or outbox["object_kind"] != "issue"
+                or int(outbox["object_number"]) != 179 or outbox["operation"] != "comment"
+                or outbox["expected_source_sha256"] != historic["issue_179_source_sha256"]
+                or outbox["idempotency_key"] != outbox_idempotency_key(historic_inventory)
+                or payload != {"body": receipt_body(historic_inventory)}
+                or outbox["payload_sha256"] != digest_json(payload)
+                or re.fullmatch(r"comment:[1-9][0-9]*", str(outbox["remote_receipt"])) is None
+                or promotion["remote_receipt"] != outbox["remote_receipt"]):
+            return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
+        predecessor = historic["inventory_sha256"]
+        expected_generation += 1
+    row = matching[0]
     try:
         objects = json.loads(row["object_manifest_json"])
         classification_counts = json.loads(row["classification_counts_json"])
@@ -1308,14 +1372,29 @@ def main() -> int:
     connection: sqlite3.Connection | None = None
     try:
         connection = open_registry_database(DEFAULT_DATABASE, read_only=True)
-        inventory = (
-            connection.execute(
-                "SELECT repository FROM routing_deprecation_inventories"
+        repository = ""
+        if (_table_exists(connection, "routing_deprecation_inventories")
+                and _table_exists(connection, "routing_deprecation_current")):
+            current_count = connection.execute(
+                "SELECT COUNT(*) FROM routing_deprecation_current"
+            ).fetchone()[0]
+            rows = connection.execute(
+                """
+                SELECT current.repository,current.generation,current.version
+                FROM routing_deprecation_current AS current
+                JOIN routing_deprecation_inventories AS inventory
+                  ON inventory.inventory_sha256=current.inventory_sha256
+                 AND inventory.repository=current.repository
+                 AND inventory.generation=current.generation
+                """
             ).fetchall()
-            if _table_exists(connection, "routing_deprecation_inventories")
-            else []
-        )
-        repository = str(inventory[0]["repository"]) if len(inventory) == 1 else ""
+            if (current_count == 1 and len(rows) == 1
+                    and type(rows[0]["repository"]) is str
+                    and type(rows[0]["generation"]) is int
+                    and type(rows[0]["version"]) is int
+                    and rows[0]["generation"] >= 1
+                    and rows[0]["version"] == rows[0]["generation"]):
+                repository = rows[0]["repository"]
         result = archive_readiness(
             connection,
             routing_page_reader=(github_page_reader(repository) if repository else None),

@@ -319,3 +319,15 @@ Archive readiness never authorizes deletion. Deleting archives or other data req
 | `issue_body_cas.py` / validators | Provider-atomic body mutation contract and document/control receipt validation. |
 
 Keep dependencies inward toward owner-safe SQLite and focused domain modules. Provider publication, process transport, approval policy, hosted operations, and repository execution remain outside the shared store.
+
+## Routing-deprecation inventory generations
+
+Routing inventories are append-only generations. `preview` binds the promoted
+current generation and every fresh scan/source digest; `prepare` inserts the
+successor and its idempotent issue-179 outbox envelope without changing routing
+authority; `promote` advances the single current pointer only after the exact
+COMPLETE comment is read back and all compare-and-swap fences still match.
+Superseded generations remain immutable provenance and archive readiness audits
+their complete lineage. Legacy-v1 recognition and any owner-database cutover are
+separate stopped-state installation work; source validation never performs that
+migration or publishes a receipt.

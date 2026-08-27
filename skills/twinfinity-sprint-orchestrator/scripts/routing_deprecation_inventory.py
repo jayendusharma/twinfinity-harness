@@ -163,18 +163,20 @@ def github_page_reader(repository: str) -> PageReader:
             "query": _graphql_query(kind),
             "variables": {"owner": owner, "name": name, "cursor": cursor},
         }
-        completed = subprocess.run(
-            ["gh", "api", "graphql", "--input", "-"],
-            input=canonical_json(payload),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        try:
+            completed = subprocess.run(
+                ["gh", "api", "graphql", "--input", "-"],
+                input=canonical_json(payload), check=False, capture_output=True,
+                text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise InventoryError("GITHUB_INVENTORY_READ_FAILED") from exc
         if completed.returncode != 0:
             raise InventoryError("GITHUB_INVENTORY_READ_FAILED")
         try:
             response = json.loads(completed.stdout)
+            if type(response) is not dict or ("errors" in response and response["errors"] != []):
+                raise InventoryError("GITHUB_INVENTORY_RESPONSE_INVALID")
             connection = response["data"]["repository"][field]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise InventoryError("GITHUB_INVENTORY_RESPONSE_INVALID") from exc
@@ -183,6 +185,31 @@ def github_page_reader(repository: str) -> PageReader:
         return connection
 
     return read
+
+
+def github_comment_reader(repository: str, issue_number: int, comment_id: int) -> dict[str, Any]:
+    """Read one exact issue comment and fail closed on identity/shape drift."""
+    if type(issue_number) is not int or issue_number != 179 or type(comment_id) is not int or comment_id <= 0:
+        raise InventoryError("GITHUB_COMMENT_IDENTITY_INVALID")
+    try:
+        completed = subprocess.run(
+            ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InventoryError("GITHUB_COMMENT_READ_FAILED") from exc
+    if completed.returncode != 0:
+        raise InventoryError("GITHUB_COMMENT_READ_FAILED")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise InventoryError("GITHUB_COMMENT_RESPONSE_INVALID") from exc
+    expected_issue_url = f"https://api.github.com/repos/{repository}/issues/{issue_number}"
+    if (type(value) is not dict or value.get("id") != comment_id
+            or type(value.get("body")) is not str
+            or value.get("issue_url") != expected_issue_url):
+        raise InventoryError("GITHUB_COMMENT_RESPONSE_INVALID")
+    return value
 
 
 def _scan_connection(kind: str, page_reader: PageReader) -> list[dict[str, Any]]:
@@ -562,6 +589,8 @@ def prepare_inventory(
     expected_endpoint_state_sha256: str,
     expected_issue_179_source_sha256: str,
     now: str,
+    expected_preview_sha256: str,
+    expected_prior_generation: int | None,
 ) -> tuple[dict[str, Any], int]:
     aliases = load_alias_artifact(alias_path)
     inventory, occurrences = build_inventory_candidate(
@@ -583,8 +612,37 @@ def prepare_inventory(
         outbox_idempotency_key=outbox_idempotency_key(inventory),
         receipt_body=receipt_body(inventory),
         now=now,
+        expected_preview_sha256=expected_preview_sha256,
+        expected_prior_generation=expected_prior_generation,
     )
     return inventory, outbox_id
+
+
+def preview_inventory(
+    store: CoordinationStore, *, repository: str, alias_path: Path,
+    page_reader: PageReader,
+) -> dict[str, Any]:
+    inventory, _ = build_inventory_candidate(
+        store.connection, repository=repository,
+        alias_artifact=load_alias_artifact(alias_path), page_reader=page_reader,
+    )
+    current = store.connection.execute(
+        "SELECT generation,inventory_sha256,version FROM routing_deprecation_current WHERE repository=?",
+        (repository,),
+    ).fetchone()
+    generation = 1 if current is None else int(current["generation"]) + 1
+    value = {
+        "repository": repository,
+        "generation": generation,
+        "predecessor_inventory_sha256": None if current is None else current["inventory_sha256"],
+        "inventory_sha256": inventory["inventory_sha256"],
+        "alias_source_sha256": inventory["alias_source_sha256"],
+        "endpoint_state_sha256": inventory["endpoint_state_sha256"],
+        "issue_179_source_sha256": inventory["issue_179_source_sha256"],
+        "object_manifest_sha256": inventory["object_manifest_sha256"],
+        "occurrence_manifest_sha256": inventory["occurrence_manifest_sha256"],
+    }
+    return {**value, "preview_sha256": digest_json(value)}
 
 
 def _open_read_only(path: Path) -> sqlite3.Connection:
@@ -602,14 +660,35 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("scan")
+    subparsers.add_parser("preview")
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("--expected-inventory-sha256", required=True)
     prepare.add_argument("--expected-endpoint-state-sha256", required=True)
     prepare.add_argument("--expected-issue-179-source-sha256", required=True)
+    prepare.add_argument("--expected-preview-sha256", required=True)
+    prepare.add_argument("--expected-prior-generation", type=int)
+    promote = subparsers.add_parser("promote")
+    promote.add_argument("--generation", required=True, type=int)
+    promote.add_argument("--inventory-sha256", required=True)
+    promote.add_argument("--expected-prior-generation", type=int)
+    promote.add_argument("--expected-preview-sha256", required=True)
+    migrate = subparsers.add_parser("migrate-legacy")
+    migrate.add_argument("--expected-inventory-sha256", required=True)
+    migrate.add_argument("--expected-occurrence-count", required=True, type=int)
     args = parser.parse_args()
     connection: sqlite3.Connection | None = None
     store: CoordinationStore | None = None
     try:
+        if args.command == "migrate-legacy":
+            store = CoordinationStore(args.database)
+            result = store.migrate_legacy_routing_deprecation_inventory(
+                expected_repository=args.repository,
+                expected_inventory_sha256=args.expected_inventory_sha256,
+                expected_occurrence_count=args.expected_occurrence_count,
+                now=utc_now(),
+            )
+            print(canonical_json({"phase": "MIGRATED", "migration": result}))
+            return 0
         aliases = load_alias_artifact(args.legacy_alias_file)
         reader = github_page_reader(args.repository)
         if args.command == "scan":
@@ -630,7 +709,10 @@ def main() -> int:
                     }
                 )
             )
-        else:
+        elif args.command == "preview":
+            store = CoordinationStore(args.database)
+            print(canonical_json({"phase": "PREVIEW", **preview_inventory(store, repository=args.repository, alias_path=args.legacy_alias_file, page_reader=reader)}))
+        elif args.command == "prepare":
             store = CoordinationStore(args.database)
             inventory, outbox_id = prepare_inventory(
                 store,
@@ -641,21 +723,25 @@ def main() -> int:
                 expected_endpoint_state_sha256=args.expected_endpoint_state_sha256,
                 expected_issue_179_source_sha256=args.expected_issue_179_source_sha256,
                 now=utc_now(),
+                expected_preview_sha256=args.expected_preview_sha256,
+                expected_prior_generation=args.expected_prior_generation,
             )
-            print(
-                canonical_json(
-                    {
-                        "phase": "PREPARED",
-                        "inventory_sha256": inventory["inventory_sha256"],
-                        "object_manifest_sha256": inventory["object_manifest_sha256"],
-                        "occurrence_manifest_sha256": inventory[
-                            "occurrence_manifest_sha256"
-                        ],
-                        "endpoint_state_sha256": inventory["endpoint_state_sha256"],
-                        "outbox_id": outbox_id,
-                    }
-                )
+            print(canonical_json({"phase": "PREPARED", "inventory_sha256": inventory["inventory_sha256"], "object_manifest_sha256": inventory["object_manifest_sha256"], "occurrence_manifest_sha256": inventory["occurrence_manifest_sha256"], "endpoint_state_sha256": inventory["endpoint_state_sha256"], "outbox_id": outbox_id}))
+        else:
+            store = CoordinationStore(args.database)
+            row = store.connection.execute("SELECT outbox_id FROM routing_deprecation_inventories WHERE repository=? AND generation=? AND inventory_sha256=?", (args.repository, args.generation, args.inventory_sha256)).fetchone()
+            if row is None:
+                raise CoordinationError("ROUTING_DEPRECATION_SUCCESSOR_MISSING")
+            outbox = store.connection.execute("SELECT remote_receipt FROM github_outbox WHERE id=?", (row["outbox_id"],)).fetchone()
+            if outbox is None or not isinstance(outbox["remote_receipt"], str) or re.fullmatch(r"comment:[1-9][0-9]*", outbox["remote_receipt"]) is None:
+                raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_INCOMPLETE")
+            comment = github_comment_reader(args.repository, 179, int(outbox["remote_receipt"].split(":", 1)[1]))
+            current_inventory, current_occurrences = build_inventory_candidate(
+                store.connection, repository=args.repository, alias_artifact=aliases,
+                page_reader=reader,
             )
+            result = store.promote_routing_deprecation_inventory(repository=args.repository, generation=args.generation, inventory_sha256=args.inventory_sha256, expected_prior_generation=args.expected_prior_generation, expected_preview_sha256=args.expected_preview_sha256, remote_receipt_body=comment["body"], current_inventory=current_inventory, current_occurrences=current_occurrences, alias_source_path=args.legacy_alias_file, now=utc_now())
+            print(canonical_json({"phase": "PROMOTED", "promotion": result}))
         return 0
     except (CoordinationError, InventoryError, sqlite3.Error) as exc:
         print(canonical_json({"phase": "HOLD", "error": str(exc)}))
