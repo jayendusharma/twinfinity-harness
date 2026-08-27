@@ -25,7 +25,6 @@ from executor_registry import (
     identity_role,
 )
 from repository_delivery_policy import (
-    delivery_branch_issue_number,
     delivery_branch_matches_owning_issue,
     expected_canonical_checkout,
     expected_worktree_parent,
@@ -39,6 +38,7 @@ CANONICAL_PREPUSH_CONTROL = Path(
     "/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/"
     "scripts/prepush_control.py"
 )
+TRUSTED_PREPUSH_INTERPRETER = Path("/usr/bin/python3")
 SHELL_TOOL = re.compile(r"(?i)(?:exec|shell|bash|command)")
 SHELL_SEGMENT = re.compile(r"&&|\|\||[;|\n]")
 TOKEN = re.compile(r"[A-Za-z0-9_./-]+")
@@ -83,7 +83,16 @@ FILESYSTEM_WRITE_TOOL = re.compile(r"(?i)(?:apply_patch|(?:write|edit|create|del
 PROVIDER_TOOL = re.compile(r"(?i)(?:boto3|cloudflare|supabase|google[._-]?cloud|gcp|aws|azure|kubectl|terraform|pulumi|vercel|heroku|flyio|provider|iam|secret|billing|production|deploy|traffic)")
 PROVIDER_COMMANDS = {"aws", "az", "gcloud", "kubectl", "pulumi", "supabase", "terraform", "tofu", "vercel", "wrangler", "flyctl", "heroku"}
 SHELL_WRAPPERS = {"bash", "dash", "sh", "zsh"}
-PREFIX_WRAPPERS = {"command", "env", "nice", "nohup", "setsid", "stdbuf", "sudo"}
+PREFIX_WRAPPERS = {
+    "command",
+    "env",
+    "exec",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "sudo",
+}
 INTERPRETER_WRAPPERS = {"node", "nodejs", "perl", "php", "python", "python3", "ruby"}
 PROCESS_EXECUTION = re.compile(
     r"(?i)(?:\bsubprocess\b|\bos\.system\s*\(|\bos\.popen\s*\(|"
@@ -159,6 +168,7 @@ class DeliveryContext:
     branch: str | None = None
     base_sha: str | None = None
     repository: str | None = None
+    owning_issue_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +185,7 @@ class CommandLeaf:
     command: str
     bounded_wait: bool = False
     interpreter: str | None = None
+    direct_launch: bool = True
 
 
 class GuardError(RuntimeError):
@@ -627,6 +638,7 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         branch,
         base_sha,
         str(payload["source"]["repository"]),
+        int(payload["issue_number"]),
     )
 
 
@@ -649,6 +661,14 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
         and candidate["recipient_session_id"] == endpoint_id
         and isinstance(payload, dict)
         and _item_matches(connection, payload, endpoint_id, exact_version=False)
+        and isinstance(payload.get("source"), dict)
+        and watch["repository"] == payload["source"].get("repository")
+        and int(watch["issue_number"]) == payload.get("issue_number")
+        and int(watch["generation"]) == payload.get("generation")
+        and watch["lease_manifest_sha256"]
+        == payload.get("lease_manifest_sha256")
+        and int(watch["admission_message_id"] or 0) == int(candidate["id"])
+        and watch["admission_payload_sha256"] == candidate["payload_sha256"]
     )
     rotated_current = bool(
         candidate is not None
@@ -682,6 +702,7 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
         branch,
         base_sha,
         str(payload["source"]["repository"]),
+        int(payload["issue_number"]),
     )
 
 
@@ -1327,34 +1348,37 @@ def _enforce_curl_command(tokens: tuple[str, ...]) -> dict[str, Any]:
 
 
 def _enforce_outbound_command(
-    command: str, context: DeliveryContext, cwd: Path
+    command: str,
+    context: DeliveryContext,
+    cwd: Path,
+    *,
+    direct_launch: bool,
 ) -> dict[str, Any] | None:
     tokens = _shell_tokens(command)
     if not tokens:
         return _deny("DELIVERY_OUTBOUND_COMMAND_UNDETERMINED")
     executable = tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
     guarded_push_arguments: tuple[str, ...] | None = None
-    if executable in {"prepush_control", "prepush_control.py"}:
-        if Path(tokens[0]) == CANONICAL_PREPUSH_CONTROL:
-            guarded_push_arguments = tokens[1:]
-    elif executable in {"python", "python3"} and len(tokens) >= 2:
+    if executable in {"python", "python3"} and len(tokens) >= 2:
         if Path(tokens[1]) == CANONICAL_PREPUSH_CONTROL:
             guarded_push_arguments = tokens[2:]
     if guarded_push_arguments is not None:
-        owning_issue = (
-            delivery_branch_issue_number(context.repository, context.branch)
-            if context.repository is not None and context.branch is not None
-            else None
-        )
+        owning_issue = context.owning_issue_number
         expected_arguments = (
             "guarded-push",
             "--repository",
             context.repository,
             "--issue",
             str(owning_issue),
-        ) if context.repository is not None and owning_issue is not None else ()
+        ) if (
+            context.repository is not None
+            and type(owning_issue) is int
+            and owning_issue > 0
+        ) else ()
         if (
             guarded_push_arguments == expected_arguments
+            and direct_launch
+            and Path(tokens[0]) == TRUSTED_PREPUSH_INTERPRETER
             and context.repository_writes
             and context.worktree is not None
             and cwd == context.worktree
@@ -1362,7 +1386,11 @@ def _enforce_outbound_command(
         ):
             return {}
         return _deny("DELIVERY_PREPUSH_CONTROLLER_NOT_APPROVED")
-    if executable in {"prepush_control", "prepush_control.py"}:
+    if executable in {"prepush_control", "prepush_control.py"} or (
+        len(tokens) >= 2 and Path(tokens[1]) == CANONICAL_PREPUSH_CONTROL
+    ):
+        return _deny("DELIVERY_PREPUSH_CONTROLLER_NOT_APPROVED")
+    if any(Path(token) == CANONICAL_PREPUSH_CONTROL for token in tokens[1:]):
         return _deny("DELIVERY_PREPUSH_CONTROLLER_NOT_APPROVED")
     if executable == "gh":
         return _enforce_gh_command(tokens, context, cwd)
@@ -1677,7 +1705,13 @@ def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool]
     return None
 
 
-def _command_leaves(command: str, *, bounded_wait: bool = False, depth: int = 0) -> tuple[CommandLeaf, ...]:
+def _command_leaves(
+    command: str,
+    *,
+    bounded_wait: bool = False,
+    direct_launch: bool = True,
+    depth: int = 0,
+) -> tuple[CommandLeaf, ...]:
     if depth > 12:
         raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
     segments = _command_segments(command)
@@ -1696,6 +1730,7 @@ def _command_leaves(command: str, *, bounded_wait: bool = False, depth: int = 0)
         for executable in segment_executables
     ):
         raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
+    leaf_direct_launch = direct_launch and len(segments) == 1
     for segment in segments:
         if ("$(" in segment or "`" in segment) and not _is_single_read_only_search(segment):
             raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
@@ -1709,12 +1744,15 @@ def _command_leaves(command: str, *, bounded_wait: bool = False, depth: int = 0)
             assignment_count += 1
         if assignment_count:
             if assignment_count == len(tokens):
-                leaves.append(CommandLeaf(segment, bounded_wait))
+                leaves.append(
+                    CommandLeaf(segment, bounded_wait, direct_launch=False)
+                )
                 continue
             leaves.extend(
                 _command_leaves(
                     shlex.join(tokens[assignment_count:]),
                     bounded_wait=bounded_wait,
+                    direct_launch=False,
                     depth=depth + 1,
                 )
             )
@@ -1737,13 +1775,20 @@ def _command_leaves(command: str, *, bounded_wait: bool = False, depth: int = 0)
                 _command_leaves(
                     child_command,
                     bounded_wait=bounded_wait or child_bounded,
+                    direct_launch=False,
                     depth=depth + 1,
                 )
             )
             continue
         if executable in SHELL_WRAPPERS:
             if any(token in {"-n", "--noprofile", "--norc"} for token in tokens[1:]) and "-n" in tokens[1:]:
-                leaves.append(CommandLeaf(segment, bounded_wait))
+                leaves.append(
+                    CommandLeaf(
+                        segment,
+                        bounded_wait,
+                        direct_launch=leaf_direct_launch,
+                    )
+                )
                 continue
             raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
         if executable in INTERPRETER_WRAPPERS:
@@ -1752,21 +1797,46 @@ def _command_leaves(command: str, *, bounded_wait: bool = False, depth: int = 0)
                 index = tokens.index(code_flag)
                 if index + 1 >= len(tokens) or index + 2 != len(tokens):
                     raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
-                leaves.append(CommandLeaf(tokens[index + 1], bounded_wait, executable))
+                leaves.append(
+                    CommandLeaf(
+                        tokens[index + 1],
+                        bounded_wait,
+                        executable,
+                        leaf_direct_launch,
+                    )
+                )
                 continue
             if executable in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {"pytest", "unittest"}:
-                leaves.append(CommandLeaf(segment, bounded_wait))
+                leaves.append(
+                    CommandLeaf(
+                        segment,
+                        bounded_wait,
+                        direct_launch=leaf_direct_launch,
+                    )
+                )
                 continue
             if (
                 len(tokens) >= 3
                 and tokens[1] == str(CANONICAL_PREPUSH_CONTROL)
                 and tokens[2] == "guarded-push"
             ):
-                leaves.append(CommandLeaf(segment, bounded_wait))
+                leaves.append(
+                    CommandLeaf(
+                        segment,
+                        bounded_wait,
+                        direct_launch=leaf_direct_launch,
+                    )
+                )
                 continue
             if len(tokens) > 1 and not all(token.startswith("-") for token in tokens[1:]):
                 raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
-        leaves.append(CommandLeaf(segment, bounded_wait))
+        leaves.append(
+            CommandLeaf(
+                segment,
+                bounded_wait,
+                direct_launch=leaf_direct_launch,
+            )
+        )
     return tuple(leaves)
 
 
@@ -1837,7 +1907,12 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
         )
         if redirection_decision:
             return redirection_decision
-        outbound_decision = _enforce_outbound_command(leaf.command, context, cwd)
+        outbound_decision = _enforce_outbound_command(
+            leaf.command,
+            context,
+            cwd,
+            direct_launch=leaf.direct_launch,
+        )
         if outbound_decision is not None:
             if outbound_decision:
                 return outbound_decision

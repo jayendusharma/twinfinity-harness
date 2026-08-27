@@ -26,6 +26,11 @@ from coordination_transfer_ledger import (  # noqa: E402
     record_existing,
     record_sha256,
 )
+from delivery_guard import (  # noqa: E402
+    GuardError,
+    _message_context,
+    _terminal_watch_context,
+)
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
@@ -382,6 +387,73 @@ class CoordinationTransferTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM coordination_events WHERE event_type='TRANSFER_ADMISSION_ACTIVATED' AND entity_key='issue314-to-320-v1'"
             ).fetchone()[0],
         )
+
+    def test_delivery_context_preserves_transferred_owning_issue(self) -> None:
+        result = activate_transfer(
+            self.store,
+            self.transaction(),
+            "2026-08-23T17:00:03Z",
+        )
+        watch = self.store.connection.execute(
+            "SELECT watch_key FROM coordination_terminal_watches "
+            "WHERE repository=? AND issue_number=320 AND generation=1",
+            (REPOSITORY,),
+        ).fetchone()
+        self.assertIsNotNone(watch)
+        lease_result = (
+            Path("/home/ubuntu/code/twinfinityapp-issue-314"),
+            frozenset(
+                {
+                    Path("/home/ubuntu/code/twinfinityapp-issue-314")
+                    / "backend/example.py"
+                }
+            ),
+            Path("/home/ubuntu/code/twinfinityapp"),
+            "codex/314-ci-hardening",
+            "a" * 40,
+        )
+        with patch("delivery_guard._load_lease", return_value=lease_result):
+            message_context = _message_context(
+                self.store.connection,
+                self.database,
+                role="sre",
+                endpoint_id=SRE_SESSION,
+                target_key=str(result["message_id"]),
+                worktree_root=Path("/home/ubuntu/code"),
+            )
+            self.assertEqual(320, message_context.owning_issue_number)
+            self.assertEqual("codex/314-ci-hardening", message_context.branch)
+
+            self.store.connection.execute(
+                "UPDATE coordination_terminal_watches SET state='ACTIVE' "
+                "WHERE watch_key=?",
+                (watch["watch_key"],),
+            )
+            watch_context = _terminal_watch_context(
+                self.store.connection,
+                self.database,
+                role="sre",
+                endpoint_id=SRE_SESSION,
+                target_key=watch["watch_key"],
+                worktree_root=Path("/home/ubuntu/code"),
+            )
+            self.assertEqual(320, watch_context.owning_issue_number)
+            self.assertEqual("codex/314-ci-hardening", watch_context.branch)
+
+            self.store.connection.execute(
+                "UPDATE coordination_terminal_watches SET issue_number=314 "
+                "WHERE watch_key=?",
+                (watch["watch_key"],),
+            )
+            with self.assertRaisesRegex(GuardError, "DELIVERY_TARGET_INVALID"):
+                _terminal_watch_context(
+                    self.store.connection,
+                    self.database,
+                    role="sre",
+                    endpoint_id=SRE_SESSION,
+                    target_key=watch["watch_key"],
+                    worktree_root=Path("/home/ubuntu/code"),
+                )
 
     def test_binding_failure_rolls_back_release_and_activation(self) -> None:
         with self.assertRaisesRegex(CoordinationError, "TRANSFER_ADMISSION_BINDING_MISMATCH"):
