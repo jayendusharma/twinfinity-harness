@@ -175,6 +175,8 @@ def github_page_reader(repository: str) -> PageReader:
             raise InventoryError("GITHUB_INVENTORY_READ_FAILED")
         try:
             response = json.loads(completed.stdout)
+            if type(response) is not dict or ("errors" in response and response["errors"] != []):
+                raise InventoryError("GITHUB_INVENTORY_RESPONSE_INVALID")
             connection = response["data"]["repository"][field]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise InventoryError("GITHUB_INVENTORY_RESPONSE_INVALID") from exc
@@ -183,6 +185,28 @@ def github_page_reader(repository: str) -> PageReader:
         return connection
 
     return read
+
+
+def github_comment_reader(repository: str, issue_number: int, comment_id: int) -> dict[str, Any]:
+    """Read one exact issue comment and fail closed on identity/shape drift."""
+    if type(issue_number) is not int or issue_number != 179 or type(comment_id) is not int or comment_id <= 0:
+        raise InventoryError("GITHUB_COMMENT_IDENTITY_INVALID")
+    completed = subprocess.run(
+        ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
+        check=False, capture_output=True, text=True, timeout=30,
+    )
+    if completed.returncode != 0:
+        raise InventoryError("GITHUB_COMMENT_READ_FAILED")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise InventoryError("GITHUB_COMMENT_RESPONSE_INVALID") from exc
+    expected_issue_url = f"https://api.github.com/repos/{repository}/issues/{issue_number}"
+    if (type(value) is not dict or value.get("id") != comment_id
+            or type(value.get("body")) is not str
+            or value.get("issue_url") != expected_issue_url):
+        raise InventoryError("GITHUB_COMMENT_RESPONSE_INVALID")
+    return value
 
 
 def _scan_connection(kind: str, page_reader: PageReader) -> list[dict[str, Any]]:
@@ -562,8 +586,8 @@ def prepare_inventory(
     expected_endpoint_state_sha256: str,
     expected_issue_179_source_sha256: str,
     now: str,
-    expected_preview_sha256: str | None = None,
-    expected_prior_generation: int | None = None,
+    expected_preview_sha256: str,
+    expected_prior_generation: int | None,
 ) -> tuple[dict[str, Any], int]:
     aliases = load_alias_artifact(alias_path)
     inventory, occurrences = build_inventory_candidate(
@@ -638,7 +662,7 @@ def main() -> int:
     prepare.add_argument("--expected-inventory-sha256", required=True)
     prepare.add_argument("--expected-endpoint-state-sha256", required=True)
     prepare.add_argument("--expected-issue-179-source-sha256", required=True)
-    prepare.add_argument("--expected-preview-sha256")
+    prepare.add_argument("--expected-preview-sha256", required=True)
     prepare.add_argument("--expected-prior-generation", type=int)
     promote = subparsers.add_parser("promote")
     promote.add_argument("--generation", required=True, type=int)
@@ -655,6 +679,7 @@ def main() -> int:
         if args.command == "migrate-legacy":
             store = CoordinationStore(args.database)
             result = store.migrate_legacy_routing_deprecation_inventory(
+                expected_repository=args.repository,
                 expected_inventory_sha256=args.expected_inventory_sha256,
                 expected_occurrence_count=args.expected_occurrence_count,
                 now=utc_now(),
@@ -705,10 +730,14 @@ def main() -> int:
             if row is None:
                 raise CoordinationError("ROUTING_DEPRECATION_SUCCESSOR_MISSING")
             outbox = store.connection.execute("SELECT remote_receipt FROM github_outbox WHERE id=?", (row["outbox_id"],)).fetchone()
-            if outbox is None or not isinstance(outbox["remote_receipt"], str) or not outbox["remote_receipt"].startswith("comment:"):
+            if outbox is None or not isinstance(outbox["remote_receipt"], str) or re.fullmatch(r"comment:[1-9][0-9]*", outbox["remote_receipt"]) is None:
                 raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_INCOMPLETE")
             comment = github_comment_reader(args.repository, 179, int(outbox["remote_receipt"].split(":", 1)[1]))
-            result = store.promote_routing_deprecation_inventory(repository=args.repository, generation=args.generation, inventory_sha256=args.inventory_sha256, expected_prior_generation=args.expected_prior_generation, expected_preview_sha256=args.expected_preview_sha256, remote_receipt_body=comment.get("body"), now=utc_now())
+            current_inventory, current_occurrences = build_inventory_candidate(
+                store.connection, repository=args.repository, alias_artifact=aliases,
+                page_reader=reader,
+            )
+            result = store.promote_routing_deprecation_inventory(repository=args.repository, generation=args.generation, inventory_sha256=args.inventory_sha256, expected_prior_generation=args.expected_prior_generation, expected_preview_sha256=args.expected_preview_sha256, remote_receipt_body=comment["body"], current_inventory=current_inventory, current_occurrences=current_occurrences, alias_source_path=args.legacy_alias_file, now=utc_now())
             print(canonical_json({"phase": "PROMOTED", "promotion": result}))
         return 0
     except (CoordinationError, InventoryError, sqlite3.Error) as exc:
