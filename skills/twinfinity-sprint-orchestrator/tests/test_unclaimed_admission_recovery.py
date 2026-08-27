@@ -78,6 +78,24 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
             ROOT,
             operation_key="unclaimed-admission-recovery-tests",
         )
+        source_config = load_registry_config(
+            ROOT / "references" / "twinfinity-executor-registry.toml",
+            codex_home=ROOT / "references",
+            profile_template_root=ROOT / "references",
+        )
+        self.registry_config = replace(
+            self.registry_config,
+            endpoints={
+                **self.registry_config.endpoints,
+                **{
+                    endpoint_id: source_config.endpoints[endpoint_id]
+                    for endpoint_id in (
+                        "role.development.v6",
+                        "role.sre.v6",
+                    )
+                },
+            },
+        )
 
     def tearDown(self) -> None:
         self.store.close()
@@ -612,7 +630,7 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         """Build one exact never-claimed lineage retained for role cutover."""
 
         historical_endpoint = f"role.{role}.v3"
-        current_endpoint_id = f"role.{role}.v4"
+        current_endpoint_id = f"role.{role}.v6"
         self._apply_role_endpoint(
             role,
             historical_endpoint,
