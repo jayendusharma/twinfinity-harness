@@ -363,13 +363,13 @@ def _current_kanban_routing(
 def github_comment_reader(
     repository: str, issue_number: int, comment_id: int
 ) -> dict[str, Any]:
-    completed = subprocess.run(
-        ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InventoryError("ROUTING_DEPRECATION_RECEIPT_READ_FAILED") from exc
     if completed.returncode != 0:
         raise InventoryError("ROUTING_DEPRECATION_RECEIPT_READ_FAILED")
     try:

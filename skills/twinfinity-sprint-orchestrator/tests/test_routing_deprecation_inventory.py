@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from archive_readiness_audit import archive_readiness  # noqa: E402
+from archive_readiness_audit import archive_readiness, github_comment_reader as archive_comment_reader  # noqa: E402
 from coordination_store import (  # noqa: E402
     CoordinationError,
     CoordinationStore,
@@ -93,6 +93,17 @@ class StaticReader:
 
 
 class RoutingInventoryScanTests(unittest.TestCase):
+    def test_github_read_boundaries_convert_timeouts_to_typed_errors(self) -> None:
+        timeout = __import__("subprocess").TimeoutExpired("gh", 30)
+        with patch("routing_deprecation_inventory.subprocess.run", side_effect=timeout):
+            with self.assertRaisesRegex(InventoryError, "GITHUB_INVENTORY_READ_FAILED"):
+                github_page_reader(REPOSITORY)("issue", None)
+            with self.assertRaisesRegex(InventoryError, "GITHUB_COMMENT_READ_FAILED"):
+                github_comment_reader(REPOSITORY, 179, 555)
+        with patch("archive_readiness_audit.subprocess.run", side_effect=timeout):
+            with self.assertRaisesRegex(InventoryError, "ROUTING_DEPRECATION_RECEIPT_READ_FAILED"):
+                archive_comment_reader(REPOSITORY, 179, 555)
+
     def test_github_reader_rejects_graphql_errors_even_with_data(self) -> None:
         response = {"errors": [{"message": "partial"}], "data": {"repository": {"issues": page(0, [], False)}}}
         completed = types.SimpleNamespace(returncode=0, stdout=json.dumps(response))
@@ -442,7 +453,7 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             ),
         )
 
-    def promoted_second_generation(self):
+    def prepare_second_complete(self):
         _, first_outbox = self.prepare()
         self.complete_outbox(first_outbox)
         changed_body = f"Immutable provenance: never dispatch to {self.alias}."
@@ -457,6 +468,10 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             expected_issue_179_source_sha256=second["issue_179_source_sha256"], expected_preview_sha256=preview["preview_sha256"],
             expected_prior_generation=1, now="2026-08-24T10:00:02Z")
         self.complete_outbox(outbox_id)
+        return second, preview
+
+    def promoted_second_generation(self):
+        second, preview = self.prepare_second_complete()
         self.promote_current(repository=REPOSITORY, generation=2,
             inventory_sha256=second["inventory_sha256"], expected_prior_generation=1,
             expected_preview_sha256=preview["preview_sha256"], remote_receipt_body=published_receipt_body(second),
@@ -528,6 +543,24 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             with self.subTest(field=field, value=value), self.assertRaisesRegex(CoordinationError, "INVENTORY_INVALID"):
                 self.store.prepare_routing_deprecation_inventory(inventory=inventory, occurrences=occurrences,
                     alias_source_path=ALIASES, outbox_idempotency_key=f"invalid-{field}-{value}", receipt_body="invalid",
+                    expected_preview_sha256="0" * 64, expected_prior_generation=None,
+                    now="2026-08-24T09:00:02Z")
+            after = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories","routing_deprecation_occurrences","github_outbox"))
+            self.assertEqual(before, after)
+
+    def test_prepare_rejects_all_noncanonical_semantic_tags_without_writes(self) -> None:
+        invalid = ([1, "ACCEPTANCE"], [True], [None], [{}], [[]], ["UNKNOWN"],
+                   ["ACCEPTANCE", "ACCEPTANCE"], ["SCOPE", "ACCEPTANCE"])
+        for value in invalid:
+            inventory, occurrences = self.candidate()
+            inventory = copy.deepcopy(inventory); occurrences = copy.deepcopy(occurrences)
+            occurrences[0]["semantic_tags"] = value
+            inventory["occurrence_manifest_sha256"] = digest_json(occurrences)
+            inventory["inventory_sha256"] = digest_json({key: item for key, item in inventory.items() if key != "inventory_sha256"})
+            before = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories","routing_deprecation_occurrences","github_outbox"))
+            with self.subTest(value=value), self.assertRaisesRegex(CoordinationError, "INVENTORY_INVALID"):
+                self.store.prepare_routing_deprecation_inventory(inventory=inventory, occurrences=occurrences,
+                    alias_source_path=ALIASES, outbox_idempotency_key="invalid-tags", receipt_body="invalid",
                     expected_preview_sha256="0" * 64, expected_prior_generation=None,
                     now="2026-08-24T09:00:02Z")
             after = tuple(self.store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("routing_deprecation_inventories","routing_deprecation_occurrences","github_outbox"))
@@ -606,6 +639,7 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             "gen2_prior": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET prior_generation=99 WHERE generation=2"),
             "gen2_inventory": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET inventory_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE generation=2"),
             "gen2_counts": ("DROP TRIGGER routing_deprecation_inventory_immutable_update", "UPDATE routing_deprecation_inventories SET classification_counts_json='{}' WHERE generation=2"),
+            "gen2_mixed_tags": ("DROP TRIGGER routing_deprecation_occurrence_immutable_update", "UPDATE routing_deprecation_occurrences SET semantic_tags_json='[1,\"ACCEPTANCE\"]' WHERE inventory_sha256=(SELECT inventory_sha256 FROM routing_deprecation_inventories WHERE generation=2)"),
         }
         for name, (setup_sql, mutation_sql) in cases.items():
             case = RoutingInventoryStoreTests(); case.setUp()
@@ -628,6 +662,53 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                 self.assertEqual(before, after)
             finally:
                 case.tearDown()
+
+    def test_new_successor_promotion_revalidates_prior_chain_zero_write(self) -> None:
+        cases = {
+            "root_map": ("DROP TRIGGER routing_deprecation_inventory_immutable_update", "UPDATE routing_deprecation_inventories SET classification_counts_json='{}' WHERE generation=1"),
+            "promotion_receipt": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET remote_receipt='comment:999' WHERE generation=1"),
+            "current_version": ("DROP TRIGGER routing_deprecation_current_monotonic", "UPDATE routing_deprecation_current SET version=999"),
+            "outbox_state": (None, "UPDATE github_outbox SET state='PREPARED' WHERE id=(SELECT outbox_id FROM routing_deprecation_inventories WHERE generation=1)"),
+        }
+        for name, (setup_sql, mutation_sql) in cases.items():
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                second, preview = case.prepare_second_complete()
+                if setup_sql: case.store.connection.execute(setup_sql)
+                case.store.connection.execute(mutation_sql); case.store.connection.commit()
+                before = tuple(tuple(row) for row in case.store.connection.execute("SELECT * FROM routing_deprecation_current UNION ALL SELECT repository,generation,inventory_sha256,prior_generation,promoted_at FROM routing_deprecation_promotions"))
+                event_count = case.store.connection.execute("SELECT COUNT(*) FROM coordination_events").fetchone()[0]
+                with self.subTest(name=name), self.assertRaisesRegex(CoordinationError, "PROMOTION_CHAIN_INVALID|PROMOTION_SOURCE_DRIFT"):
+                    case.promote_current(repository=REPOSITORY, generation=2,
+                        inventory_sha256=second["inventory_sha256"], expected_prior_generation=1,
+                        expected_preview_sha256=preview["preview_sha256"], remote_receipt_body=published_receipt_body(second),
+                        now="2026-08-24T10:10:00Z")
+                after = tuple(tuple(row) for row in case.store.connection.execute("SELECT * FROM routing_deprecation_current UNION ALL SELECT repository,generation,inventory_sha256,prior_generation,promoted_at FROM routing_deprecation_promotions"))
+                self.assertEqual((before, event_count), (after, case.store.connection.execute("SELECT COUNT(*) FROM coordination_events").fetchone()[0]))
+            finally: case.tearDown()
+
+    def test_postinsert_chain_validation_failure_rolls_back_promotion(self) -> None:
+        second, preview = self.prepare_second_complete()
+        before = ([tuple(row) for row in self.store.connection.execute("SELECT * FROM routing_deprecation_current")],
+                  [tuple(row) for row in self.store.connection.execute("SELECT * FROM routing_deprecation_promotions")],
+                  self.store.connection.execute("SELECT COUNT(*) FROM coordination_events").fetchone()[0])
+        original = self.store._validate_routing_deprecation_promoted_chain
+        calls = 0
+        def fail_second(repository):
+            nonlocal calls
+            calls += 1
+            if calls == 2: raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CHAIN_INVALID")
+            return original(repository)
+        with patch.object(self.store, "_validate_routing_deprecation_promoted_chain", side_effect=fail_second):
+            with self.assertRaisesRegex(CoordinationError, "PROMOTION_CHAIN_INVALID"):
+                self.promote_current(repository=REPOSITORY, generation=2,
+                    inventory_sha256=second["inventory_sha256"], expected_prior_generation=1,
+                    expected_preview_sha256=preview["preview_sha256"], remote_receipt_body=published_receipt_body(second),
+                    now="2026-08-24T10:10:00Z")
+        after = ([tuple(row) for row in self.store.connection.execute("SELECT * FROM routing_deprecation_current")],
+                 [tuple(row) for row in self.store.connection.execute("SELECT * FROM routing_deprecation_promotions")],
+                 self.store.connection.execute("SELECT COUNT(*) FROM coordination_events").fetchone()[0])
+        self.assertEqual(before, after)
 
     def test_current_version_zero_or_999_holds_archive_and_replay(self) -> None:
         for version in (0, 999):
@@ -689,6 +770,7 @@ class RoutingInventoryStoreTests(unittest.TestCase):
             "classification_malformed": ("inventory", "classification_counts_json='{'"),
             "semantic_tag_malformed": ("inventory", "semantic_tag_counts_json='{'"),
             "occurrence_updated": ("occurrence", "object_updated_at='2099-01-01T00:00:00Z'"),
+            "occurrence_mixed_tags": ("occurrence", "semantic_tags_json='[1,\"ACCEPTANCE\"]'"),
         }
         for name, (surface, assignment) in cases.items():
             case = RoutingInventoryStoreTests(); case.setUp()
@@ -965,6 +1047,14 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                 case.store.connection.execute(f"UPDATE routing_deprecation_inventories SET {assignment}"); case.store.connection.commit()
                 case.assert_legacy_migration_hold_is_zero_write(inventory)
             finally: case.tearDown()
+
+    def test_legacy_migration_rejects_mixed_semantic_tags_zero_write(self) -> None:
+        inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)
+        self.downgrade_to_exact_legacy_v1()
+        self.store.connection.execute("DROP TRIGGER routing_deprecation_occurrence_immutable_update")
+        self.store.connection.execute("UPDATE routing_deprecation_occurrences SET semantic_tags_json='[1,\"ACCEPTANCE\"]'")
+        self.store.connection.commit()
+        self.assert_legacy_migration_hold_is_zero_write(inventory)
 
     def test_legacy_migration_rolls_back_postcopy_failure_and_restores_foreign_keys(self) -> None:
         inventory, outbox_id = self.prepare(); self.complete_outbox(outbox_id)

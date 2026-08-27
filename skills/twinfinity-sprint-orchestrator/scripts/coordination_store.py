@@ -8432,6 +8432,7 @@ class CoordinationStore:
         ):
             raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_DIGEST_MISMATCH")
         for ordinal, item in enumerate(occurrences):
+            semantic_tags = item.get("semantic_tags")
             if (
                 item.get("ordinal") != ordinal
                 or item.get("classification")
@@ -8441,8 +8442,9 @@ class CoordinationStore:
                     "HISTORICAL_PROVENANCE",
                     "AMBIGUOUS_REFERENCE",
                 }
-                or not isinstance(item.get("semantic_tags"), list)
-                or item["semantic_tags"] != sorted(set(item["semantic_tags"]))
+                or type(semantic_tags) is not list
+                or any(type(tag) is not str for tag in semantic_tags)
+                or semantic_tags != sorted(set(semantic_tags))
             ):
                 raise CoordinationError("ROUTING_DEPRECATION_INVENTORY_INVALID")
             _validate_sha256(str(item.get("body_sha256", "")))
@@ -8696,6 +8698,8 @@ class CoordinationStore:
                     raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CONFLICT")
                 self._validate_routing_deprecation_promoted_chain(repository)
                 return dict(existing)
+            if current is not None:
+                self._validate_routing_deprecation_promoted_chain(repository)
             if (current is None) != (expected_prior_generation is None) or (current is not None and int(current["generation"]) != expected_prior_generation):
                 raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CAS_DRIFT")
             expected_generation = 1 if expected_prior_generation is None else expected_prior_generation + 1
@@ -8716,6 +8720,7 @@ class CoordinationStore:
                 (repository, generation, expected_prior_generation, inventory_sha256, expected_preview_sha256, outbox["remote_receipt"], now),
             )
             self._event("ROUTING_DEPRECATION_INVENTORY_PROMOTED", f"{repository}:routing-deprecation-inventory", {"generation": generation, "inventory_sha256": inventory_sha256, "preview_sha256": expected_preview_sha256}, now)
+            self._validate_routing_deprecation_promoted_chain(repository)
             return dict(self.connection.execute("SELECT * FROM routing_deprecation_promotions WHERE repository=? AND generation=?", (repository, generation)).fetchone())
 
     @staticmethod

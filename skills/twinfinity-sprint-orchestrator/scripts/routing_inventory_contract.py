@@ -41,6 +41,13 @@ def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequen
             raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
     canonical_occurrences: list[dict[str, Any]] = []
     for ordinal, item in enumerate(occurrences):
+        semantic_tags = item.get("semantic_tags") if type(item) is dict else None
+        tags_valid = (
+            type(semantic_tags) is list
+            and all(type(tag) is str and tag in TAGS for tag in semantic_tags)
+            and len(semantic_tags) == len(set(semantic_tags))
+            and semantic_tags == sorted(semantic_tags)
+        )
         if (type(item) is not dict or set(item) != {"ordinal","object_kind","object_number","node_id","body_sha256","alias","byte_start","byte_end","line_number","byte_column","classification","semantic_tags"}
                 or not _integer(item["ordinal"]) or item["ordinal"] != ordinal
                 or item["object_kind"] not in {"issue","pull_request"} or not _integer(item["object_number"], minimum=1)
@@ -48,8 +55,7 @@ def validate_inventory_payload(inventory: Mapping[str, Any], occurrences: Sequen
                 or type(item["alias"]) is not str or not item["alias"] or not _integer(item["byte_start"])
                 or not _integer(item["byte_end"], minimum=1) or item["byte_end"] <= item["byte_start"]
                 or not _integer(item["line_number"], minimum=1) or not _integer(item["byte_column"], minimum=1)
-                or item["classification"] not in CLASSIFICATIONS or type(item["semantic_tags"]) is not list
-                or item["semantic_tags"] != sorted(set(item["semantic_tags"])) or any(type(tag) is not str or tag not in TAGS for tag in item["semantic_tags"])):
+                or item["classification"] not in CLASSIFICATIONS or not tags_valid):
             raise RoutingInventoryContractError("ROUTING_DEPRECATION_INVENTORY_INVALID")
         canonical_occurrences.append(dict(item))
     counts = (inventory["object_count"],inventory["issue_count"],inventory["pull_request_count"],inventory["occurrence_count"])

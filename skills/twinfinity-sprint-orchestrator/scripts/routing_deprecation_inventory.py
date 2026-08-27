@@ -163,14 +163,14 @@ def github_page_reader(repository: str) -> PageReader:
             "query": _graphql_query(kind),
             "variables": {"owner": owner, "name": name, "cursor": cursor},
         }
-        completed = subprocess.run(
-            ["gh", "api", "graphql", "--input", "-"],
-            input=canonical_json(payload),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        try:
+            completed = subprocess.run(
+                ["gh", "api", "graphql", "--input", "-"],
+                input=canonical_json(payload), check=False, capture_output=True,
+                text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise InventoryError("GITHUB_INVENTORY_READ_FAILED") from exc
         if completed.returncode != 0:
             raise InventoryError("GITHUB_INVENTORY_READ_FAILED")
         try:
@@ -191,10 +191,13 @@ def github_comment_reader(repository: str, issue_number: int, comment_id: int) -
     """Read one exact issue comment and fail closed on identity/shape drift."""
     if type(issue_number) is not int or issue_number != 179 or type(comment_id) is not int or comment_id <= 0:
         raise InventoryError("GITHUB_COMMENT_IDENTITY_INVALID")
-    completed = subprocess.run(
-        ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
-        check=False, capture_output=True, text=True, timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            ["gh", "api", f"repos/{repository}/issues/comments/{comment_id}"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InventoryError("GITHUB_COMMENT_READ_FAILED") from exc
     if completed.returncode != 0:
         raise InventoryError("GITHUB_COMMENT_READ_FAILED")
     try:
