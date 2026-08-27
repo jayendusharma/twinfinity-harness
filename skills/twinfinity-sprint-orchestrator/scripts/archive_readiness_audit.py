@@ -402,15 +402,16 @@ def _routing_inventory_local_gate(
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
     current = currents[0]
     matching = [item for item in rows if item["repository"] == current["repository"] and int(item["generation"]) == int(current["generation"]) and item["inventory_sha256"] == current["inventory_sha256"]]
-    if len(matching) != 1:
+    if len(matching) != 1 or int(current["generation"]) != len(rows):
         return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
     expected_generation = 1
     predecessor = None
     for historic in rows:
         if int(historic["generation"]) != expected_generation or historic["predecessor_inventory_sha256"] != predecessor:
             return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
-        promotion = connection.execute("SELECT 1 FROM routing_deprecation_promotions WHERE repository=? AND generation=? AND inventory_sha256=?", (historic["repository"], historic["generation"], historic["inventory_sha256"])).fetchone()
-        if int(historic["generation"]) <= int(current["generation"]) and promotion is None:
+        promotion = connection.execute("SELECT * FROM routing_deprecation_promotions WHERE repository=? AND generation=? AND inventory_sha256=?", (historic["repository"], historic["generation"], historic["inventory_sha256"])).fetchone()
+        expected_prior = None if expected_generation == 1 else expected_generation - 1
+        if promotion is None or promotion["prior_generation"] != expected_prior:
             return [{"error": "ROUTING_DEPRECATION_INVENTORY_LINEAGE_INVALID"}], None
         try:
             historic_objects = json.loads(historic["object_manifest_json"])
@@ -432,6 +433,48 @@ def _routing_inventory_local_gate(
         if (digest_json(historic_objects) != historic["object_manifest_sha256"]
                 or digest_json(historic_occurrences) != historic["occurrence_manifest_sha256"]
                 or len(historic_occurrences) != int(historic["occurrence_count"])):
+            return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
+        historic_inventory = {
+            "kind": historic["kind"], "repository": historic["repository"],
+            "alias_source_sha256": historic["alias_source_sha256"],
+            "endpoint_state_sha256": historic["endpoint_state_sha256"],
+            "issue_179_source_sha256": historic["issue_179_source_sha256"],
+            "object_manifest_sha256": historic["object_manifest_sha256"],
+            "occurrence_manifest_sha256": historic["occurrence_manifest_sha256"],
+            "object_manifest": historic_objects, "object_count": int(historic["object_count"]),
+            "issue_count": int(historic["issue_count"]), "pull_request_count": int(historic["pull_request_count"]),
+            "occurrence_count": int(historic["occurrence_count"]),
+            "classification_counts": json.loads(historic["classification_counts_json"]),
+            "semantic_tag_counts": json.loads(historic["semantic_tag_counts_json"]),
+            "inventory_sha256": historic["inventory_sha256"],
+        }
+        preview = {
+            "repository": historic["repository"], "generation": int(historic["generation"]),
+            "predecessor_inventory_sha256": historic["predecessor_inventory_sha256"],
+            "inventory_sha256": historic["inventory_sha256"],
+            "alias_source_sha256": historic["alias_source_sha256"],
+            "endpoint_state_sha256": historic["endpoint_state_sha256"],
+            "issue_179_source_sha256": historic["issue_179_source_sha256"],
+            "object_manifest_sha256": historic["object_manifest_sha256"],
+            "occurrence_manifest_sha256": historic["occurrence_manifest_sha256"],
+        }
+        preview_sha256 = digest_json(preview)
+        outbox = connection.execute("SELECT * FROM github_outbox WHERE id=?", (historic["outbox_id"],)).fetchone()
+        try:
+            payload = None if outbox is None else json.loads(outbox["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if (historic["preview_sha256"] != preview_sha256
+                or promotion["preview_sha256"] != preview_sha256
+                or outbox is None or outbox["state"] != "COMPLETE"
+                or outbox["repository"] != historic["repository"] or outbox["object_kind"] != "issue"
+                or int(outbox["object_number"]) != 179 or outbox["operation"] != "comment"
+                or outbox["expected_source_sha256"] != historic["issue_179_source_sha256"]
+                or outbox["idempotency_key"] != outbox_idempotency_key(historic_inventory)
+                or payload != {"body": receipt_body(historic_inventory)}
+                or outbox["payload_sha256"] != digest_json(payload)
+                or re.fullmatch(r"comment:[1-9][0-9]*", str(outbox["remote_receipt"])) is None
+                or promotion["remote_receipt"] != outbox["remote_receipt"]):
             return [{"error": "ROUTING_DEPRECATION_HISTORY_CORRUPT"}], None
         predecessor = historic["inventory_sha256"]
         expected_generation += 1

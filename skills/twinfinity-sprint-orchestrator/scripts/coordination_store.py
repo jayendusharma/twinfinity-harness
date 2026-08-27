@@ -8557,20 +8557,11 @@ class CoordinationStore:
                 },
                 now,
             )
-            if generation == 1:
-                self.connection.execute(
-                    "INSERT INTO routing_deprecation_current(repository,generation,inventory_sha256,version,promoted_at) VALUES (?,?,?,?,?)",
-                    (repository, 1, inventory["inventory_sha256"], 1, now),
-                )
-                self.connection.execute(
-                    "INSERT INTO routing_deprecation_promotions(repository,generation,prior_generation,inventory_sha256,preview_sha256,remote_receipt,promoted_at) VALUES (?,?,?,?,?,?,?)",
-                    (repository, 1, None, inventory["inventory_sha256"], preview_sha256, "legacy-generation-1", now),
-                )
         return str(inventory["inventory_sha256"]), outbox_id
 
     def promote_routing_deprecation_inventory(
         self, *, repository: str, generation: int, inventory_sha256: str,
-        expected_prior_generation: int, expected_preview_sha256: str,
+        expected_prior_generation: int | None, expected_preview_sha256: str,
         remote_receipt_body: str, now: str,
     ) -> dict[str, Any]:
         """CAS-promote one prepared successor after exact COMPLETE receipt readback."""
@@ -8588,30 +8579,57 @@ class CoordinationStore:
                 "SELECT * FROM routing_deprecation_promotions WHERE repository=? AND generation=?",
                 (repository, generation),
             ).fetchone()
-            if existing is not None:
-                if (existing["inventory_sha256"], existing["preview_sha256"]) != (inventory_sha256, expected_preview_sha256):
-                    raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CONFLICT")
-                return dict(existing)
-            if current is None or int(current["generation"]) != expected_prior_generation:
-                raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CAS_DRIFT")
-            if generation != expected_prior_generation + 1 or row["preview_sha256"] != expected_preview_sha256 or row["predecessor_inventory_sha256"] != current["inventory_sha256"]:
-                raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_FENCE_DRIFT")
+            preview = {"repository": repository, "generation": generation, "predecessor_inventory_sha256": row["predecessor_inventory_sha256"], "inventory_sha256": inventory_sha256, "alias_source_sha256": row["alias_source_sha256"], "endpoint_state_sha256": row["endpoint_state_sha256"], "issue_179_source_sha256": row["issue_179_source_sha256"], "object_manifest_sha256": row["object_manifest_sha256"], "occurrence_manifest_sha256": row["occurrence_manifest_sha256"]}
+            canonical_preview_sha256 = digest_json(preview)
+            expected_key = f"routing-deprecation-inventory:{repository}:{inventory_sha256}"
+            expected_body = "\n".join((
+                "## Legacy routing inventory frozen", "", f"- Repository: `{repository}`",
+                f"- Inventory SHA-256: `{inventory_sha256}`", f"- Object manifest SHA-256: `{row['object_manifest_sha256']}`",
+                f"- Occurrence manifest SHA-256: `{row['occurrence_manifest_sha256']}`", f"- Endpoint-state SHA-256: `{row['endpoint_state_sha256']}`",
+                f"- Alias-source SHA-256: `{row['alias_source_sha256']}`", f"- Frozen objects: {row['object_count']}",
+                f"- Exact occurrences: {row['occurrence_count']}", "",
+                "Exact negative-routing overlay: every legacy alias occurrence in the bound object and occurrence manifests is superseded as executable routing and remains immutable provenance only. Comment-only timestamp changes are intentionally non-controlling; any object-body, node-identity, endpoint-state, alias-source, or receipt drift invalidates this overlay.", "",
+                "Negative authority: this receipt does not route work, acknowledge a receiver, grant approval, change scope, satisfy a dependency or acceptance gate, rewrite any body, or alter any non-routing semantic.",
+            ))
             outbox = self.connection.execute("SELECT * FROM github_outbox WHERE id=?", (row["outbox_id"],)).fetchone()
-            if outbox is None or outbox["state"] != "COMPLETE" or not isinstance(outbox["remote_receipt"], str) or REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"]) is None:
+            if (outbox is None or outbox["state"] != "COMPLETE" or not isinstance(outbox["remote_receipt"], str)
+                    or REMOTE_COMMENT_RECEIPT.fullmatch(outbox["remote_receipt"]) is None):
                 raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_INCOMPLETE")
             try:
-                payload_body = json.loads(outbox["payload_json"])["body"]
-            except (TypeError, KeyError, json.JSONDecodeError):
+                payload = json.loads(outbox["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                payload = None
+            if (row["preview_sha256"] != canonical_preview_sha256 or expected_preview_sha256 != canonical_preview_sha256
+                    or outbox["repository"] != repository or outbox["object_kind"] != "issue" or int(outbox["object_number"]) != 179
+                    or outbox["operation"] != "comment" or outbox["expected_source_sha256"] != row["issue_179_source_sha256"]
+                    or outbox["idempotency_key"] != expected_key or payload != {"body": expected_body}
+                    or outbox["payload_sha256"] != digest_json(payload)):
                 raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_CORRUPT")
-            marker = hashlib.sha256(outbox["idempotency_key"].encode("utf-8")).hexdigest()
-            if remote_receipt_body != f"{payload_body}\n\n<!-- twinfinity-outbox:{marker} -->":
+            marker = hashlib.sha256(expected_key.encode("utf-8")).hexdigest()
+            if remote_receipt_body != f"{expected_body}\n\n<!-- twinfinity-outbox:{marker} -->":
                 raise CoordinationError("ROUTING_DEPRECATION_RECEIPT_READBACK_DRIFT")
-            self.connection.execute(
-                "UPDATE routing_deprecation_current SET generation=?,inventory_sha256=?,version=version+1,promoted_at=? WHERE repository=? AND generation=?",
-                (generation, inventory_sha256, now, repository, expected_prior_generation),
-            )
-            if self.connection.execute("SELECT changes()").fetchone()[0] != 1:
+            if existing is not None:
+                if ((existing["inventory_sha256"], existing["preview_sha256"], existing["prior_generation"], existing["remote_receipt"])
+                        != (inventory_sha256, canonical_preview_sha256, expected_prior_generation, outbox["remote_receipt"])
+                        or current is None or int(current["generation"]) < generation
+                        or (int(current["generation"]) == generation and current["inventory_sha256"] != inventory_sha256)):
+                    raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CONFLICT")
+                return dict(existing)
+            if (current is None) != (expected_prior_generation is None) or (current is not None and int(current["generation"]) != expected_prior_generation):
                 raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CAS_DRIFT")
+            expected_generation = 1 if expected_prior_generation is None else expected_prior_generation + 1
+            expected_predecessor = None if current is None else current["inventory_sha256"]
+            if generation != expected_generation or row["preview_sha256"] != expected_preview_sha256 or row["predecessor_inventory_sha256"] != expected_predecessor:
+                raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_FENCE_DRIFT")
+            if current is None:
+                self.connection.execute("INSERT INTO routing_deprecation_current(repository,generation,inventory_sha256,version,promoted_at) VALUES (?,?,?,?,?)", (repository, generation, inventory_sha256, 1, now))
+            else:
+                self.connection.execute(
+                    "UPDATE routing_deprecation_current SET generation=?,inventory_sha256=?,version=version+1,promoted_at=? WHERE repository=? AND generation=?",
+                    (generation, inventory_sha256, now, repository, expected_prior_generation),
+                )
+                if self.connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise CoordinationError("ROUTING_DEPRECATION_PROMOTION_CAS_DRIFT")
             self.connection.execute(
                 "INSERT INTO routing_deprecation_promotions VALUES (?,?,?,?,?,?,?)",
                 (repository, generation, expected_prior_generation, inventory_sha256, expected_preview_sha256, outbox["remote_receipt"], now),

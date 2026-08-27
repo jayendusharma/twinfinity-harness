@@ -643,7 +643,7 @@ def main() -> int:
     promote = subparsers.add_parser("promote")
     promote.add_argument("--generation", required=True, type=int)
     promote.add_argument("--inventory-sha256", required=True)
-    promote.add_argument("--expected-prior-generation", required=True, type=int)
+    promote.add_argument("--expected-prior-generation", type=int)
     promote.add_argument("--expected-preview-sha256", required=True)
     migrate = subparsers.add_parser("migrate-legacy")
     migrate.add_argument("--expected-inventory-sha256", required=True)

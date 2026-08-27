@@ -379,6 +379,15 @@ class RoutingInventoryStoreTests(unittest.TestCase):
     def complete_outbox(self, outbox_id: int) -> None:
         self.store.reserve_outbox(outbox_id, "2026-08-24T09:00:03Z")
         self.store.complete_outbox(outbox_id, "comment:555", "2026-08-24T09:00:04Z")
+        row = self.store.connection.execute("SELECT * FROM routing_deprecation_inventories WHERE outbox_id=?", (outbox_id,)).fetchone()
+        current = self.store.connection.execute("SELECT 1 FROM routing_deprecation_current").fetchone()
+        if row is not None and int(row["generation"]) == 1 and current is None:
+            inventory = self.candidate()[0]
+            self.store.promote_routing_deprecation_inventory(
+                repository=REPOSITORY, generation=1, inventory_sha256=row["inventory_sha256"],
+                expected_prior_generation=None, expected_preview_sha256=row["preview_sha256"],
+                remote_receipt_body=published_receipt_body(inventory), now="2026-08-24T09:00:04Z",
+            )
 
     def comment(self, inventory: dict, *, issue: int = 179, body: str | None = None):
         return {
@@ -396,6 +405,27 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                 lambda repository, issue, comment_id: self.comment(inventory)
             ),
         )
+
+    def promoted_second_generation(self):
+        _, first_outbox = self.prepare()
+        self.complete_outbox(first_outbox)
+        changed_body = f"Immutable provenance: never dispatch to {self.alias}."
+        self.store.ingest_snapshot(repository=REPOSITORY, object_kind="issue", object_number=179,
+            payload={"number": 179, "body": changed_body, "updated_at": UPDATED},
+            source_updated_at="2026-08-24T10:00:00Z", fetched_at="2026-08-24T10:00:01Z")
+        self.reader = StaticReader([node("issue", 179, changed_body)])
+        preview = preview_inventory(self.store, repository=REPOSITORY, alias_path=ALIASES, page_reader=self.reader)
+        second = self.candidate()[0]
+        second, outbox_id = prepare_inventory(self.store, repository=REPOSITORY, alias_path=ALIASES, page_reader=self.reader,
+            expected_inventory_sha256=second["inventory_sha256"], expected_endpoint_state_sha256=second["endpoint_state_sha256"],
+            expected_issue_179_source_sha256=second["issue_179_source_sha256"], expected_preview_sha256=preview["preview_sha256"],
+            expected_prior_generation=1, now="2026-08-24T10:00:02Z")
+        self.complete_outbox(outbox_id)
+        self.store.promote_routing_deprecation_inventory(repository=REPOSITORY, generation=2,
+            inventory_sha256=second["inventory_sha256"], expected_prior_generation=1,
+            expected_preview_sha256=preview["preview_sha256"], remote_receipt_body=published_receipt_body(second),
+            now="2026-08-24T10:00:05Z")
+        return second
 
     def test_prepare_is_atomic_replayable_conflict_fenced_and_immutable(self) -> None:
         inventory, outbox_id = self.prepare()
@@ -445,6 +475,68 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                 FROM routing_deprecation_occurrences LIMIT 1
                 """
             )
+
+    def test_first_generation_prepare_is_non_authorizing_until_real_receipt_promotion(self) -> None:
+        inventory, outbox_id = self.prepare()
+        self.assertIsNone(self.store.connection.execute("SELECT * FROM routing_deprecation_current").fetchone())
+        self.assertEqual("HOLD", self.readiness(inventory)["phase"])
+        with self.assertRaisesRegex(CoordinationError, "RECEIPT_INCOMPLETE"):
+            row = self.store.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchone()
+            self.store.promote_routing_deprecation_inventory(repository=REPOSITORY, generation=1,
+                inventory_sha256=inventory["inventory_sha256"], expected_prior_generation=None,
+                expected_preview_sha256=row["preview_sha256"], remote_receipt_body=published_receipt_body(inventory),
+                now="2026-08-24T09:00:03Z")
+        self.complete_outbox(outbox_id)
+        self.assertEqual(1, self.store.connection.execute("SELECT generation FROM routing_deprecation_current").fetchone()[0])
+        self.assertEqual("comment:555", self.store.connection.execute("SELECT remote_receipt FROM routing_deprecation_promotions").fetchone()[0])
+
+    def test_exact_promotion_replay_revalidates_corrupt_outbox_state_and_receipt(self) -> None:
+        for column, value in (("state", "'PREPARED'"), ("remote_receipt", "'comment:999'")):
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                inventory, outbox_id = case.prepare(); case.complete_outbox(outbox_id)
+                row = case.store.connection.execute("SELECT * FROM routing_deprecation_inventories").fetchone()
+                before = ([tuple(item) for item in case.store.connection.execute("SELECT * FROM routing_deprecation_current")], [tuple(item) for item in case.store.connection.execute("SELECT * FROM routing_deprecation_promotions")])
+                case.store.connection.execute(f"UPDATE github_outbox SET {column}={value} WHERE id=?", (outbox_id,)); case.store.connection.commit()
+                with self.subTest(column=column), self.assertRaisesRegex(CoordinationError, "RECEIPT_INCOMPLETE|PROMOTION_CONFLICT"):
+                    case.store.promote_routing_deprecation_inventory(repository=REPOSITORY, generation=1,
+                        inventory_sha256=inventory["inventory_sha256"], expected_prior_generation=None,
+                        expected_preview_sha256=row["preview_sha256"], remote_receipt_body=published_receipt_body(inventory),
+                        now="2026-08-24T09:00:05Z")
+                after = ([tuple(item) for item in case.store.connection.execute("SELECT * FROM routing_deprecation_current")], [tuple(item) for item in case.store.connection.execute("SELECT * FROM routing_deprecation_promotions")])
+                self.assertEqual(before, after)
+            finally:
+                case.tearDown()
+
+    def test_archive_validates_intact_multigeneration_history(self) -> None:
+        second = self.promoted_second_generation()
+        self.assertEqual("PASS", self.readiness(second)["phase"])
+
+    def test_archive_holds_each_historic_promotion_preview_and_outbox_corruption(self) -> None:
+        cases = {
+            "prior_generation": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET prior_generation=99 WHERE generation=1"),
+            "inventory_preview": ("DROP TRIGGER routing_deprecation_inventory_immutable_update", "UPDATE routing_deprecation_inventories SET preview_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE generation=1"),
+            "promotion_preview": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET preview_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE generation=1"),
+            "promotion_receipt": ("DROP TRIGGER routing_deprecation_promotion_immutable_update", "UPDATE routing_deprecation_promotions SET remote_receipt='comment:999' WHERE generation=1"),
+            "outbox_state": (None, "UPDATE github_outbox SET state='PREPARED' WHERE id=(SELECT outbox_id FROM routing_deprecation_inventories WHERE generation=1)"),
+            "outbox_receipt": (None, "UPDATE github_outbox SET remote_receipt='comment:999' WHERE id=(SELECT outbox_id FROM routing_deprecation_inventories WHERE generation=1)"),
+            "outbox_payload": ("DROP TRIGGER routing_deprecation_outbox_envelope_immutable", "UPDATE github_outbox SET payload_json='{}' WHERE id=(SELECT outbox_id FROM routing_deprecation_inventories WHERE generation=1)"),
+            "outbox_idempotency": ("DROP TRIGGER routing_deprecation_outbox_envelope_immutable", "UPDATE github_outbox SET idempotency_key='changed' WHERE id=(SELECT outbox_id FROM routing_deprecation_inventories WHERE generation=1)"),
+            "outbox_source": ("DROP TRIGGER routing_deprecation_outbox_envelope_immutable", "UPDATE github_outbox SET expected_source_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE id=(SELECT outbox_id FROM routing_deprecation_inventories WHERE generation=1)"),
+        }
+        for name, (setup_sql, mutation_sql) in cases.items():
+            case = RoutingInventoryStoreTests()
+            case.setUp()
+            try:
+                second = case.promoted_second_generation()
+                if setup_sql:
+                    case.store.connection.execute(setup_sql)
+                case.store.connection.execute(mutation_sql)
+                case.store.connection.commit()
+                with self.subTest(name=name):
+                    self.assertEqual("HOLD", case.readiness(second)["phase"])
+            finally:
+                case.tearDown()
 
     def test_successor_prepare_is_non_authorizing_then_exact_promotion_is_idempotent(self) -> None:
         first, first_outbox = self.prepare()
@@ -662,7 +754,8 @@ class RoutingInventoryStoreTests(unittest.TestCase):
         self.assertEqual(before, self.legacy_database_fingerprint())
 
     def test_two_successor_prepares_have_one_winner_and_no_orphan_outbox(self) -> None:
-        self.prepare()
+        _, first_outbox = self.prepare()
+        self.complete_outbox(first_outbox)
         def install_candidate(body: str, stamp: str):
             self.store.ingest_snapshot(repository=REPOSITORY, object_kind="issue", object_number=179,
                 payload={"number": 179, "body": body, "updated_at": UPDATED},
