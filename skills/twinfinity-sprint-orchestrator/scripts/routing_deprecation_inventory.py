@@ -45,6 +45,14 @@ class InventoryError(RuntimeError):
     pass
 
 
+def _unicode_scalar_text(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class AliasArtifact:
     aliases: dict[str, str]
@@ -206,7 +214,7 @@ def github_comment_reader(repository: str, issue_number: int, comment_id: int) -
         raise InventoryError("GITHUB_COMMENT_RESPONSE_INVALID") from exc
     expected_issue_url = f"https://api.github.com/repos/{repository}/issues/{issue_number}"
     if (type(value) is not dict or value.get("id") != comment_id
-            or type(value.get("body")) is not str
+            or type(value.get("body")) is not str or not _unicode_scalar_text(value["body"])
             or value.get("issue_url") != expected_issue_url):
         raise InventoryError("GITHUB_COMMENT_RESPONSE_INVALID")
     return value
@@ -258,7 +266,9 @@ def _scan_connection(kind: str, page_reader: PageReader) -> list[dict[str, Any]]
                 or number <= 0
                 or not isinstance(node_id, str)
                 or not node_id
+                or not _unicode_scalar_text(node_id)
                 or not isinstance(body, str)
+                or not _unicode_scalar_text(body)
                 or not _valid_timestamp(updated_at)
             ):
                 raise InventoryError("GITHUB_INVENTORY_OBJECT_INVALID")

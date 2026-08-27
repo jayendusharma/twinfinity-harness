@@ -366,8 +366,16 @@ ROUTING_PROMOTIONS_TABLE_SQL = """CREATE TABLE routing_deprecation_promotions (
 
 
 def _normalized_schema_sql(value: str | None) -> str:
-    compact = " ".join((value or "").split()).lower().rstrip(";")
-    return re.sub(r"\s*([(),;=<>])\s*", r"\1", compact)
+    literals: list[str] = []
+    def preserve(match: re.Match[str]) -> str:
+        literals.append(match.group(0))
+        return f"__routing_literal_{len(literals) - 1}__"
+    protected = re.sub(r"'(?:''|[^'])*'", preserve, value or "")
+    compact = " ".join(protected.split()).lower().rstrip(";")
+    compact = re.sub(r"\s*([(),;=<>])\s*", r"\1", compact)
+    for index, literal in enumerate(literals):
+        compact = compact.replace(f"__routing_literal_{index}__", literal)
+    return compact
 
 STRUCTURED_LEASE_REQUIRED_KEYS = {
     "repository",
@@ -1447,9 +1455,30 @@ class CoordinationStore:
         routing_names = {row[0] for row in self.connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'routing_deprecation_%'"
         )}
+        routing_trigger_names = {row[0] for row in self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'routing_deprecation_%'"
+        )}
         inventory_columns = {row[1] for row in self.connection.execute(
             "PRAGMA table_info(routing_deprecation_inventories)"
         )}
+        if ("routing_deprecation_inventories" not in routing_names
+                and (routing_names or routing_trigger_names)):
+            raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
+        if "routing_deprecation_inventories" in routing_names and "generation" not in inventory_columns:
+            expected_legacy_tables = {"routing_deprecation_inventories", "routing_deprecation_occurrences", "routing_deprecation_current", "routing_deprecation_promotions"}
+            expected_legacy_triggers = {
+                "routing_deprecation_inventory_immutable_update", "routing_deprecation_inventory_immutable_delete",
+                "routing_deprecation_current_no_delete", "routing_deprecation_current_monotonic",
+                "routing_deprecation_promotion_immutable_update", "routing_deprecation_promotion_immutable_delete",
+                "routing_deprecation_occurrence_immutable_update", "routing_deprecation_occurrence_immutable_delete",
+                "routing_deprecation_occurrence_append_fenced", "routing_deprecation_outbox_envelope_immutable",
+            }
+            legacy_inventory_columns = tuple(row[1] for row in self.connection.execute("PRAGMA table_info(routing_deprecation_inventories)"))
+            legacy_occurrence_columns = tuple(row[1] for row in self.connection.execute("PRAGMA table_info(routing_deprecation_occurrences)"))
+            if (routing_names != expected_legacy_tables or routing_trigger_names != expected_legacy_triggers
+                    or legacy_inventory_columns != ("inventory_sha256","repository","kind","alias_source_sha256","endpoint_state_sha256","issue_179_source_sha256","object_manifest_sha256","occurrence_manifest_sha256","object_manifest_json","object_count","issue_count","pull_request_count","occurrence_count","classification_counts_json","semantic_tag_counts_json","outbox_id","state","created_at")
+                    or legacy_occurrence_columns != ("inventory_sha256","ordinal","object_kind","object_number","node_id","object_updated_at","body_sha256","alias","byte_start","byte_end","line_number","byte_column","classification","semantic_tags_json")):
+                raise CoordinationError("ROUTING_DEPRECATION_SCHEMA_INVALID")
         if "generation" in inventory_columns:
             expected_tables = {
                 "routing_deprecation_inventories": _normalized_schema_sql(ROUTING_INVENTORIES_TABLE_SQL),
@@ -1461,19 +1490,19 @@ class CoordinationStore:
                 "SELECT name,sql FROM sqlite_master WHERE type='table' AND name LIKE 'routing_deprecation_%'"
             )}
             expected_triggers = {
-                'routing_deprecation_current_monotonic': "create trigger routing_deprecation_current_monotonic before update on routing_deprecation_current when new.repository !=old.repository or new.generation !=old.generation + 1 or new.version !=old.version + 1 begin select raise(abort,'routing_deprecation_current_cas_invalid');end",
-                'routing_deprecation_current_no_delete': "create trigger routing_deprecation_current_no_delete before delete on routing_deprecation_current begin select raise(abort,'routing_deprecation_current_immutable');end",
-                'routing_deprecation_inventory_immutable_delete': "create trigger routing_deprecation_inventory_immutable_delete before delete on routing_deprecation_inventories begin select raise(abort,'routing_deprecation_inventory_immutable');end",
-                'routing_deprecation_inventory_immutable_update': "create trigger routing_deprecation_inventory_immutable_update before update on routing_deprecation_inventories begin select raise(abort,'routing_deprecation_inventory_immutable');end",
-                'routing_deprecation_occurrence_append_fenced': "create trigger routing_deprecation_occurrence_append_fenced before insert on routing_deprecation_occurrences when(select count(*)from routing_deprecation_occurrences where inventory_sha256=new.inventory_sha256)>=(select occurrence_count from routing_deprecation_inventories where inventory_sha256=new.inventory_sha256)begin select raise(abort,'routing_deprecation_occurrence_immutable');end",
-                'routing_deprecation_occurrence_immutable_delete': "create trigger routing_deprecation_occurrence_immutable_delete before delete on routing_deprecation_occurrences begin select raise(abort,'routing_deprecation_occurrence_immutable');end",
-                'routing_deprecation_occurrence_immutable_update': "create trigger routing_deprecation_occurrence_immutable_update before update on routing_deprecation_occurrences begin select raise(abort,'routing_deprecation_occurrence_immutable');end",
-                'routing_deprecation_outbox_envelope_immutable': "create trigger routing_deprecation_outbox_envelope_immutable before update of idempotency_key,repository,object_kind,object_number,operation,expected_source_sha256,payload_sha256,payload_json,created_at on github_outbox when exists(select 1 from routing_deprecation_inventories where outbox_id=old.id)begin select raise(abort,'routing_deprecation_outbox_immutable');end",
-                'routing_deprecation_promotion_immutable_delete': "create trigger routing_deprecation_promotion_immutable_delete before delete on routing_deprecation_promotions begin select raise(abort,'routing_deprecation_promotion_immutable');end",
-                'routing_deprecation_promotion_immutable_update': "create trigger routing_deprecation_promotion_immutable_update before update on routing_deprecation_promotions begin select raise(abort,'routing_deprecation_promotion_immutable');end",
+                'routing_deprecation_current_monotonic': "create trigger routing_deprecation_current_monotonic before update on routing_deprecation_current when new.repository !=old.repository or new.generation !=old.generation + 1 or new.version !=old.version + 1 begin select raise(abort,'ROUTING_DEPRECATION_CURRENT_CAS_INVALID');end",
+                'routing_deprecation_current_no_delete': "create trigger routing_deprecation_current_no_delete before delete on routing_deprecation_current begin select raise(abort,'ROUTING_DEPRECATION_CURRENT_IMMUTABLE');end",
+                'routing_deprecation_inventory_immutable_delete': "create trigger routing_deprecation_inventory_immutable_delete before delete on routing_deprecation_inventories begin select raise(abort,'ROUTING_DEPRECATION_INVENTORY_IMMUTABLE');end",
+                'routing_deprecation_inventory_immutable_update': "create trigger routing_deprecation_inventory_immutable_update before update on routing_deprecation_inventories begin select raise(abort,'ROUTING_DEPRECATION_INVENTORY_IMMUTABLE');end",
+                'routing_deprecation_occurrence_append_fenced': "create trigger routing_deprecation_occurrence_append_fenced before insert on routing_deprecation_occurrences when(select count(*)from routing_deprecation_occurrences where inventory_sha256=new.inventory_sha256)>=(select occurrence_count from routing_deprecation_inventories where inventory_sha256=new.inventory_sha256)begin select raise(abort,'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE');end",
+                'routing_deprecation_occurrence_immutable_delete': "create trigger routing_deprecation_occurrence_immutable_delete before delete on routing_deprecation_occurrences begin select raise(abort,'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE');end",
+                'routing_deprecation_occurrence_immutable_update': "create trigger routing_deprecation_occurrence_immutable_update before update on routing_deprecation_occurrences begin select raise(abort,'ROUTING_DEPRECATION_OCCURRENCE_IMMUTABLE');end",
+                'routing_deprecation_outbox_envelope_immutable': "create trigger routing_deprecation_outbox_envelope_immutable before update of idempotency_key,repository,object_kind,object_number,operation,expected_source_sha256,payload_sha256,payload_json,created_at on github_outbox when exists(select 1 from routing_deprecation_inventories where outbox_id=old.id)begin select raise(abort,'ROUTING_DEPRECATION_OUTBOX_IMMUTABLE');end",
+                'routing_deprecation_promotion_immutable_delete': "create trigger routing_deprecation_promotion_immutable_delete before delete on routing_deprecation_promotions begin select raise(abort,'ROUTING_DEPRECATION_PROMOTION_IMMUTABLE');end",
+                'routing_deprecation_promotion_immutable_update': "create trigger routing_deprecation_promotion_immutable_update before update on routing_deprecation_promotions begin select raise(abort,'ROUTING_DEPRECATION_PROMOTION_IMMUTABLE');end",
             }
             actual_triggers = {row[0]: _normalized_schema_sql(row[1]) for row in self.connection.execute(
-                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'routing_deprecation_%'"
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND (name LIKE 'routing_deprecation_%' OR tbl_name IN ('routing_deprecation_inventories','routing_deprecation_occurrences','routing_deprecation_current','routing_deprecation_promotions'))"
             )}
             def index_shapes(table: str) -> set[tuple[Any, ...]]:
                 return {(int(item[2]), item[3], int(item[4]), tuple(row[2] for row in self.connection.execute(f"PRAGMA index_info({item[1]})")))

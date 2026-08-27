@@ -95,6 +95,10 @@ class StaticReader:
 
 
 class RoutingInventoryScanTests(unittest.TestCase):
+    def test_unpaired_surrogate_page_text_is_typed_invalid_object(self) -> None:
+        bad = node("issue", 1, "\ud800")
+        with self.assertRaisesRegex(InventoryError, "GITHUB_INVENTORY_OBJECT_INVALID"):
+            scan_repository(REPOSITORY, {}, StaticReader([bad]))
     def test_none_page_reader_return_is_typed_invalid_page(self) -> None:
         with self.assertRaisesRegex(InventoryError, "GITHUB_INVENTORY_PAGE_INVALID"):
             scan_repository(REPOSITORY, {}, lambda kind, cursor: None)
@@ -852,6 +856,55 @@ class RoutingInventoryStoreTests(unittest.TestCase):
                 raw = sqlite3.connect(path)
                 self.assertEqual(before, list(raw.iterdump()))
                 raw.close()
+
+    def test_preexisting_v2_missing_inventory_table_is_not_misclassified_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            store = CoordinationStore(path); store.close()
+            raw = sqlite3.connect(path)
+            raw.execute("PRAGMA foreign_keys=OFF")
+            raw.execute("DROP TABLE routing_deprecation_inventories")
+            raw.commit(); before = list(raw.iterdump()); raw.close()
+            with self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+                CoordinationStore(path)
+            raw = sqlite3.connect(path)
+            self.assertEqual(before, list(raw.iterdump()))
+            self.assertIsNone(raw.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='routing_deprecation_inventories'").fetchone())
+            raw.close()
+
+    def test_partial_routing_marker_shapes_are_never_classified_fresh(self) -> None:
+        statements = {
+            "current_only": "CREATE TABLE routing_deprecation_current(repository TEXT)",
+            "occurrences_only": "CREATE TABLE routing_deprecation_occurrences(inventory_sha256 TEXT)",
+            "promotions_only": "CREATE TABLE routing_deprecation_promotions(repository TEXT)",
+            "legacy_inventory_only": "CREATE TABLE routing_deprecation_inventories(inventory_sha256 TEXT PRIMARY KEY, repository TEXT)",
+        }
+        for name, statement in statements.items():
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "state.sqlite3"
+                raw = sqlite3.connect(path); raw.execute(statement); raw.commit()
+                before = list(raw.iterdump()); raw.close(); path.chmod(0o600)
+                with self.subTest(name=name), self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+                    CoordinationStore(path)
+                raw = sqlite3.connect(path); self.assertEqual(before, list(raw.iterdump())); raw.close()
+
+    def test_v2_extra_trigger_and_lowercase_check_literal_hold_zero_write(self) -> None:
+        for name in ("extra_trigger", "lowercase_literal"):
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "state.sqlite3"
+                store = CoordinationStore(path); store.close()
+                raw = sqlite3.connect(path)
+                if name == "extra_trigger":
+                    raw.execute("CREATE TRIGGER arbitrary_behavior BEFORE INSERT ON routing_deprecation_current BEGIN SELECT RAISE(ABORT,'EXTRA'); END")
+                else:
+                    raw.execute("PRAGMA writable_schema=ON")
+                    sql = raw.execute("SELECT sql FROM sqlite_master WHERE name='routing_deprecation_inventories'").fetchone()[0]
+                    raw.execute("UPDATE sqlite_master SET sql=? WHERE name='routing_deprecation_inventories'", (sql.replace("TWINFINITY_ROUTING_DEPRECATION_INVENTORY_V1", "twinfinity_routing_deprecation_inventory_v1"),))
+                    raw.execute("PRAGMA writable_schema=OFF")
+                raw.commit(); before = list(raw.iterdump()); raw.close()
+                with self.subTest(name=name), self.assertRaisesRegex(CoordinationError, "ROUTING_DEPRECATION_SCHEMA_INVALID"):
+                    CoordinationStore(path)
+                raw = sqlite3.connect(path); self.assertEqual(before, list(raw.iterdump())); raw.close()
 
     def test_archive_main_derives_reader_from_exact_current_for_one_or_many_generations(self) -> None:
         for generations in (1, 2):
