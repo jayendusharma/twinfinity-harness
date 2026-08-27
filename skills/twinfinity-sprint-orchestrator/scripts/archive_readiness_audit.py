@@ -1372,14 +1372,29 @@ def main() -> int:
     connection: sqlite3.Connection | None = None
     try:
         connection = open_registry_database(DEFAULT_DATABASE, read_only=True)
-        inventory = (
-            connection.execute(
-                "SELECT repository FROM routing_deprecation_inventories"
+        repository = ""
+        if (_table_exists(connection, "routing_deprecation_inventories")
+                and _table_exists(connection, "routing_deprecation_current")):
+            current_count = connection.execute(
+                "SELECT COUNT(*) FROM routing_deprecation_current"
+            ).fetchone()[0]
+            rows = connection.execute(
+                """
+                SELECT current.repository,current.generation,current.version
+                FROM routing_deprecation_current AS current
+                JOIN routing_deprecation_inventories AS inventory
+                  ON inventory.inventory_sha256=current.inventory_sha256
+                 AND inventory.repository=current.repository
+                 AND inventory.generation=current.generation
+                """
             ).fetchall()
-            if _table_exists(connection, "routing_deprecation_inventories")
-            else []
-        )
-        repository = str(inventory[0]["repository"]) if len(inventory) == 1 else ""
+            if (current_count == 1 and len(rows) == 1
+                    and type(rows[0]["repository"]) is str
+                    and type(rows[0]["generation"]) is int
+                    and type(rows[0]["version"]) is int
+                    and rows[0]["generation"] >= 1
+                    and rows[0]["version"] == rows[0]["generation"]):
+                repository = rows[0]["repository"]
         result = archive_readiness(
             connection,
             routing_page_reader=(github_page_reader(repository) if repository else None),

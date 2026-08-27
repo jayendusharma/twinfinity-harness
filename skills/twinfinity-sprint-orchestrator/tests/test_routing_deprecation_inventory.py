@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import archive_readiness_audit as archive_module  # noqa: E402
 from archive_readiness_audit import archive_readiness, github_comment_reader as archive_comment_reader  # noqa: E402
 from coordination_store import (  # noqa: E402
     CoordinationError,
@@ -759,6 +760,52 @@ class RoutingInventoryStoreTests(unittest.TestCase):
     def test_archive_validates_intact_multigeneration_history(self) -> None:
         second = self.promoted_second_generation()
         self.assertEqual("PASS", self.readiness(second)["phase"])
+
+    def test_archive_main_derives_reader_from_exact_current_for_one_or_many_generations(self) -> None:
+        for generations in (1, 2):
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                if generations == 1:
+                    _, outbox = case.prepare(); case.complete_outbox(outbox)
+                else:
+                    case.promoted_second_generation()
+                marker = object()
+                with patch.object(archive_module, "open_registry_database", return_value=case.store.connection), \
+                     patch.object(archive_module, "github_page_reader", return_value=marker) as reader, \
+                     patch.object(archive_module, "archive_readiness", return_value={"phase": "PASS"}) as audit, \
+                     patch.object(sys, "argv", ["archive_readiness_audit.py"]), \
+                     patch("builtins.print"):
+                    self.assertEqual(0, archive_module.main())
+                reader.assert_called_once_with(REPOSITORY)
+                self.assertIs(audit.call_args.kwargs["routing_page_reader"], marker)
+                case.store.connection = sqlite3.connect(":memory:")
+            finally: case.tearDown()
+
+    def test_archive_main_never_guesses_reader_from_missing_or_mismatched_current(self) -> None:
+        for mismatch in (False, True):
+            case = RoutingInventoryStoreTests(); case.setUp()
+            try:
+                _, outbox = case.prepare(); case.complete_outbox(outbox)
+                if mismatch:
+                    case.store.connection.execute("PRAGMA foreign_keys=OFF")
+                    case.store.connection.execute("DROP TRIGGER routing_deprecation_current_monotonic")
+                    case.store.connection.execute("UPDATE routing_deprecation_current SET inventory_sha256=?", ("f" * 64,))
+                else:
+                    case.store.connection.execute("DROP TRIGGER routing_deprecation_promotion_immutable_delete")
+                    case.store.connection.execute("DROP TRIGGER routing_deprecation_current_no_delete")
+                    case.store.connection.execute("DELETE FROM routing_deprecation_promotions")
+                    case.store.connection.execute("DELETE FROM routing_deprecation_current")
+                case.store.connection.commit()
+                with patch.object(archive_module, "open_registry_database", return_value=case.store.connection), \
+                     patch.object(archive_module, "github_page_reader") as reader, \
+                     patch.object(archive_module, "archive_readiness", return_value={"phase": "HOLD"}) as audit, \
+                     patch.object(sys, "argv", ["archive_readiness_audit.py"]), \
+                     patch("builtins.print"):
+                    self.assertEqual(1, archive_module.main())
+                reader.assert_not_called()
+                self.assertIsNone(audit.call_args.kwargs["routing_page_reader"])
+                case.store.connection = sqlite3.connect(":memory:")
+            finally: case.tearDown()
 
     def test_archive_holds_each_historic_promotion_preview_and_outbox_corruption(self) -> None:
         cases = {
