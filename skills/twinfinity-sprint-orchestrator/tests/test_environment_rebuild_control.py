@@ -19,6 +19,7 @@ from environment_rebuild_control import (  # noqa: E402
     _capture,
     _exact_environment,
     _private_root,
+    _validate_controller_contract,
     _validate_git_lineage,
     validate_packet,
 )
@@ -26,6 +27,36 @@ from coordination_store import digest_json  # noqa: E402
 
 
 class EnvironmentRebuildControlTests(unittest.TestCase):
+    def test_controller_contract_binds_repository_delivery_policy(self) -> None:
+        paths = {
+            "coordination_store_sha256": SCRIPTS / "coordination_store.py",
+            "coordination_supervisor_sha256": SCRIPTS / "coordination_supervisor.py",
+            "environment_rebuild_control_sha256": (
+                SCRIPTS / "environment_rebuild_control.py"
+            ),
+            "prepush_control_sha256": SCRIPTS / "prepush_control.py",
+            "repository_delivery_policy_sha256": (
+                SCRIPTS / "repository_delivery_policy.py"
+            ),
+        }
+        contract = {
+            field: hashlib.sha256(path.read_bytes()).hexdigest()
+            for field, path in paths.items()
+        }
+        _validate_controller_contract({"controller_contract": contract})
+
+        with self.assertRaisesRegex(
+            EnvironmentRebuildError, "CONTROLLER_CONTRACT_DRIFT"
+        ):
+            _validate_controller_contract(
+                {
+                    "controller_contract": {
+                        **contract,
+                        "repository_delivery_policy_sha256": "0" * 64,
+                    }
+                }
+            )
+
     def test_packet_digest_and_installer_environment_are_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             contract = {
