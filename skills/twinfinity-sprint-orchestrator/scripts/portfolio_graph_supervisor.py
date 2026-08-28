@@ -12,7 +12,12 @@ import sys
 from typing import Any
 
 from coordination_store import CoordinationStore, DEFAULT_DATABASE, canonical_json
+from kanban_make_ready import sweep as sweep_make_ready
 from kanban_pull_buffer import PullBufferError, audit_pull_buffer
+from kanban_readiness import (
+    MAX_PARALLEL_CANDIDATES,
+    dispatch as dispatch_readiness,
+)
 from portfolio_convergence import (
     DEFAULT_CONVERGENCE_LIMIT,
     MAX_CONVERGENCE_LIMIT,
@@ -112,7 +117,7 @@ def supervise(
             database=database,
             store=store,
         )
-        return {
+        phase_a = {
             "repository": repository,
             "graph_version": decision["graph_version"],
             "capacity_policy_version": decision["capacity_policy_version"],
@@ -124,6 +129,37 @@ def supervise(
             "portfolio_convergence": convergence,
             "refresh_count": len((refresh_result or {}).get("refreshed", [])),
         }
+        readiness_dispatch = None
+        try:
+            phase_b_now = utc_now()
+            readiness_dispatch = dispatch_readiness(
+                store,
+                repository,
+                max_parallel=MAX_PARALLEL_CANDIDATES,
+                now=phase_b_now,
+            )
+            make_ready = sweep_make_ready(
+                store,
+                repository,
+                max_candidates=int(readiness_dispatch["available_after"]),
+                now=phase_b_now,
+                audit_invalid=list(pull_buffer.get("invalid", [])),
+            )
+            phase_b = {
+                "state": (
+                    "HOLD" if make_ready["state"] == "HOLD" else "COMPLETE"
+                ),
+                "readiness_dispatch": readiness_dispatch,
+                "make_ready": make_ready,
+            }
+        except Exception:
+            phase_b = {
+                "state": "HOLD",
+                "error": "KANBAN_PHASE_B_FAILED",
+            }
+            if readiness_dispatch is not None:
+                phase_b["readiness_dispatch"] = readiness_dispatch
+        return {**phase_a, "kanban_phase_b": phase_b}
     finally:
         store.close()
 
