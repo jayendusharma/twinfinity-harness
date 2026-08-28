@@ -77,6 +77,12 @@ unit_names = {
 }
 unit_prefix = ".config/systemd/user/"
 observed_units: set[str] = set()
+required_entrypoints = {
+    ".codex/skills/twinfinity-sprint-orchestrator/scripts/coordination_supervisor.py",
+    ".codex/skills/twinfinity-sprint-orchestrator/scripts/hosted_operation_control.py",
+    ".codex/skills/twinfinity-sprint-orchestrator/scripts/portfolio_graph_supervisor.py",
+}
+observed_destinations: set[str] = set()
 for entry in entries:
     source = atom._safe_file(source_root, atom._relative(entry["source_path"]))
     installed = atom._safe_file(destination_root, atom._relative(entry["destination_path"]))
@@ -90,10 +96,13 @@ for entry in entries:
     ):
         raise SystemExit("START_INSTALLED_SOURCE_DRIFT")
     destination = entry["destination_path"]
+    observed_destinations.add(destination)
     if destination.startswith(unit_prefix):
         observed_units.add(destination.removeprefix(unit_prefix))
 if observed_units != unit_names:
     raise SystemExit("START_UNIT_INVENTORY_DRIFT")
+if not required_entrypoints.issubset(observed_destinations):
+    raise SystemExit("START_ENTRYPOINT_INVENTORY_DRIFT")
 
 skill_root = destination_root / ".codex/skills/twinfinity-sprint-orchestrator"
 registry_path = skill_root / "references/twinfinity-executor-registry.toml"

@@ -64,8 +64,12 @@ class OperatorLifecycleTests(unittest.TestCase):
                   echo disabled
                   exit 1
                 fi
-                if [[ " $* " == *" list-units "* && "${FAKE_ACTIVE_EXECUTOR:-0}" == 1 ]]; then
-                  echo 'twinfinity-role-executor-development-message-19.service loaded active running'
+                if [[ " $* " == *" list-units "* ]]; then
+                  if [[ "${FAKE_ACTIVE_EXECUTOR:-0}" == 1 ]]; then
+                    echo 'twinfinity-role-executor-development-message-19.service loaded active running'
+                  elif [[ "${FAKE_DEACTIVATING_EXECUTOR:-0}" == 1 && " $* " == *" --state=activating,active,reloading,deactivating "* ]]; then
+                    echo 'twinfinity-role-executor-development-message-19.service loaded deactivating stop-sigterm'
+                  fi
                 fi
                 exit 0
                 """
@@ -85,6 +89,12 @@ class OperatorLifecycleTests(unittest.TestCase):
         references.mkdir(parents=True)
         units.mkdir(parents=True)
         shutil.copy2(SKILL_ROOT / "scripts/source_install_atom.py", scripts)
+        for entrypoint in (
+            "coordination_supervisor.py",
+            "hosted_operation_control.py",
+            "portfolio_graph_supervisor.py",
+        ):
+            shutil.copy2(SKILL_ROOT / "scripts" / entrypoint, scripts / entrypoint)
 
         role_versions = {"planner": 12, "development": 17, "sre": 23}
         registry_lines = ["schema_version = 2", "staged_endpoints = []", ""]
@@ -161,6 +171,17 @@ class OperatorLifecycleTests(unittest.TestCase):
                 ".codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml",
             ),
         ]
+        mappings.extend(
+            (
+                f"skills/twinfinity-sprint-orchestrator/scripts/{entrypoint}",
+                f".codex/skills/twinfinity-sprint-orchestrator/scripts/{entrypoint}",
+            )
+            for entrypoint in (
+                "coordination_supervisor.py",
+                "hosted_operation_control.py",
+                "portfolio_graph_supervisor.py",
+            )
+        )
         mappings.extend(
             (
                 f"skills/twinfinity-sprint-orchestrator/references/{profile}",
@@ -303,6 +324,27 @@ class OperatorLifecycleTests(unittest.TestCase):
         lines = self.systemctl_log.read_text(encoding="utf-8").splitlines()
         self.assertFalse(any("daemon-reload" in line or " start " in f" {line} " for line in lines))
 
+    def test_start_rejects_manifest_missing_supervisor_entrypoint(self) -> None:
+        self._install()
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        missing = (
+            ".codex/skills/twinfinity-sprint-orchestrator/scripts/"
+            "coordination_supervisor.py"
+        )
+        manifest["entries"] = [
+            entry
+            for entry in manifest["entries"]
+            if entry["destination_path"] != missing
+        ]
+        manifest["manifest_sha256"] = atom.manifest_digest(manifest)
+        self.manifest.write_text(atom.canonical_json(manifest), encoding="utf-8")
+
+        result = self._start()
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("START_ENTRYPOINT_INVENTORY_DRIFT", result.stderr)
+        self.assertFalse(self.systemctl_log.exists())
+
     def test_stop_quiesces_before_observation_and_never_kills_live_executor(self) -> None:
         result = self._stop(FAKE_ACTIVE_EXECUTOR="1")
         self.assertNotEqual(0, result.returncode)
@@ -311,6 +353,16 @@ class OperatorLifecycleTests(unittest.TestCase):
         self.assertIn(".timer", lines[0])
         self.assertIn(".service", lines[1])
         self.assertIn("list-units", lines[2])
+        self.assertFalse(any("kill" in line for line in lines))
+
+    def test_stop_treats_deactivating_executor_as_still_draining(self) -> None:
+        result = self._stop(FAKE_DEACTIVATING_EXECUTOR="1")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('"executors_active":true', result.stderr)
+        lines = self.systemctl_log.read_text(encoding="utf-8").splitlines()
+        self.assertIn(
+            "--state=activating,active,reloading,deactivating", lines[-1]
+        )
         self.assertFalse(any("kill" in line for line in lines))
 
     def test_repeated_stop_is_idempotent_when_no_executor_is_active(self) -> None:

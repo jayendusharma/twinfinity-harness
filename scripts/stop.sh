@@ -53,7 +53,7 @@ deadline=$((SECONDS + wait_seconds))
 while true; do
   if ! active_units=$("$systemctl_command" --user list-units \
     --type=service \
-    --state=activating,active,reloading \
+    --state=activating,active,reloading,deactivating \
     --plain \
     --no-legend \
     --no-pager \
