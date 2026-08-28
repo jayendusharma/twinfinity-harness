@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -21,6 +21,83 @@ NEW_MAIN = "2" * 40
 
 
 class PortfolioGraphSupervisorCliTests(unittest.TestCase):
+    def _run_mocked_supervisor(self, *, fail_dispatch: bool = False):
+        store = MagicMock()
+        current = {
+            "version": 1,
+            "observed_main_sha": NEW_MAIN,
+            "health": "CURRENT",
+            "last_error": None,
+        }
+        store.connection.execute.return_value.fetchone.return_value = current
+        decision = {
+            "graph_version": 1,
+            "capacity_policy_version": 1,
+            "selected": [],
+            "skipped": [],
+            "remaining_capacity": {"development": 5, "shared": 2, "sre": 5},
+        }
+        pull_buffer = {"audit_sha256": "a" * 64}
+        call_order = []
+
+        def dispatch_side_effect(*args, **kwargs):
+            call_order.append(("dispatch", kwargs["max_parallel"]))
+            if fail_dispatch:
+                raise RuntimeError("injected Phase B failure")
+            return {
+                "active_before": 0,
+                "dispatched": [{"issue_number": 1, "message_id": 6}],
+                "stale": [],
+                "available_after": 1,
+            }
+
+        def sweep_side_effect(*args, **kwargs):
+            call_order.append(("sweep", kwargs["max_candidates"]))
+            return {
+                "state": "COMPLETE",
+                "planned": [{"issue_number": 2, "message_id": 7}],
+                "skipped": [],
+                "available_after": 0,
+            }
+
+        convergence = MagicMock()
+        convergence.consume_due.return_value = []
+        with patch.object(
+            portfolio_graph_supervisor,
+            "CoordinationStore",
+            return_value=store,
+        ), patch.object(
+            portfolio_graph_supervisor,
+            "PortfolioConvergence",
+            return_value=convergence,
+        ), patch.object(
+            portfolio_graph_supervisor,
+            "evaluate_graph",
+            return_value={"health": "CURRENT", "stale_reasons": []},
+        ), patch.object(
+            portfolio_graph_supervisor,
+            "schedule",
+            return_value=decision,
+        ), patch.object(
+            portfolio_graph_supervisor,
+            "audit_pull_buffer",
+            return_value=pull_buffer,
+        ), patch.object(
+            portfolio_graph_supervisor,
+            "dispatch_readiness",
+            side_effect=dispatch_side_effect,
+        ), patch.object(
+            portfolio_graph_supervisor,
+            "sweep_make_ready",
+            side_effect=sweep_side_effect,
+        ):
+            result = portfolio_graph_supervisor.supervise(
+                REPOSITORY,
+                database=Path("/tmp/unused-mocked-state.sqlite3"),
+                refresh=False,
+            )
+        return result, call_order
+
     def test_production_cli_rejects_database_override(self) -> None:
         with patch.object(
             sys,
@@ -167,6 +244,42 @@ class PortfolioGraphSupervisorCliTests(unittest.TestCase):
                 [("evaluate", NEW_MAIN), ("schedule", NEW_MAIN)], observed_cursors
             )
             self.assertEqual("SCHEDULED", result["state"])
+
+    def test_pending_readiness_consumes_slots_before_make_ready(self) -> None:
+        result, call_order = self._run_mocked_supervisor()
+
+        self.assertEqual([("dispatch", 2), ("sweep", 1)], call_order)
+        self.assertEqual("SCHEDULED", result["state"])
+        self.assertEqual("COMPLETE", result["kanban_phase_b"]["state"])
+        self.assertEqual(
+            1,
+            result["kanban_phase_b"]["readiness_dispatch"]["available_after"],
+        )
+
+    def test_phase_b_failure_preserves_phase_a_result(self) -> None:
+        result, call_order = self._run_mocked_supervisor(fail_dispatch=True)
+        expected_phase_a = {
+            "repository": REPOSITORY,
+            "graph_version": 1,
+            "capacity_policy_version": 1,
+            "state": "SCHEDULED",
+            "selected": [],
+            "skipped": [],
+            "remaining_capacity": {"development": 5, "shared": 2, "sre": 5},
+            "pull_buffer": {"audit_sha256": "a" * 64},
+            "portfolio_convergence": [],
+            "refresh_count": 0,
+        }
+
+        self.assertEqual([("dispatch", 2)], call_order)
+        self.assertEqual(
+            expected_phase_a,
+            {key: result[key] for key in expected_phase_a},
+        )
+        self.assertEqual(
+            {"state": "HOLD", "error": "KANBAN_PHASE_B_FAILED"},
+            result["kanban_phase_b"],
+        )
 
 
 if __name__ == "__main__":
