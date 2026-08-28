@@ -1204,7 +1204,11 @@ class CoordinationSupervisorTests(unittest.TestCase):
         result = self.supervisor.run_once("2026-08-22T10:20:06Z")
         repeated = self.supervisor.run_once("2026-08-22T10:20:07Z")
 
-        self.assertEqual("RETRY", result["portfolio_convergence"][0]["state"])
+        self.assertEqual("HOLD", result["portfolio_convergence"][0]["state"])
+        self.assertEqual(
+            "REPOSITORY_GIT_REGISTRATION_MISSING",
+            result["portfolio_convergence"][0]["error"],
+        )
         self.assertEqual([], self.launches)
         self.assertEqual([], repeated["portfolio_convergence"])
         self.assertEqual(

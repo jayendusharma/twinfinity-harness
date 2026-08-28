@@ -290,7 +290,14 @@ def finalize_canonical_ready_candidate(
         ],
         now=now,
     )
-    finalized = finalize_ready(store, ready_path, now=now)
+    finalized = finalize_ready(
+        store,
+        ready_path,
+        now=now,
+        canonical_main_reader=lambda _repository: prepared_packet[
+            "accepted_main_at_preparation"
+        ],
+    )
     current_item = dict(
         store.connection.execute(
             "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",

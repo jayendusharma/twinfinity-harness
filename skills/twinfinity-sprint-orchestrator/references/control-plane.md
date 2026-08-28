@@ -62,6 +62,7 @@ The coordination root must be an owner-owned nonsymlink directory with mode `070
 - `portfolio_convergence.py`: dirty-event consumption and atomic selection of an already-reviewed READY candidate.
 - `approval_ledger.py`: immutable material proposals, user decisions, revocations, recipient deliveries, and effectivity guards.
 - `prepush_control.py`: repository-derived exact-head gate receipt, guarded-publication reservation, and push readback. Existing lower/Compose receipt slots remain compatibility fields for repository-specific profiles.
+- `repository_git_registry.py`: immutable bootstrap-provenance-bound repository Git-directory registration and owner-safe read-only remote-main resolution.
 - `hosted_operation_control.py`: exact provider-operation preparation, claim, capacity, verification, and receipt lifecycle.
 - `publish_coordination_outbox.py`: sparse idempotent GitHub publication with exact readback and readback-only ambiguity recovery.
 - `coordination_supervisor.py`: due local work selection and fresh role-attempt wakeup.
@@ -168,6 +169,11 @@ For a repository head:
 6. wait for natural exact-head CI and independent exact-head review.
 
 The shared pre-push hook revalidates the live reserved publication, canonical remote, branch, head, and sole ref update. Raw or bypassed publication is prohibited. Ambiguous transport is readback-only recovery. A changed head invalidates prior head-bound evidence.
+
+Pull-buffer preparation and convergence resolve remote main only through one
+immutable exact-repository Git-directory registration. The registered directory
+is read-only evidence and never expands the writable canonical-checkout,
+worktree, branch, or Git-command authority enforced by the delivery guard.
 
 Read [environment-isolation.md](environment-isolation.md) for toolchain and cleanup rules and [ui-evidence.md](ui-evidence.md) for visual changes.
 

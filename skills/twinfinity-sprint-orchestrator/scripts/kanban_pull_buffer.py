@@ -1873,9 +1873,7 @@ def prepare_zero_wip_candidate(
     if store.connection.in_transaction:
         raise PullBufferError("ZERO_WIP_TRANSACTION_CONFLICT")
     if canonical_main_reader is None:
-        from portfolio_convergence import read_canonical_local_main
-
-        canonical_main_reader = read_canonical_local_main
+        canonical_main_reader = store.read_registered_repository_main
     try:
         main_before = canonical_main_reader(request["repository"])
     except Exception as exc:
@@ -2669,6 +2667,7 @@ def finalize_ready(
     *,
     now: str,
     failpoint: Any | None = None,
+    canonical_main_reader: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """Atomically bind PASS readiness, READY state, packet, pointer, and wake."""
 
@@ -2700,6 +2699,13 @@ def finalize_ready(
         if packet["schema"] != READY_SCHEMA or packet["state"] != "READY":
             raise PullBufferError("PULL_BUFFER_READY_FINALIZATION_INVALID")
         repository = str(packet["repository"])
+        main_reader = canonical_main_reader or store.read_registered_repository_main
+        try:
+            main_before = main_reader(repository)
+        except Exception as exc:
+            raise PullBufferError("PULL_BUFFER_MAIN_EVIDENCE_INVALID") from exc
+        if main_before != packet["accepted_main_at_preparation"]:
+            raise PullBufferError("PULL_BUFFER_MAIN_DRIFT")
         issue_number = int(packet["issue_number"])
         candidate_sha = digest_json(packet)
         admission = packet["admission_transaction"]
@@ -2727,6 +2733,12 @@ def finalize_ready(
         )
 
         with store.transaction():
+            try:
+                main_during = main_reader(repository)
+            except Exception as exc:
+                raise PullBufferError("PULL_BUFFER_MAIN_EVIDENCE_INVALID") from exc
+            if main_during != main_before:
+                raise PullBufferError("PULL_BUFFER_MAIN_DRIFT")
             artifact_sha = _registered_artifact(
                 connection,
                 descriptor,
@@ -2858,6 +2870,12 @@ def finalize_ready(
                     admission_observations,
                     prepared_observations.get(int(prepared_binding["candidate_id"])),
                 )
+                try:
+                    main_final = main_reader(repository)
+                except Exception as exc:
+                    raise PullBufferError("PULL_BUFFER_MAIN_EVIDENCE_INVALID") from exc
+                if main_final != main_before:
+                    raise PullBufferError("PULL_BUFFER_MAIN_DRIFT")
                 return {
                     "repository": repository,
                     "issue_number": issue_number,
@@ -3212,6 +3230,12 @@ def finalize_ready(
                 admission_observations,
                 prepared_observation,
             )
+            try:
+                main_final = main_reader(repository)
+            except Exception as exc:
+                raise PullBufferError("PULL_BUFFER_MAIN_EVIDENCE_INVALID") from exc
+            if main_final != main_before:
+                raise PullBufferError("PULL_BUFFER_MAIN_DRIFT")
             if failpoint is not None:
                 failpoint("before_commit")
         return {

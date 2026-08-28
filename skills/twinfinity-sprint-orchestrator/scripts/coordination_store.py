@@ -76,6 +76,13 @@ from admission_source_equivalence import (
     admission_lineage_source_is_current,
     require_stable_issue_equivalence,
 )
+from repository_git_registry import (
+    RepositoryGitRegistryError,
+    ensure_repository_git_registry_schema,
+    load_repository_git_registration,
+    read_registered_repository_main,
+    record_repository_git_registration as _record_repository_git_registration,
+)
 
 
 DEFAULT_DATABASE = (
@@ -2531,6 +2538,7 @@ class CoordinationStore:
             END;
             """
         )
+        ensure_repository_git_registry_schema(self.connection)
 
     def record_bootstrap_provenance(
         self,
@@ -2601,6 +2609,47 @@ class CoordinationStore:
             {"manifest_sha256": manifest_sha256},
             now,
         )
+
+    def record_repository_git_registration(
+        self,
+        *,
+        repository: str,
+        git_dir: Path,
+        source_main_sha: str,
+        bootstrap_id: str,
+        bootstrap_manifest_sha256: str,
+        now: str,
+    ) -> dict[str, Any]:
+        """Record or replay one immutable owner-safe read-only Git identity."""
+
+        try:
+            return _record_repository_git_registration(
+                self.connection,
+                repository=repository,
+                git_dir=git_dir,
+                source_main_sha=source_main_sha,
+                bootstrap_id=bootstrap_id,
+                bootstrap_manifest_sha256=bootstrap_manifest_sha256,
+                now=now,
+            )
+        except RepositoryGitRegistryError as exc:
+            raise CoordinationError(str(exc)) from exc
+
+    def repository_git_registration(self, repository: str) -> dict[str, Any]:
+        """Return one validated immutable repository Git registration."""
+
+        try:
+            return load_repository_git_registration(self.connection, repository)
+        except RepositoryGitRegistryError as exc:
+            raise CoordinationError(str(exc)) from exc
+
+    def read_registered_repository_main(self, repository: str) -> str:
+        """Read remote main only through the repository's immutable Git identity."""
+
+        try:
+            return read_registered_repository_main(self.connection, repository)
+        except RepositoryGitRegistryError as exc:
+            raise CoordinationError(str(exc)) from exc
 
     @contextmanager
     def transaction(self) -> Iterator[None]:

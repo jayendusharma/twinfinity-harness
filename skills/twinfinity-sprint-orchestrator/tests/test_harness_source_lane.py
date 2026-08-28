@@ -90,7 +90,7 @@ class HarnessZeroWipPreparationTests(unittest.TestCase):
                 ).hexdigest(),
                 manifest=bootstrap_manifest,
                 source_harness_repository=HARNESS_REPOSITORY,
-                source_harness_main_sha="0" * 40,
+                source_harness_main_sha=MAIN,
                 source_registry_sha256="1" * 64,
                 approved_goal_sha256=self.goal_sha256,
                 application_repository="twinfinityai/twinfinityapp",
@@ -231,6 +231,73 @@ class HarnessZeroWipPreparationTests(unittest.TestCase):
             ),
             failpoint=failpoint,
         )
+
+    def _register_hidden_git_dir(self) -> Path:
+        git_dir = self.root / ".harness-common-git"
+        git_dir.mkdir()
+        (git_dir / "config").write_text(
+            "[core]\n\tbare = true\n"
+            '[remote "origin"]\n'
+            f"\turl = https://github.com/{HARNESS_REPOSITORY}.git\n"
+            "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+            encoding="utf-8",
+        )
+        ref = git_dir / "refs" / "remotes" / "origin" / "main"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(MAIN + "\n", encoding="ascii")
+        bootstrap = self.store.connection.execute(
+            "SELECT bootstrap_id,manifest_sha256 FROM coordination_bootstrap_provenance"
+        ).fetchone()
+        with self.store.transaction():
+            self.store.record_repository_git_registration(
+                repository=HARNESS_REPOSITORY,
+                git_dir=git_dir,
+                source_main_sha=MAIN,
+                bootstrap_id=bootstrap["bootstrap_id"],
+                bootstrap_manifest_sha256=bootstrap["manifest_sha256"],
+                now=NOW,
+            )
+        return git_dir
+
+    def test_default_main_reader_uses_registered_hidden_git_dir(self) -> None:
+        git_dir = self._register_hidden_git_dir()
+        self.assertFalse((self.root / "twinfinity-harness").exists())
+
+        prepared = prepare_zero_wip_candidate(self.store, self.request(), now=NOW)
+
+        self.assertEqual("PREPARED_NOT_READY", prepared["state"])
+        self.assertEqual(
+            MAIN,
+            self.store.read_registered_repository_main(HARNESS_REPOSITORY),
+        )
+        self.assertTrue(git_dir.is_dir())
+
+    def test_missing_registration_fails_before_zero_wip_state(self) -> None:
+        with self.assertRaisesRegex(
+            PullBufferError, "ZERO_WIP_MAIN_EVIDENCE_INVALID"
+        ):
+            prepare_zero_wip_candidate(self.store, self.request(), now=NOW)
+
+        for table in (
+            "portfolio_graph_revisions",
+            "portfolio_pull_buffer_candidates",
+            "coordination_items",
+            "coordination_messages",
+            "coordination_terminal_watches",
+        ):
+            exists = self.store.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            self.assertEqual(
+                0,
+                0
+                if exists is None
+                else self.store.connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0],
+                table,
+            )
 
     def test_absent_state_prepares_one_zero_wip_candidate_and_replays_exactly(self) -> None:
         first = self.prepare()
