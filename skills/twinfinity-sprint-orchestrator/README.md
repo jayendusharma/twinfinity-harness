@@ -165,7 +165,12 @@ python3 scripts/reconcile_routing_artifacts.py \
 
 Rollback preserves immutable endpoint, attempt, message, event, and change history. Stop on pointer, item, watch, or version drift.
 
-## Six installed systemd units and timers
+## On-demand lifecycle and six installed units
+
+Use the repository [installation guide](../../docs/installation.md) for the
+manifest-bound dry-run/apply/start/stop flow and the [architecture guide](../../docs/architecture.md)
+for role and state ownership. The scripts keep installation separate from
+activation and never enable the timers.
 
 The installation uses three oneshot services and three persistent timers under `/home/ubuntu/.config/systemd/user`:
 
@@ -178,22 +183,25 @@ The installation uses three oneshot services and three persistent timers under `
 | `twinfinity-portfolio-graph-supervisor.service` | `Type=oneshot`; `ExecStart=/usr/bin/python3 /home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/scripts/portfolio_graph_supervisor.py`; `TimeoutStartSec=240`; `After=default.target`. |
 | `twinfinity-portfolio-graph-supervisor.timer` | `OnBootSec=90s`; `OnUnitActiveSec=5min`; `AccuracySec=15s`; `Persistent=true`; `WantedBy=timers.target`. |
 
-Treat installed unit files as owner-controlled configuration. On migration, transfer or independently recreate their reviewed bodies, compare `ExecStart`, timeout, schedule, persistence, owner, and mode, then:
+Treat installed unit files as owner-controlled configuration. On migration,
+install their reviewed bodies through the manifest-bound lifecycle, compare
+`ExecStart`, timeout, schedule, persistence, owner, and mode, then use
+the repository-root `scripts/start.sh` only with separate live-use authority.
+It reloads the user manager and starts the three timers without enabling them.
+From the reviewed harness source root:
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user start twinfinity-coordination-supervisor.service
-systemctl --user start twinfinity-hosted-operation-supervisor.service
-systemctl --user start twinfinity-portfolio-graph-supervisor.service
-systemctl --user enable --now \
-  twinfinity-coordination-supervisor.timer \
-  twinfinity-hosted-operation-supervisor.timer \
-  twinfinity-portfolio-graph-supervisor.timer
+./scripts/start.sh \
+  --manifest /path/to/reviewed-install-manifest.json \
+  --source-root /path/to/reviewed/harness-source \
+  --destination-root /home/ubuntu
 systemctl --user list-timers 'twinfinity*' --all --no-pager
 systemctl --user list-units 'twinfinity-role-executor-*' --all --no-pager
 ```
 
-Do not enable timers until the database, exact profiles, endpoint pointers, repository path, unit bodies, and manual oneshot runs validate.
+Do not enable these timers. Stop with `scripts/stop.sh`; a transient executor
+that remains active after bounded observation is a truthful nonzero result, not
+permission to kill it or fabricate completion.
 
 ## Machine migration checklist
 

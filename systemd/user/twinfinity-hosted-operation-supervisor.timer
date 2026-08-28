@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Twinfinity hosted-operation supervisor
+
+[Timer]
+OnBootSec=25s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=twinfinity-hosted-operation-supervisor.service
+
+[Install]
+WantedBy=timers.target

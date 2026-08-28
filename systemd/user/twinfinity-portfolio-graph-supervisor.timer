@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Twinfinity portfolio-graph supervisor
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=twinfinity-portfolio-graph-supervisor.service
+
+[Install]
+WantedBy=timers.target

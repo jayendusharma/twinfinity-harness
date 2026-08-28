@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Twinfinity coordination supervisor
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=twinfinity-coordination-supervisor.service
+
+[Install]
+WantedBy=timers.target

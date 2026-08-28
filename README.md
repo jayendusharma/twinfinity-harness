@@ -20,6 +20,11 @@ Changes that share SQLite transitions or supervisor behavior may be developed se
 
 Reviewed and merged source is not installed or live state. Source maintenance reaches `SOURCE_COMPLETE` only under [the shared harness contract](skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md); installation, registration, cutover, and runtime attestation remain separate explicitly authorized operations.
 
+For the bounded on-demand operator path, see [installation](docs/installation.md)
+and the [harness architecture](docs/architecture.md). The lifecycle scripts are
+dry-run install by default, explicit start, and truthful quiesce/observation;
+they never make source completion equivalent to activation.
+
 ## Safety rules
 
 - Never commit the coordination database, approval contents, live receipts, launch tokens, provider credentials, or worktree-local evidence.

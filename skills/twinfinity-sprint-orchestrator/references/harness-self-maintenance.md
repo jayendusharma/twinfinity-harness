@@ -32,6 +32,10 @@ Keep the workflow coarse:
 
 Do not create a separate attempt or handoff for each state. One fresh bounded Development writer attempt and one exact terminal watch span authoring, validation, and at most one same-scope repair. Changed scope, authority, diagnosis, collision, or safety effect returns to Planner disposition instead of opening another repair cycle.
 
+After the minimal repair and a separately authorized installation pass the
+defined exit test, resume the blocked Planner transition before admitting
+adjacent hardening.
+
 ## Keep roles independent
 
 The same Product Planner orchestrates the lane, owns admission and Shared writer accounting, revalidates evidence, and may request a registered match-head merge after every gate passes. The Planner cannot author the candidate, approve its source head, or treat its own verification as Governor approval.

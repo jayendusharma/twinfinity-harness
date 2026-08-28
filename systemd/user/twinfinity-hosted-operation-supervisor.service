@@ -1,0 +1,9 @@
+[Unit]
+Description=Twinfinity hosted-operation supervisor
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/code/twinfinityapp
+ExecStart=/usr/bin/python3 /home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/scripts/hosted_operation_control.py supervise
+TimeoutStartSec=45
