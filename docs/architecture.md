@@ -71,10 +71,12 @@ not authorize a hosted effect.
 ## Two-phase Kanban scheduling
 
 The scheduler is dependency-aware and ranked, not pure FIFO. Only `HARD_BLOCK`
-relations affect topological readiness. `ORDER_AFTER` is a ranking preference,
-while `COLLISION` prevents overlapping mutable work from being selected
-together. Among eligible nodes, priority, lane order, readiness time,
-critical-path value, unlock value, and stable tie-breakers establish the order.
+relations affect topological readiness. `ORDER_AFTER` is accepted and stored as
+preference metadata, but the current scheduler does not enforce it; operators
+must not rely on it for ordering. `COLLISION` prevents overlapping mutable work
+from being selected together. Among eligible nodes, priority, lane order,
+readiness time, critical-path value, unlock value, and stable tie-breakers
+establish the order.
 Capacity remains a safety ceiling, never a utilization target.
 
 ```mermaid
