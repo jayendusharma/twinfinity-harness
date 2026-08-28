@@ -208,9 +208,9 @@ sequenceDiagram
     CS->>DB: Converge and activate one candidate atomically
     DB-->>CS: Allocation, lease, typed message, terminal watch
     CS->>W: Launch fresh bounded writer attempt
-    W->>GH: Publish candidate PR and exact-head evidence
     P->>V: Commission independent exact-head review
     V-->>P: Return source-head verdict
+    W->>GH: Publish candidate PR and exact-head evidence
     P->>GH: Merge approved head after all merge gates
     GH-->>P: Report exact main and post-main checks
     W->>DB: Prepare terminal closeout after cleanup
