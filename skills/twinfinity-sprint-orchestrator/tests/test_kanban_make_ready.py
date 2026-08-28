@@ -103,7 +103,9 @@ class MakeReadyHarness:
                 "excluded_issues": [],
                 "nodes": [
                     {
-                        "node_key": f"issue:{node['issue_number']}",
+                        "node_key": node.get(
+                            "node_key", f"issue:{node['issue_number']}"
+                        ),
                         "issue_number": node["issue_number"],
                         "role": node.get("role", "DELIVERY"),
                         "root_kind": node.get("root_kind", "STANDALONE"),
@@ -268,6 +270,48 @@ class KanbanMakeReadyTests(unittest.TestCase):
                 and payload["evidence"]["planner_endpoint_id"]
                 for payload in payloads
             )
+        )
+
+    def test_duplicate_issue_nodes_use_one_notice_and_one_slot(self) -> None:
+        for issue_number in (1, 2):
+            self.h.add_issue(issue_number)
+        self.h.install_graph(
+            [
+                {
+                    "issue_number": 1,
+                    "node_key": "issue:1:first",
+                    "priority_rank": 1,
+                    "lane_key": "duplicate",
+                    "lane_order": 0,
+                },
+                {
+                    "issue_number": 1,
+                    "node_key": "issue:1:second",
+                    "priority_rank": 1,
+                    "lane_key": "duplicate",
+                    "lane_order": 1,
+                },
+                {"issue_number": 2, "priority_rank": 2},
+            ]
+        )
+
+        result = sweep(
+            self.h.store,
+            REPOSITORY,
+            max_candidates=2,
+            now=NOW,
+        )
+
+        self.assertEqual([1, 2], [item["issue_number"] for item in result["planned"]])
+        self.assertEqual(
+            ["issue:1:first", "issue:2"],
+            [item["node_key"] for item in result["planned"]],
+        )
+        self.assertEqual(
+            2,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages"
+            ).fetchone()[0],
         )
 
     def test_hard_predecessor_is_a_typed_no_write_skip(self) -> None:

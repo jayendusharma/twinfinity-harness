@@ -235,7 +235,7 @@ def sweep(
             if isinstance(item, dict) and type(item.get("issue_number")) is int
         }
 
-        eligible: list[tuple[Any, dict[str, Any], str]] = []
+        eligible: dict[int, tuple[Any, dict[str, Any], str]] = {}
         skipped: list[dict[str, Any]] = []
         for row in rows:
             projection = projections[str(row["node_key"])]
@@ -343,10 +343,13 @@ def sweep(
                 "planner_endpoint_id": str(planner["endpoint_id"]),
                 "planner_pointer_version": int(planner["pointer_version"]),
             }
-            eligible.append((row, binding, digest_json(binding)))
+            eligible.setdefault(
+                int(row["issue_number"]),
+                (row, binding, digest_json(binding)),
+            )
 
         planned: list[dict[str, Any]] = []
-        for row, binding, binding_sha256 in eligible[:max_candidates]:
+        for row, binding, binding_sha256 in list(eligible.values())[:max_candidates]:
             idempotency_key = f"kanban-make-ready:{binding_sha256}"
             prior = connection.execute(
                 "SELECT id FROM coordination_messages WHERE idempotency_key=?",
