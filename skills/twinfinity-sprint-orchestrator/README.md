@@ -211,7 +211,7 @@ permission to kill it or fabricate completion.
 4. Restore canonical paths, owner, modes, and single-link regular-file invariants. A different home path requires new endpoint versions and reviewed unit bodies.
 5. Recreate Codex/GitHub authentication independently; install the Planner, Development, and SRE templates byte-for-byte at their official profile paths and validate their registry-bound digests.
 6. Restore SQLite through the staged owner-safe procedure, run integrity and routing audits, and verify current role pointers.
-7. Install the six unit bodies, run manual oneshots one at a time, inspect journals and attempt rows, then enable timers.
+7. Install the six unit bodies, run manual oneshots one at a time, inspect journals and attempt rows, then invoke the reviewed repository-root `./scripts/start.sh`; it starts all three timers without enabling them.
 8. Run validation and archive readiness. Do not delete the source installation or archives merely because the destination starts successfully.
 
 ## Crash recovery
