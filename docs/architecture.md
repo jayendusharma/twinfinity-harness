@@ -219,7 +219,7 @@ sequenceDiagram
     DB->>GH: Publish one receipt through the outbox
     GH-->>DB: Return exact marker readback
     W->>DB: Commit terminal closeout
-    DB-->>GS: Release lease and capacity; append refill event
+    DB-->>GS: Release lease and capacity and append refill event
 ```
 
 The outbox performs at most one external write and resolves ambiguity through
