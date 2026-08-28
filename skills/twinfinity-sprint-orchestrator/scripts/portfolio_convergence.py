@@ -6,11 +6,8 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
-import os
-from pathlib import Path
 import re
 import sqlite3
-import stat
 import time
 from typing import Any, Callable
 
@@ -35,9 +32,6 @@ from portfolio_graph import (
     PortfolioGraphError,
     _schedule_decision,
 )
-from repository_delivery_policy import expected_canonical_checkout
-
-
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 MAX_ATTEMPTS = 5
 RETRY_BASE_SECONDS = 5
@@ -53,213 +47,6 @@ class PortfolioConvergenceError(ValueError):
 ExternalReader = Callable[[dict[str, Any]], dict[str, Any]]
 CanonicalMainReader = Callable[[str], str]
 Failpoint = Callable[[str], None]
-
-
-def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_uid,
-        metadata.st_size,
-        metadata.st_nlink,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
-
-
-def _owner_directory_valid(metadata: os.stat_result) -> bool:
-    return bool(
-        stat.S_ISDIR(metadata.st_mode)
-        and metadata.st_uid == os.getuid()
-        and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    )
-
-
-def _read_canonical_git_file(
-    git_descriptor: int, relative_path: str, *, maximum_bytes: int
-) -> bytes | None:
-    """Read a ref through owner-safe no-follow openat traversal."""
-
-    parts = Path(relative_path).parts
-    if (
-        not parts
-        or Path(relative_path).is_absolute()
-        or any(part in {"", ".", ".."} for part in parts)
-    ):
-        raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID")
-    directory_descriptor = os.dup(git_descriptor)
-    opened_directories: list[int] = [directory_descriptor]
-    descriptor = -1
-    try:
-        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(
-            os, "O_NOFOLLOW", 0
-        )
-        for component in parts[:-1]:
-            try:
-                child = os.open(component, directory_flags, dir_fd=directory_descriptor)
-            except FileNotFoundError:
-                return None
-            except OSError as exc:
-                raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID") from exc
-            descriptor_metadata = os.fstat(child)
-            path_metadata = os.stat(
-                component, dir_fd=directory_descriptor, follow_symlinks=False
-            )
-            if (
-                not _owner_directory_valid(descriptor_metadata)
-                or _metadata_identity(descriptor_metadata)
-                != _metadata_identity(path_metadata)
-            ):
-                os.close(child)
-                raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID")
-            directory_descriptor = child
-            opened_directories.append(child)
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(parts[-1], flags, dir_fd=directory_descriptor)
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID") from exc
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.getuid()
-            or before.st_nlink != 1
-            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            or before.st_size <= 0
-            or before.st_size > maximum_bytes
-        ):
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID")
-        chunks = []
-        remaining = int(before.st_size) + 1
-        while remaining:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        after = os.fstat(descriptor)
-        try:
-            path_metadata = os.stat(
-                parts[-1], dir_fd=directory_descriptor, follow_symlinks=False
-            )
-        except OSError as exc:
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID") from exc
-        raw = b"".join(chunks)
-        if (
-            len(raw) != int(before.st_size)
-            or _metadata_identity(after) != _metadata_identity(before)
-            or _metadata_identity(path_metadata) != _metadata_identity(before)
-        ):
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID")
-        return raw
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        for opened in reversed(opened_directories):
-            os.close(opened)
-
-
-def read_canonical_local_main(repository: str) -> str:
-    """Read the canonical checkout's remote-main ref without Git or network."""
-
-    checkout = expected_canonical_checkout(repository, Path("/home/ubuntu/code"))
-    if checkout is None:
-        raise PortfolioConvergenceError("CANONICAL_REPOSITORY_UNSUPPORTED")
-    git_marker = checkout / ".git"
-    try:
-        marker_metadata = git_marker.lstat()
-    except FileNotFoundError as exc:
-        raise PortfolioConvergenceError("CANONICAL_MAIN_REF_MISSING") from exc
-    if stat.S_ISDIR(marker_metadata.st_mode) and not git_marker.is_symlink():
-        pass
-    elif stat.S_ISREG(marker_metadata.st_mode):
-        # Canonical repositories must be full owner checkouts.  Worktree
-        # indirection can escape the repository policy and its commondir.
-        raise PortfolioConvergenceError("CANONICAL_CHECKOUT_WORKTREE_FORBIDDEN")
-    else:
-        raise PortfolioConvergenceError("CANONICAL_MAIN_REF_MISSING")
-    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(
-        os, "O_NOFOLLOW", 0
-    )
-    checkout_descriptor = -1
-    git_descriptor = -1
-    try:
-        checkout_descriptor = os.open(checkout, directory_flags)
-        checkout_metadata = os.fstat(checkout_descriptor)
-        checkout_path_metadata = checkout.lstat()
-        if (
-            not _owner_directory_valid(checkout_metadata)
-            or _metadata_identity(checkout_metadata)
-            != _metadata_identity(checkout_path_metadata)
-        ):
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID")
-        git_descriptor = os.open(".git", directory_flags, dir_fd=checkout_descriptor)
-        git_metadata = os.fstat(git_descriptor)
-        git_path_metadata = os.stat(
-            ".git", dir_fd=checkout_descriptor, follow_symlinks=False
-        )
-        if (
-            not _owner_directory_valid(git_metadata)
-            or _metadata_identity(git_metadata) != _metadata_identity(git_path_metadata)
-        ):
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID")
-        ref_name = "refs/remotes/origin/main"
-        sha: str | None = None
-        loose_raw = _read_canonical_git_file(
-            git_descriptor, ref_name, maximum_bytes=256
-        )
-        if loose_raw is not None:
-            try:
-                sha = loose_raw.decode("ascii").strip()
-            except UnicodeError as exc:
-                raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID") from exc
-        else:
-            packed_raw = _read_canonical_git_file(
-                git_descriptor, "packed-refs", maximum_bytes=8 * 1024 * 1024
-            )
-            if packed_raw is None:
-                raise PortfolioConvergenceError("CANONICAL_MAIN_REF_MISSING")
-            try:
-                lines = packed_raw.decode("ascii").splitlines()
-            except UnicodeError as exc:
-                raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID") from exc
-            for line in lines:
-                if line and not line.startswith(("#", "^")):
-                    value, _, name = line.partition(" ")
-                    if name == ref_name:
-                        sha = value
-                        break
-            if _read_canonical_git_file(
-                git_descriptor, ref_name, maximum_bytes=256
-            ) is not None:
-                raise PortfolioConvergenceError("CANONICAL_MAIN_REF_CHANGED")
-        if sha is None or not GIT_SHA.fullmatch(sha):
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID")
-        if (
-            _metadata_identity(os.fstat(git_descriptor))
-            != _metadata_identity(
-                os.stat(".git", dir_fd=checkout_descriptor, follow_symlinks=False)
-            )
-            or _metadata_identity(os.fstat(checkout_descriptor))
-            != _metadata_identity(checkout.lstat())
-        ):
-            raise PortfolioConvergenceError("CANONICAL_MAIN_REF_CHANGED")
-        return sha
-    except FileNotFoundError as exc:
-        raise PortfolioConvergenceError("CANONICAL_MAIN_REF_MISSING") from exc
-    except OSError as exc:
-        raise PortfolioConvergenceError("CANONICAL_MAIN_REF_INVALID") from exc
-    finally:
-        if git_descriptor >= 0:
-            os.close(git_descriptor)
-        if checkout_descriptor >= 0:
-            os.close(checkout_descriptor)
 
 
 def _retry_seconds(attempts: int) -> int:
@@ -288,7 +75,9 @@ class PortfolioConvergence:
     ) -> None:
         self.store = store
         self.external_reader = external_reader or self._read_external_context
-        self.canonical_main_reader = canonical_main_reader or read_canonical_local_main
+        self.canonical_main_reader = (
+            canonical_main_reader or self.store.read_registered_repository_main
+        )
         self.failpoint = failpoint
         ensure_pull_buffer_schema(self.store.connection)
 
@@ -417,7 +206,14 @@ class PortfolioConvergence:
         )
         return state
 
-    def _record_retry(self, expected: dict[str, Any], error: str, now: str) -> dict[str, Any]:
+    def _record_retry(
+        self,
+        expected: dict[str, Any],
+        error: str,
+        now: str,
+        *,
+        terminal: bool = False,
+    ) -> dict[str, Any]:
         with self.store.transaction():
             row = self.store.connection.execute(
                 "SELECT * FROM portfolio_dirty_events WHERE id=?", (expected["id"],)
@@ -427,7 +223,7 @@ class PortfolioConvergence:
             if row["event_sha256"] != expected["event_sha256"]:
                 raise PortfolioConvergenceError("PORTFOLIO_EVENT_FENCE_LOST")
             attempts = int(row["attempts"]) + 1
-            state = "HOLD" if attempts >= MAX_ATTEMPTS else "RETRY"
+            state = "HOLD" if terminal or attempts >= MAX_ATTEMPTS else "RETRY"
             next_attempt = _timestamp_after(now, _retry_seconds(attempts))
             self.store.connection.execute(
                 """
@@ -759,7 +555,12 @@ class PortfolioConvergence:
             ValueError,
         ) as exc:
             error = str(exc) or type(exc).__name__
-            return self._record_retry(expected, error, observed_at)
+            return self._record_retry(
+                expected,
+                error,
+                observed_at,
+                terminal=error.startswith("REPOSITORY_GIT_"),
+            )
         finally:
             close_candidate_observations(observations)
 

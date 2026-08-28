@@ -554,6 +554,7 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                 packet_path,
                 now="2026-08-24T10:00:02Z",
                 failpoint=failpoint,
+                canonical_main_reader=lambda _repository: MAIN,
             )
             self.ready_item = dict(
                 self.store.connection.execute(
@@ -743,6 +744,90 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             "planner_session_id": planner,
         }
 
+    def test_missing_git_registration_blocks_ready_finalization_before_state_write(
+        self,
+    ) -> None:
+        packet_path = self._register_ready_candidate(finalize=False)
+        before = {
+            table: self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in (
+                "portfolio_pull_buffer_candidates",
+                "portfolio_ready_finalizations",
+                "portfolio_dirty_events",
+                "coordination_messages",
+                "coordination_terminal_watches",
+            )
+        }
+
+        with self.assertRaisesRegex(
+            PullBufferError, "PULL_BUFFER_MAIN_EVIDENCE_INVALID"
+        ):
+            finalize_ready(
+                self.store,
+                packet_path,
+                now="2026-08-24T10:00:03Z",
+            )
+
+        after = {
+            table: self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in before
+        }
+        item = self.store.connection.execute(
+            "SELECT status,allocation_class FROM coordination_items "
+            "WHERE repository=? AND issue_number=2",
+            (REPOSITORY,),
+        ).fetchone()
+        phase = self.store.connection.execute(
+            "SELECT state FROM portfolio_readiness_current "
+            "WHERE repository=? AND issue_number=2",
+            (REPOSITORY,),
+        ).fetchone()
+        self.assertEqual(before, after)
+        self.assertEqual(("PREPARED", "NONE"), tuple(item))
+        self.assertEqual("READY_ELIGIBLE", phase["state"])
+
+    def test_main_drift_during_and_before_finalization_commit_rolls_back(self) -> None:
+        packet_path = self._register_ready_candidate(finalize=False)
+        for values in ((MAIN, "d" * 40), (MAIN, MAIN, "d" * 40)):
+            with self.subTest(reads=len(values)):
+                sequence = iter(values)
+                before = {
+                    table: self.store.connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    for table in (
+                        "portfolio_pull_buffer_candidates",
+                        "portfolio_ready_finalizations",
+                        "portfolio_dirty_events",
+                        "coordination_messages",
+                        "coordination_terminal_watches",
+                    )
+                }
+                with self.assertRaisesRegex(PullBufferError, "PULL_BUFFER_MAIN_DRIFT"):
+                    finalize_ready(
+                        self.store,
+                        packet_path,
+                        now="2026-08-24T10:00:03Z",
+                        canonical_main_reader=lambda _repository: next(sequence),
+                    )
+                after = {
+                    table: self.store.connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    for table in before
+                }
+                item = self.store.connection.execute(
+                    "SELECT status,allocation_class FROM coordination_items "
+                    "WHERE repository=? AND issue_number=2",
+                    (REPOSITORY,),
+                ).fetchone()
+                self.assertEqual(before, after)
+                self.assertEqual(("PREPARED", "NONE"), tuple(item))
+
     def test_ready_finalization_rolls_back_each_write_and_replays_exactly(self) -> None:
         packet_path = self._register_ready_candidate(finalize=False)
         initial_message_count = self.store.connection.execute(
@@ -774,6 +859,7 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                         packet_path,
                         now="2026-08-24T10:00:03Z",
                         failpoint=injected,
+                        canonical_main_reader=lambda _repository: MAIN,
                     )
                 item = self.store.connection.execute(
                     "SELECT status,allocation_class,version FROM coordination_items "
@@ -815,11 +901,13 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             self.store,
             packet_path,
             now="2026-08-24T10:00:04Z",
+            canonical_main_reader=lambda _repository: MAIN,
         )
         replay = finalize_ready(
             self.store,
             packet_path,
             now="2026-08-24T10:00:05Z",
+            canonical_main_reader=lambda _repository: MAIN,
         )
         self.assertFalse(first["replay"])
         self.assertTrue(replay["replay"])
