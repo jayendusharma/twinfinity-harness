@@ -1,0 +1,8 @@
+[Unit]
+Description=Twinfinity portfolio-graph supervisor
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/scripts/portfolio_graph_supervisor.py
+TimeoutStartSec=240
