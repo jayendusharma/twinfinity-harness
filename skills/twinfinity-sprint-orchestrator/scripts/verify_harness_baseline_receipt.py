@@ -32,7 +32,10 @@ from typing import Any, Callable, Iterable, Sequence
 REPOSITORY = "jayendusharma/twinfinity-harness"
 ORIGIN_URL = "https://github.com/jayendusharma/twinfinity-harness.git"
 GIT = "/usr/bin/git"
-PYTHON = "/usr/bin/python3"
+PYTHON_PROC_SELF_EXE = "/proc/self/exe"
+# This is a stable receipt token, not an executable lookup.  The executable
+# used for every command is the accepted-base interpreter derived below.
+PYTHON_MANIFEST_TOKEN = "/usr/bin/python3"
 VERIFIER_PATH = (
     "skills/twinfinity-sprint-orchestrator/scripts/"
     "verify_harness_baseline_receipt.py"
@@ -941,6 +944,38 @@ class VerificationError(RuntimeError):
     """A closed verifier invariant failed."""
 
 
+def _derive_executing_interpreter_path() -> str:
+    """Return the kernel-bound interpreter, rejecting caller substitution."""
+
+    try:
+        first_link = os.readlink(PYTHON_PROC_SELF_EXE)
+        resolved = Path(PYTHON_PROC_SELF_EXE).resolve(strict=True)
+        executable = Path(sys.executable)
+        if not executable.is_absolute():
+            raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED")
+        caller_resolved = executable.resolve(strict=True)
+        proc_identity = os.stat(PYTHON_PROC_SELF_EXE, follow_symlinks=True)
+        path_identity = os.stat(resolved, follow_symlinks=False)
+        second_link = os.readlink(PYTHON_PROC_SELF_EXE)
+    except VerificationError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED") from exc
+    if (
+        not resolved.is_absolute()
+        or first_link != second_link
+        or caller_resolved != resolved
+        or not stat.S_ISREG(path_identity.st_mode)
+        or (proc_identity.st_dev, proc_identity.st_ino)
+        != (path_identity.st_dev, path_identity.st_ino)
+    ):
+        raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED")
+    return os.fspath(resolved)
+
+
+PYTHON = _derive_executing_interpreter_path()
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -1657,13 +1692,13 @@ def _require_issue92_post_merge_git_bindings(
         raise VerificationError(error)
 
 
-def _read_regular(
+def _read_regular_with_identity(
     path: Path,
     *,
     maximum: int,
     error: str,
     allowed_uids: set[int] | None = None,
-) -> bytes:
+) -> tuple[bytes, os.stat_result]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -1694,15 +1729,35 @@ def _read_regular(
             len(contents) > maximum
             or before.st_dev != after.st_dev
             or before.st_ino != after.st_ino
+            or before.st_mode != after.st_mode
+            or before.st_uid != after.st_uid
+            or before.st_gid != after.st_gid
+            or before.st_nlink != after.st_nlink
             or before.st_size != after.st_size
             or before.st_mtime_ns != after.st_mtime_ns
             or before.st_ctime_ns != after.st_ctime_ns
             or len(contents) != after.st_size
         ):
             raise VerificationError(error)
-        return contents
+        return contents, after
     finally:
         os.close(descriptor)
+
+
+def _read_regular(
+    path: Path,
+    *,
+    maximum: int,
+    error: str,
+    allowed_uids: set[int] | None = None,
+) -> bytes:
+    contents, _ = _read_regular_with_identity(
+        path,
+        maximum=maximum,
+        error=error,
+        allowed_uids=allowed_uids,
+    )
+    return contents
 
 
 def _validate_json_nesting(raw: bytes, error: str, maximum: int = 128) -> None:
@@ -2800,7 +2855,12 @@ def _validate_v4_manifest_validation_evidence(
         "66ec928121cd52bb25284bfe10907ec7455cb029e7e4c3c4b38278b233b2404d",
         "0bec0ad83ede5111054db71edbe94f7366e579f9f3c81eb53f5e679a7fc94b55",
     )
-    lineage_argv = [PYTHON, "-c", lineage_code, os.fspath(verifier_path)]
+    lineage_argv = [
+        PYTHON_MANIFEST_TOKEN,
+        "-c",
+        lineage_code,
+        os.fspath(verifier_path),
+    ]
     for generation, digest in enumerate(packet_digests, start=1):
         lineage_argv.extend(
             (
@@ -2814,7 +2874,7 @@ def _validate_v4_manifest_validation_evidence(
     accepted_validator_path = os.fspath(accepted_validator)
     expected_invocations = [
         [
-            PYTHON,
+            PYTHON_MANIFEST_TOKEN,
             accepted_validator_path,
             os.fspath(candidate_root / skill_root),
         ]
@@ -2822,7 +2882,12 @@ def _validate_v4_manifest_validation_evidence(
     ]
     expected_validations: list[dict[str, Any]] = [
         {
-            "argv": [PYTHON, "-c", schema_code, os.fspath(schema_path)],
+            "argv": [
+                PYTHON_MANIFEST_TOKEN,
+                "-c",
+                schema_code,
+                os.fspath(schema_path),
+            ],
             "cwd": worktree,
             "environment_overrides": {"PYTHONDONTWRITEBYTECODE": "1"},
             "gate": "draft_2020_12_schema",
@@ -2830,7 +2895,7 @@ def _validate_v4_manifest_validation_evidence(
         },
         {
             "argv": [
-                PYTHON,
+                PYTHON_MANIFEST_TOKEN,
                 "-m",
                 "py_compile",
                 os.fspath(verifier_path),
@@ -2845,7 +2910,7 @@ def _validate_v4_manifest_validation_evidence(
         },
         {
             "argv": [
-                PYTHON,
+                PYTHON_MANIFEST_TOKEN,
                 os.fspath(runner_path),
                 "-v",
                 "test_verify_harness_baseline_receipt",
@@ -2858,7 +2923,7 @@ def _validate_v4_manifest_validation_evidence(
         },
         {
             "argv": [
-                PYTHON,
+                PYTHON_MANIFEST_TOKEN,
                 "-m",
                 "unittest",
                 "skills.twinfinity-sprint-orchestrator.tests."
@@ -2897,7 +2962,7 @@ def _validate_v4_manifest_validation_evidence(
         },
         {
             "argv": [
-                PYTHON,
+                PYTHON_MANIFEST_TOKEN,
                 os.fspath(accepted_registry),
                 "--config",
                 os.fspath(reference_root / "twinfinity-executor-registry.toml"),
@@ -2928,7 +2993,7 @@ def _validate_v4_manifest_validation_evidence(
                 "CODEX_HOME",
                 "-u",
                 "PYTHONPATH",
-                PYTHON,
+                PYTHON_MANIFEST_TOKEN,
                 os.fspath(runner_path),
             ],
             "cwd": worktree,
@@ -2995,7 +3060,7 @@ def _validate_v4_manifest_validation_evidence(
         ),
         "jsonschema_version": "4.10.3",
         "python": {
-            "logical_path": PYTHON,
+            "logical_path": PYTHON_MANIFEST_TOKEN,
             "resolved_path": "/usr/bin/python3.12",
             "version": "3.12.3",
         },
@@ -3796,7 +3861,7 @@ def _validate_rejected_manifest_shape(
             != {"logical_path": GIT, "version": "2.43.0"}
             or provenance.get("python")
             != {
-                "logical_path": PYTHON,
+                "logical_path": PYTHON_MANIFEST_TOKEN,
                 "resolved_path": "/usr/bin/python3.12",
                 "version": "3.12.3",
             }
@@ -5669,7 +5734,7 @@ def _sealed_command(
     if (
         type(canonical) is not list
         or len(canonical) < 3
-        or canonical[0] != PYTHON
+        or canonical[0] != PYTHON_MANIFEST_TOKEN
         or not canonical[1].startswith("ACCEPTED_BASE/")
     ):
         raise VerificationError("BOOTSTRAP_COMMAND_CATALOG_INVALID")
@@ -5713,11 +5778,13 @@ def _sealed_command(
 
 def _external_identity(name: str, logical_path: str) -> dict[str, Any]:
     logical = Path(logical_path)
+    if not logical.is_absolute():
+        raise VerificationError("BOOTSTRAP_EXTERNAL_TOOL_MISSING")
     try:
         resolved = logical.resolve(strict=True)
     except OSError as exc:
         raise VerificationError("BOOTSTRAP_EXTERNAL_TOOL_MISSING") from exc
-    contents = _read_regular(
+    contents, identity = _read_regular_with_identity(
         resolved,
         maximum=1024 * 1024 * 1024,
         error="BOOTSTRAP_EXTERNAL_TOOL_UNSAFE",
@@ -5726,9 +5793,21 @@ def _external_identity(name: str, logical_path: str) -> dict[str, Any]:
     )
     try:
         final_resolved = logical.resolve(strict=True)
+        final_identity = os.stat(final_resolved, follow_symlinks=False)
     except OSError as exc:
         raise VerificationError("BOOTSTRAP_EXTERNAL_TOOL_DRIFT") from exc
-    if final_resolved != resolved:
+    if (
+        final_resolved != resolved
+        or (final_identity.st_dev, final_identity.st_ino)
+        != (identity.st_dev, identity.st_ino)
+        or final_identity.st_mode != identity.st_mode
+        or final_identity.st_uid != identity.st_uid
+        or final_identity.st_gid != identity.st_gid
+        or final_identity.st_nlink != identity.st_nlink
+        or final_identity.st_size != identity.st_size
+        or final_identity.st_mtime_ns != identity.st_mtime_ns
+        or final_identity.st_ctime_ns != identity.st_ctime_ns
+    ):
         raise VerificationError("BOOTSTRAP_EXTERNAL_TOOL_DRIFT")
     return {
         "name": name,
@@ -5736,11 +5815,19 @@ def _external_identity(name: str, logical_path: str) -> dict[str, Any]:
         "resolved_path": os.fspath(resolved),
         "sha256": _sha256(contents),
         "size": str(len(contents)),
+        "device": str(identity.st_dev),
+        "inode": str(identity.st_ino),
+        "mode": str(identity.st_mode),
+        "uid": str(identity.st_uid),
+        "gid": str(identity.st_gid),
+        "link_count": str(identity.st_nlink),
+        "mtime_ns": str(identity.st_mtime_ns),
+        "ctime_ns": str(identity.st_ctime_ns),
     }
 
 
 def _external_tools() -> list[dict[str, Any]]:
-    if Path(sys.executable).resolve() != Path(PYTHON).resolve():
+    if _derive_executing_interpreter_path() != PYTHON:
         raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED")
     return [
         _external_identity("python", PYTHON),
@@ -5758,7 +5845,7 @@ def _command_manifest() -> dict[str, Any]:
                     "root": root,
                     "kind": "SKILL_VALIDATOR",
                     "argv": [
-                        PYTHON,
+                        PYTHON_MANIFEST_TOKEN,
                         f"ACCEPTED_BASE/{VALIDATOR_PATH}",
                         f"{root}/{skill_root}",
                     ],
@@ -5772,7 +5859,7 @@ def _command_manifest() -> dict[str, Any]:
                 "root": root,
                 "kind": "EXECUTOR_REGISTRY_AUDIT",
                 "argv": [
-                    PYTHON,
+                    PYTHON_MANIFEST_TOKEN,
                     f"ACCEPTED_BASE/{REGISTRY_AUDIT_PATH}",
                     "--config",
                     f"{root}/{REGISTRY_CONFIG_PATH}",

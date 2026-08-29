@@ -1346,6 +1346,95 @@ class BootstrapVerifierTests(unittest.TestCase):
             [f"head:skill:{root}" for root in verifier.SKILL_ROOTS],
             [item["command_id"] for item in commands[12:23]],
         )
+        self.assertEqual(
+            {verifier.PYTHON_MANIFEST_TOKEN},
+            {item["argv"][0] for item in commands},
+        )
+
+    def test_executing_python_is_kernel_derived_and_exactly_attested(self) -> None:
+        self.assertEqual(verifier.PYTHON, verifier._derive_executing_interpreter_path())
+        identity = verifier._external_tools()[0]
+        executable = Path(verifier.PYTHON)
+        executable_stat = executable.stat(follow_symlinks=False)
+        self.assertEqual("python", identity["name"])
+        self.assertEqual(verifier.PYTHON, identity["logical_path"])
+        self.assertEqual(verifier.PYTHON, identity["resolved_path"])
+        self.assertEqual(str(executable_stat.st_dev), identity["device"])
+        self.assertEqual(str(executable_stat.st_ino), identity["inode"])
+        self.assertEqual(str(executable_stat.st_mode), identity["mode"])
+        self.assertEqual(str(executable_stat.st_uid), identity["uid"])
+        self.assertEqual(str(executable_stat.st_gid), identity["gid"])
+        self.assertEqual(str(executable_stat.st_nlink), identity["link_count"])
+        self.assertEqual(str(executable_stat.st_mtime_ns), identity["mtime_ns"])
+        self.assertEqual(str(executable_stat.st_ctime_ns), identity["ctime_ns"])
+
+    def test_alternate_absolute_executing_python_path_is_accepted(self) -> None:
+        alternate = self.root / "alternate-executing-python"
+        alternate.write_bytes(Path(verifier.PYTHON).read_bytes())
+        alternate.chmod(0o700)
+        proc_alias = self.root / "alternate-proc-self-exe"
+        proc_alias.symlink_to(alternate)
+        with (
+            patch.object(verifier, "PYTHON_PROC_SELF_EXE", os.fspath(proc_alias)),
+            patch.object(verifier.sys, "executable", os.fspath(alternate)),
+            patch.object(verifier, "PYTHON", os.fspath(alternate)),
+        ):
+            self.assertEqual(
+                os.fspath(alternate),
+                verifier._derive_executing_interpreter_path(),
+            )
+            identity = verifier._external_tools()[0]
+        self.assertEqual(os.fspath(alternate), identity["logical_path"])
+        self.assertEqual(os.fspath(alternate), identity["resolved_path"])
+
+    def test_python_caller_or_bound_identity_override_is_rejected(self) -> None:
+        with patch.object(verifier.sys, "executable", verifier.GIT):
+            with self.assertRaisesRegex(
+                verifier.VerificationError,
+                "BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED",
+            ):
+                verifier._derive_executing_interpreter_path()
+        with patch.object(verifier, "PYTHON", verifier.GIT):
+            with self.assertRaisesRegex(
+                verifier.VerificationError,
+                "BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED",
+            ):
+                verifier._external_tools()
+
+    def test_external_tool_resolved_path_and_bytes_drift_are_detected(self) -> None:
+        first = self.root / "external-python-first"
+        second = self.root / "external-python-second"
+        first.write_bytes(b"first external tool\n")
+        second.write_bytes(b"other external tool\n")
+        first.chmod(0o700)
+        second.chmod(0o700)
+        logical = self.root / "external-python"
+        logical.symlink_to(first)
+        real_read = verifier._read_regular_with_identity
+
+        def read_then_substitute(*args: object, **kwargs: object) -> object:
+            result = real_read(*args, **kwargs)
+            logical.unlink()
+            logical.symlink_to(second)
+            return result
+
+        with patch.object(
+            verifier,
+            "_read_regular_with_identity",
+            side_effect=read_then_substitute,
+        ):
+            with self.assertRaisesRegex(
+                verifier.VerificationError,
+                "BOOTSTRAP_EXTERNAL_TOOL_DRIFT",
+            ):
+                verifier._external_identity("python", os.fspath(logical))
+
+        before = verifier._external_identity("python", os.fspath(second))
+        second.write_bytes(b"drift external tool\n")
+        second.chmod(0o700)
+        after = verifier._external_identity("python", os.fspath(second))
+        self.assertNotEqual(before, after)
+        self.assertNotEqual(before["sha256"], after["sha256"])
 
     def test_schema_uses_portable_noncapturing_command_pattern(self) -> None:
         pattern = self.schema["$defs"]["command"]["properties"]["command_id"][
