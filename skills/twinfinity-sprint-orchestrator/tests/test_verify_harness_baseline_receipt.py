@@ -1176,6 +1176,48 @@ class BootstrapVerifierTests(unittest.TestCase):
             "output_limit_bytes": verifier.OUTPUT_LIMIT,
         }
 
+    def _run_bounded_after_pid_marker_ready(
+        self,
+        actual_argv: list[str],
+        *,
+        pid_marker: Path,
+        timeout_seconds: float,
+        readiness_timeout_seconds: float = 2.0,
+    ) -> dict[str, object]:
+        real_popen = verifier.subprocess.Popen
+        marker_ready = False
+
+        def spawn_and_wait_for_marker(
+            *arguments: object, **keywords: object
+        ) -> subprocess.Popen[bytes]:
+            nonlocal marker_ready
+            process = real_popen(*arguments, **keywords)
+            readiness_deadline = time.monotonic() + readiness_timeout_seconds
+            while (
+                not pid_marker.is_file()
+                and process.poll() is None
+                and time.monotonic() < readiness_deadline
+            ):
+                time.sleep(0.01)
+            marker_ready = pid_marker.is_file()
+            return process
+
+        with patch.object(
+            verifier.subprocess, "Popen", side_effect=spawn_and_wait_for_marker
+        ):
+            observation = verifier._run_bounded(
+                actual_argv,
+                canonical_command=self._synthetic_command(),
+                cwd=self.root,
+                environment=verifier._validation_environment(self.root),
+                timeout_seconds=timeout_seconds,
+            )
+        self.assertTrue(
+            marker_ready,
+            "terminal descendant PID marker was not ready before timeout start",
+        )
+        return observation
+
     def test_timeout_and_output_limit_are_bounded_and_clean(self) -> None:
         environment = verifier._validation_environment(self.root)
         timeout = verifier._run_bounded(
@@ -1930,6 +1972,8 @@ class BootstrapVerifierTests(unittest.TestCase):
         )
         for name, terminal, overrides in scenarios:
             pid_file = self.root / f"{name}-terminal.pid"
+            pid_file.unlink(missing_ok=True)
+            startup_delay = "time.sleep(.2);" if name == "timeout" else ""
             child = (
                 "import os,signal,time,pathlib;os.setsid();"
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
@@ -1938,6 +1982,7 @@ class BootstrapVerifierTests(unittest.TestCase):
             )
             parent = (
                 "import pathlib,subprocess,time;"
+                f"{startup_delay}"
                 f"subprocess.Popen([{verifier.PYTHON!r},'-c',{child!r}],"
                 "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
                 "stderr=subprocess.DEVNULL,close_fds=True);"
@@ -1946,12 +1991,22 @@ class BootstrapVerifierTests(unittest.TestCase):
                 "exec(\"while not p.exists() and time.monotonic()<deadline: time.sleep(.01)\");"
                 f"exec({terminal!r})"
             )
-            observation = verifier._run_bounded(
-                [verifier.PYTHON, "-c", parent],
-                canonical_command=self._synthetic_command(),
-                cwd=self.root,
-                environment=environment,
-                **overrides,
+            if name == "timeout":
+                observation = self._run_bounded_after_pid_marker_ready(
+                    [verifier.PYTHON, "-c", parent],
+                    pid_marker=pid_file,
+                    timeout_seconds=overrides["timeout_seconds"],
+                )
+            else:
+                observation = verifier._run_bounded(
+                    [verifier.PYTHON, "-c", parent],
+                    canonical_command=self._synthetic_command(),
+                    cwd=self.root,
+                    environment=environment,
+                    **overrides,
+                )
+            self.assertTrue(
+                pid_file.is_file(), f"{name} descendant PID marker was not created"
             )
             self.assertTrue(observation["descendants_detected"], name)
             self.assertTrue(observation["cleanup_verified"], name)
@@ -1987,6 +2042,21 @@ class BootstrapVerifierTests(unittest.TestCase):
         self.assertTrue(late["cleanup_verified"])
         pid = int(late_pid.read_text(encoding="utf-8"))
         self.assertFalse(Path(f"/proc/{pid}").exists())
+
+    def test_terminal_pid_marker_readiness_failure_is_deterministic(self) -> None:
+        missing_marker = self.root / "missing-terminal.pid"
+        missing_marker.unlink(missing_ok=True)
+        with self.assertRaisesRegex(
+            AssertionError,
+            "terminal descendant PID marker was not ready before timeout start",
+        ):
+            self._run_bounded_after_pid_marker_ready(
+                [verifier.PYTHON, "-c", "import time; time.sleep(30)"],
+                pid_marker=missing_marker,
+                timeout_seconds=0.1,
+                readiness_timeout_seconds=0.05,
+            )
+        self.assertFalse(missing_marker.exists())
 
     def test_extracted_tool_substitution_is_rejected_before_sealed_execution(self) -> None:
         sentinel = self.root / "same-uid-substitution-sentinel"
