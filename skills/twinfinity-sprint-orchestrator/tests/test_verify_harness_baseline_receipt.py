@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
 from pathlib import Path
@@ -1354,8 +1355,7 @@ class BootstrapVerifierTests(unittest.TestCase):
     def test_executing_python_is_kernel_derived_and_exactly_attested(self) -> None:
         self.assertEqual(verifier.PYTHON, verifier._derive_executing_interpreter_path())
         identity = verifier._external_tools()[0]
-        executable = Path(verifier.PYTHON)
-        executable_stat = executable.stat(follow_symlinks=False)
+        executable_stat = os.fstat(verifier.PYTHON_SOURCE_FD)
         self.assertEqual("python", identity["name"])
         self.assertEqual(verifier.PYTHON, identity["logical_path"])
         self.assertEqual(verifier.PYTHON, identity["resolved_path"])
@@ -1367,6 +1367,17 @@ class BootstrapVerifierTests(unittest.TestCase):
         self.assertEqual(str(executable_stat.st_nlink), identity["link_count"])
         self.assertEqual(str(executable_stat.st_mtime_ns), identity["mtime_ns"])
         self.assertEqual(str(executable_stat.st_ctime_ns), identity["ctime_ns"])
+        self.assertEqual(
+            verifier.PINNED_PYTHON_EXECUTION_SOURCE,
+            identity["execution_source"],
+        )
+        self.assertEqual(identity["sha256"], identity["execution_sha256"])
+        execution = verifier._attest_python_execution()
+        self.assertEqual(executable_stat.st_dev, execution["device"])
+        self.assertEqual(executable_stat.st_ino, execution["inode"])
+        with self.assertRaises(OSError) as denied:
+            os.open(verifier.PYTHON_EXECUTABLE, os.O_WRONLY)
+        self.assertIn(denied.exception.errno, {errno.EACCES, errno.ETXTBSY})
 
     def test_alternate_absolute_executing_python_path_is_accepted(self) -> None:
         alternate = self.root / "alternate-executing-python"
@@ -1377,15 +1388,88 @@ class BootstrapVerifierTests(unittest.TestCase):
         with (
             patch.object(verifier, "PYTHON_PROC_SELF_EXE", os.fspath(proc_alias)),
             patch.object(verifier.sys, "executable", os.fspath(alternate)),
-            patch.object(verifier, "PYTHON", os.fspath(alternate)),
         ):
-            self.assertEqual(
-                os.fspath(alternate),
-                verifier._derive_executing_interpreter_path(),
+            path, descriptor, identity, execution = (
+                verifier._bind_executing_interpreter()
             )
-            identity = verifier._external_tools()[0]
+        try:
+            self.assertEqual(os.fspath(alternate), path)
+            command = [
+                f"/proc/self/fd/{descriptor}",
+                "-B",
+                "-I",
+                "-c",
+                "import sys;print(sys.version_info[0])",
+            ]
+            completed = subprocess.run(
+                command,
+                executable=command[0],
+                pass_fds=(descriptor,),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual("3", completed.stdout.strip())
+            attested = verifier._attest_python_execution(execution)
+            self.assertEqual(execution["sha256"], attested["sha256"])
+            self.assertEqual(execution["inode"], attested["inode"])
+        finally:
+            os.close(descriptor)
         self.assertEqual(os.fspath(alternate), identity["logical_path"])
         self.assertEqual(os.fspath(alternate), identity["resolved_path"])
+
+    def test_python_path_swap_and_transient_bytes_substitution_cannot_win(self) -> None:
+        original = self.root / "pinned-python-original"
+        replacement = self.root / "pinned-python-replacement"
+        original.write_bytes(Path(verifier.PYTHON).read_bytes())
+        replacement.write_bytes(Path(verifier.GIT).read_bytes())
+        original.chmod(0o700)
+        replacement.chmod(0o700)
+        proc_alias = self.root / "pinned-python-proc-alias"
+        proc_alias.symlink_to(original)
+        with (
+            patch.object(verifier, "PYTHON_PROC_SELF_EXE", os.fspath(proc_alias)),
+            patch.object(verifier.sys, "executable", os.fspath(original)),
+        ):
+            _, descriptor, _, execution = verifier._bind_executing_interpreter()
+        try:
+            proc_alias.unlink()
+            proc_alias.symlink_to(replacement)
+            marker = self.root / "pinned-python-running"
+            command = [
+                f"/proc/self/fd/{descriptor}",
+                "-B",
+                "-I",
+                "-c",
+                (
+                    "import pathlib,time;"
+                    f"pathlib.Path({os.fspath(marker)!r}).write_text('ready');"
+                    "time.sleep(0.25);print('ORIGINAL')"
+                ),
+            ]
+            process = subprocess.Popen(
+                command,
+                executable=command[0],
+                pass_fds=(descriptor,),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 2
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(marker.exists())
+            with self.assertRaises(OSError) as denied:
+                os.open(original, os.O_WRONLY)
+            self.assertEqual(errno.ETXTBSY, denied.exception.errno)
+            stdout, stderr = process.communicate(timeout=2)
+            self.assertEqual(0, process.returncode, stderr)
+            self.assertEqual("ORIGINAL", stdout.strip())
+            attested = verifier._attest_python_execution(execution)
+            self.assertEqual(execution["sha256"], attested["sha256"])
+            self.assertEqual(execution["inode"], attested["inode"])
+        finally:
+            os.close(descriptor)
 
     def test_python_caller_or_bound_identity_override_is_rejected(self) -> None:
         with patch.object(verifier.sys, "executable", verifier.GIT):
@@ -1904,7 +1988,7 @@ class BootstrapVerifierTests(unittest.TestCase):
         pid = int(late_pid.read_text(encoding="utf-8"))
         self.assertFalse(Path(f"/proc/{pid}").exists())
 
-    def test_sealed_accepted_base_tools_resist_same_uid_substitution(self) -> None:
+    def test_extracted_tool_substitution_is_rejected_before_sealed_execution(self) -> None:
         sentinel = self.root / "same-uid-substitution-sentinel"
         sentinel.unlink(missing_ok=True)
         real_extract = verifier._extract_tree
@@ -1912,9 +1996,9 @@ class BootstrapVerifierTests(unittest.TestCase):
 
         def extract_then_substitute(
             repository: Path, tree: str, destination: Path
-        ) -> None:
+        ) -> dict[str, tuple[str, int, int, str]]:
             nonlocal extracted_base
-            real_extract(repository, tree, destination)
+            expected = real_extract(repository, tree, destination)
             if destination.name == "base":
                 extracted_base = destination
             elif destination.name == "head":
@@ -1932,26 +2016,182 @@ class BootstrapVerifierTests(unittest.TestCase):
                     target = extracted_base / relative
                     self.assertEqual(os.getuid(), target.stat().st_uid)
                     target.write_text(forged, encoding="utf-8")
+            return expected
 
         with patch.object(
             verifier, "_extract_tree", side_effect=extract_then_substitute
         ):
-            observed = verifier._execute_observations(
-                self.repository,
-                self.base_tree,
-                self.head_tree,
-                self.evidence["command_manifest"],
-            )
-        self.assertEqual(24, len(observed))
+            with self.assertRaisesRegex(
+                verifier.VerificationError,
+                "BOOTSTRAP_VALIDATION_ROOT_DRIFT",
+            ):
+                verifier._execute_observations(
+                    self.repository,
+                    self.base_tree,
+                    self.head_tree,
+                    self.evidence["command_manifest"],
+                )
         self.assertFalse(sentinel.exists())
-        self.assertEqual(self.observations, observed)
-        self.assertTrue(
-            all(
-                item["execution_source"] == verifier.SEALED_EXECUTION_SOURCE
-                and item["execution_seals"] == verifier.SEALED_EXECUTION_SEALS
-                for item in observed
-            )
-        )
+
+    def test_validation_roots_reject_every_transient_mutation_class(self) -> None:
+        def exercise(
+            mutate,
+        ) -> None:
+            with tempfile.TemporaryDirectory(prefix="root-guard-mutation-") as raw:
+                private = Path(raw)
+                private.chmod(0o700)
+                scratch = private / "scratch"
+                scratch.mkdir(mode=0o700)
+                base = private / "base"
+                head = private / "head"
+                base_expected = verifier._extract_tree(
+                    self.repository, self.base_tree, base
+                )
+                head_expected = verifier._extract_tree(
+                    self.repository, self.head_tree, head
+                )
+                with self.assertRaisesRegex(
+                    verifier.VerificationError,
+                    "BOOTSTRAP_VALIDATION_ROOT_DRIFT",
+                ):
+                    with verifier._ValidationRootGuard(
+                        private,
+                        ((base, base_expected), (head, head_expected)),
+                    ) as guard:
+                        mutate(base, head, scratch)
+                        guard.revalidate()
+
+        def rewrite_restore(base: Path, _: Path, __: Path) -> None:
+            target = base / "README.md"
+            original = target.read_bytes()
+            target.write_bytes(b"transient base mutation\n")
+            target.write_bytes(original)
+
+        def head_rewrite_restore(_: Path, head: Path, __: Path) -> None:
+            target = head / "README.md"
+            original = target.read_bytes()
+            target.write_bytes(b"transient head mutation\n")
+            target.write_bytes(original)
+
+        def chmod_restore(base: Path, _: Path, __: Path) -> None:
+            target = base / "README.md"
+            target.chmod(0o400)
+            target.chmod(0o600)
+
+        def symlink_create_delete(base: Path, _: Path, __: Path) -> None:
+            linked = base / "transient-link"
+            linked.symlink_to("README.md")
+            linked.unlink()
+
+        def new_file_create_delete(_: Path, head: Path, __: Path) -> None:
+            added = head / "transient-new-file"
+            added.write_bytes(b"transient\n")
+            added.unlink()
+
+        def pycache_create_delete(base: Path, _: Path, __: Path) -> None:
+            cache = base / "__pycache__"
+            cache.mkdir()
+            bytecode = cache / "forged.cpython-312.pyc"
+            bytecode.write_bytes(b"forged")
+            bytecode.unlink()
+            cache.rmdir()
+
+        def root_rename_replace(base: Path, _: Path, scratch: Path) -> None:
+            moved = scratch / "moved-base"
+            replacement = scratch / "replacement-base"
+            replacement.mkdir(mode=0o700)
+            base.rename(moved)
+            replacement.rename(base)
+            base.rename(replacement)
+            moved.rename(base)
+            replacement.rmdir()
+
+        def external_hardlink_mutation(base: Path, _: Path, scratch: Path) -> None:
+            target = base / "README.md"
+            original = target.read_bytes()
+            external = scratch / "external-hardlink"
+            os.link(target, external)
+            external.write_bytes(b"transient hardlink mutation\n")
+            external.write_bytes(original)
+            external.unlink()
+
+        for mutate in (
+            rewrite_restore,
+            head_rewrite_restore,
+            chmod_restore,
+            symlink_create_delete,
+            new_file_create_delete,
+            pycache_create_delete,
+            root_rename_replace,
+            external_hardlink_mutation,
+        ):
+            with self.subTest(mutation=mutate.__name__):
+                exercise(mutate)
+
+    def test_validation_loop_rejects_base_and_head_mutate_restore_races(self) -> None:
+        for root_name, tree in (("base", self.base_tree), ("head", self.head_tree)):
+            with self.subTest(root=root_name):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"root-guard-race-{root_name}-"
+                ) as raw:
+                    private = Path(raw)
+                    private.chmod(0o700)
+                    scratch = private / "scratch"
+                    scratch.mkdir(mode=0o700)
+                    base = private / "base"
+                    head = private / "head"
+                    base_expected = verifier._extract_tree(
+                        self.repository, self.base_tree, base
+                    )
+                    head_expected = verifier._extract_tree(
+                        self.repository, self.head_tree, head
+                    )
+                    target_root = base if root_name == "base" else head
+                    target = target_root / "README.md"
+                    ready = scratch / "ready"
+                    original = target.read_bytes()
+
+                    def mutate_during_child() -> None:
+                        deadline = time.monotonic() + 2
+                        while not ready.exists() and time.monotonic() < deadline:
+                            time.sleep(0.001)
+                        if ready.exists():
+                            target.write_bytes(b"transient validator race\n")
+                            target.write_bytes(original)
+
+                    worker = threading.Thread(target=mutate_during_child)
+                    with self.assertRaisesRegex(
+                        verifier.VerificationError,
+                        "BOOTSTRAP_VALIDATION_ROOT_DRIFT",
+                    ):
+                        with verifier._ValidationRootGuard(
+                            private,
+                            ((base, base_expected), (head, head_expected)),
+                        ) as guard:
+                            worker.start()
+                            code = (
+                                "import pathlib,time;"
+                                f"pathlib.Path({os.fspath(ready)!r}).write_text('ready');"
+                                "time.sleep(.5)"
+                            )
+                            command = [
+                                verifier.PYTHON_EXECUTABLE,
+                                "-B",
+                                "-I",
+                                "-c",
+                                code,
+                            ]
+                            verifier._run_bounded(
+                                command,
+                                canonical_command=self._synthetic_command(),
+                                cwd=target_root,
+                                environment=verifier._validation_environment(scratch),
+                                pass_fds=(verifier.PYTHON_EXECUTION["fd"],),
+                                python_execution=verifier.PYTHON_EXECUTION,
+                                input_guard=guard.check_events,
+                            )
+                    worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
 
     def test_behavioral_routing_uses_accepted_tools_correct_roots_and_never_candidate_runner(
         self,

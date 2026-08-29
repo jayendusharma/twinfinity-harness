@@ -188,12 +188,22 @@
             },
             {
               "type": "object",
+              "required": [
+                "execution_source",
+                "execution_sha256"
+              ],
               "properties": {
                 "name": {
                   "const": "python"
                 },
                 "logical_path": {
                   "$ref": "#/$defs/absolute_tool_path"
+                },
+                "execution_source": {
+                  "const": "PINNED_KERNEL_EXECUTABLE_FD"
+                },
+                "execution_sha256": {
+                  "$ref": "#/$defs/sha256"
                 }
               }
             }
@@ -417,6 +427,12 @@
         },
         "ctime_ns": {
           "$ref": "#/$defs/file_identity_decimal"
+        },
+        "execution_source": {
+          "const": "PINNED_KERNEL_EXECUTABLE_FD"
+        },
+        "execution_sha256": {
+          "$ref": "#/$defs/sha256"
         }
       }
     },
@@ -508,6 +524,8 @@
         "execution_seals",
         "executed_tool_sha256",
         "executed_dependency_sha256",
+        "executed_python_source",
+        "executed_python_sha256",
         "exit_code",
         "timed_out",
         "output_limited",
@@ -562,6 +580,12 @@
           "$ref": "#/$defs/sha256"
         },
         "executed_dependency_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "executed_python_source": {
+          "const": "PINNED_KERNEL_EXECUTABLE_FD"
+        },
+        "executed_python_sha256": {
           "$ref": "#/$defs/sha256"
         },
         "exit_code": {

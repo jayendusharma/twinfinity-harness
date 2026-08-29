@@ -21,6 +21,7 @@ import select
 import selectors
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,7 @@ SKILL_ROOTS = (
     "skills/twinfinity-sprint-orchestrator",
 )
 SEALED_EXECUTION_SOURCE = "SEALED_ACCEPTED_BASE_MEMFD"
+PINNED_PYTHON_EXECUTION_SOURCE = "PINNED_KERNEL_EXECUTABLE_FD"
 TOOL_PATHS = (
     ("accepted_base_verifier", VERIFIER_PATH, "ACCEPTED_BASE"),
     ("receipt_schema", SCHEMA_PATH, "ACCEPTED_BASE"),
@@ -115,6 +117,12 @@ EVIDENCE_SCOPE = (
 )
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 SEALED_EXECUTION_SEALS = "SEAL|SHRINK|GROW|WRITE"
+REQUIRED_SEALS = (
+    fcntl.F_SEAL_SEAL
+    | fcntl.F_SEAL_SHRINK
+    | fcntl.F_SEAL_GROW
+    | fcntl.F_SEAL_WRITE
+)
 DIRECT_ROUTE = "DIRECT_HARNESS_SOURCE"
 APPLICATION_ROUTE = "NORMAL_APPLICATION_ADMISSION"
 CONSOLIDATED_ISSUE92_PACKET_V5_SHA256 = (
@@ -898,9 +906,34 @@ import fcntl, hashlib, json, os, sys, types
 required = (fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK |
             fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE)
 try:
-    bundle = json.loads(sys.argv[1])
-    logical_main = sys.argv[2]
-    tool_argv = sys.argv[3:]
+    python = json.loads(sys.argv[1])
+    python_fd = int(python["fd"])
+    python_size = int(python["size"])
+    python_before = os.fstat(python_fd)
+    python_proc = os.stat("/proc/self/exe", follow_symlinks=True)
+    python_contents = os.pread(python_fd, python_size + 1, 0)
+    python_after = os.fstat(python_fd)
+    python_before_identity = [
+        python_before.st_dev, python_before.st_ino, python_before.st_mode,
+        python_before.st_uid, python_before.st_gid, python_before.st_nlink,
+        python_before.st_size, python_before.st_mtime_ns, python_before.st_ctime_ns,
+    ]
+    python_after_identity = [
+        python_after.st_dev, python_after.st_ino, python_after.st_mode,
+        python_after.st_uid, python_after.st_gid, python_after.st_nlink,
+        python_after.st_size, python_after.st_mtime_ns, python_after.st_ctime_ns,
+    ]
+    if (python_before_identity != python["identity"] or
+            python_before_identity != python_after_identity or
+            python_before.st_size != python_size or
+            python_before.st_dev != python_proc.st_dev or
+            python_before.st_ino != python_proc.st_ino or
+            len(python_contents) != python_size or
+            hashlib.sha256(python_contents).hexdigest() != python["sha256"]):
+        raise RuntimeError("python_identity")
+    bundle = json.loads(sys.argv[2])
+    logical_main = sys.argv[3]
+    tool_argv = sys.argv[4:]
     loaded = {}
     for item in bundle:
         fd = int(item["fd"])
@@ -973,7 +1006,114 @@ def _derive_executing_interpreter_path() -> str:
     return os.fspath(resolved)
 
 
-PYTHON = _derive_executing_interpreter_path()
+def _pread_exact(descriptor: int, size: int, error: str) -> bytes:
+    if type(size) is not int or size < 0 or size > 1024 * 1024 * 1024:
+        raise VerificationError(error)
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < size:
+        try:
+            chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        except OSError as exc:
+            raise VerificationError(error) from exc
+        if not chunk:
+            raise VerificationError(error)
+        chunks.append(chunk)
+        offset += len(chunk)
+    try:
+        trailing = os.pread(descriptor, 1, size)
+    except OSError as exc:
+        raise VerificationError(error) from exc
+    if trailing:
+        raise VerificationError(error)
+    return b"".join(chunks)
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _bind_executing_interpreter() -> tuple[str, int, dict[str, Any], dict[str, Any]]:
+    """Pin the running kernel executable descriptor for every child exec."""
+
+    source_fd: int | None = None
+    try:
+        source_fd = os.open(
+            PYTHON_PROC_SELF_EXE,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        resolved = _derive_executing_interpreter_path()
+        source_before = os.fstat(source_fd)
+        path_metadata = os.stat(resolved, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(source_before.st_mode)
+            or _stat_identity(source_before) != _stat_identity(path_metadata)
+            or source_before.st_uid not in {0, 65534, os.getuid()}
+            or source_before.st_size <= 0
+            or not source_before.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        ):
+            raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED")
+        contents = _pread_exact(
+            source_fd,
+            source_before.st_size,
+            "BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED",
+        )
+        source_after = os.fstat(source_fd)
+        if _stat_identity(source_before) != _stat_identity(source_after):
+            raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED")
+        digest = hashlib.sha256(contents).hexdigest()
+        source_identity = {
+            "name": "python",
+            "logical_path": resolved,
+            "resolved_path": resolved,
+            "sha256": digest,
+            "size": str(source_before.st_size),
+            "device": str(source_before.st_dev),
+            "inode": str(source_before.st_ino),
+            "mode": str(source_before.st_mode),
+            "uid": str(source_before.st_uid),
+            "gid": str(source_before.st_gid),
+            "link_count": str(source_before.st_nlink),
+            "mtime_ns": str(source_before.st_mtime_ns),
+            "ctime_ns": str(source_before.st_ctime_ns),
+            "execution_source": PINNED_PYTHON_EXECUTION_SOURCE,
+            "execution_sha256": digest,
+        }
+        execution_identity = {
+            "fd": source_fd,
+            "sha256": digest,
+            "size": len(contents),
+            "device": source_before.st_dev,
+            "inode": source_before.st_ino,
+            "identity": _stat_identity(source_before),
+            "source": PINNED_PYTHON_EXECUTION_SOURCE,
+        }
+        result_source = source_fd
+        source_fd = None
+        return resolved, result_source, source_identity, execution_identity
+    except VerificationError:
+        raise
+    except OSError as exc:
+        raise VerificationError("BOOTSTRAP_PYTHON_EXEC_FD_UNAVAILABLE") from exc
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+
+
+PYTHON, PYTHON_SOURCE_FD, PYTHON_SOURCE_IDENTITY, PYTHON_EXECUTION = (
+    _bind_executing_interpreter()
+)
+PYTHON_EXECUTABLE = f"/proc/self/fd/{PYTHON_EXECUTION['fd']}"
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -5628,12 +5768,58 @@ def _tool_identities(
 
 
 def _required_seals() -> int:
-    return (
-        fcntl.F_SEAL_SEAL
-        | fcntl.F_SEAL_SHRINK
-        | fcntl.F_SEAL_GROW
-        | fcntl.F_SEAL_WRITE
-    )
+    return REQUIRED_SEALS
+
+
+def _attest_python_execution(
+    execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    item = PYTHON_EXECUTION if execution is None else execution
+    try:
+        descriptor = item["fd"]
+        expected_size = item["size"]
+        expected_sha256 = item["sha256"]
+    except (KeyError, TypeError):
+        raise VerificationError(
+            "BOOTSTRAP_PYTHON_EXEC_FD_ATTESTATION_FAILED"
+        ) from None
+    if (
+        type(descriptor) is not int
+        or descriptor < 0
+        or type(expected_size) is not int
+        or type(expected_sha256) is not str
+    ):
+        raise VerificationError("BOOTSTRAP_PYTHON_EXEC_FD_ATTESTATION_FAILED")
+    try:
+        before = os.fstat(descriptor)
+        contents = _pread_exact(
+            descriptor,
+            expected_size,
+            "BOOTSTRAP_PYTHON_EXEC_FD_ATTESTATION_FAILED",
+        )
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise VerificationError(
+            "BOOTSTRAP_PYTHON_EXEC_FD_ATTESTATION_FAILED"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or _stat_identity(before) != _stat_identity(after)
+        or before.st_dev != item.get("device")
+        or before.st_ino != item.get("inode")
+        or _stat_identity(before) != item.get("identity")
+        or before.st_size != expected_size
+        or _sha256(contents) != expected_sha256
+        or item.get("source") != PINNED_PYTHON_EXECUTION_SOURCE
+    ):
+        raise VerificationError("BOOTSTRAP_PYTHON_EXEC_FD_ATTESTATION_FAILED")
+    return {
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "size": expected_size,
+        "sha256": expected_sha256,
+        "source": PINNED_PYTHON_EXECUTION_SOURCE,
+    }
 
 
 def _attest_sealed_fd(
@@ -5764,16 +5950,29 @@ def _sealed_command(
         pass_fds.append(item["fd"])
     arguments = _actual_argv(canonical[2:], base_root, head_root)
     bundle_json = json.dumps(bundle, sort_keys=True, separators=(",", ":"))
+    python_execution = _attest_python_execution()
+    python_bundle = json.dumps(
+        {
+            "fd": PYTHON_EXECUTION["fd"],
+            "sha256": python_execution["sha256"],
+            "size": python_execution["size"],
+            "identity": PYTHON_EXECUTION["identity"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     actual = [
-        PYTHON,
+        PYTHON_EXECUTABLE,
+        "-B",
         "-I",
         "-c",
         SEALED_TOOL_LOADER,
+        python_bundle,
         bundle_json,
         tool_path,
         *arguments,
     ]
-    return actual, tuple(pass_fds), bundle
+    return actual, (PYTHON_EXECUTION["fd"], *pass_fds), bundle
 
 
 def _external_identity(name: str, logical_path: str) -> dict[str, Any]:
@@ -5829,8 +6028,19 @@ def _external_identity(name: str, logical_path: str) -> dict[str, Any]:
 def _external_tools() -> list[dict[str, Any]]:
     if _derive_executing_interpreter_path() != PYTHON:
         raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED")
+    execution = _attest_python_execution()
+    try:
+        current_path = os.stat(PYTHON, follow_symlinks=False)
+    except OSError as exc:
+        raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED") from exc
+    if (
+        current_path.st_dev != execution["device"]
+        or current_path.st_ino != execution["inode"]
+        or current_path.st_size != execution["size"]
+    ):
+        raise VerificationError("BOOTSTRAP_PYTHON_IDENTITY_SUBSTITUTED")
     return [
-        _external_identity("python", PYTHON),
+        dict(PYTHON_SOURCE_IDENTITY),
         _external_identity("git", GIT),
     ]
 
@@ -5919,11 +6129,14 @@ def _raw_tree_entries(
     return entries
 
 
-def _extract_tree(repository_root: Path, tree: str, destination: Path) -> None:
+def _extract_tree(
+    repository_root: Path, tree: str, destination: Path
+) -> dict[str, tuple[str, int, int, str]]:
     destination.mkdir(mode=0o700)
     count = 0
     total = 0
     seen: set[str] = set()
+    expected: dict[str, tuple[str, int, int, str]] = {}
 
     def materialize(tree_id: str, components: tuple[str, ...]) -> None:
         nonlocal count, total
@@ -5949,6 +6162,7 @@ def _extract_tree(repository_root: Path, tree: str, destination: Path) -> None:
             seen.add(path)
             target = destination.joinpath(*child_components)
             if mode == "40000":
+                expected[path] = ("directory", 0o700, 0, EMPTY_SHA256)
                 try:
                     target.mkdir(mode=0o700)
                 except OSError as exc:
@@ -5968,8 +6182,9 @@ def _extract_tree(repository_root: Path, tree: str, destination: Path) -> None:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             try:
+                file_mode = 0o700 if mode == "100755" else 0o600
                 descriptor = os.open(
-                    target, flags, 0o700 if mode == "100755" else 0o600
+                    target, flags, file_mode
                 )
                 try:
                     _write_all(descriptor, contents)
@@ -5977,8 +6192,403 @@ def _extract_tree(repository_root: Path, tree: str, destination: Path) -> None:
                     os.close(descriptor)
             except OSError as exc:
                 raise VerificationError("BOOTSTRAP_TREE_WRITE_FAILED") from exc
+            expected[path] = (
+                "file",
+                file_mode,
+                len(contents),
+                _sha256(contents),
+            )
 
     materialize(tree, ())
+    return expected
+
+
+IN_MODIFY = 0x00000002
+IN_ATTRIB = 0x00000004
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_UNMOUNT = 0x00002000
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+IN_ONLYDIR = 0x01000000
+INOTIFY_DIRECTORY_MASK = (
+    IN_MODIFY
+    | IN_ATTRIB
+    | IN_CLOSE_WRITE
+    | IN_MOVED_FROM
+    | IN_MOVED_TO
+    | IN_CREATE
+    | IN_DELETE
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF
+    | IN_UNMOUNT
+    | IN_Q_OVERFLOW
+    | IN_IGNORED
+)
+INOTIFY_FILE_MASK = (
+    IN_MODIFY
+    | IN_ATTRIB
+    | IN_CLOSE_WRITE
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF
+    | IN_UNMOUNT
+    | IN_Q_OVERFLOW
+    | IN_IGNORED
+)
+INOTIFY_EVENT = struct.Struct("iIII")
+
+
+def _open_directory_descriptor(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags)
+    except OSError as exc:
+        raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT") from exc
+
+
+def _snapshot_extracted_tree(
+    root_descriptor: int,
+) -> dict[str, tuple[str, int, int, str]]:
+    observed: dict[str, tuple[str, int, int, str]] = {}
+    count = 0
+    total = 0
+
+    def scan(directory_fd: int, components: tuple[str, ...]) -> None:
+        nonlocal count, total
+        try:
+            iterator = os.scandir(directory_fd)
+        except OSError as exc:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT") from exc
+        try:
+            with iterator:
+                entries = iterator
+                for entry in entries:
+                    name = entry.name
+                    if (
+                        not name
+                        or name in {".", "..", "__pycache__"}
+                        or name.endswith((".pyc", ".pyo"))
+                        or "/" in name
+                    ):
+                        raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+                    count += 1
+                    if count > ENTRY_LIMIT:
+                        raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+                    child_components = (*components, name)
+                    relative = "/".join(child_components)
+                    try:
+                        lexical = os.stat(
+                            name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                    except OSError as exc:
+                        raise VerificationError(
+                            "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                        ) from exc
+                    if stat.S_ISDIR(lexical.st_mode):
+                        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(
+                            os, "O_NOFOLLOW", 0
+                        )
+                        child_fd: int | None = None
+                        try:
+                            child_fd = os.open(name, flags, dir_fd=directory_fd)
+                            pinned = os.fstat(child_fd)
+                            if (
+                                (
+                                    pinned.st_dev,
+                                    pinned.st_ino,
+                                    pinned.st_mode,
+                                    pinned.st_uid,
+                                )
+                                != (
+                                    lexical.st_dev,
+                                    lexical.st_ino,
+                                    lexical.st_mode,
+                                    lexical.st_uid,
+                                )
+                                or pinned.st_uid != os.getuid()
+                                or stat.S_IMODE(pinned.st_mode) != 0o700
+                            ):
+                                raise VerificationError(
+                                    "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                                )
+                            observed[relative] = (
+                                "directory",
+                                0o700,
+                                0,
+                                EMPTY_SHA256,
+                            )
+                            scan(child_fd, child_components)
+                        except VerificationError:
+                            raise
+                        except OSError as exc:
+                            raise VerificationError(
+                                "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                            ) from exc
+                        finally:
+                            if child_fd is not None:
+                                os.close(child_fd)
+                        continue
+                    if not stat.S_ISREG(lexical.st_mode):
+                        raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+                    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+                        os, "O_NONBLOCK", 0
+                    )
+                    file_fd: int | None = None
+                    try:
+                        file_fd = os.open(name, flags, dir_fd=directory_fd)
+                        before = os.fstat(file_fd)
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or before.st_uid != os.getuid()
+                            or before.st_nlink != 1
+                            or stat.S_IMODE(before.st_mode) not in {0o600, 0o700}
+                            or before.st_size > EXTRACTED_LIMIT - total
+                        ):
+                            raise VerificationError(
+                                "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                            )
+                        contents = _pread_exact(
+                            file_fd,
+                            before.st_size,
+                            "BOOTSTRAP_VALIDATION_ROOT_DRIFT",
+                        )
+                        after = os.fstat(file_fd)
+                        current = os.stat(
+                            name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                        if (
+                            _stat_identity(before) != _stat_identity(after)
+                            or _stat_identity(before) != _stat_identity(current)
+                        ):
+                            raise VerificationError(
+                                "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                            )
+                        total += len(contents)
+                        observed[relative] = (
+                            "file",
+                            stat.S_IMODE(before.st_mode),
+                            len(contents),
+                            _sha256(contents),
+                        )
+                    except VerificationError:
+                        raise
+                    except OSError as exc:
+                        raise VerificationError(
+                            "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                        ) from exc
+                    finally:
+                        if file_fd is not None:
+                            os.close(file_fd)
+        except OSError as exc:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT") from exc
+
+    root = os.fstat(root_descriptor)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != os.getuid()
+        or stat.S_IMODE(root.st_mode) != 0o700
+    ):
+        raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+    scan(root_descriptor, ())
+    return observed
+
+
+class _ValidationRootGuard:
+    """Reject every persistent or transient mutation of validation inputs."""
+
+    def __init__(
+        self,
+        private_root: Path,
+        roots: Sequence[tuple[Path, dict[str, tuple[str, int, int, str]]]],
+    ) -> None:
+        self._fd = -1
+        self._private_root = private_root
+        self._private_fd = -1
+        self._private_identity: tuple[int, ...] = ()
+        self._roots: list[
+            tuple[Path, int, tuple[int, ...], dict[str, tuple[str, int, int, str]]]
+        ] = []
+        self._arm_limit = sum(len(expected) for _, expected in roots)
+        self._armed_entries = 0
+        self._arm_deadline = time.monotonic() + 30.0
+        libc = ctypes.CDLL(None, use_errno=True)
+        init = libc.inotify_init1
+        init.argtypes = [ctypes.c_int]
+        init.restype = ctypes.c_int
+        descriptor = init(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        if descriptor < 0:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_GUARD_UNAVAILABLE")
+        self._fd = descriptor
+        add = libc.inotify_add_watch
+        add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add.restype = ctypes.c_int
+        self._inotify_add_watch = add
+        try:
+            self._private_fd = _open_directory_descriptor(private_root)
+            self._private_identity = _stat_identity(os.fstat(self._private_fd))
+            self._add_watch(self._private_fd, INOTIFY_DIRECTORY_MASK | IN_ONLYDIR)
+            for path, expected in roots:
+                root_fd = _open_directory_descriptor(path)
+                identity = _stat_identity(os.fstat(root_fd))
+                self._roots.append((path, root_fd, identity, expected))
+                self._arm_tree(root_fd)
+            if self._armed_entries != self._arm_limit:
+                raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+            self.revalidate()
+        except BaseException:
+            self.close()
+            raise
+
+    def _add_watch(self, descriptor: int, mask: int) -> None:
+        alias = os.fsencode(f"/proc/self/fd/{descriptor}")
+        if self._inotify_add_watch(self._fd, alias, mask) < 0:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_GUARD_UNAVAILABLE")
+
+    def _arm_tree(self, directory_fd: int) -> None:
+        self._add_watch(directory_fd, INOTIFY_DIRECTORY_MASK | IN_ONLYDIR)
+        try:
+            iterator = os.scandir(directory_fd)
+        except OSError as exc:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT") from exc
+        try:
+            with iterator:
+                for entry in iterator:
+                    self._armed_entries += 1
+                    if (
+                        self._armed_entries > self._arm_limit
+                        or time.monotonic() >= self._arm_deadline
+                    ):
+                        raise VerificationError(
+                            "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                        )
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise VerificationError(
+                            "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                        ) from exc
+                    if stat.S_ISDIR(metadata.st_mode):
+                        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(
+                            os, "O_NOFOLLOW", 0
+                        )
+                        child_fd = os.open(
+                            entry.name, flags, dir_fd=directory_fd
+                        )
+                        try:
+                            self._arm_tree(child_fd)
+                        finally:
+                            os.close(child_fd)
+                    elif stat.S_ISREG(metadata.st_mode):
+                        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+                            os, "O_NONBLOCK", 0
+                        )
+                        file_fd = os.open(
+                            entry.name, flags, dir_fd=directory_fd
+                        )
+                        try:
+                            self._add_watch(file_fd, INOTIFY_FILE_MASK)
+                        finally:
+                            os.close(file_fd)
+                    else:
+                        raise VerificationError(
+                            "BOOTSTRAP_VALIDATION_ROOT_DRIFT"
+                        )
+        except OSError as exc:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT") from exc
+
+    def check_events(self) -> None:
+        if self._fd < 0:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_GUARD_UNAVAILABLE")
+        while True:
+            try:
+                payload = os.read(self._fd, 1024 * 1024)
+            except BlockingIOError:
+                return
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                raise VerificationError(
+                    "BOOTSTRAP_VALIDATION_ROOT_GUARD_UNAVAILABLE"
+                ) from exc
+            if not payload:
+                raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_GUARD_UNAVAILABLE")
+            offset = 0
+            while offset < len(payload):
+                if len(payload) - offset < INOTIFY_EVENT.size:
+                    raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+                _, _, _, name_length = INOTIFY_EVENT.unpack_from(payload, offset)
+                offset += INOTIFY_EVENT.size + name_length
+                if offset > len(payload):
+                    raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+
+    def revalidate(self) -> None:
+        self.check_events()
+        try:
+            if _stat_identity(os.fstat(self._private_fd)) != self._private_identity:
+                raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+            lexical_private = _open_directory_descriptor(self._private_root)
+            try:
+                if _stat_identity(os.fstat(lexical_private)) != self._private_identity:
+                    raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+            finally:
+                os.close(lexical_private)
+            for path, root_fd, identity, expected in self._roots:
+                if _stat_identity(os.fstat(root_fd)) != identity:
+                    raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+                lexical = _open_directory_descriptor(path)
+                try:
+                    if _stat_identity(os.fstat(lexical)) != identity:
+                        raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+                finally:
+                    os.close(lexical)
+                if _snapshot_extracted_tree(root_fd) != expected:
+                    raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT")
+        except VerificationError:
+            raise
+        except OSError as exc:
+            raise VerificationError("BOOTSTRAP_VALIDATION_ROOT_DRIFT") from exc
+        self.check_events()
+
+    def close(self) -> None:
+        roots, self._roots = self._roots, []
+        for _, descriptor, _, _ in roots:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if self._private_fd >= 0:
+            try:
+                os.close(self._private_fd)
+            except OSError:
+                pass
+            self._private_fd = -1
+        if self._fd >= 0:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = -1
+
+    def __enter__(self) -> _ValidationRootGuard:
+        return self
+
+    def __exit__(self, exc_type: object, *_: object) -> None:
+        try:
+            if exc_type is None:
+                self.revalidate()
+        finally:
+            self.close()
 
 
 def _proc_stat(pid: int) -> tuple[int, int, int] | None:
@@ -6307,6 +6917,8 @@ def _run_bounded(
     output_limit_bytes: int | None = None,
     pass_fds: Sequence[int] = (),
     sealed_bundle: Sequence[dict[str, Any]] = (),
+    python_execution: dict[str, Any] | None = None,
+    input_guard: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     _enable_subreaper()
     timeout_value = (
@@ -6327,6 +6939,21 @@ def _run_bounded(
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     cleanup_verified = False
     try:
+        if input_guard is not None:
+            input_guard()
+        if python_execution is not None:
+            python_identity = _attest_python_execution(python_execution)
+            python_fd = python_execution["fd"]
+            if (
+                python_fd not in pass_fds
+                or not actual_argv
+                or actual_argv[0] != f"/proc/self/fd/{python_fd}"
+            ):
+                raise VerificationError(
+                    "BOOTSTRAP_PYTHON_EXEC_FD_ATTESTATION_FAILED"
+                )
+        else:
+            python_identity = None
         for item in sealed_bundle:
             _attest_sealed_fd(
                 item["fd"],
@@ -6335,6 +6962,11 @@ def _run_bounded(
             )
         process = subprocess.Popen(
             list(actual_argv),
+            executable=(
+                f"/proc/self/fd/{python_execution['fd']}"
+                if python_execution is not None
+                else None
+            ),
             cwd=cwd,
             env=environment,
             stdin=subprocess.DEVNULL,
@@ -6360,6 +6992,8 @@ def _run_bounded(
         timed_out = False
         output_limited = False
         while process.poll() is None:
+            if input_guard is not None:
+                input_guard()
             _remember_processes(process.pid, root_start_time, baseline, known)
             output_limited = (
                 _drain_ready(selector, buffers, limit) or output_limited
@@ -6369,9 +7003,18 @@ def _run_bounded(
             if timed_out or output_limited:
                 break
         _remember_processes(process.pid, root_start_time, baseline, known)
+        if input_guard is not None:
+            input_guard()
         cleanup_verified = _cleanup_processes(
             process, baseline, known, root_start_time
         )
+        if input_guard is not None:
+            input_guard()
+        if python_execution is not None:
+            if _attest_python_execution(python_execution) != python_identity:
+                raise VerificationError(
+                    "BOOTSTRAP_PYTHON_EXEC_FD_ATTESTATION_FAILED"
+                )
         for item in sealed_bundle:
             _attest_sealed_fd(
                 item["fd"],
@@ -6407,6 +7050,16 @@ def _run_bounded(
                 "executed_dependency_sha256": (
                     sealed_bundle[1]["sha256"]
                     if len(sealed_bundle) > 1
+                    else EMPTY_SHA256
+                ),
+                "executed_python_source": (
+                    python_identity["source"]
+                    if python_identity is not None
+                    else "UNSEALED_TEST_ONLY"
+                ),
+                "executed_python_sha256": (
+                    python_identity["sha256"]
+                    if python_identity is not None
                     else EMPTY_SHA256
                 ),
                 "exit_code": return_code,
@@ -6454,6 +7107,8 @@ def _run_bounded(
                 key.fileobj.close()
             selector.close()
         _close_known_processes(known)
+        if python_execution is not None:
+            _attest_python_execution(python_execution)
 
 
 def _actual_argv(
@@ -6498,34 +7153,47 @@ def _execute_observations(
         with tempfile.TemporaryDirectory(prefix="twinfinity-bootstrap-verifier-") as root:
             private = Path(root)
             private.chmod(0o700)
+            scratch_root = private / "scratch"
+            scratch_root.mkdir(mode=0o700)
             base_root = private / "base"
             head_root = private / "head"
-            _extract_tree(repository_root, base_tree, base_root)
-            _extract_tree(repository_root, head_tree, head_root)
-            environment = _validation_environment(private)
+            base_expected = _extract_tree(repository_root, base_tree, base_root)
+            head_expected = _extract_tree(repository_root, head_tree, head_root)
+            environment = _validation_environment(scratch_root)
             observations: list[dict[str, Any]] = []
-            for command in manifest["commands"]:
-                cwd = base_root if command["root"] == "BASE" else head_root
-                actual, pass_fds, bundle = _sealed_command(
-                    command, base_root, head_root, sealed
-                )
-                observation = _run_bounded(
-                    actual,
-                    canonical_command=command,
-                    cwd=cwd,
-                    environment=environment,
-                    pass_fds=pass_fds,
-                    sealed_bundle=bundle,
-                )
-                observations.append(observation)
-                if (
-                    observation["exit_code"] != "0"
-                    or observation["timed_out"]
-                    or observation["output_limited"]
-                    or not observation["cleanup_verified"]
-                ):
-                    raise VerificationError("BOOTSTRAP_INDEPENDENT_VALIDATION_FAILED")
-            return observations
+            with _ValidationRootGuard(
+                private,
+                ((base_root, base_expected), (head_root, head_expected)),
+            ) as input_guard:
+                for command in manifest["commands"]:
+                    input_guard.revalidate()
+                    cwd = base_root if command["root"] == "BASE" else head_root
+                    actual, pass_fds, bundle = _sealed_command(
+                        command, base_root, head_root, sealed
+                    )
+                    observation = _run_bounded(
+                        actual,
+                        canonical_command=command,
+                        cwd=cwd,
+                        environment=environment,
+                        pass_fds=pass_fds,
+                        sealed_bundle=bundle,
+                        python_execution=PYTHON_EXECUTION,
+                        input_guard=input_guard.check_events,
+                    )
+                    input_guard.revalidate()
+                    observations.append(observation)
+                    if (
+                        observation["exit_code"] != "0"
+                        or observation["timed_out"]
+                        or observation["output_limited"]
+                        or not observation["cleanup_verified"]
+                    ):
+                        raise VerificationError(
+                            "BOOTSTRAP_INDEPENDENT_VALIDATION_FAILED"
+                        )
+                input_guard.revalidate()
+                return observations
     finally:
         _close_sealed_tools(sealed)
         os.umask(old_umask)
@@ -6593,6 +7261,7 @@ OBSERVATION_KEYS = {
     "descendants_detected", "cleanup_verified", "stdout_bytes",
     "stdout_sha256", "stderr_bytes", "stderr_sha256", "execution_source",
     "execution_seals", "executed_tool_sha256", "executed_dependency_sha256",
+    "executed_python_source", "executed_python_sha256",
 }
 CANDIDATE_KEYS = {
     "schema", "repository", "issue_number", "packet_sha256", "base", "head",
@@ -6614,6 +7283,7 @@ def _validate_observation_shape(value: Any) -> None:
         or item["output_limit_bytes"] != OUTPUT_LIMIT_DECIMAL
         or item["execution_source"] != SEALED_EXECUTION_SOURCE
         or item["execution_seals"] != SEALED_EXECUTION_SEALS
+        or item["executed_python_source"] != PINNED_PYTHON_EXECUTION_SOURCE
         or item["exit_code"] != "0"
         or any(type(item[key]) is not bool for key in (
             "timed_out", "output_limited", "descendants_detected", "cleanup_verified"
@@ -6644,6 +7314,11 @@ def _validate_observation_shape(value: Any) -> None:
     )
     _require_sha(
         item["executed_dependency_sha256"],
+        SHA256,
+        "BOOTSTRAP_CANDIDATE_OBSERVATION_DIGEST",
+    )
+    _require_sha(
+        item["executed_python_sha256"],
         SHA256,
         "BOOTSTRAP_CANDIDATE_OBSERVATION_DIGEST",
     )
