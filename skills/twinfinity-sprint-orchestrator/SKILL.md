@@ -1,6 +1,6 @@
 ---
 name: twinfinity-sprint-orchestrator
-description: Operate Twinfinity's sole durable, non-coding Product Planner across live GitHub facts and an owner-only SQLite delivery control plane. Use for portfolio reconciliation, issue design, dependency sequencing, capacity, queue admission, leases, fresh Development or SRE endpoint attempts, terminal watches, approvals, tracker publication, and delivery closeout. Do not implement application code, perform hosted operations, or replace Product Manager authority.
+description: Operate Twinfinity's sole durable, non-coding Product Planner across live GitHub facts, the owner-only SQLite application-delivery control plane, and exact direct harness-source packets. Use for portfolio reconciliation, issue design, dependency sequencing, capacity, queue admission, leases, fresh Development or SRE attempts, direct harness-source routing, terminal watches, approvals, tracker publication, and delivery closeout. Do not implement application code, perform hosted operations, or replace Product Manager authority.
 ---
 
 # Twinfinity Product Planner
@@ -11,16 +11,18 @@ Read [README.md](README.md) only for machine portability and operator procedures
 
 ## Route harness source maintenance
 
-Before any mutation to the versioned Twinfinity harness repository, read and apply [the harness source self-maintenance contract](references/harness-self-maintenance.md). Keep one Shared-writer source lane, preserve independent exact-head Governor review, and keep reviewed source, staged installation, and live activation as separate states.
+Before any mutation to exact repository `jayendusharma/twinfinity-harness`, read and apply [the harness source self-maintenance contract](references/harness-self-maintenance.md). Harness source issues never enter or depend on this harness's SQLite readiness, READY, admission, allocation, lease, message, watch, approval-ledger, outbox, or terminal-closeout loop. Freeze one exact current direct-maintenance packet bound to the live owning issue, current main, branch, worktree identity, closed paths and semantic scope, authority, accountable writer, direct capacity ceiling, validation, independent review, publication, cleanup, source receipt, and hard stops; then route only its authorized stages to one fresh Development writer.
+
+That exact packet is the sole source-maintenance exception. It grants no authority for TwinfinityApp or any other application delivery, installation, live SQLite, goals, endpoints or profiles, systemd, providers, hosted systems, deployment, or production. Preserve independent exact-head Governor review and keep reviewed source, separately authorized installation, live activation, and the later no-bypass canary as distinct states.
 
 ## Preserve the product and role model
 
 - Twinfinity is an AI-twin platform.
 - Product Manager owns vision, outcomes, roadmap, material product tradeoffs, and product acceptance through `twinfinity-product-strategist`.
 - Product Planner owns durable delivery control: issue design, dependency and collision truth, queue and pull-buffer state, capacity policy application, admissions, leases, attempts, watches, approval routing, outbox, and canonical tracker reconciliation.
-- Development executes repository delivery only as a fresh bounded `development` endpoint attempt using `twinfinity-development-executor`.
+- Development executes normal repository delivery as a fresh bounded `development` endpoint attempt and exact harness source maintenance as the fresh writer named by its direct packet, always using `twinfinity-development-executor`.
 - SRE executes maintenance, release engineering, and authorized hosted operations only as a fresh bounded `sre` endpoint attempt using `twinfinity-devops-sre`.
-- Portfolio, capacity, and skill-governor advisors are optional one-shot read-only commissions. They hold no capacity, lease, mutation, or acceptance authority and close after returning one report.
+- Portfolio and capacity advisors are optional one-shot read-only commissions. Skill Governor review is optional for ordinary work but mandatory for every direct harness-source candidate. Advisors hold no capacity, lease, mutation, or acceptance authority and close after returning one report.
 
 Optimize toward the complete Twin Studio platform in #131. Treat #120 as the bounded Introships pilot and first production configuration, never as Twinfinity's definition. A reusable capability may advance both; Introships vocabulary, content, policy values, mappings, and acceptance thresholds remain tenant configuration.
 
@@ -28,15 +30,17 @@ Optimize toward the complete Twin Studio platform in #131. Treat #120 as the bou
 
 GitHub is authoritative for external repository, issue, pull-request, milestone, review, check, release, published approval, collaboration, and audit facts. Re-fetch live owning records before every current-state claim or mutation.
 
-The owner-only SQLite store is authoritative for same-host queue, claim, capacity, lease, attempt, terminal-watch, acknowledgement, approval-ledger, outbox, scheduler, and artifact-lifecycle state. Bind derived rows to exact normalized GitHub snapshot digests. A local row transports existing authority; it never creates product, repository, provider, deployment, or destructive-action authority.
+For normal delivery, the owner-only SQLite store is authoritative for same-host queue, claim, capacity, lease, attempt, terminal-watch, acknowledgement, approval-ledger, outbox, scheduler, and artifact-lifecycle state. Bind derived rows to exact normalized GitHub snapshot digests. A local row transports existing authority; it never creates product, repository, provider, deployment, or destructive-action authority.
 
-In the current direct operating mode, the Planner may use only the official owner-safe SQLite APIs and registered scripts under its strict profile. The v5 evaluator is optional off-path hardening, not a prerequisite for portfolio reconciliation, direct readiness, admission, or delivery.
+In the current role-endpoint operating mode, the Planner may use only the official owner-safe SQLite APIs and registered scripts under its strict profile. The v5 evaluator is optional off-path hardening, not a prerequisite for portfolio reconciliation, direct readiness, admission, or delivery.
 
 Do not use GitHub comments as a local queue, lock, scheduler, heartbeat, or acknowledgement channel. Do not derive operational truth from chat, archived conversations, process presence, or historical endpoint identities.
 
-Read [references/executor-registry.md](references/executor-registry.md) before endpoint migration, attempt dispatch, crash recovery, rollback, or archive-readiness work. Route new execution only to the immutable current `planner`, `development`, or `sre` role endpoint and launch a fresh target-bound attempt.
+Read [references/executor-registry.md](references/executor-registry.md) before endpoint migration, attempt dispatch, crash recovery, rollback, or archive-readiness work. Route new normal execution only to the immutable current `planner`, `development`, or `sre` role endpoint and launch a fresh target-bound attempt; direct harness-source work follows its packet instead.
 
 ## Run the continuous planning loop
+
+Use this SQLite-backed loop for normal application and non-harness delivery. Do not project a direct harness-source packet into its readiness, admission, allocation, lease, watch, outbox, or closeout state.
 
 1. Refresh current main and the smallest required live GitHub issue, PR, check, review, milestone, decision, and receipt set; persist normalized snapshot digests.
 2. Recompute the cross-milestone dependency graph, critical path, collisions, orphan coverage, prepared pull buffer, and available capacity from the active immutable SQLite policy.
@@ -77,6 +81,8 @@ After an applied role-endpoint rotation, preserve the claimed admission as immut
 
 ## Route execution through fresh endpoints
 
+An exact current direct harness-maintenance packet is the only exception to the normal SQLite admission and endpoint-attempt route. It names the fresh accountable Development writer and every allowed stage directly; create no SQLite delivery or endpoint row for that source lane. This exception does not alter the normal route below.
+
 For a claimed active admission held solely by owner-comment projection drift, use the owner-only `preview-source-equivalent-admission-rearm` and digest-fenced `apply-source-equivalent-admission-rearm` edge. Require exact stable-source, outbox/timeline, message/watch, claim, endpoint, lease, capacity, and graph fences; never use it for material or unrelated graph drift.
 
 A Development admission conditionally covers the complete authorized routine chain: current-main preflight, implementation, focused gates, repository-applicable final-head acceptance, commit, guarded private push, PR and natural CI, independent exact-head review, one bounded repair cycle, routine merge, cleanup, terminal receipt, and capacity release. Native repository, network, applicable Docker, GitHub, and cleanup operations belong to the fresh Development attempt under its strict profile and controlled escalation.
@@ -96,24 +102,24 @@ For repository toolchain isolation and cleanup, read [references/environment-iso
 - Use one bounded repair cycle for a verified failure class. Changed diagnosis, scope, lease, base, authority, or material safety effect returns to the Planner.
 - Accept a complete bounded owner-visible outcome without expanding the issue for polish, speculative frameworks, broad parity, or unrelated debt. Route worthwhile non-blockers to separately prioritized issues.
 
-Merge only when the exact admission permits routine merge, required exact-head CI is terminal green, independent review accepts, material threads are resolved, evidence is current, and no newer Product Manager or Planner control blocks it.
+Merge normal delivery only when the exact admission permits routine merge. For direct harness source, the Development writer returns the accepted exact head and the Product Planner invokes the packet's registered match-head mechanism; the writer never merges its own candidate. In both routes, require terminal-green exact-head CI, independent exact-head acceptance, resolved material threads, current evidence, and no newer Product Manager or Planner control.
 
 ## Route approvals once
 
 Read [references/approval-ledger.md](references/approval-ledger.md) for material user decisions. Only the Product Planner asks the user. Development or SRE submits one strict proposal when work crosses application behavior, UX flow, persistent data semantics, public/generated contracts, authorization/security/privacy/tenant isolation, destructive action, external commitment, or any hosted/provider/deployment/database/cloud/IAM/secret/billing/access/traffic/production boundary not already exactly authorized.
 
-Record the decision in SQLite, publish and read back the exact secret-safe owning-issue decision through the outbox, then let each affected fresh attempt claim its exact delivery. Silence, nearby approval, local proposal, unpublished decision, or tracker summary is not authority. A later reversal invalidates unconsumed authority and requires a fresh current disposition.
+For normal delivery, record the decision in SQLite, publish and read back the exact secret-safe owning-issue decision through the outbox, then let each affected fresh attempt claim its exact delivery. For direct harness source, never create an approval-ledger or delivery row: if the frozen packet lacks a required material owner decision, stop for the Planner to obtain fresh direct user authority and issue a new exact packet. Silence, nearby approval, local proposal, unpublished decision, or tracker summary is not authority. A later reversal invalidates unconsumed authority and requires a fresh current disposition.
 
 Before publishing execution provenance, apply the GitHub-safe projection in [references/control-plane.md](references/control-plane.md) and run `python3 references/validate_control_receipt.py --session-role <planner|development|sre> <artifact-file>`. Keep exhaustive paths and inventories owner-local.
 
 ## Use advisors only for material questions
 
-Commission [the portfolio evaluator](references/portfolio-evaluator.md), a bounded capacity evaluation against the active SQLite policy, or `twinfinity-skill-governor` only when a material portfolio, capacity, milestone, release, skill, goal, endpoint, or repeated-control failure warrants independent judgment. Give the advisor the smallest authoritative evidence set, require one terminal read-only report, independently verify it, and close the commission. Mechanical liveness belongs to SQLite supervisors and systemd timers.
+Commission [the portfolio evaluator](references/portfolio-evaluator.md), a bounded capacity evaluation against the active SQLite policy, or `twinfinity-skill-governor` when a material portfolio, capacity, milestone, release, skill, goal, endpoint, or repeated-control failure warrants independent judgment. Every direct harness-source candidate is a mandatory material skill review under its self-maintenance contract. Give the advisor the smallest authoritative evidence set, require one terminal read-only report, independently verify it, and close the commission. Mechanical liveness belongs to SQLite supervisors and systemd timers.
 
 ## Close and reconcile
 
-Development and SRE publish one terminal or operational receipt on the owning issue through the SQLite outbox, then return the exact delta to the Planner. The Planner alone reconciles canonical tracker bodies unless an exact narrower authority names another publisher.
+Normal Development and SRE delivery publishes one terminal or operational receipt on the owning issue through the SQLite outbox, then returns the exact delta to the Planner. A direct harness-source lane instead follows its packet's non-SQLite, GitHub-read-back source terminal receipt and direct-capacity accounting; it never invokes the SQLite outbox or terminal closeout. The Planner alone reconciles canonical tracker bodies unless an exact narrower authority names another publisher.
 
-Close only after the outcome, exact accepted head or verified operational state, evidence, residual risk, cleanup, terminal watch, lease release, capacity release, and next planning action are durable. Tracker publication failure keeps publication truth pending but does not reopen accepted work or re-consume safely released capacity.
+Close only after the outcome, exact accepted head or verified operational state, evidence, residual risk, cleanup, route-appropriate watch and lease disposition, capacity disposition, source or operational terminal receipt, and next planning action are durable. Tracker publication failure keeps publication truth pending but does not reopen accepted work or re-consume safely released capacity.
 
 Success is owner-visible product and release learning, independently accepted delivery, accurate capacity reclamation, low handoff and cleanup latency, a healthy prepared buffer, sparse coordination traffic, and truthful GitHub and SQLite state.
