@@ -26,6 +26,8 @@ import verify_harness_baseline_receipt as verifier
 
 
 ISSUE_NUMBER = 92
+ISSUE92_ACCEPTED_BASE_COMMIT = "948e94e608b70d7b3a0a576079c1f648c4acbc40"
+ISSUE92_ACCEPTED_BASE_TREE = "99caef65a4d0db450186e16035c2c6cff667e746"
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -45,6 +47,24 @@ def _git(root: Path, *arguments: str) -> str:
         env=environment,
     )
     return completed.stdout.strip()
+
+
+def _git_blob(root: Path, object_id: str) -> bytes:
+    environment = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": os.fspath(root),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+    completed = subprocess.run(
+        [verifier.GIT, "-C", os.fspath(root), "cat-file", "blob", object_id],
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
+    return completed.stdout
 
 
 def _write(path: Path, contents: str | bytes) -> None:
@@ -366,6 +386,8 @@ class BootstrapVerifierTests(unittest.TestCase):
 
     def _post_merge_issue92_fixture(
         self,
+        *,
+        contaminate_outer_candidate: bool = False,
     ) -> tuple[tempfile.TemporaryDirectory[str], dict[str, object]]:
         temporary = tempfile.TemporaryDirectory(
             prefix="post-merge-issue92-successor-"
@@ -401,6 +423,51 @@ class BootstrapVerifierTests(unittest.TestCase):
         }
         for relative in sorted(required_base_paths):
             _write(repository / relative, (source_root / relative).read_bytes())
+        contaminated_outer_paths = {}
+        if contaminate_outer_candidate:
+            for relative, starting_sha256, _ in (
+                verifier.ISSUE92_POST_MERGE_MUTABLE_PATHS
+            ):
+                if starting_sha256 == "ABSENT":
+                    continue
+                target = repository / relative
+                target.write_bytes(
+                    target.read_bytes() + b"\n# contaminated outer candidate\n"
+                )
+                contaminated_outer_paths[relative] = verifier._sha256(
+                    target.read_bytes()
+                )
+
+        trusted_repository = Path(verifier.__file__).resolve().parents[3]
+        self.assertEqual(
+            ISSUE92_ACCEPTED_BASE_COMMIT,
+            _git(trusted_repository, "rev-parse", f"{ISSUE92_ACCEPTED_BASE_COMMIT}^{{commit}}"),
+        )
+        self.assertEqual(
+            ISSUE92_ACCEPTED_BASE_TREE,
+            _git(trusted_repository, "rev-parse", f"{ISSUE92_ACCEPTED_BASE_COMMIT}^{{tree}}"),
+        )
+        for relative, starting_sha256, starting_git_blob in (
+            verifier.ISSUE92_POST_MERGE_MUTABLE_PATHS
+        ):
+            trusted_entry = _git(
+                trusted_repository,
+                "ls-tree",
+                ISSUE92_ACCEPTED_BASE_COMMIT,
+                "--",
+                relative,
+            )
+            if starting_sha256 == "ABSENT":
+                self.assertEqual("ABSENT", starting_git_blob)
+                self.assertEqual("", trusted_entry)
+                (repository / relative).unlink(missing_ok=True)
+                continue
+            self.assertEqual(
+                f"100644 blob {starting_git_blob}\t{relative}", trusted_entry
+            )
+            trusted_bytes = _git_blob(trusted_repository, starting_git_blob)
+            self.assertEqual(starting_sha256, verifier._sha256(trusted_bytes))
+            _write(repository / relative, trusted_bytes)
         _write(
             repository / verifier.VALIDATOR_PATH,
             "#!/usr/bin/env python3\n"
@@ -439,10 +506,25 @@ class BootstrapVerifierTests(unittest.TestCase):
         base_tree = _git(repository, "rev-parse", "HEAD^{tree}")
         _git(repository, "update-ref", "refs/remotes/origin/main", base_sha)
 
-        _git(repository, "checkout", "-b", verifier.ISSUE92_POST_MERGE_BRANCH)
+        accepted_base_mutable_paths = []
         for relative, starting_sha256, _ in (
             verifier.ISSUE92_POST_MERGE_MUTABLE_PATHS
         ):
+            if starting_sha256 == "ABSENT":
+                accepted_base_mutable_paths.append(
+                    (relative, "ABSENT", "ABSENT")
+                )
+                continue
+            starting_git_blob, base_sha256, _ = verifier._blob_identity(
+                repository, base_tree, relative
+            )
+            accepted_base_mutable_paths.append(
+                (relative, base_sha256, starting_git_blob)
+            )
+        accepted_base_mutable_paths = tuple(accepted_base_mutable_paths)
+
+        _git(repository, "checkout", "-b", verifier.ISSUE92_POST_MERGE_BRANCH)
+        for relative, starting_sha256, _ in accepted_base_mutable_paths:
             target = repository / relative
             if starting_sha256 == "ABSENT":
                 _write(target, '{"synthetic":true}\n')
@@ -470,6 +552,8 @@ class BootstrapVerifierTests(unittest.TestCase):
             "base_tree": base_tree,
             "candidate_head": candidate_head,
             "candidate_tree": candidate_tree,
+            "accepted_base_mutable_paths": accepted_base_mutable_paths,
+            "contaminated_outer_paths": contaminated_outer_paths,
             "prior_retained_head": prior_retained_head,
             "prior_retained_tree": candidate_tree,
             "prior_retained_parent": old_base,
@@ -2462,6 +2546,60 @@ class BootstrapVerifierTests(unittest.TestCase):
                         path, verifier._sha256(path.read_bytes())
                     )
 
+    def test_post_merge_issue92_outer_candidate_bytes_cannot_become_base_evidence(
+        self,
+    ) -> None:
+        temporary, fixture = self._post_merge_issue92_fixture(
+            contaminate_outer_candidate=True
+        )
+        try:
+            self.assertEqual(
+                verifier.ISSUE92_POST_MERGE_MUTABLE_PATHS,
+                fixture["accepted_base_mutable_paths"],
+            )
+            self.assertEqual(5, len(fixture["contaminated_outer_paths"]))
+            for relative, starting_sha256, starting_git_blob in (
+                verifier.ISSUE92_POST_MERGE_MUTABLE_PATHS
+            ):
+                if starting_sha256 == "ABSENT":
+                    continue
+                self.assertNotEqual(
+                    starting_sha256,
+                    fixture["contaminated_outer_paths"][relative],
+                )
+                base_blob, base_sha256, _ = verifier._blob_identity(
+                    fixture["repository"], fixture["base_tree"], relative
+                )
+                self.assertEqual(
+                    (starting_sha256, starting_git_blob),
+                    (base_sha256, base_blob),
+                )
+
+            with self._post_merge_issue92_constant_patch(fixture):
+                document = verifier._issue92_post_merge_expected_document(
+                    {
+                        "starting_main_sha": fixture["base_sha"],
+                        "starting_main_tree": fixture["base_tree"],
+                        "candidate_head": fixture["candidate_head"],
+                        "candidate_tree": fixture["candidate_tree"],
+                        "candidate_parent": fixture["base_sha"],
+                    }
+                )
+            document_preimages = tuple(
+                (
+                    item["path"],
+                    item["starting_sha256"],
+                    item["starting_git_blob"],
+                )
+                for item in document["mutable_paths"]
+            )
+            self.assertEqual(
+                verifier.ISSUE92_POST_MERGE_MUTABLE_PATHS,
+                document_preimages,
+            )
+        finally:
+            temporary.cleanup()
+
     def test_post_merge_issue92_successor_passes_rebased_synthetic_topology(
         self,
     ) -> None:
@@ -2476,6 +2614,52 @@ class BootstrapVerifierTests(unittest.TestCase):
                     "candidate_parent": fixture["base_sha"],
                 }
                 document = verifier._issue92_post_merge_expected_document(seed)
+                document_preimages = tuple(
+                    (
+                        item["path"],
+                        item["starting_sha256"],
+                        item["starting_git_blob"],
+                    )
+                    for item in document["mutable_paths"]
+                )
+                self.assertEqual(
+                    fixture["accepted_base_mutable_paths"],
+                    document_preimages,
+                )
+                for relative, starting_sha256, starting_git_blob in (
+                    document_preimages
+                ):
+                    if starting_sha256 == "ABSENT":
+                        self.assertEqual("ABSENT", starting_git_blob)
+                        self.assertEqual(
+                            "",
+                            _git(
+                                fixture["repository"],
+                                "ls-tree",
+                                fixture["base_tree"],
+                                "--",
+                                relative,
+                            ),
+                        )
+                    else:
+                        base_blob, base_sha256, _ = verifier._blob_identity(
+                            fixture["repository"],
+                            fixture["base_tree"],
+                            relative,
+                        )
+                        self.assertEqual(
+                            (starting_sha256, starting_git_blob),
+                            (base_sha256, base_blob),
+                        )
+                    head_blob, head_sha256, _ = verifier._blob_identity(
+                        fixture["repository"],
+                        fixture["candidate_tree"],
+                        relative,
+                    )
+                    self.assertNotEqual(
+                        (starting_sha256, starting_git_blob),
+                        (head_sha256, head_blob),
+                    )
                 packet_path = Path(temporary.name) / "generation4-successor.json"
                 packet_path.write_bytes(verifier._canonical_bytes(document))
                 packet_sha256 = verifier._sha256(packet_path.read_bytes())
