@@ -16,6 +16,11 @@ import stat
 import tempfile
 from typing import Any, Callable
 
+from delivery_identity import (
+    admission_transaction_sha256,
+    delivery_identity_error,
+    delivery_identity_sha256,
+)
 from coordination_store import (
     DEFAULT_DATABASE,
     UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA,
@@ -62,8 +67,8 @@ from repository_delivery_policy import (
 
 
 SCHEMA = "twinfinity-kanban-pull-buffer/v2"
-READY_SCHEMA = "twinfinity-kanban-pull-buffer/v3"
-FINALIZATION_SCHEMA = "twinfinity-kanban-ready-finalization/v1"
+READY_SCHEMA = "twinfinity-kanban-pull-buffer/v4"
+FINALIZATION_SCHEMA = "twinfinity-kanban-ready-finalization/v2"
 DRIFT_RECOVERY_SCHEMA = "twinfinity-kanban-ready-drift-recovery/v1"
 UNCLAIMED_ADMISSION_RECOVERY_SCHEMA = "twinfinity-unclaimed-admission-recovery/v1"
 UNCLAIMED_ADMISSION_REFILL_TRIGGER = "UNCLAIMED_ADMISSION_RECOVERY_REFILL"
@@ -581,7 +586,14 @@ def _validate_packet(packet: Any) -> None:
     if "admission_transaction" in packet:
         expected_keys.add("admission_transaction")
     if ready_v3:
-        expected_keys.update({"prepared_candidate", "readiness_binding"})
+        expected_keys.update(
+            {
+                "prepared_candidate",
+                "readiness_binding",
+                "delivery_identity",
+                "delivery_identity_sha256",
+            }
+        )
     if set(packet) != expected_keys:
         raise PullBufferError("PULL_BUFFER_PACKET_INVALID")
     for key, kind in required_scalars.items():
@@ -618,6 +630,8 @@ def _validate_packet(packet: Any) -> None:
     if ready_v3:
         prepared = packet.get("prepared_candidate")
         readiness = packet.get("readiness_binding")
+        identity = packet.get("delivery_identity")
+        identity_sha256 = packet.get("delivery_identity_sha256")
         if (
             not isinstance(prepared, dict)
             or set(prepared) != {"candidate_id", "candidate_sha256"}
@@ -639,6 +653,12 @@ def _validate_packet(packet: Any) -> None:
                 or len(readiness[field]) != 64
                 for field in ("plan_sha256", "receipt_sha256")
             )
+            or delivery_identity_error(
+                identity,
+                admission=packet.get("admission_transaction"),
+                expected_sha256=identity_sha256,
+            )
+            is not None
         ):
             raise PullBufferError("PULL_BUFFER_READINESS_BINDING_INVALID")
     policy = packet.get("capacity_policy")
@@ -1095,6 +1115,11 @@ def admission_binding_error(
         or manifest.get("worktree_path") != payload.get("worktree_path")
     ):
         return "ADMISSION_LEASE_LINEAGE_MISMATCH"
+    identity_error = delivery_identity_error(
+        payload.get("delivery_identity"), admission=admission
+    )
+    if identity_error is not None:
+        return identity_error
     return None
 
 
@@ -1145,7 +1170,7 @@ def ready_attestation_error(
                current.campaign_id AS current_campaign_id,
                current.receipt_id AS current_receipt_id,
                current.finalized_candidate_id, current.finalized_event_id,
-               campaign.plan_sha256, receipt.verdict,
+               campaign.plan_sha256, campaign.plan_json, receipt.verdict,
                receipt.receipt_sha256, receipt.receipt_json,
                dirty.id AS observed_dirty_event_id,
                dirty.state AS dirty_state,
@@ -1171,6 +1196,9 @@ def ready_attestation_error(
         receipt_payload = json.loads(
             row["receipt_json"], object_pairs_hook=_strict_object
         )
+        plan_payload = json.loads(
+            row["plan_json"], object_pairs_hook=_strict_object
+        )
         finalization_payload = json.loads(
             row["payload_json"], object_pairs_hook=_strict_object
         )
@@ -1184,7 +1212,27 @@ def ready_attestation_error(
         and int(row["finalized_event_id"] or -1) == int(row["dirty_event_id"])
         and int(row["observed_dirty_event_id"] or -1) == int(row["dirty_event_id"])
         and row["verdict"] == "PASS"
+        and receipt_payload.get("schema")
+        == "twinfinity-kanban-readiness-receipt/v2"
         and digest_json(receipt_payload) == row["receipt_sha256"]
+        and receipt_payload.get("delivery_identity_sha256")
+        == plan_payload.get("delivery_identity_sha256")
+        and finalization_payload.get("delivery_identity")
+        == plan_payload.get("delivery_identity")
+        and finalization_payload.get("delivery_identity_sha256")
+        == plan_payload.get("delivery_identity_sha256")
+        and isinstance(finalization_payload.get("delivery_identity"), dict)
+        and finalization_payload.get("admission_transaction_sha256")
+        == finalization_payload.get("delivery_identity", {}).get(
+            "admission_transaction_sha256"
+        )
+        and delivery_identity_error(
+            finalization_payload.get("delivery_identity"),
+            expected_sha256=finalization_payload.get(
+                "delivery_identity_sha256"
+            ),
+        )
+        is None
         and candidate.get("readiness_campaign_id") == int(row["campaign_id"])
         and candidate.get("readiness_receipt_id") == int(row["receipt_id"])
         and candidate.get("readiness_plan_sha256") == row["plan_sha256"]
@@ -2753,7 +2801,8 @@ def finalize_ready(
                 SELECT current.state, current.version AS current_version,
                        current.campaign_id, current.receipt_id,
                        current.finalized_candidate_id, current.finalized_event_id,
-                       campaign.plan_sha256, campaign.candidate_sha256,
+                       campaign.plan_sha256, campaign.plan_json,
+                       campaign.candidate_sha256,
                        campaign.repository, campaign.issue_number,
                        campaign.generation, campaign.item_version,
                        campaign.source_payload_sha256, campaign.accepted_main_sha,
@@ -2783,12 +2832,18 @@ def finalize_ready(
                     + ",".join(readiness_reasons)
                 )
             receipt_payload: dict[str, Any] | None = None
+            plan_payload: dict[str, Any] | None = None
             try:
                 receipt_payload = json.loads(
                     phase["receipt_json"], object_pairs_hook=_strict_object
                 )
+                plan_payload = json.loads(
+                    phase["plan_json"], object_pairs_hook=_strict_object
+                )
             except (TypeError, json.JSONDecodeError):
                 pass
+            identity = packet["delivery_identity"]
+            identity_sha256 = packet["delivery_identity_sha256"]
             if (
                 int(readiness["campaign_id"]) != int(phase["campaign_id"])
                 or int(readiness["current_version"])
@@ -2801,6 +2856,18 @@ def finalize_ready(
                 or int(phase["receipt_campaign_id"] or -1) != int(phase["campaign_id"])
                 or not isinstance(receipt_payload, dict)
                 or digest_json(receipt_payload) != phase["receipt_sha256"]
+                or not isinstance(plan_payload, dict)
+                or plan_payload.get("delivery_identity") != identity
+                or plan_payload.get("delivery_identity_sha256")
+                != identity_sha256
+                or receipt_payload.get("delivery_identity_sha256")
+                != identity_sha256
+                or delivery_identity_error(
+                    identity,
+                    admission=admission,
+                    expected_sha256=identity_sha256,
+                )
+                is not None
             ):
                 raise PullBufferError("PULL_BUFFER_READINESS_ATTESTATION_DRIFT")
 
@@ -2845,6 +2912,11 @@ def finalize_ready(
                     or finalization["prepared_candidate_sha256"]
                     != prepared_binding["candidate_sha256"]
                     or final_payload.get("schema") != FINALIZATION_SCHEMA
+                    or final_payload.get("delivery_identity") != identity
+                    or final_payload.get("delivery_identity_sha256")
+                    != identity_sha256
+                    or final_payload.get("admission_transaction_sha256")
+                    != identity["admission_transaction_sha256"]
                     or digest_json(final_payload)
                     != finalization["finalization_sha256"]
                     or _ready_dirty_event_error(
@@ -3115,7 +3187,11 @@ def finalize_ready(
                 "readiness_receipt_sha256": phase["receipt_sha256"],
                 "ready_packet_content_sha256": artifact_sha,
                 "ready_candidate_sha256": candidate_sha,
-                "admission_transaction_sha256": digest_json(admission),
+                "delivery_identity": identity,
+                "delivery_identity_sha256": identity_sha256,
+                "admission_transaction_sha256": admission_transaction_sha256(
+                    admission
+                ),
                 "lease_manifest_sha256": payload["lease_manifest_sha256"],
             }
             finalization_sha = digest_json(finalization_payload)
@@ -5350,6 +5426,9 @@ def main() -> int:
     readiness_reopen.add_argument(
         "--expected-terminal-receipt-sha256", required=True
     )
+    readiness_reopen.add_argument(
+        "--delivery-identity", type=Path, required=True
+    )
     readiness_decision = subparsers.add_parser("readiness-apply-decision")
     readiness_decision.add_argument("--message-id", type=int, required=True)
     readiness_decision.add_argument("--planner-session-id", required=True)
@@ -5457,6 +5536,9 @@ def main() -> int:
                     ),
                     expected_terminal_receipt_sha256=(
                         args.expected_terminal_receipt_sha256
+                    ),
+                    delivery_identity=read_readiness_json(
+                        args.delivery_identity
                     ),
                     now=utc_now(),
                 )

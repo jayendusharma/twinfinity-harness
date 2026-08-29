@@ -25,6 +25,7 @@ from coordination_store import (
     parse_structured_lease_manifest,
     utc_now,
 )
+from delivery_identity import delivery_identity_error
 from coordination_transfer_ledger import (
     intent_sha256 as transfer_intent_sha256,
     load_record as load_transfer_record,
@@ -375,6 +376,14 @@ class PrePushControl:
                 admission_payload = None
         if admission is None or admission_payload is None:
             raise PrePushError("PREPUSH_COMPLETED_ADMISSION_ABSENT")
+        if (
+            admission["topic"] in {"development.admission", "sre.admission"}
+            and delivery_identity_error(
+                admission_payload.get("delivery_identity")
+            )
+            is not None
+        ):
+            raise PrePushError("PREPUSH_ADMISSION_INVALID")
         branch = admission_payload.get("branch")
         worktree_path = admission_payload.get("worktree_path")
         opaque_worktree_id = admission_payload.get("opaque_worktree_id")

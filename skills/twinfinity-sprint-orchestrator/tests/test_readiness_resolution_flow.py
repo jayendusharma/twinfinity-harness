@@ -10,12 +10,14 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+
 from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from tests.delivery_identity_fixture import synthetic_delivery_identity  # noqa: E402
 import kanban_pull_buffer  # noqa: E402
 from coordination_store import (  # noqa: E402
     CoordinationError,
@@ -285,6 +287,9 @@ class ResolutionHarness:
 
     def _plan(self) -> dict:
         policy = self._policy()
+        identity, identity_sha256 = synthetic_delivery_identity(
+            REPOSITORY, ISSUE, 1
+        )
         return {
             "schema": PLAN_SCHEMA,
             "repository": REPOSITORY,
@@ -298,6 +303,8 @@ class ResolutionHarness:
             "candidate_sha256": self.initial_candidate["candidate_sha256"],
             "worker_role": "sre",
             "phase_summary": "Evaluate the complete candidate in one read-only phase.",
+            "delivery_identity": identity,
+            "delivery_identity_sha256": identity_sha256,
             "gates": [
                 {
                     "gate_key": "complete-review",
@@ -358,6 +365,9 @@ class ResolutionHarness:
             "repository": REPOSITORY,
             "issue_number": ISSUE,
             "readiness_plan_sha256": self.registered["plan_sha256"],
+            "delivery_identity_sha256": synthetic_delivery_identity(
+                REPOSITORY, ISSUE, 1
+            )[1],
             "verdict": "ACTIONABLE_HOLD",
             "worker_role": "sre",
             "message_id": self.worker_message_id,

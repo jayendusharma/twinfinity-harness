@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 from coordination_store import canonical_json, digest_json  # noqa: E402
 from coordination_transfer import activate_transfer  # noqa: E402
 from coordination_transfer_ledger import intent_sha256  # noqa: E402
+from delivery_identity import bind_delivery_identity  # noqa: E402
 from prepush_control import (  # noqa: E402
     ExistingEnvironment,
     LeaseManifest,
@@ -99,11 +100,18 @@ class PrePushControlTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-23T00:00:02Z",
         )
-        self.message = self.control.store.enqueue_message(
-            idempotency_key="issue-314-generation-2-sre",
-            recipient_session_id=SESSION,
-            topic="sre.admission",
-            payload={
+        admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": ISSUE,
+                "generation": 2,
+                "expected_version": 0,
+            },
+            "message": {
+                "idempotency_key": "issue-314-generation-2-sre",
+                "recipient_session_id": SESSION,
+                "topic": "sre.admission",
+                "payload": {
                 "source": {
                     "repository": REPOSITORY,
                     "object_kind": "issue",
@@ -127,6 +135,11 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+        }
+        bind_delivery_identity(admission)
+        self.message = self.control.store.enqueue_message(
+            **admission["message"],
             now="2026-08-23T00:00:03Z",
         )
         message = self.control.connection.execute(
@@ -161,8 +174,12 @@ class PrePushControlTests(unittest.TestCase):
         self.control.close()
         self.temp.cleanup()
 
-    def rewrite_admission_payload(self, **updates: object) -> None:
+    def rewrite_admission_payload(
+        self, *, remove: tuple[str, ...] = (), **updates: object
+    ) -> None:
         payload = json.loads(canonical_json(self.admission_payload))
+        for field in remove:
+            payload.pop(field, None)
         payload.update(updates)
         payload_sha256 = digest_json(payload)
         self.control.connection.execute(
@@ -210,11 +227,18 @@ class PrePushControlTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-26T10:59:02Z",
         )
-        message_id = self.control.store.enqueue_message(
-            idempotency_key="issue-328-generation-6-development-versioned",
-            recipient_session_id=session_id,
-            topic="development.admission",
-            payload={
+        admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": issue_number,
+                "generation": generation,
+                "expected_version": 0,
+            },
+            "message": {
+                "idempotency_key": "issue-328-generation-6-development-versioned",
+                "recipient_session_id": session_id,
+                "topic": "development.admission",
+                "payload": {
                 "source": {
                     "repository": REPOSITORY,
                     "object_kind": "issue",
@@ -240,6 +264,11 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+        }
+        bind_delivery_identity(admission)
+        message_id = self.control.store.enqueue_message(
+            **admission["message"],
             now="2026-08-26T10:59:03Z",
         )
         message = self.control.connection.execute(
@@ -320,6 +349,14 @@ class PrePushControlTests(unittest.TestCase):
         ):
             self.control._lineage(REPOSITORY, ISSUE)
 
+    def test_missing_delivery_identity_cannot_reach_prepush(self) -> None:
+        self.rewrite_admission_payload(remove=("delivery_identity",))
+
+        with self.assertRaisesRegex(
+            PrePushError, "PREPUSH_ADMISSION_INVALID"
+        ):
+            self.control._lineage(REPOSITORY, ISSUE)
+
     def test_exact_issue_328_versioned_identity_reaches_ordinary_lineage(self) -> None:
         message_id = self.seed_issue_328_versioned_lineage()
 
@@ -394,11 +431,18 @@ class PrePushControlTests(unittest.TestCase):
             "routine_chain": routine_chain,
             "hard_stops": hard_stops,
         }
-        message_id = self.control.store.enqueue_message(
-            idempotency_key="issue-36-generation-1-harness-source",
-            recipient_session_id=session_id,
-            topic="development.admission",
-            payload={
+        admission = {
+            "item": {
+                "repository": HARNESS_REPOSITORY,
+                "issue_number": issue_number,
+                "generation": generation,
+                "expected_version": 0,
+            },
+            "message": {
+                "idempotency_key": "issue-36-generation-1-harness-source",
+                "recipient_session_id": session_id,
+                "topic": "development.admission",
+                "payload": {
                 "source": {
                     "repository": HARNESS_REPOSITORY,
                     "object_kind": "issue",
@@ -439,6 +483,11 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+        }
+        bind_delivery_identity(admission)
+        message_id = self.control.store.enqueue_message(
+            **admission["message"],
             now="2026-08-27T00:00:03Z",
         )
         message = self.control.connection.execute(
@@ -844,6 +893,8 @@ class PrePushControlTests(unittest.TestCase):
                 },
             },
         }
+        bind_delivery_identity(transaction["activation"])
+
         def fetch_comment(repository: str, comment_id: int) -> dict:
             return {
                 "id": comment_id,

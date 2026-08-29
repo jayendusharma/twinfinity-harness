@@ -31,6 +31,7 @@ from delivery_guard import (  # noqa: E402
     _message_context,
     _terminal_watch_context,
 )
+from delivery_identity import bind_delivery_identity  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
@@ -88,11 +89,18 @@ class CoordinationTransferTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-23T17:00:02Z",
         )
-        self.parent_message = self.store.enqueue_message(
-            idempotency_key="issue314-generation8-parent-admission",
-            recipient_session_id=SRE_SESSION,
-            topic="sre.admission",
-            payload={
+        parent_admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": 314,
+                "generation": 8,
+                "expected_version": 0,
+            },
+            "message": {
+                "idempotency_key": "issue314-generation8-parent-admission",
+                "recipient_session_id": SRE_SESSION,
+                "topic": "sre.admission",
+                "payload": {
                 "source": {
                     "repository": REPOSITORY,
                     "object_kind": "issue",
@@ -112,6 +120,11 @@ class CoordinationTransferTests(unittest.TestCase):
                 "capacity": {"development_units": 0, "shared_units": 0, "sre_units": 1},
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+        }
+        bind_delivery_identity(parent_admission)
+        self.parent_message = self.store.enqueue_message(
+            **parent_admission["message"],
             now="2026-08-23T17:00:03Z",
         )
         parent = self.store.connection.execute(
@@ -273,6 +286,7 @@ class CoordinationTransferTests(unittest.TestCase):
             },
         }
         self.refresh_transfer_intent_hash(transaction)
+        bind_delivery_identity(transaction["activation"])
         return transaction
 
     @staticmethod

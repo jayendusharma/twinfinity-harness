@@ -14,6 +14,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from delivery_guard import pre_tool  # noqa: E402
+from delivery_identity import bind_delivery_identity  # noqa: E402
 from run_role_executor import build_child_environment  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
@@ -144,6 +145,21 @@ class RoleLeaseGuardTests(unittest.TestCase):
             "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
         }
         topic = f"{role}.admission"
+        admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": issue,
+                "generation": 3,
+                "expected_version": 0,
+            },
+            "message": {
+                "idempotency_key": f"role-lease-guard-{role}-{issue}",
+                "recipient_session_id": endpoint,
+                "topic": topic,
+                "payload": payload,
+            },
+        }
+        bind_delivery_identity(admission)
         self.connection.execute(
             """
             INSERT INTO executor_attempts(
@@ -231,6 +247,37 @@ class RoleLeaseGuardTests(unittest.TestCase):
         self.assertEqual("11", environment["TWINFINITY_EXECUTOR_TARGET_KEY"])
         self.assertEqual(ATTEMPT_ID, environment["TWINFINITY_EXECUTOR_ATTEMPT_ID"])
         self.assertEqual(TOKEN, environment["TWINFINITY_EXECUTOR_TOKEN"])
+
+    def test_missing_delivery_identity_denies_writer_context(self) -> None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM coordination_messages WHERE id=11"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        del payload["delivery_identity"]
+        self.connection.execute(
+            "UPDATE coordination_messages SET payload_json=? WHERE id=11",
+            (json.dumps(payload, sort_keys=True),),
+        )
+        self.connection.commit()
+
+        output = self.decision(
+            self.event(
+                "apply_patch",
+                {
+                    "patch": "*** Begin Patch\n*** Update File: "
+                    + str(self.worktree / "scripts" / "allowed.py")
+                    + "\n@@\n-original\n+changed\n*** End Patch"
+                },
+            )
+        )
+
+        self.assert_denied(output, "DELIVERY_CONTEXT_INVALID")
+        self.assertEqual(
+            "original\n",
+            (self.worktree / "scripts" / "allowed.py").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     def test_stale_endpoint_fails_closed_even_for_read_only_operation(self) -> None:
         self.connection.execute(

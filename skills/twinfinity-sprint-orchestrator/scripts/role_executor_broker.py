@@ -461,7 +461,7 @@ def instruction_bundle(role: str) -> dict[str, Any]:
         _instruction_source(role), "BROKER_INSTRUCTION_BUNDLE_INVALID"
     )
     schema_raw = _read_reviewed_reference(
-        REFERENCE_ROOT / "twinfinity-kanban-readiness-receipt-v1.schema.json",
+        REFERENCE_ROOT / "twinfinity-kanban-readiness-receipt-v2.schema.json",
         "BROKER_RECEIPT_SCHEMA_INVALID",
     )
     try:
@@ -736,6 +736,9 @@ def _build_input_projection(
         "issue_number": issue_number,
         "campaign_id": int(campaign["id"]),
         "readiness_plan_sha256": str(campaign["plan_sha256"]),
+        "delivery_identity_sha256": str(
+            plan["delivery_identity_sha256"]
+        ),
         "candidate_sha256": str(campaign["candidate_sha256"]),
         "source_payload_sha256": str(campaign["source_payload_sha256"]),
         "accepted_main_sha": str(campaign["accepted_main_sha"]),
@@ -2289,10 +2292,17 @@ def complete_broker_receipt(
         reasons = _binding_reasons(connection, campaign)
         if reasons:
             raise BrokerError("BROKER_READINESS_BINDING_DRIFT:" + ",".join(reasons))
+        try:
+            campaign_plan = json.loads(str(campaign["plan_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise BrokerError("BROKER_TERMINAL_BINDING_INVALID") from exc
         expected_receipt_binding = {
             "repository": run["repository"],
             "issue_number": int(run["issue_number"]),
             "readiness_plan_sha256": run["readiness_plan_sha256"],
+            "delivery_identity_sha256": campaign_plan.get(
+                "delivery_identity_sha256"
+            ),
             "worker_role": run["role"],
             "message_id": int(run["message_id"]),
             "attempt_id": attempt_id,
@@ -2601,11 +2611,17 @@ def _stage_terminal_readiness_receipt(
     )
     message_id = int(receipt["message_id"])
     attempt_id = str(receipt["attempt_id"])
+    try:
+        plan = json.loads(campaign["plan_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ReadinessError("READINESS_PLAN_INVALID") from exc
     if (
         campaign["state"] != "RUNNING"
         or campaign["attempt_id"] != attempt_id
         or int(campaign["message_id"]) != message_id
         or receipt["readiness_plan_sha256"] != campaign["plan_sha256"]
+        or receipt["delivery_identity_sha256"]
+        != plan.get("delivery_identity_sha256")
         or receipt["worker_role"] != campaign["worker_role"]
     ):
         raise ReadinessError("READINESS_RECEIPT_ATTEMPT_DRIFT")

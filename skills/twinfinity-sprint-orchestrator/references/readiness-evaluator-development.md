@@ -21,8 +21,10 @@ repository or network service, request approval, launch another agent, resume a
 session, implement code, or mutate anything.
 
 Write one JSON object matching the receipt schema to the contract's exact
-`result_path`. Bind its repository, issue, plan, role, message, attempt, and
-complete gate set exactly. A PASS requires every gate to pass. Use one
+`result_path`. Bind its repository, issue, plan, canonical delivery-identity
+digest, role, message, attempt, and complete gate set exactly. Copy the
+delivery-identity digest only from the immutable readiness plan; never derive,
+replace, or omit it. A PASS requires every gate to pass. Use one
 consolidated actionable hold when work can autonomously close the evidence gap;
 use approval required only when the gate genuinely needs human authority; use a
 terminal hold only for a non-recoverable contradiction. Write no other file.

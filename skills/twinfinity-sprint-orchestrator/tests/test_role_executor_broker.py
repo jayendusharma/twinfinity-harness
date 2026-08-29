@@ -12,6 +12,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+
 from unittest.mock import patch
 
 
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from tests.delivery_identity_fixture import synthetic_delivery_identity  # noqa: E402
 from coordination_store import CoordinationStore, canonical_json  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from executor_registry import (  # noqa: E402
@@ -411,6 +413,9 @@ class BrokerHarness:
                 """,
                 (REPOSITORY, issue_number, int(cursor.lastrowid), NOW),
             )
+        identity, identity_sha256 = synthetic_delivery_identity(
+            REPOSITORY, issue_number, 1
+        )
         plan = {
             "schema": PLAN_SCHEMA,
             "repository": REPOSITORY,
@@ -424,6 +429,8 @@ class BrokerHarness:
             "candidate_sha256": self.candidate_sha256,
             "worker_role": role,
             "phase_summary": "Evaluate every readiness gate without mutation.",
+            "delivery_identity": identity,
+            "delivery_identity_sha256": identity_sha256,
             "gates": [
                 {
                     "gate_key": "complete-review",
@@ -457,6 +464,9 @@ class BrokerHarness:
                 """,
                 (REPOSITORY, self.issue_number),
             ).fetchone()[0],
+            "delivery_identity_sha256": synthetic_delivery_identity(
+                REPOSITORY, self.issue_number, 1
+            )[1],
             "verdict": verdict,
             "worker_role": self.store.connection.execute(
                 """
@@ -1681,6 +1691,58 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             self.h.store.connection.execute(
                 "SELECT receipt_json FROM portfolio_readiness_receipts"
             ).fetchone()[0],
+        )
+
+    def test_terminal_staging_rejects_delivery_identity_drift_atomically(self) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        receipt = self.h.receipt(attempt_id)
+        receipt["delivery_identity_sha256"] = "f" * 64
+        spool.receipt_path.write_text(canonical_json(receipt), encoding="utf-8")
+        parsed, receipt_json, observation = read_receipt_file(
+            spool.receipt_path, observed_at=NOW
+        )
+
+        with self.assertRaisesRegex(
+            BrokerError, "BROKER_RECEIPT_BINDING_INVALID"
+        ):
+            complete_broker_receipt(
+                self.h.store.connection,
+                attempt_id=attempt_id,
+                receipt=parsed,
+                receipt_json=receipt_json,
+                observation=observation,
+                now=NOW,
+                evaluator_inactivity=process_exit(),
+            )
+
+        self.assertEqual(
+            ("CLAIMED", "RUNNING", "RUNNING", 0),
+            (
+                self.h.store.connection.execute(
+                    "SELECT state FROM coordination_messages WHERE id=?",
+                    (self.h.message_id,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT state FROM executor_attempts WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT state FROM role_executor_broker_runs WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()[0],
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM role_executor_broker_receipt_pickups"
+                ).fetchone()[0],
+            ),
         )
 
     def test_terminal_staging_requires_positive_evaluator_inactivity(self) -> None:

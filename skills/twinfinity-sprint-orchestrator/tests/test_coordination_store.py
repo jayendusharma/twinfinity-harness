@@ -692,7 +692,7 @@ class CoordinationStoreTests(unittest.TestCase):
             },
             now="2026-08-22T10:00:03Z",
         )
-        return finalize_canonical_ready_item(
+        finalized = finalize_canonical_ready_item(
             self.store,
             database=self.database,
             artifact_root=self.database.parent,
@@ -704,7 +704,12 @@ class CoordinationStoreTests(unittest.TestCase):
             worker_endpoint_id=endpoint,
             now="2026-08-22T10:00:04Z",
             suffix=suffix,
-        )["item"]
+        )
+        return {
+            **finalized["item"],
+            "admission_transaction": finalized["admission_transaction"],
+            "delivery_identity": finalized["delivery_identity"],
+        }
 
     def bind_admission_lease(
         self,
@@ -1168,6 +1173,10 @@ class CoordinationStoreTests(unittest.TestCase):
         item, message, artifacts = self.bind_admission_lease(
             item, message, "atomic-issue-92-admission-lease"
         )
+        transaction = copy.deepcopy(ready["admission_transaction"])
+        item = transaction["item"]
+        message = transaction["message"]
+        artifacts = transaction.get("artifacts")
         payload = message["payload"]
         before_messages = self.store.connection.execute(
             "SELECT COUNT(*) FROM coordination_messages"
@@ -1176,11 +1185,22 @@ class CoordinationStoreTests(unittest.TestCase):
             "SELECT COUNT(*) FROM coordination_terminal_watches"
         ).fetchone()[0]
         with self.assertRaisesRegex(
-            CoordinationError, "ADMISSION_ITEM_BINDING_MISMATCH"
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_DRIFT"
         ):
             self.store.activate_admission(
                 item=item,
                 message={**message, "payload": {**payload, "item_version": 99}},
+                artifacts=artifacts,
+                now="2026-08-22T10:00:03Z",
+            )
+        unbound_message = copy.deepcopy(message)
+        del unbound_message["payload"]["delivery_identity"]
+        with self.assertRaisesRegex(
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_DRIFT"
+        ):
+            self.store.activate_admission(
+                item=item,
+                message=unbound_message,
                 artifacts=artifacts,
                 now="2026-08-22T10:00:03Z",
             )
@@ -1225,6 +1245,34 @@ class CoordinationStoreTests(unittest.TestCase):
             (REPOSITORY, 92),
         ).fetchone()
         self.assertEqual(("PENDING_CLAIM", SESSION, 3, 0), tuple(watch))
+        replay_before = {
+            table: self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in (
+                "coordination_events",
+                "coordination_messages",
+                "coordination_terminal_watches",
+                "coordination_artifacts",
+            )
+        }
+        replayed, replay_message_id = self.store.activate_admission(
+            item=item,
+            message=message,
+            artifacts=artifacts,
+            now="2026-08-22T10:00:04Z",
+        )
+        self.assertEqual(activated, replayed)
+        self.assertEqual(message_id, replay_message_id)
+        self.assertEqual(
+            replay_before,
+            {
+                table: self.store.connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in replay_before
+            },
+        )
         with self.assertRaisesRegex(
             CoordinationError, "TERMINAL_WATCH_FENCE_MISMATCH"
         ):
@@ -1252,6 +1300,67 @@ class CoordinationStoreTests(unittest.TestCase):
                 expected_version=1,
                 now="2026-08-22T11:00:01Z",
             )
+
+    def test_unattested_legacy_ready_item_cannot_admit_or_allocate(self) -> None:
+        source = self.snapshot()
+        ready = self.canonical_ready_item(
+            source,
+            generation=3,
+            shared_units=1,
+            suffix="legacy-unattested-ready",
+        )
+        transaction = copy.deepcopy(ready["admission_transaction"])
+        trigger_sql = self.store.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='portfolio_ready_finalizations_immutable_delete'"
+        ).fetchone()[0]
+        with self.store.transaction():
+            self.store.connection.execute(
+                "DROP TRIGGER portfolio_ready_finalizations_immutable_delete"
+            )
+            self.store.connection.execute(
+                "DELETE FROM portfolio_ready_finalizations "
+                "WHERE repository=? AND issue_number=?",
+                (REPOSITORY, 92),
+            )
+            self.store.connection.execute(trigger_sql)
+        before = {
+            table: self.store.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in (
+                "coordination_events",
+                "coordination_messages",
+                "coordination_terminal_watches",
+                "coordination_artifacts",
+            )
+        }
+
+        with self.assertRaisesRegex(
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_MISSING"
+        ):
+            self.store.activate_admission(
+                item=transaction["item"],
+                message=transaction["message"],
+                artifacts=transaction.get("artifacts"),
+                now="2026-08-22T10:00:05Z",
+            )
+
+        observed = self.store.connection.execute(
+            "SELECT status,allocation_class,version FROM coordination_items "
+            "WHERE repository=? AND issue_number=?",
+            (REPOSITORY, 92),
+        ).fetchone()
+        self.assertEqual(("READY", "NONE", ready["version"]), tuple(observed))
+        self.assertEqual(
+            before,
+            {
+                table: self.store.connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in before
+            },
+        )
 
     def test_direct_activation_rejects_every_invalid_dispatch_binding_atomically(
         self,
@@ -1758,7 +1867,7 @@ class CoordinationStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(
             CoordinationError, "ADMISSION_LEASE_LINEAGE_MISMATCH"
         ):
-            self.store.activate_admission(
+            self.store._activate_admission_for_test_fixture(
                 **stale, now="2026-08-22T10:00:03Z"
             )
         unchanged = self.store.connection.execute(
@@ -1788,7 +1897,7 @@ class CoordinationStoreTests(unittest.TestCase):
         current_path = plans / "current-generation-3-lease.json"
         current_digest = write_manifest(current_path, 3)
         current = transaction(current_path, current_digest)
-        activated, message_id = self.store.activate_admission(
+        activated, message_id = self.store._activate_admission_for_test_fixture(
             **current, now="2026-08-22T10:00:04Z"
         )
         self.assertEqual((3, "ACTIVE_FENCED"), (activated["generation"], activated["status"]))
@@ -2019,6 +2128,10 @@ class CoordinationStoreTests(unittest.TestCase):
         item, message, artifacts = self.bind_admission_lease(
             item, message, "atomic-issue-314-sre-admission-lease"
         )
+        transaction = copy.deepcopy(ready["admission_transaction"])
+        item = transaction["item"]
+        message = transaction["message"]
+        artifacts = transaction.get("artifacts")
         payload = message["payload"]
         before_messages = self.store.connection.execute(
             "SELECT COUNT(*) FROM coordination_messages"
@@ -2065,7 +2178,7 @@ class CoordinationStoreTests(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(
-            CoordinationError, "MESSAGE_CAPACITY_CLASS_MISMATCH"
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_DRIFT"
         ):
             self.store.activate_admission(
                 item=item,

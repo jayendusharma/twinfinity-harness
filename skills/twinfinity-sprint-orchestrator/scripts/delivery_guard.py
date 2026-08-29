@@ -18,6 +18,7 @@ import sys
 from typing import Any, Iterable, Mapping
 
 from coordination_store import terminal_watch_key
+from delivery_identity import delivery_identity_error
 from executor_registry import (
     RegistryError,
     applied_endpoint_rotation_chain,
@@ -483,9 +484,9 @@ def _rotated_admission_matches(
             if role == "development"
             else {"sre.admission"}
         )
-        or
-        not isinstance(source, dict)
+        or not isinstance(source, dict)
         or not isinstance(capacity, dict)
+        or delivery_identity_error(payload.get("delivery_identity")) is not None
         or message["state"] != "CLAIMED"
         or message["claimed_by"] != message["recipient_session_id"]
         or identity_role(connection, str(message["recipient_session_id"])) != role
@@ -611,6 +612,11 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         return DeliveryContext(role, endpoint_id, "message", target_key, topic, None, frozenset(), False)
     if topic in {"development.recovery_prepare", "development.terminal_closeout"}:
         return DeliveryContext(role, endpoint_id, "message", target_key, topic, None, frozenset(), False)
+    if (
+        topic in {"development.admission", "sre.admission"}
+        and delivery_identity_error(payload.get("delivery_identity")) is not None
+    ):
+        raise GuardError("DELIVERY_IDENTITY_INVALID")
     watch = connection.execute(
         "SELECT * FROM coordination_terminal_watches "
         "WHERE repository=? AND issue_number=? AND generation=?",
@@ -680,6 +686,10 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
         and candidate["topic"] in topics
         and candidate["recipient_session_id"] == endpoint_id
         and isinstance(payload, dict)
+        and (
+            candidate["topic"] == "development.recovery_commit"
+            or delivery_identity_error(payload.get("delivery_identity")) is None
+        )
         and _item_matches(connection, payload, endpoint_id, exact_version=False)
         and isinstance(payload.get("source"), dict)
         and watch["repository"] == payload["source"].get("repository")

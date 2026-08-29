@@ -7,12 +7,14 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+
 from unittest.mock import patch
 
 
 STAGED = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(STAGED))
 
+from tests.delivery_identity_fixture import synthetic_delivery_identity  # noqa: E402
 from approval_guard import readiness_execution_scope_sha256  # noqa: E402
 from approval_ledger import (  # noqa: E402
     create_review_batch,
@@ -267,6 +269,9 @@ class ApprovalFlowHarness:
                 (REPOSITORY,),
             ).fetchone()[0]
         )
+        identity, identity_sha256 = synthetic_delivery_identity(
+            REPOSITORY, ISSUE, 1
+        )
         return {
             "schema": PLAN_SCHEMA,
             "repository": REPOSITORY,
@@ -283,6 +288,8 @@ class ApprovalFlowHarness:
                 "Resolve the complete material readiness question without "
                 "repository mutation."
             ),
+            "delivery_identity": identity,
+            "delivery_identity_sha256": identity_sha256,
             "gates": [
                 {
                     "gate_key": "material-decision",
@@ -420,6 +427,9 @@ class ApprovalFlowHarness:
             "repository": REPOSITORY,
             "issue_number": ISSUE,
             "readiness_plan_sha256": self.registered["plan_sha256"],
+            "delivery_identity_sha256": synthetic_delivery_identity(
+                REPOSITORY, ISSUE, 1
+            )[1],
             "verdict": "APPROVAL_REQUIRED",
             "worker_role": "sre",
             "message_id": self.worker_message_id,
@@ -682,6 +692,9 @@ class ReadinessApprovalFlowTests(unittest.TestCase):
             "repository": REPOSITORY,
             "issue_number": ISSUE,
             "readiness_plan_sha256": campaign["plan_sha256"],
+            "delivery_identity_sha256": synthetic_delivery_identity(
+                REPOSITORY, ISSUE, 1
+            )[1],
             "verdict": "ACTIONABLE_HOLD",
             "worker_role": "sre",
             "message_id": self.h.worker_message_id,

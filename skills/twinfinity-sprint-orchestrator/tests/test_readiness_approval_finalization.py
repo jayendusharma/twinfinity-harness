@@ -20,6 +20,10 @@ from coordination_store import (  # noqa: E402
     canonical_json,
     digest_json,
 )
+from delivery_identity import (  # noqa: E402
+    bind_delivery_identity,
+    delivery_identity_sha256,
+)
 from approval_guard import readiness_execution_scope_sha256  # noqa: E402
 from approval_ledger import (  # noqa: E402
     claim_decision,
@@ -32,6 +36,7 @@ from approval_ledger import (  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from kanban_pull_buffer import (  # noqa: E402
     PullBufferError,
+    READY_SCHEMA,
     admission_binding_error,
     audit_pull_buffer,
     close_candidate_observations,
@@ -43,6 +48,7 @@ from kanban_pull_buffer import (  # noqa: E402
 from kanban_readiness import (  # noqa: E402
     PLAN_SCHEMA,
     RECEIPT_SCHEMA,
+    ReadinessError,
     attach as attach_readiness,
     discover as discover_readiness,
     dispatch as dispatch_readiness,
@@ -196,6 +202,8 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
         existing_lease: bool = False,
         finalize: bool = True,
         failpoint=None,
+        packet_mutator=None,
+        receipt_mutator=None,
     ) -> Path:
         plans = self.root / "plans"
         plans.mkdir(exist_ok=True)
@@ -263,6 +271,94 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             """,
             (REPOSITORY,),
         ).fetchone()
+        lease_path = plans / "issue-2-lease.json"
+        lease_payload = {
+            "repository": REPOSITORY,
+            "issue_number": 2,
+            "generation": 1,
+            "base_sha": MAIN,
+            "branch": "codex/2-ready-successor",
+            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-2",
+            "no_additional_paths": True,
+            "paths": [{
+                "path": "backend/successor.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "b" * 40,
+            }],
+        }
+        lease_path.write_text(
+            json.dumps(lease_payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        lease_sha = hashlib.sha256(lease_path.read_bytes()).hexdigest()
+        lease_artifacts = [{
+            "repository": REPOSITORY,
+            "issue_number": 2,
+            "generation": 1,
+            "path": str(lease_path),
+            "retention_class": "CLOSEOUT_EVIDENCE",
+        }]
+        item = {
+            "repository": REPOSITORY,
+            "issue_number": 2,
+            "status": "ACTIVE",
+            "allocation_class": "ACTIVE",
+            "generation": 1,
+            "accountable_session_id": DEVELOPMENT_SESSION,
+            "lease_manifest_sha256": lease_sha,
+            "development_units": 1,
+            "shared_units": 0,
+            "sre_units": 0,
+            "expected_source_sha256": self.sources[2],
+            "expected_version": self.ready_item["version"] + 1,
+        }
+        message = {
+            "idempotency_key": "portfolio-convergence-issue-2",
+            "recipient_session_id": DEVELOPMENT_SESSION,
+            "topic": "development.admission",
+            "payload": {
+                "source": {
+                    "repository": REPOSITORY,
+                    "object_kind": "issue",
+                    "object_number": 2,
+                    "payload_sha256": self.sources[2],
+                },
+                "issue_number": 2,
+                "generation": 1,
+                "item_version": self.ready_item["version"] + 2,
+                "base_sha": MAIN,
+                "branch": "codex/2-ready-successor",
+                "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-2",
+                "opaque_worktree_id": "twinfinityapp-issue-2",
+                "accountable_session_id": DEVELOPMENT_SESSION,
+                "writer": "issue-2-accountable-writer",
+                "reviewer_plan": ["Different-session exact-head review."],
+                "collision_proof": ["The closed lease is disjoint from active work."],
+                "environment_rule": "Use only an issue-owned environment.",
+                "routine_chain": [
+                    "Implement and run the issue-owned gates.",
+                    "Publish only through the guarded closeout chain.",
+                ],
+                "hard_stops": [
+                    "Stop on source, graph, lease, capacity, or authority drift."
+                ],
+                "lease_manifest_sha256": lease_sha,
+                "authority_sha256": "7" * 64,
+                "capacity": {
+                    "development_units": 1,
+                    "shared_units": 0,
+                    "sre_units": 0,
+                },
+                "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
+            },
+        }
+        prospective_admission = {
+            "item": item,
+            "message": message,
+            **({} if existing_lease else {"artifacts": lease_artifacts}),
+        }
+        delivery_identity = bind_delivery_identity(prospective_admission)
+        delivery_identity_digest = delivery_identity_sha256(delivery_identity)
         readiness_plan = {
             "schema": PLAN_SCHEMA,
             "repository": REPOSITORY,
@@ -276,6 +372,8 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             "candidate_sha256": prepared["candidate_sha256"],
             "worker_role": "development",
             "phase_summary": "Complete one all-gates readiness phase.",
+            "delivery_identity": delivery_identity,
+            "delivery_identity_sha256": delivery_identity_digest,
             "gates": [{
                 "gate_key": "complete-review",
                 "description": "All readiness evidence is current.",
@@ -328,6 +426,7 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                 "repository": REPOSITORY,
                 "issue_number": 2,
                 "readiness_plan_sha256": campaign["plan_sha256"],
+                "delivery_identity_sha256": delivery_identity_digest,
                 "verdict": "PASS",
                 "worker_role": "development",
                 "message_id": message_id,
@@ -346,6 +445,8 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                 "summary": "The candidate is ready for atomic finalization.",
                 "observed_at": "2026-08-24T10:00:02Z",
             }
+        if receipt_mutator is not None:
+            receipt_mutator(receipt)
         draft = self.root / "readiness-receipt-2.json"
         draft.write_text(canonical_json(receipt), encoding="utf-8")
         draft.chmod(0o600)
@@ -481,8 +582,15 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
         }
+        admission_transaction = {
+            "item": item,
+            "message": message,
+            **({} if existing_lease else {"artifacts": lease_artifacts}),
+        }
+        if bind_delivery_identity(admission_transaction) != delivery_identity:
+            raise AssertionError("prospective delivery identity drifted before READY")
         packet = {
-            "schema": "twinfinity-kanban-pull-buffer/v3",
+            "schema": READY_SCHEMA,
             "repository": REPOSITORY,
             "issue_number": 2,
             "generation": 1,
@@ -515,11 +623,9 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             "promotion_checks_after_predecessor": ["Revalidate every local guard."],
             "hard_stops": ["Stop on any source, graph, lease, or capacity drift."],
             "promotion_trigger": "Issue 1 releases its capacity.",
-            "admission_transaction": {
-                "item": item,
-                "message": message,
-                **({} if existing_lease else {"artifacts": lease_artifacts}),
-            },
+            "admission_transaction": admission_transaction,
+            "delivery_identity": delivery_identity,
+            "delivery_identity_sha256": delivery_identity_digest,
             "prepared_candidate": {
                 "candidate_id": int(prepared["id"]),
                 "candidate_sha256": prepared["candidate_sha256"],
@@ -533,6 +639,8 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             },
         }
         packet_path = plans / "issue-2-pull-buffer.json"
+        if packet_mutator is not None:
+            packet_mutator(packet)
         packet_path.write_text(
             json.dumps(packet, sort_keys=True), encoding="utf-8"
         )
@@ -743,6 +851,151 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             "decision_sha256": decision["decision_sha256"],
             "planner_session_id": planner,
         }
+
+    def test_every_post_pass_delivery_substitution_fails_before_ready_without_writes(
+        self,
+    ) -> None:
+        def mutate_identity(field: str, value):
+            def apply(packet: dict) -> None:
+                packet["delivery_identity"][field] = value
+                packet["admission_transaction"]["message"]["payload"][
+                    "delivery_identity"
+                ][field] = value
+
+            return apply
+
+        def mutate_payload(field: str, value):
+            def apply(packet: dict) -> None:
+                packet["admission_transaction"]["message"]["payload"][
+                    field
+                ] = value
+
+            return apply
+
+        def mutate_item(packet: dict) -> None:
+            packet["admission_transaction"]["item"]["expected_version"] += 1
+
+        def mutate_message(packet: dict) -> None:
+            packet["admission_transaction"]["message"][
+                "idempotency_key"
+            ] += "-substituted"
+
+        def mutate_artifacts(packet: dict) -> None:
+            packet["admission_transaction"].setdefault("artifacts", []).append(
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": 2,
+                    "generation": 1,
+                    "path": str(self.root / "foreign-artifact.json"),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            )
+
+        mutations = (
+            ("lease", mutate_payload("lease_manifest_sha256", "f" * 64)),
+            ("branch", mutate_payload("branch", "codex/2-substituted")),
+            (
+                "worktree",
+                mutate_payload(
+                    "worktree_path",
+                    "/home/ubuntu/code/twinfinityapp-issue-2-g2",
+                ),
+            ),
+            ("opaque", mutate_payload("opaque_worktree_id", "issue-2-generation-9")),
+            ("generation", mutate_payload("generation", 2)),
+            ("admission-payload", mutate_payload("authority_sha256", "8" * 64)),
+            ("artifact-set", mutate_artifacts),
+            ("item-binding", mutate_item),
+            ("message-binding", mutate_message),
+            (
+                "execution-scope",
+                mutate_identity("admission_execution_scope_sha256", "4" * 64),
+            ),
+            (
+                "transaction-digest",
+                mutate_identity("admission_transaction_sha256", "5" * 64),
+            ),
+        )
+        for index, (field, mutator) in enumerate(mutations):
+            if index:
+                self.tearDown()
+                self.setUp()
+            with self.subTest(field=field):
+                packet_path = self._register_ready_candidate(
+                    finalize=False, packet_mutator=mutator
+                )
+                tables = (
+                    "portfolio_pull_buffer_candidates",
+                    "portfolio_ready_finalizations",
+                    "portfolio_dirty_events",
+                    "coordination_messages",
+                    "coordination_terminal_watches",
+                )
+                before = {
+                    table: self.store.connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    for table in tables
+                }
+                with self.assertRaisesRegex(
+                    PullBufferError,
+                    "DELIVERY_IDENTITY|PULL_BUFFER_READINESS_BINDING",
+                ):
+                    finalize_ready(
+                        self.store,
+                        packet_path,
+                        now="2026-08-24T10:00:03Z",
+                        canonical_main_reader=lambda _repository: MAIN,
+                    )
+                after = {
+                    table: self.store.connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    for table in tables
+                }
+                item = self.store.connection.execute(
+                    "SELECT status,allocation_class FROM coordination_items "
+                    "WHERE repository=? AND issue_number=2",
+                    (REPOSITORY,),
+                ).fetchone()
+                ready_count = self.store.connection.execute(
+                    "SELECT COUNT(*) FROM portfolio_pull_buffer_candidates "
+                    "WHERE repository=? AND issue_number=2 AND state='READY'",
+                    (REPOSITORY,),
+                ).fetchone()[0]
+                self.assertEqual(before, after)
+                self.assertEqual(("PREPARED", "NONE"), tuple(item))
+                self.assertEqual(0, ready_count)
+
+    def test_historical_unbound_receipt_requires_a_fresh_campaign(self) -> None:
+        def historical(receipt: dict) -> None:
+            receipt["schema"] = "twinfinity-kanban-readiness-receipt/v1"
+            del receipt["delivery_identity_sha256"]
+
+        with self.assertRaisesRegex(ReadinessError, "READINESS_RECEIPT_INVALID"):
+            self._register_ready_candidate(
+                finalize=False, receipt_mutator=historical
+            )
+        item = self.store.connection.execute(
+            "SELECT status,allocation_class FROM coordination_items "
+            "WHERE repository=? AND issue_number=2",
+            (REPOSITORY,),
+        ).fetchone()
+        self.assertEqual(("PREPARED", "NONE"), tuple(item))
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_pull_buffer_candidates "
+                "WHERE repository=? AND issue_number=2 AND state='READY'",
+                (REPOSITORY,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_ready_finalizations"
+            ).fetchone()[0],
+        )
 
     def test_missing_git_registration_blocks_ready_finalization_before_state_write(
         self,

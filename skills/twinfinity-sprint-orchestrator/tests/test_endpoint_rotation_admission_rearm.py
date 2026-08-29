@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 from coordination_store import CoordinationError, CoordinationStore, digest_json  # noqa: E402
 import coordination_store as coordination_store_module  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
+from delivery_identity import bind_delivery_identity  # noqa: E402
 from delivery_guard import (  # noqa: E402
     GuardError,
     _message_context,
@@ -149,6 +150,25 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             "routine_chain": ["Complete the admitted delivery chain."],
             "hard_stops": ["Stop on binding drift."],
         }
+        bind_delivery_identity(
+            {
+                "item": {
+                    "repository": REPOSITORY,
+                    "issue_number": ISSUE,
+                    "generation": GENERATION,
+                    "expected_version": 1,
+                },
+                "message": {
+                    "idempotency_key": (
+                        f"issue-328-generation-{GENERATION}-admission"
+                    ),
+                    "recipient_session_id": V3,
+                    "topic": "development.admission",
+                    "payload": self.payload,
+                },
+                "artifacts": [],
+            }
+        )
         self.message_id = self.store.enqueue_message(
             idempotency_key=f"issue-328-generation-{GENERATION}-admission",
             recipient_session_id=V3,
