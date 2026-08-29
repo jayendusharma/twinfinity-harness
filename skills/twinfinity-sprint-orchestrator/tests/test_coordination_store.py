@@ -780,52 +780,13 @@ class CoordinationStoreTests(unittest.TestCase):
             shared_units=1,
             suffix=f"{slug}-ready",
         )
-        item = {
-            "repository": REPOSITORY,
-            "issue_number": 92,
-            "status": "ACTIVE",
-            "allocation_class": "ACTIVE",
-            "generation": generation,
-            "accountable_session_id": SESSION,
-            "lease_manifest_sha256": LEASE,
-            "development_units": 1,
-            "shared_units": 1,
-            "sre_units": 0,
-            "expected_source_sha256": source.payload_sha256,
-            "expected_version": ready["version"],
-        }
-        message = {
-            "idempotency_key": f"{slug}-admission",
-            "recipient_session_id": SESSION,
-            "topic": "development.admission",
-            "payload": {
-                "source": {
-                    "repository": REPOSITORY,
-                    "object_kind": "issue",
-                    "object_number": 92,
-                    "payload_sha256": source.payload_sha256,
-                },
-                "issue_number": 92,
-                "generation": generation,
-                "item_version": ready["version"] + 1,
-                "base_sha": "a" * 40,
-                "branch": "codex/92-transcript-review-editor",
-                "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-92",
-                "opaque_worktree_id": "twinfinityapp-issue-92",
-                "accountable_session_id": SESSION,
-                "authority_sha256": "7" * 64,
-                "capacity": {
-                    "development_units": 1,
-                    "shared_units": 1,
-                    "sre_units": 0,
-                },
-                "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
-            },
-        }
-        bound_item, bound_message, artifacts = self.bind_admission_lease(
-            item, message, f"{slug}-lease"
+        transaction = copy.deepcopy(ready["admission_transaction"])
+        return (
+            transaction["item"],
+            transaction["message"],
+            transaction.get("artifacts", []),
+            ready,
         )
-        return bound_item, bound_message, artifacts, ready
 
     def test_database_is_durable_and_coexists_with_ack_table(self) -> None:
         self.assertEqual("wal", self.store.connection.execute("PRAGMA journal_mode").fetchone()[0])
@@ -1300,6 +1261,75 @@ class CoordinationStoreTests(unittest.TestCase):
                 expected_version=1,
                 now="2026-08-22T11:00:01Z",
             )
+
+    def test_claim_rejects_idempotency_substitution_without_writes(self) -> None:
+        source = self.snapshot()
+        ready = self.canonical_ready_item(
+            source,
+            generation=3,
+            shared_units=1,
+            suffix="claim-immutable-admission",
+        )
+        transaction = copy.deepcopy(ready["admission_transaction"])
+        _active, message_id = self.store.activate_admission(
+            item=transaction["item"],
+            message=transaction["message"],
+            artifacts=transaction.get("artifacts"),
+            now="2026-08-22T10:00:05Z",
+        )
+        running, token = self.running_message_attempt(message_id)
+        self.store.connection.execute(
+            "DROP TRIGGER IF EXISTS coordination_message_envelope_immutable"
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_messages SET idempotency_key=? WHERE id=?",
+            ("claim-substituted-idempotency", message_id),
+        )
+        before_changes = self.store.connection.total_changes
+        before_message = tuple(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()
+        )
+        before_watch = tuple(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_terminal_watches "
+                "WHERE admission_message_id=?",
+                (message_id,),
+            ).fetchone()
+        )
+
+        with self.assertRaisesRegex(
+            CoordinationError, "ADMISSION_DELIVERY_IDENTITY_INVALID"
+        ):
+            self.store.claim_message(
+                message_id,
+                SESSION,
+                "2026-08-22T10:00:06Z",
+                attempt_id=running["attempt_id"],
+                executor_token=token,
+            )
+
+        self.assertEqual(before_changes, self.store.connection.total_changes)
+        self.assertEqual(
+            before_message,
+            tuple(
+                self.store.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=?",
+                    (message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            before_watch,
+            tuple(
+                self.store.connection.execute(
+                    "SELECT * FROM coordination_terminal_watches "
+                    "WHERE admission_message_id=?",
+                    (message_id,),
+                ).fetchone()
+            ),
+        )
 
     def test_unattested_legacy_ready_item_cannot_admit_or_allocate(self) -> None:
         source = self.snapshot()
@@ -2426,7 +2456,7 @@ class CoordinationStoreTests(unittest.TestCase):
         item, message, artifacts, _ready = self.prepare_development_admission(
             "issue-92-terminal-closeout-generation-zero", generation=0
         )
-        active, admission_id = self.store._activate_admission_for_test_fixture(
+        active, admission_id = self.store.activate_admission(
             item=item,
             message=message,
             artifacts=artifacts,
@@ -2434,11 +2464,6 @@ class CoordinationStoreTests(unittest.TestCase):
         )
         self.remote_main_shas[REPOSITORY] = "a" * 40
         watch_key = f"terminal:{REPOSITORY}:issue:92:generation:0"
-        self.store.connection.execute(
-            "UPDATE coordination_terminal_watches SET state='PENDING_CLAIM' "
-            "WHERE watch_key=?",
-            (watch_key,),
-        )
         running, token = self.running_message_attempt(admission_id)
         self.assertEqual(0, running["lineage_generation"])
         with self.assertRaisesRegex(

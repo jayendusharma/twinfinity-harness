@@ -285,6 +285,11 @@ class ResolutionHarness:
             now=CLAIMED_AT,
         )
 
+    def replacement_delivery_identity(self) -> dict:
+        identity = copy.deepcopy(self.plan["delivery_identity"])
+        identity["admission_transaction_sha256"] = "4" * 64
+        return identity
+
     def _plan(self) -> dict:
         policy = self._policy()
         identity, identity_sha256 = synthetic_delivery_identity(
@@ -494,7 +499,9 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         )
         return message_id, context
 
-    def test_cold_context_owner_readback_successor_and_replay(self) -> None:
+    def test_candidate_rebuild_requires_fresh_identity_without_apply_writes(
+        self,
+    ) -> None:
         message_id, context = self._claim()
         self.assertEqual(self.h.plan, context["parent_plan"])
         self.assertEqual(
@@ -524,49 +531,45 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         self.assertEqual("COMPLETE", action_receipt["state"])
         replayed_receipt = self.h.execute_candidate_action(message_id, context)
         self.assertTrue(replayed_receipt["replay"])
-        result = apply_readiness_resolution(
-            self.h.store,
-            message_id=message_id,
-            planner_session_id=PLANNER,
-            expected_context_sha256=context["context_sha256"],
-            now=APPLIED_AT,
-        )
-        self.assertEqual("SUCCESSOR", result["outcome"])
-        self.assertEqual("RESUMED", result["disposition"])
-        successor = self.h.store.connection.execute(
-            "SELECT * FROM portfolio_readiness_campaigns WHERE id=?",
-            (result["successor_campaign_id"],),
-        ).fetchone()
-        self.assertEqual(self.h.desired_candidate_sha256, successor["candidate_sha256"])
-        self.assertEqual(
-            result["action_set_sha256"], successor["resolution_action_set_sha256"]
-        )
-        self.assertEqual(
-            result["changed_evidence_sha256"], successor["changed_evidence_sha256"]
-        )
-        replay = apply_readiness_resolution(
-            self.h.store,
-            message_id=message_id,
-            planner_session_id=PLANNER,
-            expected_context_sha256=context["context_sha256"],
-            now=APPLIED_AT,
-        )
-        self.assertTrue(replay["replay"])
-        self.assertEqual(result["successor_campaign_id"], replay["successor_campaign_id"])
-        context_replay = claim_readiness_resolution_context(
-            self.h.store,
-            message_id=message_id,
-            planner_session_id=PLANNER,
-            now=APPLIED_AT,
-        )
-        self.assertTrue(context_replay["replay"])
-        self.assertEqual(context["context_sha256"], context_replay["context_sha256"])
-        self.assertEqual(
-            1,
+        before = tuple(
             self.h.store.connection.execute(
-                "SELECT COUNT(*) FROM portfolio_readiness_resolution_cycles"
-            ).fetchone()[0],
+                "SELECT "
+                "(SELECT COUNT(*) FROM portfolio_readiness_campaigns),"
+                "(SELECT COUNT(*) FROM portfolio_readiness_resolution_cycles),"
+                "(SELECT state FROM coordination_messages WHERE id=?),"
+                "(SELECT state FROM portfolio_readiness_current "
+                " WHERE repository=? AND issue_number=?)",
+                (message_id, REPOSITORY, ISSUE),
+            ).fetchone()
         )
+        total_changes = self.h.store.connection.total_changes
+        for _ in range(2):
+            with self.assertRaisesRegex(
+                ReadinessError,
+                "READINESS_RESOLUTION_DELIVERY_IDENTITY_REFRESH_REQUIRED",
+            ):
+                apply_readiness_resolution(
+                    self.h.store,
+                    message_id=message_id,
+                    planner_session_id=PLANNER,
+                    expected_context_sha256=context["context_sha256"],
+                    now=APPLIED_AT,
+                )
+            self.assertEqual(total_changes, self.h.store.connection.total_changes)
+            self.assertEqual(
+                before,
+                tuple(
+                    self.h.store.connection.execute(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM portfolio_readiness_campaigns),"
+                        "(SELECT COUNT(*) FROM portfolio_readiness_resolution_cycles),"
+                        "(SELECT state FROM coordination_messages WHERE id=?),"
+                        "(SELECT state FROM portfolio_readiness_current "
+                        " WHERE repository=? AND issue_number=?)",
+                        (message_id, REPOSITORY, ISSUE),
+                    ).fetchone()
+                ),
+            )
         self.assert_zero_writer_wip()
 
     def test_context_and_apply_are_cold_process_safe(self) -> None:
@@ -583,14 +586,33 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         self.h.execute_candidate_action(message_id, context)
         self.h.store.close()
         self.h.store = CoordinationStore(self.h.database)
+        replacement_identity = self.h.replacement_delivery_identity()
         result = apply_readiness_resolution(
             self.h.store,
             message_id=message_id,
             planner_session_id=PLANNER,
             expected_context_sha256=context["context_sha256"],
             now=APPLIED_AT,
+            replacement_delivery_identity=replacement_identity,
         )
         self.assertEqual("SUCCESSOR", result["outcome"])
+        successor = self.h.store.connection.execute(
+            "SELECT plan_json FROM portfolio_readiness_campaigns WHERE id=?",
+            (result["successor_campaign_id"],),
+        ).fetchone()
+        self.assertEqual(
+            replacement_identity,
+            json.loads(successor["plan_json"])["delivery_identity"],
+        )
+        replay = apply_readiness_resolution(
+            self.h.store,
+            message_id=message_id,
+            planner_session_id=PLANNER,
+            expected_context_sha256=context["context_sha256"],
+            now=APPLIED_AT,
+            replacement_delivery_identity=replacement_identity,
+        )
+        self.assertTrue(replay["replay"])
         self.assert_zero_writer_wip()
 
     def test_digest_drift_terminal_holds_once_and_replays(self) -> None:
@@ -675,6 +697,7 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
         before_campaigns = self.h.store.connection.execute(
             "SELECT COUNT(*) FROM portfolio_readiness_campaigns"
         ).fetchone()[0]
+        replacement_identity = self.h.replacement_delivery_identity()
 
         def failpoint(step: str) -> None:
             if step == "after_successor_registered":
@@ -687,6 +710,7 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
                 planner_session_id=PLANNER,
                 expected_context_sha256=context["context_sha256"],
                 now=APPLIED_AT,
+                replacement_delivery_identity=replacement_identity,
                 failpoint=failpoint,
             )
         self.assertEqual(
@@ -713,6 +737,7 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
             planner_session_id=PLANNER,
             expected_context_sha256=context["context_sha256"],
             now=APPLIED_AT,
+            replacement_delivery_identity=replacement_identity,
         )
         self.assertEqual("SUCCESSOR", result["outcome"])
         self.assert_zero_writer_wip()
@@ -995,22 +1020,29 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
             self.assertTrue(replay["replay"])
         self.assertEqual(receipts_before_replay, durable_counts())
 
+        replacement_identity = self.h.replacement_delivery_identity()
         result = apply_readiness_resolution(
             self.h.store,
             message_id=message_id,
             planner_session_id=PLANNER,
             expected_context_sha256=context["context_sha256"],
             now=APPLIED_AT,
+            replacement_delivery_identity=replacement_identity,
         )
         successor = self.h.store.connection.execute(
             "SELECT source_payload_sha256, graph_version, item_version, "
-            "candidate_sha256 FROM portfolio_readiness_campaigns WHERE id=?",
+            "candidate_sha256, plan_json FROM portfolio_readiness_campaigns "
+            "WHERE id=?",
             (result["successor_campaign_id"],),
         ).fetchone()
         self.assertEqual(next_source_sha256, successor["source_payload_sha256"])
         self.assertEqual(2, successor["graph_version"])
         self.assertEqual(item["version"], successor["item_version"])
         self.assertEqual(desired_candidate_sha256, successor["candidate_sha256"])
+        self.assertEqual(
+            replacement_identity,
+            json.loads(successor["plan_json"])["delivery_identity"],
+        )
         self.assert_zero_writer_wip()
 
     def test_exhaustion_holds_without_an_executable_notice(self) -> None:
@@ -1108,6 +1140,11 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
             self.assertEqual(0, kanban_pull_buffer.main())
         action_result = json.loads(output.getvalue())
         self.assertEqual("COMPLETE", action_result["result"]["state"])
+        replacement_path = self.h.root / "replacement-delivery-identity.json"
+        replacement_path.write_text(
+            canonical_json(self.h.replacement_delivery_identity()),
+            encoding="utf-8",
+        )
         output = io.StringIO()
         with patch.object(
             kanban_pull_buffer, "DEFAULT_DATABASE", self.h.database
@@ -1123,10 +1160,13 @@ class ReadinessResolutionFlowTests(unittest.TestCase):
                 PLANNER,
                 "--expected-context-sha256",
                 context["context_sha256"],
+                "--replacement-delivery-identity",
+                str(replacement_path),
             ],
         ), redirect_stdout(output):
             self.assertEqual(0, kanban_pull_buffer.main())
         result = json.loads(output.getvalue())
+        self.assertEqual("COMPLETE", result["phase"])
         self.assertEqual("SUCCESSOR", result["result"]["outcome"])
         self.assert_zero_writer_wip()
 

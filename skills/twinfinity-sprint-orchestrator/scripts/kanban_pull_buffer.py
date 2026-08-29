@@ -1228,6 +1228,7 @@ def ready_attestation_error(
         )
         and delivery_identity_error(
             finalization_payload.get("delivery_identity"),
+            admission=finalization_payload.get("admission_transaction"),
             expected_sha256=finalization_payload.get(
                 "delivery_identity_sha256"
             ),
@@ -2917,6 +2918,7 @@ def finalize_ready(
                     != identity_sha256
                     or final_payload.get("admission_transaction_sha256")
                     != identity["admission_transaction_sha256"]
+                    or final_payload.get("admission_transaction") != admission
                     or digest_json(final_payload)
                     != finalization["finalization_sha256"]
                     or _ready_dirty_event_error(
@@ -3189,6 +3191,7 @@ def finalize_ready(
                 "ready_candidate_sha256": candidate_sha,
                 "delivery_identity": identity,
                 "delivery_identity_sha256": identity_sha256,
+                "admission_transaction": admission,
                 "admission_transaction_sha256": admission_transaction_sha256(
                     admission
                 ),
@@ -5442,6 +5445,9 @@ def main() -> int:
     readiness_resolution.add_argument(
         "--expected-context-sha256", required=True
     )
+    readiness_resolution.add_argument(
+        "--replacement-delivery-identity", type=Path
+    )
     readiness_action = subparsers.add_parser(
         "readiness-execute-resolution-action"
     )
@@ -5576,6 +5582,13 @@ def main() -> int:
                         planner_session_id=args.planner_session_id,
                         expected_context_sha256=args.expected_context_sha256,
                         now=utc_now(),
+                        replacement_delivery_identity=(
+                            None
+                            if args.replacement_delivery_identity is None
+                            else read_readiness_json(
+                                args.replacement_delivery_identity
+                            )
+                        ),
                     )
                 finally:
                     resolution_store.close()

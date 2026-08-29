@@ -41,8 +41,6 @@ from executor_registry import (
     utc_now,
 )
 from kanban_readiness import (
-    RECEIPT_JSON_SCHEMA_ID,
-    RECEIPT_SCHEMA,
     ReadinessError,
     _artifact_matches_pickup,
     _assert_artifact_current,
@@ -96,10 +94,112 @@ BROKER_TERMINAL_SYSTEMD_RESULTS = {
 }
 BROKER_PROTOCOL = BROKERED_READINESS_PROTOCOL
 REFERENCE_ROOT = Path(__file__).resolve().parents[1] / "references"
+BROKER_RECEIPT_SCHEMA = "twinfinity-kanban-readiness-receipt/v1"
+BROKER_RECEIPT_JSON_SCHEMA_ID = (
+    "https://twinfinity.ai/schemas/twinfinity-kanban-readiness-receipt/v1"
+)
+BROKER_TABLES = frozenset(
+    {
+        "role_executor_broker_runs",
+        "role_executor_broker_receipt_pickups",
+        "role_executor_broker_pickup_consumptions",
+        "role_executor_broker_events",
+    }
+)
 
 
 class BrokerError(RegistryError):
     """Typed, secret-free broker boundary failure."""
+
+
+def _require_retired_fixture_database(
+    connection: sqlite3.Connection,
+) -> None:
+    """Fence dormant mechanics to one owner-safe disposable SQLite file."""
+
+    try:
+        databases = list(connection.execute("PRAGMA database_list"))
+        if (
+            len(databases) != 1
+            or str(databases[0][1]) != "main"
+            or not str(databases[0][2])
+        ):
+            raise BrokerError("BROKER_TEST_FIXTURE_DATABASE_REQUIRED")
+        path = Path(str(databases[0][2]))
+        if not path.is_absolute():
+            raise BrokerError("BROKER_TEST_FIXTURE_DATABASE_REQUIRED")
+        resolved = path.resolve(strict=True)
+        if path != resolved or Path("/tmp") not in resolved.parents:
+            raise BrokerError("BROKER_TEST_FIXTURE_DATABASE_REQUIRED")
+        descriptor = os.open(
+            resolved, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        try:
+            before = os.fstat(descriptor)
+            observed = os.stat(resolved, follow_symlinks=False)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_nlink,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or identity(before) != identity(observed)
+            or identity(before) != identity(after)
+        ):
+            raise BrokerError("BROKER_TEST_FIXTURE_DATABASE_REQUIRED")
+    except (BrokerError, OSError, sqlite3.Error):
+        raise BrokerError("BROKER_TEST_FIXTURE_DATABASE_REQUIRED")
+
+
+def _require_active_broker_receipt_contract(
+    run: sqlite3.Row | dict[str, Any] | None = None,
+    *,
+    connection: sqlite3.Connection | None = None,
+    allow_retired_test_fixture: bool = False,
+) -> None:
+    """Fail closed for the retired historical v5 readiness/v1 broker.
+
+    Canonical readiness now requires the delivery-bound v2 receipt.  The v5
+    profiles and their v1 contract are immutable historical endpoint identity,
+    so they cannot be silently upgraded or translated.  Tests may exercise the
+    dormant mechanics only through an explicit fixture-only opt-in.
+    """
+
+    if allow_retired_test_fixture:
+        if connection is None:
+            raise BrokerError("BROKER_TEST_FIXTURE_DATABASE_REQUIRED")
+        _require_retired_fixture_database(connection)
+        return
+    if run is not None:
+        try:
+            contract_json = str(run["contract_json"])
+            contract = json.loads(contract_json)
+            contract_sha256 = str(run["contract_sha256"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise BrokerError("BROKER_RUN_BINDING_INVALID") from exc
+        if (
+            not isinstance(contract, dict)
+            or canonical_json(contract) != contract_json
+            or hashlib.sha256(contract_json.encode("utf-8")).hexdigest()
+            != contract_sha256
+            or contract.get("protocol") != BROKER_PROTOCOL
+            or contract.get("result_schema")
+            not in {
+                BROKER_RECEIPT_SCHEMA,
+                "twinfinity-kanban-readiness-receipt/v2",
+            }
+        ):
+            raise BrokerError("BROKER_RUN_BINDING_INVALID")
+    raise BrokerError("BROKER_RECEIPT_CONTRACT_RETIRED")
 
 
 @dataclass(frozen=True)
@@ -331,6 +431,24 @@ def ensure_broker_schema(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _broker_schema_available(connection: sqlite3.Connection) -> bool:
+    """Read retired broker schema state without creating durable objects."""
+
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM main.sqlite_master "
+            "WHERE type='table' AND name IN (?,?,?,?)",
+            tuple(sorted(BROKER_TABLES)),
+        )
+    }
+    if not present:
+        return False
+    if present != BROKER_TABLES:
+        raise BrokerError("BROKER_SCHEMA_INVALID")
+    return True
+
+
 def _broker_event(
     connection: sqlite3.Connection,
     *,
@@ -461,7 +579,7 @@ def instruction_bundle(role: str) -> dict[str, Any]:
         _instruction_source(role), "BROKER_INSTRUCTION_BUNDLE_INVALID"
     )
     schema_raw = _read_reviewed_reference(
-        REFERENCE_ROOT / "twinfinity-kanban-readiness-receipt-v2.schema.json",
+        REFERENCE_ROOT / "twinfinity-kanban-readiness-receipt-v1.schema.json",
         "BROKER_RECEIPT_SCHEMA_INVALID",
     )
     try:
@@ -472,7 +590,7 @@ def instruction_bundle(role: str) -> dict[str, Any]:
         raise BrokerError("BROKER_INSTRUCTION_BUNDLE_INVALID") from exc
     if (
         not isinstance(schema, dict)
-        or schema.get("$id") != RECEIPT_JSON_SCHEMA_ID
+        or schema.get("$id") != BROKER_RECEIPT_JSON_SCHEMA_ID
         or schema.get("additionalProperties") is not False
     ):
         raise BrokerError("BROKER_RECEIPT_SCHEMA_INVALID")
@@ -773,7 +891,7 @@ def _build_contract(
         "target_key": attempt["target_key"],
         **binding,
         "input_projection_sha256": input_projection_sha256,
-        "result_schema": RECEIPT_SCHEMA,
+        "result_schema": BROKER_RECEIPT_SCHEMA,
         "result_path": RESULT_PATH,
         "result_max_bytes": RESULT_MAX_BYTES,
         "instruction_path": INSTRUCTION_PATH,
@@ -801,9 +919,14 @@ def prepare_broker_run(
     attempt_id: str,
     profile_path: Path,
     now: str,
+    _allow_retired_test_fixture: bool = False,
 ) -> dict[str, Any]:
     """Persist one immutable PREPARING contract before any child exists."""
 
+    _require_active_broker_receipt_contract(
+        connection=connection,
+        allow_retired_test_fixture=_allow_retired_test_fixture
+    )
     if configured.execution_protocol != BROKER_PROTOCOL:
         raise BrokerError("BROKER_PROTOCOL_INVALID")
     ensure_readiness_schema(connection)
@@ -1124,7 +1247,7 @@ def broker_prompt(role: str) -> str:
         "broker contract and canonical input projection at the paths named by "
         "TWINFINITY_BROKER_CONTRACT and TWINFINITY_BROKER_INPUT. "
         "Evaluate every gate once without mutation. Write exactly one strict "
-        f"{RECEIPT_SCHEMA} JSON object to {RESULT_PATH}; do not write any other "
+        f"{BROKER_RECEIPT_SCHEMA} JSON object to {RESULT_PATH}; do not write any other "
         "persistent file."
     )
 
@@ -1525,9 +1648,14 @@ def mark_broker_launching(
     evidence: SystemdUnitEvidence,
     command_attestation: dict[str, Any],
     now: str,
+    _allow_retired_test_fixture: bool = False,
 ) -> dict[str, Any]:
     """Atomically bind systemd identity and enter broker LAUNCHING."""
 
+    _require_active_broker_receipt_contract(
+        connection=connection,
+        allow_retired_test_fixture=_allow_retired_test_fixture
+    )
     ensure_broker_schema(connection)
     systemd_limits = attest_broker_systemd_limits(evidence)
     connection.execute("BEGIN IMMEDIATE")
@@ -1633,9 +1761,14 @@ def claim_attach_and_start(
     token: str,
     process_id: int,
     now: str,
+    _allow_retired_test_fixture: bool = False,
 ) -> dict[str, Any]:
     """Atomically claim, attach, and mark RUNNING before releasing the gate."""
 
+    _require_active_broker_receipt_contract(
+        connection=connection,
+        allow_retired_test_fixture=_allow_retired_test_fixture
+    )
     store = _store_for_connection(connection)
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -2194,9 +2327,21 @@ def complete_broker_receipt(
     observation: dict[str, Any],
     now: str,
     evaluator_inactivity: BrokerEvaluatorInactivity | None = None,
+    _allow_retired_test_fixture: bool = False,
 ) -> dict[str, Any]:
     """Atomically stage the receipt and terminalize message, attempt, and run."""
 
+    run = connection.execute(
+        "SELECT * FROM role_executor_broker_runs WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    if run is None:
+        raise BrokerError("BROKER_RUN_MISSING")
+    _require_active_broker_receipt_contract(
+        run,
+        connection=connection,
+        allow_retired_test_fixture=_allow_retired_test_fixture,
+    )
     try:
         _validate_receipt(receipt)
     except ReadinessError as exc:
@@ -2420,6 +2565,7 @@ def replay_broker_receipt(
     runtime: BrokerRuntimePaths | None = None,
     now: str,
     evaluator_inactivity: BrokerEvaluatorInactivity | None = None,
+    _allow_retired_test_fixture: bool = False,
 ) -> dict[str, Any]:
     """Recover a crashed broker from the isolated output or exact staged pickup."""
 
@@ -2428,6 +2574,11 @@ def replay_broker_receipt(
     ).fetchone()
     if run is None:
         raise BrokerError("BROKER_RUN_MISSING")
+    _require_active_broker_receipt_contract(
+        run,
+        connection=connection,
+        allow_retired_test_fixture=_allow_retired_test_fixture,
+    )
     if run["state"] == "COMPLETE":
         pickup = connection.execute(
             """
@@ -2447,6 +2598,7 @@ def replay_broker_receipt(
             observation=json.loads(str(pickup["observation_json"])),
             now=now,
             evaluator_inactivity=evaluator_inactivity,
+            _allow_retired_test_fixture=_allow_retired_test_fixture,
         )
     runtime = runtime or default_runtime_paths()
     receipt_path = runtime.spool_root / attempt_id / "out" / "receipt.json"
@@ -2459,7 +2611,141 @@ def replay_broker_receipt(
         observation=observation,
         now=now,
         evaluator_inactivity=evaluator_inactivity,
+        _allow_retired_test_fixture=_allow_retired_test_fixture,
     )
+
+
+def _validated_pickup_lineage(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+) -> tuple[sqlite3.Row, sqlite3.Row, dict[str, Any]]:
+    """Read one exact run/pickup/current-campaign lineage before mutation."""
+
+    pickup = connection.execute(
+        """
+        SELECT pickup.*,
+               run.state AS run_state,
+               run.repository AS run_repository,
+               run.issue_number AS run_issue_number,
+               run.campaign_id AS run_campaign_id,
+               run.message_id AS run_message_id,
+               run.endpoint_id AS run_endpoint_id,
+               run.role AS run_role,
+               run.target_kind AS run_target_kind,
+               run.target_key AS run_target_key,
+               run.message_payload_sha256 AS run_message_payload_sha256,
+               run.readiness_plan_sha256 AS run_readiness_plan_sha256,
+               run.candidate_sha256 AS run_candidate_sha256,
+               run.source_payload_sha256 AS run_source_payload_sha256,
+               run.accepted_main_sha AS run_accepted_main_sha,
+               run.graph_version AS run_graph_version,
+               run.capacity_policy_version AS run_capacity_policy_version,
+               run.receipt_sha256 AS run_receipt_sha256,
+               run.contract_sha256 AS run_contract_sha256,
+               run.contract_json AS run_contract_json
+        FROM role_executor_broker_receipt_pickups pickup
+        JOIN role_executor_broker_runs run ON run.attempt_id=pickup.attempt_id
+        WHERE pickup.attempt_id=?
+        """,
+        (attempt_id,),
+    ).fetchone()
+    if pickup is None:
+        raise BrokerError("BROKER_PICKUP_MISSING")
+    try:
+        campaign = _campaign(
+            connection,
+            str(pickup["run_repository"]),
+            int(pickup["run_issue_number"]),
+        )
+    except ReadinessError as exc:
+        raise BrokerError("BROKER_PICKUP_LINEAGE_INVALID") from exc
+    attempt = connection.execute(
+        "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+    ).fetchone()
+    message = connection.execute(
+        "SELECT * FROM coordination_messages WHERE id=?",
+        (int(pickup["run_message_id"]),),
+    ).fetchone()
+    contract = _parse_canonical_json(
+        str(pickup["run_contract_json"]),
+        str(pickup["run_contract_sha256"]),
+        "BROKER_PICKUP_LINEAGE_INVALID",
+    )
+    receipt = _parse_canonical_json(
+        str(pickup["receipt_json"]),
+        str(pickup["receipt_sha256"]),
+        "BROKER_PICKUP_LINEAGE_INVALID",
+    )
+    receipt_binding = {
+        "repository": pickup["run_repository"],
+        "issue_number": int(pickup["run_issue_number"]),
+        "readiness_plan_sha256": pickup["run_readiness_plan_sha256"],
+        "worker_role": pickup["run_role"],
+        "message_id": int(pickup["run_message_id"]),
+        "attempt_id": attempt_id,
+    }
+    if (
+        pickup["run_state"] != "COMPLETE"
+        or pickup["state"] != "STAGED"
+        or int(pickup["campaign_id"]) != int(pickup["run_campaign_id"])
+        or int(pickup["message_id"]) != int(pickup["run_message_id"])
+        or pickup["receipt_sha256"] != pickup["run_receipt_sha256"]
+        or pickup["run_target_kind"] != "message"
+        or pickup["run_target_key"] != str(pickup["run_message_id"])
+        or not isinstance(contract, dict)
+        or contract.get("protocol") != BROKER_PROTOCOL
+        or contract.get("attempt_id") != attempt_id
+        or contract.get("result_schema")
+        not in {
+            BROKER_RECEIPT_SCHEMA,
+            "twinfinity-kanban-readiness-receipt/v2",
+        }
+        or not isinstance(receipt, dict)
+        or receipt.get("schema")
+        not in {
+            BROKER_RECEIPT_SCHEMA,
+            "twinfinity-kanban-readiness-receipt/v2",
+        }
+        or any(receipt.get(key) != value for key, value in receipt_binding.items())
+        or attempt is None
+        or attempt["state"] != "COMPLETE"
+        or attempt["endpoint_id"] != pickup["run_endpoint_id"]
+        or attempt["target_kind"] != "message"
+        or attempt["target_key"] != str(pickup["run_message_id"])
+        or message is None
+        or message["state"] != "COMPLETE"
+        or message["recipient_session_id"] != pickup["run_endpoint_id"]
+        or message["claimed_by"] != pickup["run_endpoint_id"]
+        or message["payload_sha256"] != pickup["run_message_payload_sha256"]
+        or int(campaign["id"]) != int(pickup["run_campaign_id"])
+        or campaign["plan_sha256"] != pickup["run_readiness_plan_sha256"]
+        or campaign["candidate_sha256"] != pickup["run_candidate_sha256"]
+        or campaign["source_payload_sha256"]
+        != pickup["run_source_payload_sha256"]
+        or campaign["accepted_main_sha"] != pickup["run_accepted_main_sha"]
+        or int(campaign["graph_version"]) != int(pickup["run_graph_version"])
+        or int(campaign["capacity_policy_version"])
+        != int(pickup["run_capacity_policy_version"])
+        or campaign["worker_role"] != pickup["run_role"]
+        or campaign["attempt_id"] != attempt_id
+        or int(campaign["message_id"] or 0) != int(pickup["run_message_id"])
+        or campaign["endpoint_id"] != pickup["run_endpoint_id"]
+    ):
+        raise BrokerError("BROKER_PICKUP_LINEAGE_INVALID")
+    if campaign["receipt_id"] is not None:
+        recorded = connection.execute(
+            "SELECT receipt_sha256,attempt_id,message_id "
+            "FROM portfolio_readiness_receipts WHERE id=? AND campaign_id=?",
+            (int(campaign["receipt_id"]), int(campaign["id"])),
+        ).fetchone()
+        if (
+            recorded is None
+            or recorded["receipt_sha256"] != pickup["receipt_sha256"]
+            or recorded["attempt_id"] != attempt_id
+            or int(recorded["message_id"]) != int(pickup["run_message_id"])
+        ):
+            raise BrokerError("BROKER_PICKUP_LINEAGE_INVALID")
+    return pickup, campaign, receipt
 
 
 def _persist_pickup_disposition(
@@ -2469,6 +2755,7 @@ def _persist_pickup_disposition(
     error: str,
     now: str,
     verdict: str | None,
+    retired: bool = False,
 ) -> dict[str, Any]:
     """Durably retire one poison pickup without blocking later supervisor work."""
 
@@ -2479,7 +2766,7 @@ def _persist_pickup_disposition(
             "SELECT * FROM role_executor_broker_pickup_consumptions WHERE attempt_id=?",
             (attempt_id,),
         ).fetchone()
-        if existing is not None:
+        if existing is not None and not retired:
             outcome = _parse_canonical_json(
                 str(existing["outcome_json"]),
                 str(existing["outcome_sha256"]),
@@ -2487,79 +2774,120 @@ def _persist_pickup_disposition(
             )
             connection.execute("COMMIT")
             return outcome
-        pickup = connection.execute(
-            """
-            SELECT pickup.*, run.repository, run.issue_number,
-                   run.campaign_id AS run_campaign_id,
-                   run.receipt_sha256 AS run_receipt_sha256
-            FROM role_executor_broker_receipt_pickups pickup
-            JOIN role_executor_broker_runs run ON run.attempt_id=pickup.attempt_id
-            WHERE pickup.attempt_id=?
-            """,
-            (attempt_id,),
-        ).fetchone()
-        if pickup is None:
-            raise BrokerError("BROKER_PICKUP_MISSING")
-        current = connection.execute(
-            """
-            SELECT * FROM portfolio_readiness_current WHERE campaign_id=?
-            """,
-            (int(pickup["campaign_id"]),),
-        ).fetchone()
-        readiness_state = None if current is None else str(current["state"])
+        pickup, campaign, _receipt = _validated_pickup_lineage(
+            connection, attempt_id
+        )
+        readiness_state = str(campaign["state"])
         disposition = "ERROR"
         reasons: list[str] = []
-        if current is not None:
-            try:
-                campaign = _campaign(
-                    connection,
-                    str(pickup["repository"]),
-                    int(pickup["issue_number"]),
-                )
-            except ReadinessError:
-                campaign = None
-            if campaign is not None and int(campaign["id"]) == int(
-                pickup["campaign_id"]
-            ):
-                reasons = _binding_reasons(connection, campaign)
-                if readiness_state == "RUNNING" and reasons:
-                    _mark_stale(connection, campaign, reasons, now)
-                    readiness_state = "STALE"
-                if readiness_state == "STALE":
-                    disposition = "STALE"
-                    safe_error = (
-                        "READINESS_BINDING_DRIFT:" + ",".join(reasons)
-                        if reasons
-                        else str(current["last_error"] or safe_error)
-                    )
-                elif readiness_state == "RUNNING":
-                    updated = connection.execute(
-                        """
-                        UPDATE portfolio_readiness_current
-                        SET state='HOLD', version=version+1, updated_at=?,
-                            last_error=?
-                        WHERE campaign_id=? AND state='RUNNING' AND version=?
-                        """,
-                        (
-                            now,
-                            safe_error,
-                            int(campaign["id"]),
-                            int(campaign["current_version"]),
-                        ),
-                    )
-                    if updated.rowcount != 1:
-                        raise BrokerError("BROKER_PICKUP_DISPOSITION_RACE")
-                    readiness_event(
-                        connection,
-                        int(campaign["id"]),
-                        "READINESS_BROKER_PICKUP_HELD",
-                        {"attempt_id": attempt_id, "error": safe_error},
+        if retired:
+            if readiness_state == "FINALIZED":
+                raise BrokerError("BROKER_RETIRED_PICKUP_ALREADY_FINALIZED")
+            if readiness_state in {
+                "PENDING",
+                "RUNNING",
+                "READY_ELIGIBLE",
+                "APPROVAL_PENDING",
+                "RESOLUTION_PENDING",
+            }:
+                updated = connection.execute(
+                    """
+                    UPDATE portfolio_readiness_current
+                    SET state='HOLD', version=version+1, updated_at=?,
+                        last_error=?
+                    WHERE campaign_id=? AND state=? AND version=?
+                      AND attempt_id=? AND message_id=? AND endpoint_id=?
+                    """,
+                    (
                         now,
-                    )
-                    readiness_state = "HOLD"
-                    disposition = "HOLD"
-                elif readiness_state == "HOLD":
-                    disposition = "HOLD"
+                        safe_error,
+                        int(campaign["id"]),
+                        readiness_state,
+                        int(campaign["current_version"]),
+                        attempt_id,
+                        int(pickup["run_message_id"]),
+                        pickup["run_endpoint_id"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise BrokerError("BROKER_PICKUP_DISPOSITION_RACE")
+                readiness_event(
+                    connection,
+                    int(campaign["id"]),
+                    "READINESS_BROKER_PICKUP_HELD",
+                    {"attempt_id": attempt_id, "error": safe_error},
+                    now,
+                )
+                readiness_state = "HOLD"
+            disposition = readiness_state
+            if readiness_state not in {"HOLD", "STALE"}:
+                raise BrokerError("BROKER_PICKUP_LINEAGE_INVALID")
+        else:
+            reasons = _binding_reasons(connection, campaign)
+            if readiness_state == "RUNNING" and reasons:
+                _mark_stale(connection, campaign, reasons, now)
+                readiness_state = "STALE"
+            if readiness_state == "STALE":
+                disposition = "STALE"
+                safe_error = (
+                    "READINESS_BINDING_DRIFT:" + ",".join(reasons)
+                    if reasons
+                    else str(campaign["last_error"] or safe_error)
+                )
+            elif readiness_state == "RUNNING":
+                updated = connection.execute(
+                    """
+                    UPDATE portfolio_readiness_current
+                    SET state='HOLD', version=version+1, updated_at=?,
+                        last_error=?
+                    WHERE campaign_id=? AND state='RUNNING' AND version=?
+                      AND attempt_id=? AND message_id=? AND endpoint_id=?
+                    """,
+                    (
+                        now,
+                        safe_error,
+                        int(campaign["id"]),
+                        int(campaign["current_version"]),
+                        attempt_id,
+                        int(pickup["run_message_id"]),
+                        pickup["run_endpoint_id"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise BrokerError("BROKER_PICKUP_DISPOSITION_RACE")
+                readiness_event(
+                    connection,
+                    int(campaign["id"]),
+                    "READINESS_BROKER_PICKUP_HELD",
+                    {"attempt_id": attempt_id, "error": safe_error},
+                    now,
+                )
+                readiness_state = "HOLD"
+                disposition = "HOLD"
+            elif readiness_state == "HOLD":
+                disposition = "HOLD"
+        if existing is not None:
+            outcome = _parse_canonical_json(
+                str(existing["outcome_json"]),
+                str(existing["outcome_sha256"]),
+                "BROKER_CONSUMPTION_INVALID",
+            )
+            if (
+                int(existing["campaign_id"]) != int(pickup["campaign_id"])
+                or existing["receipt_sha256"] != pickup["receipt_sha256"]
+                or outcome.get("attempt_id") != attempt_id
+                or int(outcome.get("campaign_id", 0)) != int(pickup["campaign_id"])
+                or outcome.get("receipt_sha256") != pickup["receipt_sha256"]
+            ):
+                raise BrokerError("BROKER_CONSUMPTION_INVALID")
+            connection.execute("COMMIT")
+            return {
+                **outcome,
+                "readiness_state": readiness_state,
+                "disposition": disposition,
+                "error": safe_error,
+                "reconciled": True,
+            }
         outcome = {
             "schema": PICKUP_CONSUMPTION_SCHEMA,
             "attempt_id": attempt_id,
@@ -2808,9 +3136,33 @@ def consume_broker_pickup(
     *,
     attempt_id: str,
     now: str,
+    _allow_retired_test_fixture: bool = False,
 ) -> dict[str, Any]:
     """Record only the immutable SQLite pickup into readiness, idempotently."""
 
+    run = connection.execute(
+        "SELECT * FROM role_executor_broker_runs WHERE attempt_id=?",
+        (attempt_id,),
+    ).fetchone()
+    if run is None:
+        raise BrokerError("BROKER_RUN_MISSING")
+    try:
+        _require_active_broker_receipt_contract(
+            run,
+            connection=connection,
+            allow_retired_test_fixture=_allow_retired_test_fixture,
+        )
+    except BrokerError as exc:
+        if str(exc) != "BROKER_RECEIPT_CONTRACT_RETIRED":
+            raise
+        return _persist_pickup_disposition(
+            connection,
+            attempt_id=attempt_id,
+            error=str(exc),
+            now=now,
+            verdict=None,
+            retired=True,
+        )
     ensure_broker_schema(connection)
     existing = connection.execute(
         "SELECT * FROM role_executor_broker_pickup_consumptions WHERE attempt_id=?",
@@ -2944,16 +3296,15 @@ def consume_staged_broker_pickups(
 ) -> list[dict[str, Any]]:
     """Consume all canonical staged pickups; caller bytes are never accepted."""
 
-    ensure_broker_schema(connection)
+    if not _broker_schema_available(connection):
+        return []
     attempt_ids = [
         str(row["attempt_id"])
         for row in connection.execute(
             """
             SELECT pickup.attempt_id
             FROM role_executor_broker_receipt_pickups pickup
-            LEFT JOIN role_executor_broker_pickup_consumptions consumed
-              ON consumed.attempt_id=pickup.attempt_id
-            WHERE pickup.state='STAGED' AND consumed.attempt_id IS NULL
+            WHERE pickup.state='STAGED'
             ORDER BY pickup.id
             """
         )
@@ -3141,10 +3492,17 @@ def recover_stale_broker_runs(
     now: str,
     runtime: BrokerRuntimePaths | None = None,
     evidence_reader: Callable[[str], SystemdUnitEvidence] = probe_systemd_unit,
+    _allow_retired_test_fixture: bool = False,
 ) -> list[dict[str, Any]]:
     """Recover active broker rows without letting generic recovery split truth."""
 
-    ensure_broker_schema(connection)
+    if _allow_retired_test_fixture:
+        _require_active_broker_receipt_contract(
+            connection=connection,
+            allow_retired_test_fixture=True,
+        )
+    if not _broker_schema_available(connection):
+        return []
     candidates = connection.execute(
         """
         SELECT run.attempt_id, run.state AS broker_state, run.updated_at AS broker_updated,
@@ -3187,9 +3545,13 @@ def recover_stale_broker_runs(
                     runtime=runtime,
                     now=now,
                     evaluator_inactivity=evaluator_inactivity,
+                    _allow_retired_test_fixture=_allow_retired_test_fixture,
                 )
                 consumed = consume_broker_pickup(
-                    connection, attempt_id=attempt_id, now=now
+                    connection,
+                    attempt_id=attempt_id,
+                    now=now,
+                    _allow_retired_test_fixture=_allow_retired_test_fixture,
                 )
                 results.append(
                     {
@@ -3270,6 +3632,7 @@ def execute_brokered_readiness(
         raise BrokerError("BROKER_PROTOCOL_INVALID")
     if heartbeat_seconds <= 0:
         raise BrokerError("BROKER_HEARTBEAT_INVALID")
+    _require_active_broker_receipt_contract(connection=connection)
     attest_broker_systemd_limits(systemd_evidence)
     # Prove this is the implemented readiness RPC before consuming an attempt.
     try:
@@ -3304,9 +3667,14 @@ def _execute_brokered_readiness_mechanics(
     popen: Callable[..., subprocess.Popen[Any]],
     heartbeat_seconds: int,
     evidence_reader: Callable[[str], SystemdUnitEvidence] = probe_systemd_unit,
+    _allow_retired_test_fixture: bool = False,
 ) -> dict[str, Any]:
     """Latent owner mechanics; production dispatch is fenced by preflight."""
 
+    _require_active_broker_receipt_contract(
+        connection=connection,
+        allow_retired_test_fixture=_allow_retired_test_fixture
+    )
     def reservation_precondition(candidate: sqlite3.Connection) -> Any:
         _build_input_projection(
             candidate,
@@ -3340,6 +3708,7 @@ def _execute_brokered_readiness_mechanics(
             attempt_id=attempt_id,
             profile_path=profile_path,
             now=utc_now(),
+            _allow_retired_test_fixture=_allow_retired_test_fixture,
         )
         run_created = True
         spool = prepare_spool(runtime, run)
@@ -3358,6 +3727,7 @@ def _execute_brokered_readiness_mechanics(
             evidence=systemd_evidence,
             command_attestation=command_attestation,
             now=utc_now(),
+            _allow_retired_test_fixture=_allow_retired_test_fixture,
         )
         process = popen(
             command,
@@ -3377,6 +3747,7 @@ def _execute_brokered_readiness_mechanics(
             token=token,
             process_id=int(process.pid),
             now=utc_now(),
+            _allow_retired_test_fixture=_allow_retired_test_fixture,
         )
         os.write(gate_write, b"1")
         os.close(gate_write)
@@ -3432,9 +3803,13 @@ def _execute_brokered_readiness_mechanics(
             observation=observation,
             now=utc_now(),
             evaluator_inactivity=evaluator_inactivity,
+            _allow_retired_test_fixture=_allow_retired_test_fixture,
         )
         consumed = consume_broker_pickup(
-            connection, attempt_id=attempt_id, now=utc_now()
+            connection,
+            attempt_id=attempt_id,
+            now=utc_now(),
+            _allow_retired_test_fixture=_allow_retired_test_fixture,
         )
         return {
             "phase": "PASS",

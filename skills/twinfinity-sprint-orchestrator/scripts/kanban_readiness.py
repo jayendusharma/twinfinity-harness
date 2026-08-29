@@ -3459,6 +3459,7 @@ def _resolution_observations_and_successor(
     row: sqlite3.Row,
     parent_plan: dict[str, Any],
     actions: list[dict[str, Any]],
+    replacement_delivery_identity: dict[str, Any] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     successor = {
         key: value
@@ -3570,6 +3571,56 @@ def _resolution_observations_and_successor(
         raise ReadinessError(
             "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_SET_INVALID"
         )
+    identity_bound_fields = (
+        "generation",
+        "item_version",
+        "source_payload_sha256",
+        "accepted_main_sha",
+        "graph_version",
+        "capacity_policy_version",
+        "candidate_sha256",
+    )
+    if any(
+        successor.get(field) != parent_plan.get(field)
+        for field in identity_bound_fields
+    ):
+        parent_identity = parent_plan["delivery_identity"]
+        if replacement_delivery_identity is None:
+            raise ReadinessError(
+                "READINESS_RESOLUTION_DELIVERY_IDENTITY_REFRESH_REQUIRED"
+            )
+        if (
+            delivery_identity_error(replacement_delivery_identity) is not None
+            or replacement_delivery_identity["repository"]
+            != successor["repository"]
+            or int(replacement_delivery_identity["issue_number"])
+            != int(successor["issue_number"])
+            or int(replacement_delivery_identity["generation"])
+            != int(successor["generation"])
+            or any(
+                replacement_delivery_identity[field] != parent_identity[field]
+                for field in (
+                    "lease_manifest_sha256",
+                    "branch",
+                    "worktree_path",
+                    "opaque_worktree_id",
+                )
+            )
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_DELIVERY_IDENTITY_INVALID"
+            )
+        if (
+            replacement_delivery_identity["admission_transaction_sha256"]
+            == parent_identity["admission_transaction_sha256"]
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_DELIVERY_IDENTITY_REFRESH_REQUIRED"
+            )
+        successor["delivery_identity"] = replacement_delivery_identity
+        successor["delivery_identity_sha256"] = delivery_identity_sha256(
+            replacement_delivery_identity
+        )
     frozen_approval_values = {
         "proposal_sha256": row["approval_proposal_sha256"],
         "decision_sha256": row["approval_decision_sha256"],
@@ -3647,6 +3698,7 @@ def apply_readiness_resolution(
     planner_session_id: str,
     expected_context_sha256: str,
     now: str,
+    replacement_delivery_identity: dict[str, Any] | None = None,
     failpoint: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Consume one claimed context after all broker-owned prerequisites read back."""
@@ -3670,6 +3722,18 @@ def apply_readiness_resolution(
             )
             if digest_json(result) != row["cycle_result_sha256"]:
                 raise ReadinessError("READINESS_RESOLUTION_RESULT_INVALID")
+            result_identity_sha256 = result.get("delivery_identity_sha256")
+            if result_identity_sha256 is not None and (
+                replacement_delivery_identity is None
+                or delivery_identity_error(
+                    replacement_delivery_identity,
+                    expected_sha256=str(result_identity_sha256),
+                )
+                is not None
+            ):
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_REPLAY_DELIVERY_IDENTITY_INVALID"
+                )
             return {**result, "replay": True}
         parent_plan, _receipt, actions = _validate_resolution_notice_binding(
             store.connection,
@@ -3700,7 +3764,11 @@ def apply_readiness_resolution(
             raise ReadinessError("READINESS_RESOLUTION_CONTEXT_INVALID")
         try:
             observations, successor = _resolution_observations_and_successor(
-                store.connection, row, parent_plan, actions
+                store.connection,
+                row,
+                parent_plan,
+                actions,
+                replacement_delivery_identity,
             )
             reasons = _binding_reasons(
                 store.connection, {**successor, "id": -1, "endpoint_id": None}
@@ -3800,6 +3868,9 @@ def apply_readiness_resolution(
             "changed_evidence_sha256": changed_evidence_sha256,
             "context_sha256": expected_context_sha256,
             "observation_set_sha256": digest_json(observations),
+            "delivery_identity_sha256": successor[
+                "delivery_identity_sha256"
+            ],
         }
         _insert_resolution_cycle(
             store.connection,

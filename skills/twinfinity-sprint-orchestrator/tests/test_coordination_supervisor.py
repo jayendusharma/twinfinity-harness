@@ -52,6 +52,9 @@ from reconcile_routing_artifacts import (  # noqa: E402
 from tests.reviewed_endpoint_catalog_fixture import (  # noqa: E402
     reviewed_current_endpoint_catalog,
 )
+from tests.canonical_ready_fixture import (  # noqa: E402
+    finalize_canonical_ready_item,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +113,21 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
     def seed_current_graph(self, source_sha256: str) -> None:
         main_sha = "a" * 40
+        current = self.store.connection.execute(
+            "SELECT observed_main_sha,health FROM portfolio_graph_current "
+            "WHERE repository=?",
+            (REPOSITORY,),
+        ).fetchone()
+        if current is not None:
+            self.assertEqual((main_sha, "CURRENT"), tuple(current))
+            node = self.store.connection.execute(
+                "SELECT source_payload_sha256 FROM portfolio_graph_nodes "
+                "WHERE repository=? AND issue_number=92",
+                (REPOSITORY,),
+            ).fetchone()
+            self.assertIsNotNone(node)
+            self.assertEqual(source_sha256, node["source_payload_sha256"])
+            return
         graph_sha = digest_json({"issue": 92, "source": source_sha256})
         self.store.connection.execute(
             "INSERT INTO portfolio_graph_revisions VALUES (?,?,NULL,?,?,?,?,?)",
@@ -132,18 +150,17 @@ class CoordinationSupervisorTests(unittest.TestCase):
             (REPOSITORY, main_sha, "2026-08-22T10:00:01Z"),
         )
 
-    def bound_development_admission(
-        self, *, complete: bool
-    ) -> tuple[object, int, str, object, str]:
-        source = self.snapshot()
-        active = self.store._set_issue_status_for_test_fixture(
+    def activate_canonical_development_admission(
+        self, source: object, *, suffix: str
+    ) -> tuple[dict, int]:
+        self.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=92,
-            status="ACTIVE_FENCED",
-            allocation_class="ACTIVE",
+            status="PREPARED",
+            allocation_class="NONE",
             generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
+            accountable_session_id=None,
+            lease_manifest_sha256=None,
             development_units=1,
             shared_units=1,
             sre_units=0,
@@ -151,53 +168,37 @@ class CoordinationSupervisorTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-22T10:00:02Z",
         )
-        payload = {
-            "source": {
-                "repository": REPOSITORY,
-                "object_kind": "issue",
-                "object_number": 92,
-                "payload_sha256": source.payload_sha256,
-            },
-            "issue_number": 92,
-            "generation": 1,
-            "item_version": active["version"],
-            "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
-            "base_sha": "a" * 40,
-            "branch": "codex/92-supervisor-terminal-binding",
-            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-92",
-            "opaque_worktree_id": "issue-92-supervisor-terminal-binding",
-            "accountable_session_id": DEVELOPMENT_SESSION,
-            "lease_manifest_sha256": LEASE,
-            "authority_sha256": "7" * 64,
-            "capacity": {
-                "development_units": 1,
-                "shared_units": 1,
-                "sre_units": 0,
-            },
-            "writer": "accountable-writer",
-            "reviewer_plan": ["Different-session exact-head review."],
-            "collision_proof": ["Closed lease is collision-free."],
-            "environment_rule": "Use only an issue-owned environment.",
-            "routine_chain": ["Continue through routine closeout."],
-            "hard_stops": ["Stop on any binding drift."],
-        }
-        message_id = self.store.enqueue_message(
-            idempotency_key="supervisor-terminal-binding",
-            recipient_session_id=DEVELOPMENT_SESSION,
-            topic="development.admission",
-            payload=payload,
+        self.seed_current_graph(source.payload_sha256)
+        ready = finalize_canonical_ready_item(
+            self.store,
+            database=self.store.path,
+            artifact_root=self.store.path.parent,
+            repository=REPOSITORY,
+            issue_number=92,
+            source_payload_sha256=source.payload_sha256,
+            accepted_main_sha="a" * 40,
+            worker_role="development",
+            worker_endpoint_id=DEVELOPMENT_SESSION,
             now="2026-08-22T10:00:03Z",
+            suffix=suffix,
+        )
+        transaction = ready["admission_transaction"]
+        _active, message_id = self.store.activate_admission(
+            item=transaction["item"],
+            message=transaction["message"],
+            artifacts=transaction.get("artifacts"),
+            now="2026-08-22T10:00:04Z",
+        )
+        return transaction["message"]["payload"], message_id
+
+    def bound_development_admission(
+        self, *, complete: bool
+    ) -> tuple[object, int, str, object, str]:
+        source = self.snapshot()
+        _payload, message_id = self.activate_canonical_development_admission(
+            source, suffix="supervisor-terminal-binding"
         )
         watch_key = f"terminal:{REPOSITORY}:issue:92:generation:1"
-        self.store.connection.execute(
-            """
-            UPDATE coordination_terminal_watches
-            SET state='PENDING_CLAIM', admission_message_id=?,
-                admission_payload_sha256=?, claim_attempt_id=NULL
-            WHERE watch_key=?
-            """,
-            (message_id, digest_json(payload), watch_key),
-        )
         reserved, token = reserve_attempt(
             self.store.connection,
             role="development",
@@ -386,64 +387,8 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
     def claimed_admission(self) -> tuple[object, int]:
         source = self.snapshot()
-        active = self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY,
-            issue_number=92,
-            status="ACTIVE_FENCED",
-            allocation_class="ACTIVE",
-            generation=1,
-            accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
-            development_units=1,
-            shared_units=1,
-            sre_units=0,
-            expected_source_sha256=source.payload_sha256,
-            expected_version=0,
-            now="2026-08-22T10:00:02Z",
-        )
-        message_id = self.store.enqueue_message(
-            idempotency_key="claimed-admission",
-            recipient_session_id=DEVELOPMENT_SESSION,
-            topic="development.admission",
-            payload={
-                "source": {
-                    "repository": REPOSITORY,
-                    "object_kind": "issue",
-                    "object_number": 92,
-                    "payload_sha256": source.payload_sha256,
-                },
-                "issue_number": 92,
-                "generation": 1,
-                "item_version": active["version"],
-                "action": "CREATE_LOCAL_BRANCH_AND_WORKTREE_THEN_CONTINUE",
-                "base_sha": "a" * 40,
-                "branch": "codex/92-claimed-retry",
-                "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-92",
-                "opaque_worktree_id": "twinfinityapp-issue-92",
-                "accountable_session_id": DEVELOPMENT_SESSION,
-                "lease_manifest_sha256": LEASE,
-                "authority_sha256": "7" * 64,
-                "capacity": {
-                    "development_units": 1,
-                    "shared_units": 1,
-                    "sre_units": 0,
-                },
-            },
-            now="2026-08-22T10:00:03Z",
-        )
-        watch_key = f"terminal:{REPOSITORY}:issue:92:generation:1"
-        message = self.store.connection.execute(
-            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
-            (message_id,),
-        ).fetchone()
-        self.store.connection.execute(
-            """
-            UPDATE coordination_terminal_watches
-            SET state='PENDING_CLAIM', admission_message_id=?,
-                admission_payload_sha256=?, claim_attempt_id=NULL
-            WHERE watch_key=?
-            """,
-            (message_id, message["payload_sha256"], watch_key),
+        _payload, message_id = self.activate_canonical_development_admission(
+            source, suffix="claimed-retry"
         )
         reserved, token = reserve_attempt(
             self.store.connection,
@@ -583,7 +528,8 @@ class CoordinationSupervisorTests(unittest.TestCase):
         source, message_id = self.claimed_admission()
         self.supervisor.run_once("2026-08-22T10:00:05Z")
         active = self.store.connection.execute(
-            "SELECT version FROM coordination_items WHERE repository=? AND issue_number=92",
+            "SELECT version,lease_manifest_sha256 FROM coordination_items "
+            "WHERE repository=? AND issue_number=92",
             (REPOSITORY,),
         ).fetchone()
         self.store.set_issue_status(
@@ -593,7 +539,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             allocation_class="RETAINED",
             generation=1,
             accountable_session_id=DEVELOPMENT_SESSION,
-            lease_manifest_sha256=LEASE,
+            lease_manifest_sha256=active["lease_manifest_sha256"],
             development_units=1,
             shared_units=1,
             sre_units=0,
@@ -1012,13 +958,19 @@ class CoordinationSupervisorTests(unittest.TestCase):
             executor_token=token,
         )
         self.seed_current_graph(source.payload_sha256)
+        active_item = self.store.connection.execute(
+            "SELECT version,lease_manifest_sha256 FROM coordination_items "
+            "WHERE repository=? AND issue_number=92",
+            (REPOSITORY,),
+        ).fetchone()
+        lease = active_item["lease_manifest_sha256"]
         receipt = {
             "schema": "twinfinity-terminal-receipt/v1",
             "repository": REPOSITORY,
             "issue_number": 92,
             "generation": 1,
             "source_payload_sha256": source.payload_sha256,
-            "lease_manifest_sha256": LEASE,
+            "lease_manifest_sha256": lease,
             "outcome": "ACCEPTED",
             "accepted_head_sha": "c" * 40,
             "operational_state_sha256": None,
@@ -1030,7 +982,7 @@ class CoordinationSupervisorTests(unittest.TestCase):
             "repository": REPOSITORY,
             "issue_number": 92,
             "generation": 1,
-            "lease_manifest_sha256": LEASE,
+            "lease_manifest_sha256": lease,
             "owned_resources_absent": True,
             "temporary_resources_absent": True,
             "worktree_disposition": "ABSENT",
@@ -1045,9 +997,9 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 "repository": REPOSITORY,
                 "issue_number": 92,
                 "generation": 1,
-                "expected_item_version": 1,
+                "expected_item_version": active_item["version"],
                 "source_payload_sha256": source.payload_sha256,
-                "lease_manifest_sha256": LEASE,
+                "lease_manifest_sha256": lease,
                 "terminal_watch_key": watch_key,
                 "activation_message_id": message_id,
                 "terminal_receipt": receipt,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from contextlib import redirect_stdout
 from pathlib import Path
+import hashlib
 import io
 import json
 import shutil
@@ -18,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import CoordinationError, CoordinationStore, digest_json  # noqa: E402
 import coordination_store as coordination_store_module  # noqa: E402
+from canonical_ready_fixture import finalize_canonical_ready_candidate  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from delivery_identity import bind_delivery_identity  # noqa: E402
 from delivery_guard import (  # noqa: E402
@@ -35,6 +37,7 @@ from executor_registry import (  # noqa: E402
     transition_attempt,
 )
 from prepush_control import PrePushControl, PrePushError  # noqa: E402
+from portfolio_graph import replace_graph  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
@@ -46,7 +49,6 @@ from run_role_executor import _validate_target  # noqa: E402
 REPOSITORY = "twinfinityai/twinfinityapp"
 ISSUE = 328
 GENERATION = 0
-LEASE = "5" * 64
 V3 = "role.development.v3"
 V6 = "role.development.v6"
 
@@ -57,6 +59,7 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
         temporary = Path(self.temp.name)
         coordination_root = temporary / "coordination"
         coordination_root.mkdir(mode=0o700)
+        self.root = coordination_root
         self.database = coordination_root / "state.sqlite3"
         self.store = CoordinationStore(self.database)
 
@@ -105,14 +108,14 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             fetched_at="2026-08-26T10:00:02Z",
         )
         self.source_sha256 = source.payload_sha256
-        self.store._set_issue_status_for_test_fixture(
+        prepared_item = self.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=ISSUE,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
+            status="PREPARED",
+            allocation_class="NONE",
             generation=GENERATION,
             accountable_session_id=V3,
-            lease_manifest_sha256=LEASE,
+            lease_manifest_sha256=None,
             development_units=1,
             shared_units=0,
             sre_units=0,
@@ -120,6 +123,63 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-26T10:00:03Z",
         )
+        replace_graph(
+            self.store.connection,
+            {
+                "repository": REPOSITORY,
+                "accepted_main_sha": "a" * 40,
+                "expected_current_version": 0,
+                "scope_milestones": [{"title": "Endpoint rotation", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [
+                    {
+                        "node_key": f"issue:{ISSUE}",
+                        "issue_number": ISSUE,
+                        "role": "DELIVERY",
+                        "root_kind": "STANDALONE",
+                        "root_reason": "Canonical rotated admission lineage",
+                        "lane_key": "endpoint-rotation",
+                        "lane_order": 0,
+                        "dispatchable": True,
+                        "priority_rank": 1,
+                        "estimate_units": 1,
+                        "development_units": 1,
+                        "shared_units": 0,
+                        "sre_units": 0,
+                        "source_payload_sha256": self.source_sha256,
+                        "ready_at": "2026-08-26T10:00:03Z",
+                    }
+                ],
+                "relations": [],
+            },
+            now="2026-08-26T10:00:03Z",
+        )
+        lease_path = coordination_root / "issue-328-rotation-lease.json"
+        lease_path.write_text(
+            json.dumps(
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": ISSUE,
+                    "generation": GENERATION,
+                    "base_sha": "a" * 40,
+                    "branch": "codex/328-endpoint-rotation-continuation",
+                    "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-328",
+                    "no_additional_paths": True,
+                    "paths": [
+                        {
+                            "path": "backend/example.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "5" * 40,
+                        }
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.lease_sha = hashlib.sha256(lease_path.read_bytes()).hexdigest()
         self.payload = {
             "source": {
                 "repository": REPOSITORY,
@@ -129,13 +189,13 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             },
             "issue_number": ISSUE,
             "generation": GENERATION,
-            "item_version": 1,
+            "item_version": int(prepared_item["version"]) + 2,
             "base_sha": "a" * 40,
             "branch": "codex/328-endpoint-rotation-continuation",
             "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-328",
             "opaque_worktree_id": "twinfinityapp-issue-328",
             "accountable_session_id": V3,
-            "lease_manifest_sha256": LEASE,
+            "lease_manifest_sha256": self.lease_sha,
             "authority_sha256": "7" * 64,
             "capacity": {
                 "development_units": 1,
@@ -150,44 +210,96 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             "routine_chain": ["Complete the admitted delivery chain."],
             "hard_stops": ["Stop on binding drift."],
         }
-        bind_delivery_identity(
-            {
-                "item": {
+        admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": ISSUE,
+                "status": "ACTIVE",
+                "allocation_class": "ACTIVE",
+                "generation": GENERATION,
+                "accountable_session_id": V3,
+                "lease_manifest_sha256": self.lease_sha,
+                "development_units": 1,
+                "shared_units": 0,
+                "sre_units": 0,
+                "expected_source_sha256": self.source_sha256,
+                "expected_version": int(prepared_item["version"]) + 1,
+            },
+            "message": {
+                "idempotency_key": f"issue-328-generation-{GENERATION}-admission",
+                "recipient_session_id": V3,
+                "topic": "development.admission",
+                "payload": self.payload,
+            },
+            "artifacts": [
+                {
                     "repository": REPOSITORY,
                     "issue_number": ISSUE,
                     "generation": GENERATION,
-                    "expected_version": 1,
-                },
-                "message": {
-                    "idempotency_key": (
-                        f"issue-328-generation-{GENERATION}-admission"
-                    ),
-                    "recipient_session_id": V3,
-                    "topic": "development.admission",
-                    "payload": self.payload,
-                },
-                "artifacts": [],
-            }
+                    "path": str(lease_path),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            ],
+        }
+        bind_delivery_identity(admission)
+        policy = self.store.capacity_policy(
+            REPOSITORY, now="2026-08-26T10:00:04Z"
         )
-        self.message_id = self.store.enqueue_message(
-            idempotency_key=f"issue-328-generation-{GENERATION}-admission",
-            recipient_session_id=V3,
-            topic="development.admission",
-            payload=self.payload,
+        finalized = finalize_canonical_ready_candidate(
+            self.store,
+            database=self.database,
+            artifact_root=coordination_root,
+            prepared_packet={
+                "schema": "twinfinity-kanban-pull-buffer/v2",
+                "repository": REPOSITORY,
+                "issue_number": ISSUE,
+                "generation": GENERATION,
+                "item_version_at_preparation": int(prepared_item["version"]),
+                "source_payload_sha256": self.source_sha256,
+                "accepted_main_at_preparation": "a" * 40,
+                "portfolio_graph_version": 1,
+                "state": "PREPARED_NOT_READY",
+                "verticality": "END_TO_END",
+                "owner_visible_outcome": "Continue the exact rotated admission.",
+                "capacity_policy": {
+                    "version": int(policy["version"]),
+                    "development_limit": int(policy["development_limit"]),
+                    "shared_limit": int(policy["shared_limit"]),
+                    "sre_limit": int(policy["sre_limit"]),
+                },
+                "capacity_on_activation": {
+                    "development_units": 1,
+                    "shared_units": 0,
+                    "sre_units": 0,
+                },
+                "precomputed_collision_matrix": [
+                    {
+                        "other_issue": 999999,
+                        "disposition": "DISJOINT",
+                        "reason": "The rotated-lineage lease is issue-specific.",
+                    }
+                ],
+                "preparation_complete": ["The exact admission is complete."],
+                "promotion_checks_after_predecessor": [
+                    "Revalidate every rotated-lineage consumer."
+                ],
+                "hard_stops": ["Stop on binding drift."],
+                "promotion_trigger": "All canonical readiness gates pass.",
+            },
+            admission_transaction=admission,
+            worker_role="development",
+            worker_endpoint_id=V3,
+            now="2026-08-26T10:00:04Z",
+            suffix="endpoint-rotation",
+        )
+        self.assertEqual("READY", finalized["item"]["status"])
+        _active, self.message_id = self.store.activate_admission(
+            item=admission["item"],
+            message=admission["message"],
+            artifacts=admission["artifacts"],
             now="2026-08-26T10:00:04Z",
         )
-        message = self.store.connection.execute(
-            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
-            (self.message_id,),
-        ).fetchone()
         self.watch_key = f"terminal:{REPOSITORY}:issue:{ISSUE}:generation:{GENERATION}"
-        self.store.connection.execute(
-            "UPDATE coordination_terminal_watches "
-            "SET state='PENDING_CLAIM', admission_message_id=?, "
-            "admission_payload_sha256=? "
-            "WHERE watch_key=?",
-            (self.message_id, message["payload_sha256"], self.watch_key),
-        )
         old_attempt, token = reserve_attempt(
             self.store.connection,
             role="development",
@@ -375,6 +487,32 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             receipt["kind"],
         )
 
+    def test_rearm_rejects_idempotency_substitution_without_writes(self) -> None:
+        self.store.connection.execute(
+            "DROP TRIGGER IF EXISTS coordination_message_envelope_immutable"
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_messages SET idempotency_key=? WHERE id=?",
+            ("issue-328-generation-0-substituted", self.message_id),
+        )
+        before_changes = self.store.connection.total_changes
+        before_rearms = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_endpoint_rotation_rearms"
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(
+            CoordinationError, "ENDPOINT_ROTATION_REARM_STATE_MISMATCH"
+        ):
+            self.preview()
+
+        self.assertEqual(before_changes, self.store.connection.total_changes)
+        self.assertEqual(
+            before_rearms,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_endpoint_rotation_rearms"
+            ).fetchone()[0],
+        )
+
     def test_rearmed_lineage_continues_through_all_runtime_consumers(self) -> None:
         self.apply()
         message = self.store.connection.execute(
@@ -400,7 +538,7 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
                 allowed_topics={"development.admission"},
             )
         self.assertEqual(
-            AttemptLineage(REPOSITORY, ISSUE, GENERATION, LEASE),
+            AttemptLineage(REPOSITORY, ISSUE, GENERATION, self.lease_sha),
             _validate_target(
                 self.store.connection,
                 role="development",
@@ -470,6 +608,43 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             ),
         )
         self.assertEqual((V6, "RESERVED"), (fresh["endpoint_id"], fresh["state"]))
+
+    def test_rotated_watch_and_prepush_reject_idempotency_substitution(self) -> None:
+        self.apply()
+        self.store.connection.execute(
+            "DROP TRIGGER IF EXISTS coordination_message_envelope_immutable"
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_messages SET idempotency_key=? WHERE id=?",
+            ("issue-328-generation-0-substituted", self.message_id),
+        )
+        before_changes = self.store.connection.total_changes
+        lease_result = (
+            Path(self.payload["worktree_path"]),
+            frozenset({Path(self.payload["worktree_path"]) / "backend/example.py"}),
+            Path("/home/ubuntu/code/twinfinityapp"),
+            self.payload["branch"],
+            self.payload["base_sha"],
+        )
+        with (
+            patch("delivery_guard._load_lease", return_value=lease_result),
+            self.assertRaisesRegex(GuardError, "DELIVERY_IDENTITY_INVALID"),
+        ):
+            _terminal_watch_context(
+                self.store.connection,
+                self.database,
+                role="development",
+                endpoint_id=V6,
+                target_key=self.watch_key,
+                worktree_root=Path("/home/ubuntu/code"),
+            )
+        prepush = PrePushControl(self.database)
+        try:
+            with self.assertRaisesRegex(PrePushError, "PREPUSH_ADMISSION_INVALID"):
+                prepush._lineage(REPOSITORY, ISSUE)
+        finally:
+            prepush.close()
+        self.assertEqual(before_changes, self.store.connection.total_changes)
 
     def test_claimed_historical_admission_routes_only_through_terminal_watch(self) -> None:
         self.apply()
@@ -821,7 +996,7 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
             target_key=self.watch_key,
             now="2026-08-26T10:00:10Z",
             precondition=lambda _connection: AttemptLineage(
-                REPOSITORY, ISSUE, GENERATION, LEASE
+                REPOSITORY, ISSUE, GENERATION, self.lease_sha
             ),
         )
         with self.assertRaisesRegex(
@@ -921,7 +1096,7 @@ class EndpointRotationAdmissionRearmTests(unittest.TestCase):
                 ISSUE,
                 GENERATION,
                 self.source_sha256,
-                LEASE,
+                self.lease_sha,
                 "development",
                 V3,
                 self.old_attempt_id,

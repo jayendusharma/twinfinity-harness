@@ -16,8 +16,10 @@ sys.path.insert(0, str(SCRIPTS))
 from admission_source_equivalence import admission_lineage_source_is_current  # noqa: E402
 from coordination_store import CoordinationError, CoordinationStore, canonical_json, digest_json  # noqa: E402
 from executor_registry import attempt_lineage_for_target, load_registry_config, reserve_attempt, stable_systemd_unit, transition_attempt  # noqa: E402
+from portfolio_graph import replace_graph  # noqa: E402
 from reconcile_routing_artifacts import apply_plan, build_plan, load_legacy_alias_fixture  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
+from tests.canonical_ready_fixture import finalize_canonical_ready_item  # noqa: E402
 
 
 REPOSITORY = "twinfinityai/twinfinityapp"
@@ -58,34 +60,54 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
             fetched_at="2026-08-26T20:00:02Z",
         )
         self.bound_sha = bound.payload_sha256
-        self.store._set_issue_status_for_test_fixture(
-            repository=REPOSITORY, issue_number=ISSUE, status="ACTIVE", allocation_class="ACTIVE",
-            generation=GENERATION, accountable_session_id=ENDPOINT, lease_manifest_sha256=LEASE,
+        self.store.set_issue_status(
+            repository=REPOSITORY, issue_number=ISSUE, status="PREPARED", allocation_class="NONE",
+            generation=GENERATION, accountable_session_id=None, lease_manifest_sha256=None,
             development_units=1, shared_units=1, sre_units=0, expected_source_sha256=self.bound_sha,
             expected_version=0, now="2026-08-26T20:00:03Z",
         )
-        self.payload = {
-            "source": {"repository": REPOSITORY, "object_kind": "issue", "object_number": ISSUE, "payload_sha256": self.bound_sha},
-            "issue_number": ISSUE, "generation": GENERATION, "item_version": 1,
-            "base_sha": "a" * 40, "branch": "codex/272-bounded",
-            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-272",
-            "opaque_worktree_id": "issue-272", "accountable_session_id": ENDPOINT,
-            "lease_manifest_sha256": LEASE, "authority_sha256": "7" * 64,
-            "capacity": {"development_units": 1, "shared_units": 1, "sre_units": 0},
-            "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
-            "writer": "one", "reviewer_plan": ["independent"], "collision_proof": ["exact"],
-            "environment_rule": "isolated", "routine_chain": ["closeout"], "hard_stops": ["drift"],
-        }
-        self.message_id = self.store.enqueue_message(
-            idempotency_key="issue-272-g0-admission", recipient_session_id=ENDPOINT,
-            topic="development.admission", payload=self.payload, now="2026-08-26T20:00:04Z",
+        replace_graph(
+            self.store.connection,
+            {
+                "repository": REPOSITORY,
+                "accepted_main_sha": "b" * 40,
+                "expected_current_version": 0,
+                "scope_milestones": [{"title": "Fixture", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [{
+                    "node_key": f"issue:{ISSUE}", "issue_number": ISSUE,
+                    "role": "DELIVERY", "root_kind": "STANDALONE",
+                    "root_reason": "Bounded source-equivalence fixture",
+                    "lane_key": "development", "lane_order": 0,
+                    "dispatchable": True, "priority_rank": 1, "estimate_units": 1,
+                    "development_units": 1, "shared_units": 1, "sre_units": 0,
+                    "source_payload_sha256": self.bound_sha,
+                    "ready_at": "2026-08-26T20:00:03Z",
+                }],
+                "relations": [],
+            },
+            now="2026-08-26T20:00:03Z",
         )
-        message = self.store.connection.execute("SELECT * FROM coordination_messages WHERE id=?", (self.message_id,)).fetchone()
+        ready = finalize_canonical_ready_item(
+            self.store,
+            database=self.store.path,
+            artifact_root=self.store.path.parent,
+            repository=REPOSITORY,
+            issue_number=ISSUE,
+            source_payload_sha256=self.bound_sha,
+            accepted_main_sha="b" * 40,
+            worker_role="development",
+            worker_endpoint_id=ENDPOINT,
+            now="2026-08-26T20:00:04Z",
+            suffix="bounded",
+        )
+        transaction = ready["admission_transaction"]
+        self.payload = transaction["message"]["payload"]
+        _active, self.message_id = self.store.activate_admission(
+            item=transaction["item"], message=transaction["message"],
+            artifacts=transaction.get("artifacts"), now="2026-08-26T20:00:05Z",
+        )
         self.watch_key = f"terminal:{REPOSITORY}:issue:{ISSUE}:generation:{GENERATION}"
-        self.store.connection.execute(
-            "UPDATE coordination_terminal_watches SET state='PENDING_CLAIM',admission_message_id=?,admission_payload_sha256=? WHERE watch_key=?",
-            (self.message_id, message["payload_sha256"], self.watch_key),
-        )
         attempt, token = reserve_attempt(
             self.store.connection, role="development", endpoint_id=ENDPOINT,
             target_kind="message", target_key=str(self.message_id), now="2026-08-26T20:00:05Z",
@@ -97,21 +119,6 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
         self.store.claim_message(self.message_id, ENDPOINT, "2026-08-26T20:00:07Z", attempt_id=attempt["attempt_id"], executor_token=token)
         transition_attempt(self.store.connection, attempt_id=attempt["attempt_id"], token=token, expected_version=running["version"], new_state="COMPLETE", exit_code=0, now="2026-08-26T20:00:08Z")
         self.attempt_id = attempt["attempt_id"]
-
-        self.store.connection.execute(
-            "INSERT INTO portfolio_graph_revisions VALUES (?,?,?,?,?,?,?,?)",
-            (REPOSITORY, 1, None, "b" * 40, "8" * 64,
-             canonical_json({"kind": "ISSUE_SET"}), canonical_json([]), "2026-08-26T20:00:08Z"),
-        )
-        self.store.connection.execute(
-            "INSERT INTO portfolio_graph_current VALUES (?,1,?,'CURRENT',?,NULL)",
-            (REPOSITORY, "b" * 40, "2026-08-26T20:00:08Z"),
-        )
-        self.store.connection.execute(
-            "INSERT INTO portfolio_graph_nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (REPOSITORY, 1, f"issue:{ISSUE}", ISSUE, "DELIVERY", "STANDALONE", "bounded", None, None,
-             "development", 0, 1, 1, 1, 1, 1, 0, self.bound_sha, "2026-08-26T20:00:08Z"),
-        )
         self.store.connection.commit()
 
         body = {"kind": "OWNER_CONTROL_COMMENT", "body": "receipt"}

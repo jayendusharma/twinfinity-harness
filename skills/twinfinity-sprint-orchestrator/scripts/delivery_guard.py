@@ -18,7 +18,7 @@ import sys
 from typing import Any, Iterable, Mapping
 
 from coordination_store import terminal_watch_key
-from delivery_identity import delivery_identity_error
+from delivery_identity import immutable_admission_error
 from executor_registry import (
     RegistryError,
     applied_endpoint_rotation_chain,
@@ -486,7 +486,10 @@ def _rotated_admission_matches(
         )
         or not isinstance(source, dict)
         or not isinstance(capacity, dict)
-        or delivery_identity_error(payload.get("delivery_identity")) is not None
+        or immutable_admission_error(
+            connection, message=message, payload=payload
+        )
+        is not None
         or message["state"] != "CLAIMED"
         or message["claimed_by"] != message["recipient_session_id"]
         or identity_role(connection, str(message["recipient_session_id"])) != role
@@ -614,7 +617,10 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
         return DeliveryContext(role, endpoint_id, "message", target_key, topic, None, frozenset(), False)
     if (
         topic in {"development.admission", "sre.admission"}
-        and delivery_identity_error(payload.get("delivery_identity")) is not None
+        and immutable_admission_error(
+            connection, message=row, payload=payload
+        )
+        is not None
     ):
         raise GuardError("DELIVERY_IDENTITY_INVALID")
     watch = connection.execute(
@@ -681,6 +687,16 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
         payload = None if candidate is None else json.loads(candidate["payload_json"])
     except (TypeError, json.JSONDecodeError):
         payload = None
+    if (
+        candidate is not None
+        and candidate["topic"] in {"development.admission", "sre.admission"}
+        and isinstance(payload, dict)
+        and immutable_admission_error(
+            connection, message=candidate, payload=payload
+        )
+        is not None
+    ):
+        raise GuardError("DELIVERY_IDENTITY_INVALID")
     exact_current = bool(
         candidate is not None
         and candidate["topic"] in topics
@@ -688,7 +704,10 @@ def _terminal_watch_context(connection: sqlite3.Connection, database: Path, *, r
         and isinstance(payload, dict)
         and (
             candidate["topic"] == "development.recovery_commit"
-            or delivery_identity_error(payload.get("delivery_identity")) is None
+            or immutable_admission_error(
+                connection, message=candidate, payload=payload
+            )
+            is None
         )
         and _item_matches(connection, payload, endpoint_id, exact_version=False)
         and isinstance(payload.get("source"), dict)

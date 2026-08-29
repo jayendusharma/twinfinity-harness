@@ -196,6 +196,47 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
             "source_payload_sha256": self.sources[number],
             "ready_at": "2026-08-24T10:00:00Z",
         }
+
+    def _release_predecessor(self, now: str) -> None:
+        self.release_item = self.store._set_issue_status_for_test_fixture(
+            repository=REPOSITORY,
+            issue_number=1,
+            status="DONE",
+            allocation_class="NONE",
+            generation=1,
+            accountable_session_id=DEVELOPMENT_SESSION,
+            lease_manifest_sha256="1" * 64,
+            development_units=0,
+            shared_units=0,
+            sre_units=0,
+            expected_source_sha256=self.sources[1],
+            expected_version=int(self.release_item["version"]),
+            now=now,
+        )
+
+    def _delivery_snapshot(self) -> tuple:
+        tables = (
+            "coordination_items",
+            "coordination_messages",
+            "coordination_terminal_watches",
+            "coordination_events",
+            "coordination_artifacts",
+            "portfolio_readiness_current",
+            "portfolio_ready_finalizations",
+        )
+        return (
+            self.store.connection.total_changes,
+            *(
+                tuple(
+                    tuple(row)
+                    for row in self.store.connection.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ).fetchall()
+                )
+                for table in tables
+            ),
+        )
+
     def _register_ready_candidate(
         self,
         *,
@@ -1266,6 +1307,89 @@ class ReadinessApprovalFinalizationTests(unittest.TestCase):
                 "WHERE issue_number=2 AND state IN ('PENDING_CLAIM','ACTIVE')"
             ).fetchone()[0],
         )
+
+    def test_approval_bound_activation_exact_replay_is_idempotent_and_current(self) -> None:
+        packet_path = self._register_ready_candidate()
+        authority = self._bind_finalized_candidate_to_effective_readiness_approval()
+        admission = json.loads(packet_path.read_text(encoding="utf-8"))[
+            "admission_transaction"
+        ]
+        self._release_predecessor("2026-08-24T10:00:06Z")
+
+        first = self.store.activate_admission(
+            item=admission["item"],
+            message=admission["message"],
+            artifacts=admission.get("artifacts"),
+            now="2026-08-24T10:00:07Z",
+        )
+        before_replay = self._delivery_snapshot()
+        replay = self.store.activate_admission(
+            item=admission["item"],
+            message=admission["message"],
+            artifacts=admission.get("artifacts"),
+            now="2026-08-24T10:00:08Z",
+        )
+        self.assertEqual(first, replay)
+        self.assertEqual(before_replay, self._delivery_snapshot())
+
+        revoke_decision(
+            self.store,
+            proposal_sha256=authority["proposal_sha256"],
+            decision_sha256=authority["decision_sha256"],
+            reason="Authority was withdrawn after the exact successful replay.",
+            user_input_sha256="9" * 64,
+            user_event_source="CODEX_DIRECT_USER_TURN",
+            user_event_id="portfolio-activation-replay-revocation",
+            planner_session_id=authority["planner_session_id"],
+            now="2026-08-24T10:00:09Z",
+        )
+        revoked = self._delivery_snapshot()
+        with self.assertRaisesRegex(
+            CoordinationError, "READY_APPROVAL_AUTHORITY_"
+        ):
+            self.store.activate_admission(
+                item=admission["item"],
+                message=admission["message"],
+                artifacts=admission.get("artifacts"),
+                now="2026-08-24T10:00:10Z",
+            )
+        self.assertEqual(revoked, self._delivery_snapshot())
+
+    def test_terminal_approval_activation_cannot_replay_or_write(self) -> None:
+        packet_path = self._register_ready_candidate()
+        self._bind_finalized_candidate_to_effective_readiness_approval()
+        admission = json.loads(packet_path.read_text(encoding="utf-8"))[
+            "admission_transaction"
+        ]
+        self._release_predecessor("2026-08-24T10:00:06Z")
+        _item, message_id = self.store.activate_admission(
+            item=admission["item"],
+            message=admission["message"],
+            artifacts=admission.get("artifacts"),
+            now="2026-08-24T10:00:07Z",
+        )
+        with self.store.transaction():
+            self.store.connection.execute(
+                "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
+                "WHERE id=? AND state='PREPARED'",
+                ("2026-08-24T10:00:08Z", message_id),
+            )
+            self.store.connection.execute(
+                "UPDATE coordination_terminal_watches SET state='COMPLETE',updated_at=? "
+                "WHERE admission_message_id=? AND state='PENDING_CLAIM'",
+                ("2026-08-24T10:00:08Z", message_id),
+            )
+        terminal = self._delivery_snapshot()
+        with self.assertRaisesRegex(
+            CoordinationError, "ADMISSION_READY_REQUIRED"
+        ):
+            self.store.activate_admission(
+                item=admission["item"],
+                message=admission["message"],
+                artifacts=admission.get("artifacts"),
+                now="2026-08-24T10:00:09Z",
+            )
+        self.assertEqual(terminal, self._delivery_snapshot())
 
     def test_generic_evaluation_cannot_stale_a_finalized_ready_lineage(self) -> None:
         self._register_ready_candidate()

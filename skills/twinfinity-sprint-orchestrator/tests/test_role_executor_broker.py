@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 import hashlib
 import json
 import os
@@ -21,7 +22,11 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from tests.delivery_identity_fixture import synthetic_delivery_identity  # noqa: E402
-from coordination_store import CoordinationStore, canonical_json  # noqa: E402
+from coordination_store import (  # noqa: E402
+    CoordinationStore,
+    canonical_json,
+    digest_json,
+)
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from executor_registry import (  # noqa: E402
     RegistryError,
@@ -72,6 +77,35 @@ from role_executor_transport import (  # noqa: E402
     launch_role_executor,
 )
 from run_role_executor import execute_role  # noqa: E402
+
+
+# These aliases exercise the historical broker mechanics as inert fixtures.
+# Production entry points intentionally reject the retired v1 receipt contract.
+prepare_broker_run = partial(
+    prepare_broker_run, _allow_retired_test_fixture=True
+)
+mark_broker_launching = partial(
+    mark_broker_launching, _allow_retired_test_fixture=True
+)
+claim_attach_and_start = partial(
+    claim_attach_and_start, _allow_retired_test_fixture=True
+)
+complete_broker_receipt = partial(
+    complete_broker_receipt, _allow_retired_test_fixture=True
+)
+replay_broker_receipt = partial(
+    replay_broker_receipt, _allow_retired_test_fixture=True
+)
+consume_broker_pickup = partial(
+    consume_broker_pickup, _allow_retired_test_fixture=True
+)
+recover_stale_broker_runs = partial(
+    recover_stale_broker_runs, _allow_retired_test_fixture=True
+)
+_execute_brokered_readiness_mechanics = partial(
+    _execute_brokered_readiness_mechanics,
+    _allow_retired_test_fixture=True,
+)
 
 
 CONFIG = (
@@ -497,6 +531,157 @@ class BrokerHarness:
             "observed_at": NOW,
         }
 
+    def historical_receipt(self, attempt_id: str, *, schema: str) -> dict:
+        receipt = self.receipt(attempt_id)
+        receipt["schema"] = schema
+        if schema == broker.BROKER_RECEIPT_SCHEMA:
+            receipt.pop("delivery_identity_sha256")
+        return receipt
+
+    def stage_historical_pickup(
+        self,
+        *,
+        attempt_id: str,
+        token: str,
+        schema: str,
+    ) -> dict:
+        """Seed the exact old crash boundary without accepting it as current."""
+
+        receipt = self.historical_receipt(attempt_id, schema=schema)
+        receipt_json = canonical_json(receipt)
+        receipt_sha256 = hashlib.sha256(receipt_json.encode("utf-8")).hexdigest()
+        attempt = self.store.connection.execute(
+            "SELECT version FROM executor_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        transition_attempt(
+            self.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            expected_version=int(attempt["version"]),
+            new_state="COMPLETE",
+            now=NOW,
+            exit_code=0,
+        )
+        with self.store.transaction():
+            run = self.store.connection.execute(
+                "SELECT * FROM role_executor_broker_runs WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            self.store.connection.execute(
+                "UPDATE coordination_messages SET state='COMPLETE', updated_at=? "
+                "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
+                (NOW, int(run["message_id"]), run["endpoint_id"]),
+            )
+            self.store.connection.execute(
+                """
+                INSERT INTO role_executor_broker_receipt_pickups(
+                    attempt_id,campaign_id,message_id,receipt_sha256,
+                    receipt_json,observation_json,observed_at,staged_at,state
+                ) VALUES (?,?,?,?,?,?,?,?,'STAGED')
+                """,
+                (
+                    attempt_id,
+                    int(run["campaign_id"]),
+                    int(run["message_id"]),
+                    receipt_sha256,
+                    receipt_json,
+                    canonical_json({"historical_fixture": True}),
+                    NOW,
+                    NOW,
+                ),
+            )
+            updated = self.store.connection.execute(
+                "UPDATE role_executor_broker_runs SET state='COMPLETE', "
+                "receipt_sha256=?, version=version+1, updated_at=? "
+                "WHERE attempt_id=? AND state='RUNNING' AND version=?",
+                (receipt_sha256, NOW, attempt_id, int(run["version"])),
+            )
+            if updated.rowcount != 1:
+                raise AssertionError("historical broker run did not terminalize")
+        return receipt
+
+    def record_historical_ready(
+        self,
+        receipt: dict,
+        *,
+        with_consumption: bool,
+    ) -> None:
+        receipt_json = canonical_json(receipt)
+        receipt_sha256 = hashlib.sha256(receipt_json.encode("utf-8")).hexdigest()
+        with self.store.transaction():
+            current = self.store.connection.execute(
+                "SELECT * FROM portfolio_readiness_current WHERE repository=? "
+                "AND issue_number=?",
+                (REPOSITORY, self.issue_number),
+            ).fetchone()
+            self.store.connection.execute(
+                """
+                INSERT INTO portfolio_readiness_receipts(
+                    campaign_id,verdict,worker_role,message_id,attempt_id,
+                    resolution_role,resolution_action_set_sha256,
+                    approval_proposal_sha256,receipt_sha256,receipt_json,
+                    observed_at,recorded_at
+                ) VALUES (?,?,?,?,?,NULL,?,NULL,?,?,?,?)
+                """,
+                (
+                    int(current["campaign_id"]),
+                    "PASS",
+                    receipt["worker_role"],
+                    int(receipt["message_id"]),
+                    receipt["attempt_id"],
+                    digest_json([]),
+                    receipt_sha256,
+                    receipt_json,
+                    receipt["observed_at"],
+                    NOW,
+                ),
+            )
+            receipt_id = int(self.store.connection.execute(
+                "SELECT id FROM portfolio_readiness_receipts "
+                "WHERE receipt_sha256=?",
+                (receipt_sha256,),
+            ).fetchone()[0])
+            updated = self.store.connection.execute(
+                "UPDATE portfolio_readiness_current SET state='READY_ELIGIBLE', "
+                "receipt_id=?, version=version+1, updated_at=?, last_error=NULL "
+                "WHERE campaign_id=? AND state='RUNNING' AND version=?",
+                (
+                    receipt_id,
+                    NOW,
+                    int(current["campaign_id"]),
+                    int(current["version"]),
+                ),
+            )
+            if updated.rowcount != 1:
+                raise AssertionError("historical receipt did not become promotable")
+            if with_consumption:
+                outcome = {
+                    "schema": broker.PICKUP_CONSUMPTION_SCHEMA,
+                    "attempt_id": receipt["attempt_id"],
+                    "campaign_id": int(current["campaign_id"]),
+                    "receipt_sha256": receipt_sha256,
+                    "readiness_state": "READY_ELIGIBLE",
+                    "verdict": "PASS",
+                }
+                outcome_json = canonical_json(outcome)
+                self.store.connection.execute(
+                    """
+                    INSERT INTO role_executor_broker_pickup_consumptions(
+                        attempt_id,campaign_id,receipt_sha256,outcome_sha256,
+                        outcome_json,consumed_at
+                    ) VALUES (?,?,?,?,?,?)
+                    """,
+                    (
+                        receipt["attempt_id"],
+                        int(current["campaign_id"]),
+                        receipt_sha256,
+                        hashlib.sha256(outcome_json.encode("utf-8")).hexdigest(),
+                        outcome_json,
+                        NOW,
+                    ),
+                )
+
     def reserve_and_launch(self, *, role: str = "development"):
         endpoint = self.config.roles[role]
         reserved, token = reserve_attempt(
@@ -592,6 +777,44 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             self.assertFalse(provider["requires_openai_auth"])
             self.assertNotIn("env_key", provider)
             self.assertNotIn("auth.json", profile_path.read_text(encoding="utf-8"))
+
+    def test_historical_v5_profile_bundle_contract_and_prompt_are_all_v1(self) -> None:
+        for role in ("development", "sre"):
+            with self.subTest(role=role):
+                endpoint = self.h.config.roles[role]
+                profile_path = (
+                    ROOT
+                    / "references"
+                    / f"{endpoint.runtime_codex_profile}.config.toml"
+                )
+                profile_text = profile_path.read_text(encoding="utf-8")
+                bundle = broker.instruction_bundle(role)
+                schema = json.loads(bundle["receipt_schema"]["text"])
+                contract = broker._build_contract(
+                    configured=endpoint,
+                    attempt={
+                        "attempt_id": "fixture-attempt",
+                        "instance_id": "fixture-instance",
+                        "target_kind": "message",
+                        "target_key": "1",
+                    },
+                    binding={},
+                    input_projection_sha256="a" * 64,
+                )
+                self.assertIn(broker.BROKER_RECEIPT_SCHEMA, profile_text)
+                self.assertNotIn(RECEIPT_SCHEMA, profile_text)
+                self.assertEqual(
+                    broker.BROKER_RECEIPT_JSON_SCHEMA_ID, schema["$id"]
+                )
+                self.assertEqual(
+                    broker.BROKER_RECEIPT_SCHEMA, contract["result_schema"]
+                )
+                self.assertIn(
+                    broker.BROKER_RECEIPT_SCHEMA, broker.broker_prompt(role)
+                )
+                self.assertNotIn(
+                    "delivery_identity_sha256", bundle["instruction"]["text"]
+                )
 
     def test_v5_catalog_rejects_protocol_or_topic_authority_expansion(self) -> None:
         raw = CONFIG.read_text(encoding="utf-8")
@@ -701,7 +924,14 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         self.assertEqual(INPUT_SCHEMA, projection["schema"])
         self.assertEqual(RESULT_PATH, contract["result_path"])
         self.assertEqual(RESULT_MAX_BYTES, contract["result_max_bytes"])
+        self.assertEqual(
+            broker.BROKER_RECEIPT_SCHEMA, contract["result_schema"]
+        )
         bundle = projection["instruction_bundle"]
+        self.assertEqual(
+            broker.BROKER_RECEIPT_JSON_SCHEMA_ID,
+            json.loads(bundle["receipt_schema"]["text"])["$id"],
+        )
         self.assertEqual(
             contract["instruction_closure_sha256"],
             hashlib.sha256(canonical_json(bundle).encode()).hexdigest(),
@@ -819,7 +1049,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_writer_and_hosted_targets_fail_before_attempt_reservation(self) -> None:
+    def test_retired_v5_targets_fail_before_attempt_reservation(self) -> None:
         self.h.seed()
         endpoint = self.h.config.roles["development"]
         payload = {"not": "readiness"}
@@ -848,7 +1078,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         ):
             with self.subTest(target_kind=target_kind):
                 with self.assertRaisesRegex(
-                    BrokerError, "BROKER_RPC_NOT_IMPLEMENTED"
+                    BrokerError, "BROKER_RECEIPT_CONTRACT_RETIRED"
                 ):
                     execute_role(
                         self.h.store.connection,
@@ -966,11 +1196,11 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         self.assertIn(str(spool.runtime_profile_path), command)
         self.assertNotIn(str(copied), command)
 
-    def test_supported_readiness_holds_before_reservation_without_credentials(self) -> None:
+    def test_retired_v5_readiness_holds_before_reservation(self) -> None:
         self.h.seed()
         endpoint = self.h.config.roles["development"]
         with self.assertRaisesRegex(
-            BrokerError, "BROKER_CREDENTIAL_TRANSPORT_NOT_IMPLEMENTED"
+            BrokerError, "BROKER_RECEIPT_CONTRACT_RETIRED"
         ):
             execute_role(
                 self.h.store.connection,
@@ -987,11 +1217,17 @@ class RoleExecutorBrokerTests(unittest.TestCase):
                 broker_runtime=self.h.runtime,
             )
         self.assertEqual(
-            (0, "PREPARED", None),
+            (0, False, "PREPARED", None),
             (
                 self.h.store.connection.execute(
                     "SELECT COUNT(*) FROM executor_attempts"
                 ).fetchone()[0],
+                bool(
+                    self.h.store.connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='role_executor_broker_runs'"
+                    ).fetchone()
+                ),
                 self.h.store.connection.execute(
                     "SELECT state FROM coordination_messages WHERE id=?",
                     (self.h.message_id,),
@@ -1001,6 +1237,76 @@ class RoleExecutorBrokerTests(unittest.TestCase):
                 ).fetchone()[0],
             ),
         )
+
+    def test_v1_and_contrary_v2_outputs_cannot_cross_retired_contract(self) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=1234,
+            now=NOW,
+        )
+        v2_receipt = self.h.receipt(attempt_id)
+        v1_receipt = dict(v2_receipt)
+        v1_receipt["schema"] = broker.BROKER_RECEIPT_SCHEMA
+        v1_receipt.pop("delivery_identity_sha256")
+        before = (
+            self.h.store.connection.total_changes,
+            self.h.store.connection.execute(
+                "SELECT state FROM coordination_messages WHERE id=?",
+                (self.h.message_id,),
+            ).fetchone()[0],
+            self.h.store.connection.execute(
+                "SELECT state FROM portfolio_readiness_current"
+            ).fetchone()[0],
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM role_executor_broker_receipt_pickups"
+            ).fetchone()[0],
+        )
+        for receipt in (v1_receipt, v2_receipt):
+            with self.subTest(schema=receipt["schema"]), self.assertRaisesRegex(
+                BrokerError, "BROKER_RECEIPT_CONTRACT_RETIRED"
+            ):
+                broker.complete_broker_receipt(
+                    self.h.store.connection,
+                    attempt_id=attempt_id,
+                    receipt=receipt,
+                    receipt_json=canonical_json(receipt),
+                    observation={},
+                    now=NOW,
+                )
+            self.assertEqual(
+                before,
+                (
+                    self.h.store.connection.total_changes,
+                    self.h.store.connection.execute(
+                        "SELECT state FROM coordination_messages WHERE id=?",
+                        (self.h.message_id,),
+                    ).fetchone()[0],
+                    self.h.store.connection.execute(
+                        "SELECT state FROM portfolio_readiness_current"
+                    ).fetchone()[0],
+                    self.h.store.connection.execute(
+                        "SELECT COUNT(*) FROM role_executor_broker_receipt_pickups"
+                    ).fetchone()[0],
+                ),
+            )
+        spool.receipt_path.write_text(
+            canonical_json(v2_receipt), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            BrokerError, "BROKER_RECEIPT_CONTRACT_RETIRED"
+        ):
+            broker.replay_broker_receipt(
+                self.h.store.connection,
+                attempt_id=attempt_id,
+                runtime=self.h.runtime,
+                now=NOW,
+            )
+        self.assertEqual(before[0], self.h.store.connection.total_changes)
 
     def test_preclaimed_and_preattached_inputs_never_reserve_a_fresh_attempt(self) -> None:
         endpoint = self.h.config.roles["development"]
@@ -1465,6 +1771,108 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         self.assertIs(subprocess.DEVNULL, observed["stderr"])
         self.assertIs(broker._apply_child_resource_limits, observed["preexec_fn"])
 
+    def test_retired_fixture_opt_in_requires_temporary_database(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            before_changes = connection.total_changes
+            before_schema = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master"
+            ).fetchone()[0]
+            with self.assertRaisesRegex(
+                BrokerError, "BROKER_TEST_FIXTURE_DATABASE_REQUIRED"
+            ):
+                broker._require_active_broker_receipt_contract(
+                    connection=connection,
+                    allow_retired_test_fixture=True,
+                )
+            self.assertEqual(before_changes, connection.total_changes)
+            self.assertEqual(
+                before_schema,
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master"
+                ).fetchone()[0],
+            )
+        finally:
+            connection.close()
+
+    def test_retired_fixture_opt_in_rejects_attached_and_hardlinked_databases(
+        self,
+    ) -> None:
+        attached = self.h.root / "attached.sqlite3"
+        self.h.store.connection.execute(
+            "ATTACH DATABASE ? AS attached", (str(attached),)
+        )
+        before_changes = self.h.store.connection.total_changes
+        before_attached = self.h.store.connection.execute(
+            "SELECT COUNT(*) FROM attached.sqlite_master"
+        ).fetchone()[0]
+        try:
+            with self.assertRaisesRegex(
+                BrokerError, "BROKER_TEST_FIXTURE_DATABASE_REQUIRED"
+            ):
+                broker._require_active_broker_receipt_contract(
+                    connection=self.h.store.connection,
+                    allow_retired_test_fixture=True,
+                )
+            self.assertEqual(before_changes, self.h.store.connection.total_changes)
+            self.assertEqual(
+                before_attached,
+                self.h.store.connection.execute(
+                    "SELECT COUNT(*) FROM attached.sqlite_master"
+                ).fetchone()[0],
+            )
+        finally:
+            self.h.store.connection.execute("DETACH DATABASE attached")
+
+        original = self.h.root / "hardlink-main.sqlite3"
+        alias = self.h.root / "hardlink-alias.sqlite3"
+        connection = sqlite3.connect(original)
+        try:
+            os.link(original, alias)
+            with self.assertRaisesRegex(
+                BrokerError, "BROKER_TEST_FIXTURE_DATABASE_REQUIRED"
+            ):
+                broker._require_active_broker_receipt_contract(
+                    connection=connection,
+                    allow_retired_test_fixture=True,
+                )
+        finally:
+            connection.close()
+
+    def test_retired_supervisor_scans_do_not_create_missing_schema(self) -> None:
+        database = self.h.root / "fresh-supervisor.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        try:
+            before = tuple(
+                connection.execute(
+                    "SELECT type,name,sql FROM sqlite_master ORDER BY type,name"
+                )
+            )
+            self.assertEqual(
+                [],
+                broker.consume_staged_broker_pickups(connection, now=NOW),
+            )
+            self.assertEqual(
+                [],
+                broker.recover_stale_broker_runs(
+                    connection,
+                    before=NOW,
+                    now=NOW,
+                ),
+            )
+            self.assertEqual(
+                before,
+                tuple(
+                    connection.execute(
+                        "SELECT type,name,sql FROM sqlite_master "
+                        "ORDER BY type,name"
+                    )
+                ),
+            )
+        finally:
+            connection.close()
+
     def test_delayed_kill_must_observe_exit_before_terminal_hold(self) -> None:
         self.h.seed()
         endpoint = self.h.config.roles["development"]
@@ -1839,9 +2247,9 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             ),
         )
 
-    def test_supervisor_consumes_a_crash_left_immutable_pickup(self) -> None:
+    def test_supervisor_holds_a_crash_left_retired_v1_pickup(self) -> None:
         self.h.seed()
-        _endpoint, reserved, token, spool = self.h.reserve_and_launch()
+        _endpoint, reserved, token, _spool = self.h.reserve_and_launch()
         attempt_id = str(reserved["attempt_id"])
         claim_attach_and_start(
             self.h.store.connection,
@@ -1850,15 +2258,13 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             process_id=9001,
             now=NOW,
         )
-        receipt = self.h.receipt(attempt_id)
-        spool.receipt_path.write_text(canonical_json(receipt), encoding="utf-8")
-        replay_broker_receipt(
-            self.h.store.connection,
+        receipt = self.h.stage_historical_pickup(
             attempt_id=attempt_id,
-            runtime=self.h.runtime,
-            now=NOW,
-            evaluator_inactivity=process_exit(),
+            token=token,
+            schema=broker.BROKER_RECEIPT_SCHEMA,
         )
+        self.assertEqual(broker.BROKER_RECEIPT_SCHEMA, receipt["schema"])
+        self.assertNotIn("delivery_identity_sha256", receipt)
         supervisor = CoordinationSupervisor(
             self.h.store,
             launcher=lambda _identity, _message_id: 1,
@@ -1867,9 +2273,13 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         )
         result = supervisor.run_once("2026-08-25T05:00:30Z")
         self.assertEqual(1, len(result["broker_pickups"]))
-        self.assertEqual("READY_ELIGIBLE", result["broker_pickups"][0]["readiness_state"])
+        self.assertEqual("HOLD", result["broker_pickups"][0]["readiness_state"])
         self.assertEqual(
-            ("READY_ELIGIBLE", 1),
+            "BROKER_RECEIPT_CONTRACT_RETIRED",
+            result["broker_pickups"][0]["error"],
+        )
+        self.assertEqual(
+            ("HOLD", 1),
             (
                 self.h.store.connection.execute(
                     "SELECT state FROM portfolio_readiness_current"
@@ -1880,7 +2290,184 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             ),
         )
 
-    def test_poison_pickup_is_terminal_then_later_good_pickup_and_wake_continue(self) -> None:
+    def test_retired_pickup_rejects_advanced_current_lineage_without_writes(
+        self,
+    ) -> None:
+        self.h.seed()
+        _endpoint, reserved, token, _spool = self.h.reserve_and_launch()
+        attempt_id = str(reserved["attempt_id"])
+        claim_attach_and_start(
+            self.h.store.connection,
+            attempt_id=attempt_id,
+            token=token,
+            process_id=9001,
+            now=NOW,
+        )
+        self.h.stage_historical_pickup(
+            attempt_id=attempt_id,
+            token=token,
+            schema=broker.BROKER_RECEIPT_SCHEMA,
+        )
+        advanced, _advanced_token = reserve_attempt(
+            self.h.store.connection,
+            role="development",
+            endpoint_id=self.h.config.roles["development"].endpoint_id,
+            target_kind="message",
+            target_key=str(self.h.message_id),
+            now=NOW,
+            precondition=lambda _connection: None,
+        )
+        advanced_attempt_id = str(advanced["attempt_id"])
+        with self.h.store.transaction():
+            self.h.store.connection.execute(
+                "UPDATE portfolio_readiness_current SET attempt_id=?, "
+                "version=version+1, updated_at=? WHERE repository=? "
+                "AND issue_number=?",
+                (advanced_attempt_id, NOW, REPOSITORY, self.h.issue_number),
+            )
+        before_current = tuple(self.h.store.connection.execute(
+            "SELECT * FROM portfolio_readiness_current WHERE repository=? "
+            "AND issue_number=?",
+            (REPOSITORY, self.h.issue_number),
+        ).fetchone())
+        before_changes = self.h.store.connection.total_changes
+        result = broker.consume_staged_broker_pickups(
+            self.h.store.connection, now=NOW
+        )
+        self.assertEqual(
+            ("ERROR", "BROKER_PICKUP_LINEAGE_INVALID"),
+            (result[0]["disposition"], result[0]["error"]),
+        )
+        self.assertEqual(before_changes, self.h.store.connection.total_changes)
+        self.assertEqual(
+            before_current,
+            tuple(self.h.store.connection.execute(
+                "SELECT * FROM portfolio_readiness_current WHERE repository=? "
+                "AND issue_number=?",
+                (REPOSITORY, self.h.issue_number),
+            ).fetchone()),
+        )
+        self.assertEqual(
+            0,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
+            ).fetchone()[0],
+        )
+
+    def test_retired_ready_receipts_are_quarantined_with_or_without_consumption(
+        self,
+    ) -> None:
+        cases = (
+            (broker.BROKER_RECEIPT_SCHEMA, False),
+            (broker.BROKER_RECEIPT_SCHEMA, True),
+            (RECEIPT_SCHEMA, False),
+            (RECEIPT_SCHEMA, True),
+        )
+        for index, (schema, with_consumption) in enumerate(cases):
+            with self.subTest(
+                schema=schema, with_consumption=with_consumption
+            ):
+                if index:
+                    self.h.close()
+                    self.h = BrokerHarness()
+                self.h.seed()
+                _endpoint, reserved, token, _spool = self.h.reserve_and_launch()
+                attempt_id = str(reserved["attempt_id"])
+                claim_attach_and_start(
+                    self.h.store.connection,
+                    attempt_id=attempt_id,
+                    token=token,
+                    process_id=9001,
+                    now=NOW,
+                )
+                receipt = self.h.stage_historical_pickup(
+                    attempt_id=attempt_id,
+                    token=token,
+                    schema=schema,
+                )
+                self.h.record_historical_ready(
+                    receipt, with_consumption=with_consumption
+                )
+                before_writer_effects = tuple(
+                    self.h.store.connection.execute(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM portfolio_ready_finalizations),"
+                        "(SELECT COUNT(*) FROM portfolio_pull_buffer_candidates "
+                        " WHERE state='READY'),"
+                        "(SELECT COUNT(*) FROM coordination_messages WHERE topic "
+                        " IN ('development.admission','sre.admission')) ,"
+                        "(SELECT COUNT(*) FROM coordination_terminal_watches)"
+                    ).fetchone()
+                )
+                result = broker.consume_staged_broker_pickups(
+                    self.h.store.connection, now=NOW
+                )
+                self.assertEqual(
+                    (
+                        "HOLD",
+                        "HOLD",
+                        "BROKER_RECEIPT_CONTRACT_RETIRED",
+                    ),
+                    (
+                        result[0]["disposition"],
+                        result[0]["readiness_state"],
+                        result[0]["error"],
+                    ),
+                )
+                self.assertEqual(
+                    "HOLD",
+                    self.h.store.connection.execute(
+                        "SELECT state FROM portfolio_readiness_current"
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    1,
+                    self.h.store.connection.execute(
+                        "SELECT COUNT(*) FROM "
+                        "role_executor_broker_pickup_consumptions"
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    before_writer_effects,
+                    tuple(
+                        self.h.store.connection.execute(
+                            "SELECT "
+                            "(SELECT COUNT(*) FROM portfolio_ready_finalizations),"
+                            "(SELECT COUNT(*) FROM "
+                            " portfolio_pull_buffer_candidates WHERE state='READY'),"
+                            "(SELECT COUNT(*) FROM coordination_messages WHERE topic "
+                            " IN ('development.admission','sre.admission')) ,"
+                            "(SELECT COUNT(*) FROM coordination_terminal_watches)"
+                        ).fetchone()
+                    ),
+                )
+                before_replay = (
+                    tuple(self.h.store.connection.execute(
+                        "SELECT * FROM portfolio_readiness_current"
+                    ).fetchone()),
+                    self.h.store.connection.execute(
+                        "SELECT COUNT(*) FROM portfolio_readiness_events"
+                    ).fetchone()[0],
+                    self.h.store.connection.total_changes,
+                )
+                replay = broker.consume_staged_broker_pickups(
+                    self.h.store.connection, now=NOW
+                )
+                self.assertEqual("HOLD", replay[0]["readiness_state"])
+                self.assertEqual(
+                    before_replay,
+                    (
+                        tuple(self.h.store.connection.execute(
+                            "SELECT * FROM portfolio_readiness_current"
+                        ).fetchone()),
+                        self.h.store.connection.execute(
+                            "SELECT COUNT(*) FROM portfolio_readiness_events"
+                        ).fetchone()[0],
+                        self.h.store.connection.total_changes,
+                    ),
+                )
+
+    def test_retired_pickups_terminalize_independently_without_admission(self) -> None:
         self.h.seed(issue_number=88)
         _endpoint, reserved, token, spool = self.h.reserve_and_launch()
         poison_attempt_id = str(reserved["attempt_id"])
@@ -1921,7 +2508,7 @@ class RoleExecutorBrokerTests(unittest.TestCase):
         )
         first = supervisor.run_once("2026-08-25T05:00:30Z")
         self.assertEqual(
-            (1, "STALE", "STALE", 1, []),
+            (1, "HOLD", "HOLD", 1, []),
             (
                 len(first["broker_pickups"]),
                 first["broker_pickups"][0]["disposition"],
@@ -1960,19 +2547,24 @@ class RoleExecutorBrokerTests(unittest.TestCase):
             evaluator_inactivity=process_exit(9002),
         )
         second = supervisor.run_once("2026-08-25T05:00:32Z")
-        self.assertEqual(1, len(second["broker_pickups"]))
+        self.assertEqual(2, len(second["broker_pickups"]))
+        good_pickup = next(
+            pickup
+            for pickup in second["broker_pickups"]
+            if pickup["attempt_id"] == good_attempt_id
+        )
         self.assertEqual(
-            (good_attempt_id, "READY_ELIGIBLE"),
+            (good_attempt_id, "HOLD", "BROKER_RECEIPT_CONTRACT_RETIRED"),
             (
-                second["broker_pickups"][0]["attempt_id"],
-                second["broker_pickups"][0]["readiness_state"],
+                good_pickup["attempt_id"],
+                good_pickup["readiness_state"],
+                good_pickup["error"],
             ),
         )
         self.assertEqual(2, self.h.store.connection.execute(
             "SELECT COUNT(*) FROM role_executor_broker_pickup_consumptions"
         ).fetchone()[0])
-        self.assertTrue(second["launched"])
-        self.assertTrue(any(identity == self.h.config.roles["planner"].endpoint_id for identity, _ in launches))
+        self.assertEqual([], second["launched"])
 
     def test_endpoint_drift_pickup_is_durably_retired_as_stale(self) -> None:
         self.h.seed()

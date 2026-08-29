@@ -6,8 +6,10 @@ from copy import deepcopy
 import hashlib
 import hmac
 import json
+from pathlib import Path
 import re
-from typing import Any
+import sqlite3
+from typing import Any, Mapping
 
 from approval_guard import admission_execution_scope_sha256
 from repository_delivery_policy import (
@@ -15,6 +17,7 @@ from repository_delivery_policy import (
     delivery_branch_issue_number,
     delivery_branch_matches_owning_issue,
     expected_worktree_identity,
+    expected_worktree_parent,
     strict_delivery_branch_matches,
     worktree_identity_matches,
 )
@@ -34,6 +37,7 @@ DELIVERY_IDENTITY_KEYS = {
     "admission_transaction_sha256",
 }
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+WORKSPACE_ROOT = Path("/home/ubuntu/code")
 
 
 def _canonical_json(value: Any) -> str:
@@ -162,6 +166,8 @@ def delivery_identity_error(
     surface_issue_number = delivery_branch_issue_number(
         repository, identity["branch"]
     )
+    worktree_path = Path(identity["worktree_path"])
+    expected_parent = expected_worktree_parent(repository, WORKSPACE_ROOT)
     transfer_identity = False
     if (
         repository == APPLICATION_REPOSITORY
@@ -179,14 +185,19 @@ def delivery_identity_error(
         )
     same_issue_identity = worktree_identity_matches(
         repository,
-        surface_issue_number=issue_number,
+        surface_issue_number=surface_issue_number,
         owning_issue_number=issue_number,
         generation=generation,
         worktree_path=identity["worktree_path"],
         opaque_worktree_id=identity["opaque_worktree_id"],
     )
     if (
-        not strict_delivery_branch_matches(repository, identity["branch"])
+        surface_issue_number is None
+        or expected_parent is None
+        or not worktree_path.is_absolute()
+        or identity["worktree_path"] != str(worktree_path)
+        or worktree_path.parent != expected_parent
+        or not strict_delivery_branch_matches(repository, identity["branch"])
         or not delivery_branch_matches_owning_issue(
             repository, identity["branch"], issue_number
         )
@@ -218,6 +229,114 @@ def delivery_identity_error(
             return str(exc)
         if computed != identity:
             return "DELIVERY_IDENTITY_TRANSACTION_DRIFT"
+    return None
+
+
+def immutable_admission_error(
+    connection: sqlite3.Connection,
+    *,
+    message: Mapping[str, Any],
+    payload: dict[str, Any],
+) -> str | None:
+    """Compare a live admission message with its immutable READY transaction.
+
+    Writer-side consumers cannot safely validate the transaction digest from
+    the message payload alone: the digest also covers the item and artifact
+    set.  The v2 finalization therefore retains the exact reviewed transaction,
+    and this check compares every immutable message byte with that attestation.
+    Endpoint rotation may change the current item/watch route, but it never
+    rewrites the admission message or its reviewed transaction.
+    """
+
+    identity = payload.get("delivery_identity")
+    error = delivery_identity_error(identity)
+    source = payload.get("source")
+    if error is not None:
+        return error
+    if (
+        not isinstance(source, dict)
+        or not isinstance(source.get("repository"), str)
+        or type(payload.get("issue_number")) is not int
+        or type(payload.get("generation")) is not int
+    ):
+        return "DELIVERY_IDENTITY_ADMISSION_INVALID"
+    try:
+        row = connection.execute(
+            """
+            SELECT finalization.finalization_sha256,
+                   finalization.payload_json,
+                   current.state AS readiness_state,
+                   candidate.state AS candidate_state
+            FROM portfolio_ready_finalizations finalization
+            JOIN portfolio_readiness_current current
+              ON current.repository=finalization.repository
+             AND current.issue_number=finalization.issue_number
+             AND current.campaign_id=finalization.campaign_id
+             AND current.finalized_candidate_id=finalization.ready_candidate_id
+             AND current.finalized_event_id=finalization.dirty_event_id
+            JOIN portfolio_pull_buffer_candidates candidate
+              ON candidate.id=finalization.ready_candidate_id
+            WHERE finalization.repository=?
+              AND finalization.issue_number=?
+              AND finalization.generation=?
+            """,
+            (
+                source["repository"],
+                payload["issue_number"],
+                payload["generation"],
+            ),
+        ).fetchall()
+    except sqlite3.Error:
+        return "DELIVERY_IDENTITY_ATTESTATION_MISSING"
+    if len(row) != 1:
+        return "DELIVERY_IDENTITY_ATTESTATION_MISSING"
+    attestation = row[0]
+    try:
+        finalization = json.loads(attestation["payload_json"])
+    except (TypeError, json.JSONDecodeError):
+        return "DELIVERY_IDENTITY_ATTESTATION_DRIFT"
+    admission = (
+        finalization.get("admission_transaction")
+        if isinstance(finalization, dict)
+        else None
+    )
+    expected_message = (
+        admission.get("message") if isinstance(admission, dict) else None
+    )
+    try:
+        current_message = {
+            "idempotency_key": message["idempotency_key"],
+            "recipient_session_id": message["recipient_session_id"],
+            "topic": message["topic"],
+            "payload": payload,
+        }
+    except (KeyError, IndexError, TypeError):
+        return "DELIVERY_IDENTITY_ADMISSION_INVALID"
+    if (
+        attestation["readiness_state"] != "FINALIZED"
+        or attestation["candidate_state"] != "READY"
+        or not isinstance(finalization, dict)
+        or _digest_json(finalization) != attestation["finalization_sha256"]
+        or finalization.get("schema")
+        != "twinfinity-kanban-ready-finalization/v2"
+        or finalization.get("repository") != source["repository"]
+        or finalization.get("issue_number") != payload["issue_number"]
+        or finalization.get("generation") != payload["generation"]
+        or finalization.get("delivery_identity") != identity
+        or finalization.get("delivery_identity_sha256")
+        != delivery_identity_sha256(identity)
+        or finalization.get("admission_transaction_sha256")
+        != identity["admission_transaction_sha256"]
+        or not isinstance(admission, dict)
+        or expected_message != current_message
+        or delivery_identity_error(
+            identity,
+            admission=admission,
+            expected_sha256=finalization.get("delivery_identity_sha256"),
+        )
+        is not None
+    ):
+        return "DELIVERY_IDENTITY_ATTESTATION_DRIFT"
     return None
 
 

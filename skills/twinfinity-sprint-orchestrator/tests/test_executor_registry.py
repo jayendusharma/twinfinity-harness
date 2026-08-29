@@ -47,6 +47,7 @@ from executor_registry import (  # noqa: E402
     stable_systemd_unit,
     transition_attempt,
 )
+from portfolio_graph import replace_graph  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
     _legacy_occurrences,
     _verify_or_insert_endpoint,
@@ -60,6 +61,9 @@ from run_role_executor import build_fresh_command, execute_role  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     reviewed_current_endpoint_catalog,
     reviewed_planner_rotation_catalog,
+)
+from tests.canonical_ready_fixture import (  # noqa: E402
+    finalize_canonical_ready_item,
 )
 
 
@@ -1952,14 +1956,14 @@ class ExecutorRegistryTests(unittest.TestCase):
     def test_runner_terminal_watch_reservation_repeats_item_endpoint_and_lineage(self) -> None:
         source = self.snapshot()
         self.migrate("runner-terminal-watch-contract")
-        self.store._set_issue_status_for_test_fixture(
+        self.store.set_issue_status(
             repository=REPOSITORY,
             issue_number=92,
-            status="ACTIVE_FENCED",
-            allocation_class="ACTIVE",
+            status="PREPARED",
+            allocation_class="NONE",
             generation=3,
-            accountable_session_id=DEVELOPMENT_ENDPOINT,
-            lease_manifest_sha256=LEASE,
+            accountable_session_id=None,
+            lease_manifest_sha256=None,
             development_units=1,
             shared_units=0,
             sre_units=0,
@@ -1967,13 +1971,69 @@ class ExecutorRegistryTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-24T10:00:01Z",
         )
+        replace_graph(
+            self.store.connection,
+            {
+                "repository": REPOSITORY,
+                "accepted_main_sha": "a" * 40,
+                "expected_current_version": 0,
+                "scope_milestones": [{"title": "Fixture", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [
+                    {
+                        "node_key": "issue:92",
+                        "issue_number": 92,
+                        "role": "DELIVERY",
+                        "root_kind": "STANDALONE",
+                        "root_reason": "Independent terminal-watch fixture outcome",
+                        "lane_key": "lane-92",
+                        "lane_order": 0,
+                        "dispatchable": True,
+                        "priority_rank": 1,
+                        "estimate_units": 1,
+                        "development_units": 1,
+                        "shared_units": 0,
+                        "sre_units": 0,
+                        "source_payload_sha256": source.payload_sha256,
+                        "ready_at": "2026-08-24T10:00:00Z",
+                    }
+                ],
+                "relations": [],
+            },
+            now="2026-08-24T10:00:02Z",
+        )
+        ready = finalize_canonical_ready_item(
+            self.store,
+            database=self.store.path,
+            artifact_root=self.store.path.parent,
+            repository=REPOSITORY,
+            issue_number=92,
+            source_payload_sha256=source.payload_sha256,
+            accepted_main_sha="a" * 40,
+            worker_role="development",
+            worker_endpoint_id=DEVELOPMENT_ENDPOINT,
+            now="2026-08-24T10:00:03Z",
+            suffix="runner-terminal-watch-binding",
+        )
+        transaction = ready["admission_transaction"]
+        _active, message_id = self.store.activate_admission(
+            item=transaction["item"],
+            message=transaction["message"],
+            artifacts=transaction.get("artifacts"),
+            now="2026-08-24T10:00:04Z",
+        )
+        payload = transaction["message"]["payload"]
         watch_key = f"terminal:{REPOSITORY}:issue:92:generation:3"
         watch = self.store.connection.execute(
             "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
             (watch_key,),
         ).fetchone()
         self.assertEqual(
-            ("ACTIVE", DEVELOPMENT_ENDPOINT, LEASE),
+            (
+                "PENDING_CLAIM",
+                DEVELOPMENT_ENDPOINT,
+                payload["lease_manifest_sha256"],
+            ),
             (
                 watch["state"],
                 watch["accountable_session_id"],
@@ -1998,52 +2058,6 @@ class ExecutorRegistryTests(unittest.TestCase):
                 ),
                 popen=lambda *_args, **_kwargs: self.fail("child must not launch"),
             )
-        payload = {
-            "source": {
-                "repository": REPOSITORY,
-                "object_kind": "issue",
-                "object_number": 92,
-                "payload_sha256": source.payload_sha256,
-            },
-            "issue_number": 92,
-            "generation": 3,
-            "item_version": 1,
-            "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
-            "base_sha": "a" * 40,
-            "branch": "codex/92-runner-terminal-binding",
-            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-92",
-            "opaque_worktree_id": "issue-92-runner-terminal-binding",
-            "accountable_session_id": DEVELOPMENT_ENDPOINT,
-            "lease_manifest_sha256": LEASE,
-            "authority_sha256": "7" * 64,
-            "capacity": {
-                "development_units": 1,
-                "shared_units": 0,
-                "sre_units": 0,
-            },
-            "writer": "accountable-writer",
-            "reviewer_plan": ["Different-session exact-head review."],
-            "collision_proof": ["Closed lease is collision-free."],
-            "environment_rule": "Use only an issue-owned environment.",
-            "routine_chain": ["Continue through routine closeout."],
-            "hard_stops": ["Stop on any binding drift."],
-        }
-        message_id = self.store.enqueue_message(
-            idempotency_key="runner-terminal-watch-binding",
-            recipient_session_id=DEVELOPMENT_ENDPOINT,
-            topic="development.admission",
-            payload=payload,
-            now="2026-08-24T10:00:02Z",
-        )
-        self.store.connection.execute(
-            """
-            UPDATE coordination_terminal_watches
-            SET state='PENDING_CLAIM', admission_message_id=?,
-                admission_payload_sha256=?
-            WHERE watch_key=?
-            """,
-            (message_id, digest_json(payload), watch_key),
-        )
         reserved, token = reserve_attempt(
             self.store.connection,
             role="development",

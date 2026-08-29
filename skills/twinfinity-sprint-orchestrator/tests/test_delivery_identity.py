@@ -148,7 +148,7 @@ class DeliveryIdentityTests(unittest.TestCase):
                 generation=1,
                 branch="change/68-delivery-identity",
                 worktree_path=(
-                    "/home/ubuntu/code/twinfinity/harness/"
+                    "/home/ubuntu/code/twinfinity/"
                     "twinfinity-harness-issue68-delivery"
                 ),
                 opaque_worktree_id="twinfinity-harness-issue68-delivery",
@@ -170,6 +170,53 @@ class DeliveryIdentityTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "DELIVERY_IDENTITY_POLICY_INVALID"):
             bind_delivery_identity(rejected)
+        policy_substitutions = (
+            self.admission(
+                branch="codex/304-wrong-surface",
+                worktree_path="/home/ubuntu/code/twinfinityapp-issue-303",
+                opaque_worktree_id="twinfinityapp-issue-303",
+            ),
+            self.admission(
+                worktree_path=(
+                    "/home/ubuntu/code/./twinfinityapp-issue-303"
+                ),
+            ),
+            self.admission(
+                worktree_path=(
+                    "/home/ubuntu//code/twinfinityapp-issue-303"
+                ),
+            ),
+            self.admission(
+                repository=HARNESS_REPOSITORY,
+                issue_number=68,
+                generation=1,
+                branch="change/68-delivery-identity",
+                worktree_path=(
+                    "/home/ubuntu/code/twinfinity/harness/"
+                    "twinfinity-harness-issue68-delivery"
+                ),
+                opaque_worktree_id="twinfinity-harness-issue68-delivery",
+            ),
+            self.admission(
+                repository=HARNESS_REPOSITORY,
+                issue_number=68,
+                generation=1,
+                branch="change/69-wrong-owner",
+                worktree_path=(
+                    "/home/ubuntu/code/twinfinity/"
+                    "twinfinity-harness-issue69-wrong-owner"
+                ),
+                opaque_worktree_id="twinfinity-harness-issue69-wrong-owner",
+            ),
+        )
+        for substituted in policy_substitutions:
+            with self.subTest(
+                branch=substituted["message"]["payload"]["branch"],
+                worktree=substituted["message"]["payload"]["worktree_path"],
+            ), self.assertRaisesRegex(
+                ValueError, "DELIVERY_IDENTITY_POLICY_INVALID"
+            ):
+                bind_delivery_identity(substituted)
 
 
 if __name__ == "__main__":
