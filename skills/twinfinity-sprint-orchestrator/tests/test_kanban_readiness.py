@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -16,8 +17,10 @@ from unittest.mock import patch
 STAGED = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(STAGED))
 
+from tests.delivery_identity_fixture import synthetic_delivery_identity  # noqa: E402
 from coordination_store import CoordinationStore, canonical_json  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
+from delivery_identity import delivery_identity_sha256  # noqa: E402
 import kanban_pull_buffer  # noqa: E402
 from kanban_pull_buffer import ensure_pull_buffer_schema  # noqa: E402
 from kanban_readiness import (  # noqa: E402
@@ -185,6 +188,9 @@ class Harness:
             "SELECT version FROM coordination_capacity_current WHERE repository=?",
             (REPOSITORY,),
         ).fetchone()[0]
+        identity, identity_sha256 = synthetic_delivery_identity(
+            REPOSITORY, issue, 1
+        )
         return {
             "schema": PLAN_SCHEMA,
             "repository": REPOSITORY,
@@ -198,6 +204,8 @@ class Harness:
             "candidate_sha256": self.candidates[issue],
             "worker_role": role,
             "phase_summary": "Resolve and assess the complete readiness phase without repository mutation.",
+            "delivery_identity": identity,
+            "delivery_identity_sha256": identity_sha256,
             "gates": [
                 {
                     "gate_key": "complete-review",
@@ -289,6 +297,9 @@ class Harness:
             "repository": REPOSITORY,
             "issue_number": 1,
             "readiness_plan_sha256": registered["plan_sha256"],
+            "delivery_identity_sha256": synthetic_delivery_identity(
+                REPOSITORY, 1, 1
+            )[1],
             "verdict": "PASS",
             "worker_role": "sre",
             "message_id": message_id,
@@ -450,6 +461,7 @@ class KanbanReadinessTests(unittest.TestCase):
         self.h.close()
 
     def reopen(self, hold: dict) -> dict:
+        generation = int(self.h.items[1]["generation"])
         return reopen_terminal_hold(
             self.h.store.connection,
             REPOSITORY,
@@ -458,7 +470,36 @@ class KanbanReadinessTests(unittest.TestCase):
             expected_current_version=int(hold["version"]),
             expected_terminal_receipt_id=int(hold["receipt_id"]),
             expected_terminal_receipt_sha256=str(hold["receipt_sha256"]),
+            delivery_identity=synthetic_delivery_identity(
+                REPOSITORY, 1, generation
+            )[0],
             now="2026-08-25T05:02:00Z",
+        )
+
+    def test_plan_rejects_delivery_identity_digest_and_lineage_drift(self) -> None:
+        self.h.seed([1])
+        digest_drift = self.h.plan(1)
+        digest_drift["delivery_identity"]["branch"] = "codex/1-drifted"
+        lineage_drift = self.h.plan(1)
+        lineage_drift["delivery_identity"]["issue_number"] = 2
+        lineage_drift["delivery_identity_sha256"] = delivery_identity_sha256(
+            lineage_drift["delivery_identity"]
+        )
+
+        for label, plan in (
+            ("digest", digest_drift),
+            ("lineage", lineage_drift),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                ReadinessError, "READINESS_DELIVERY_IDENTITY_INVALID"
+            ):
+                register(self.h.store.connection, plan, now=NOW)
+
+        self.assertEqual(
+            0,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_campaigns"
+            ).fetchone()[0],
         )
 
     def test_terminal_hold_reopens_only_to_new_bound_prepared_generation(self) -> None:
@@ -663,6 +704,9 @@ class KanbanReadinessTests(unittest.TestCase):
                         expected_current_version=int(before[2]),
                         expected_terminal_receipt_id=1,
                         expected_terminal_receipt_sha256="a" * 64,
+                        delivery_identity=synthetic_delivery_identity(
+                            REPOSITORY, 1, 1
+                        )[0],
                         now="2026-08-25T05:02:00Z",
                     )
                 self.assertEqual(
@@ -734,6 +778,45 @@ class KanbanReadinessTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_terminal_hold_reopen_cannot_introduce_a_transfer_identity(self) -> None:
+        hold = self.h.terminal_hold()
+        self.h.complete_planner_notice(hold)
+        item = self.h.advance_generation()
+        identity = synthetic_delivery_identity(
+            REPOSITORY, 1, int(item["generation"])
+        )[0]
+        identity.update(
+            {
+                "branch": "codex/999-foreign-transfer",
+                "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-999",
+                "opaque_worktree_id": "twinfinityapp-issue-999",
+            }
+        )
+        before = self.h.store.connection.total_changes
+
+        with self.assertRaisesRegex(
+            ReadinessError, "READINESS_TERMINAL_HOLD_BINDING_DRIFT"
+        ):
+            reopen_terminal_hold(
+                self.h.store.connection,
+                REPOSITORY,
+                1,
+                expected_campaign_id=int(hold["campaign_id"]),
+                expected_current_version=int(hold["version"]),
+                expected_terminal_receipt_id=int(hold["receipt_id"]),
+                expected_terminal_receipt_sha256=str(hold["receipt_sha256"]),
+                delivery_identity=identity,
+                now="2026-08-25T05:02:00Z",
+            )
+
+        self.assertEqual(before, self.h.store.connection.total_changes)
+        self.assertEqual(
+            1,
+            self.h.store.connection.execute(
+                "SELECT COUNT(*) FROM portfolio_readiness_campaigns"
+            ).fetchone()[0],
+        )
+
     def test_terminal_hold_reopen_cli_uses_exact_fences(self) -> None:
         hold = self.h.terminal_hold()
         self.h.complete_planner_notice(hold)
@@ -748,6 +831,14 @@ class KanbanReadinessTests(unittest.TestCase):
             "--expected-terminal-receipt-id", str(hold["receipt_id"]),
             "--expected-terminal-receipt-sha256", str(hold["receipt_sha256"]),
         ]
+        identity_path = self.h.root / "generation-2-delivery-identity.json"
+        identity_path.write_text(
+            canonical_json(
+                synthetic_delivery_identity(REPOSITORY, 1, 2)[0]
+            ),
+            encoding="utf-8",
+        )
+        argv.extend(["--delivery-identity", str(identity_path)])
         output = io.StringIO()
         with (
             patch.object(kanban_pull_buffer, "DEFAULT_DATABASE", self.h.database),
@@ -1377,6 +1468,9 @@ class KanbanReadinessTests(unittest.TestCase):
             "repository": REPOSITORY,
             "issue_number": 1,
             "readiness_plan_sha256": registered["plan_sha256"],
+            "delivery_identity_sha256": synthetic_delivery_identity(
+                REPOSITORY, 1, 1
+            )[1],
             "verdict": "ACTIONABLE_HOLD",
             "worker_role": "sre",
             "message_id": message_id,
@@ -1520,6 +1614,9 @@ class KanbanReadinessTests(unittest.TestCase):
                 "repository": REPOSITORY,
                 "issue_number": 1,
                 "readiness_plan_sha256": campaigns[1]["plan_sha256"],
+                "delivery_identity_sha256": synthetic_delivery_identity(
+                    REPOSITORY, 1, 1
+                )[1],
                 "verdict": "PASS",
                 "worker_role": "sre",
                 "message_id": message_id,

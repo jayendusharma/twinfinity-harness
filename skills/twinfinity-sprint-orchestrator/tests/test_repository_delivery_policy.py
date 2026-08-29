@@ -17,6 +17,10 @@ from coordination_store import (  # noqa: E402
     parse_structured_lease_manifest,
 )
 from delivery_guard import GuardError, _parse_lease  # noqa: E402
+from delivery_identity import (  # noqa: E402
+    DELIVERY_IDENTITY_SCHEMA,
+    delivery_identity_error,
+)
 from approval_guard import (  # noqa: E402
     admission_execution_scope_sha256,
     execution_scope_sha256,
@@ -201,6 +205,16 @@ class RepositoryDeliveryPolicyTests(unittest.TestCase):
         self.assertFalse(
             worktree_identity_matches(
                 APPLICATION_REPOSITORY,
+                surface_issue_number=303,
+                owning_issue_number=303,
+                generation=2,
+                worktree_path="/home/ubuntu/code/twinfinityapp-issue-303-g2",
+                opaque_worktree_id="issue-303-generation-2",
+            )
+        )
+        self.assertFalse(
+            worktree_identity_matches(
+                APPLICATION_REPOSITORY,
                 surface_issue_number=36,
                 owning_issue_number=36,
                 generation=2,
@@ -258,6 +272,99 @@ class RepositoryDeliveryPolicyTests(unittest.TestCase):
                         worktree_path=path,
                         opaque_worktree_id=opaque,
                     )
+                )
+
+    def test_delivery_identity_policy_rejects_the_issue_303_g2_regression(self) -> None:
+        def identity(
+            repository: str,
+            issue_number: int,
+            generation: int,
+            branch: str,
+            worktree_path: str,
+            opaque_worktree_id: str,
+        ) -> dict:
+            return {
+                "schema": DELIVERY_IDENTITY_SCHEMA,
+                "repository": repository,
+                "issue_number": issue_number,
+                "generation": generation,
+                "lease_manifest_sha256": "1" * 64,
+                "branch": branch,
+                "worktree_path": worktree_path,
+                "opaque_worktree_id": opaque_worktree_id,
+                "admission_execution_scope_sha256": "2" * 64,
+                "admission_transaction_sha256": "3" * 64,
+            }
+
+        accepted = (
+            identity(
+                APPLICATION_REPOSITORY,
+                303,
+                2,
+                "codex/303-delivery-identity",
+                "/home/ubuntu/code/twinfinityapp-issue-303",
+                "twinfinityapp-issue-303",
+            ),
+            identity(
+                APPLICATION_REPOSITORY,
+                303,
+                2,
+                "codex/303-delivery-identity",
+                "/home/ubuntu/code/twinfinityapp-issue-303-v2",
+                "issue-303-generation-2",
+            ),
+            identity(
+                HARNESS_REPOSITORY,
+                68,
+                1,
+                "change/68-delivery-identity",
+                "/home/ubuntu/code/twinfinity/twinfinity-harness-issue68-recovery",
+                "twinfinity-harness-issue68-recovery",
+            ),
+        )
+        for candidate in accepted:
+            with self.subTest(candidate=candidate["worktree_path"]):
+                self.assertIsNone(delivery_identity_error(candidate))
+
+        rejected = (
+            identity(
+                APPLICATION_REPOSITORY,
+                303,
+                2,
+                "codex/303-delivery-identity",
+                "/home/ubuntu/code/twinfinityapp-issue-303-g2",
+                "issue-303-generation-2",
+            ),
+            identity(
+                APPLICATION_REPOSITORY,
+                303,
+                2,
+                "change/303-delivery-identity",
+                "/home/ubuntu/code/twinfinityapp-issue-303",
+                "twinfinityapp-issue-303",
+            ),
+            identity(
+                HARNESS_REPOSITORY,
+                68,
+                1,
+                "codex/68-delivery-identity",
+                "/home/ubuntu/code/twinfinity/twinfinity-harness-issue68-recovery",
+                "twinfinity-harness-issue68-recovery",
+            ),
+            identity(
+                HARNESS_REPOSITORY,
+                68,
+                1,
+                "change/67-delivery-identity",
+                "/home/ubuntu/code/twinfinity/twinfinity-harness-issue68-recovery",
+                "twinfinity-harness-issue68-recovery",
+            ),
+        )
+        for candidate in rejected:
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    "DELIVERY_IDENTITY_POLICY_INVALID",
+                    delivery_identity_error(candidate),
                 )
 
     def test_store_and_delivery_guard_share_the_harness_lease_policy(self) -> None:

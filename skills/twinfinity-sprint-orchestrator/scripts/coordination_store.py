@@ -31,6 +31,7 @@ from approval_guard import (
     admission_execution_scope_sha256,
     require_effective_approval,
 )
+from delivery_identity import delivery_identity_error, immutable_admission_error
 from portfolio_graph import (
     PortfolioGraphError,
     enqueue_convergence_dirty_event,
@@ -3799,6 +3800,7 @@ class CoordinationStore:
         generation: int,
         ready_item_version: int,
         source_payload_sha256: str,
+        admission_transaction: dict[str, Any] | None = None,
     ) -> str | None:
         required_objects = {
             ("table", "portfolio_readiness_current"),
@@ -3831,7 +3833,8 @@ class CoordinationStore:
                    current.receipt_id AS current_receipt_id,
                    current.finalized_candidate_id,
                    current.finalized_event_id,
-                   campaign.plan_sha256, campaign.transition_kind,
+                   campaign.plan_sha256, campaign.plan_json,
+                   campaign.transition_kind,
                    campaign.approval_proposal_sha256,
                    campaign.approval_decision_sha256,
                    campaign.approval_recipient_session_id,
@@ -3880,6 +3883,7 @@ class CoordinationStore:
             return "READY_FINALIZATION_ATTESTATION_MISSING"
         try:
             receipt_payload = json.loads(row["receipt_json"])
+            plan_payload = json.loads(row["plan_json"])
             finalization_payload = json.loads(row["finalization_payload_json"])
         except (TypeError, json.JSONDecodeError):
             return "READY_FINALIZATION_ATTESTATION_DRIFT"
@@ -3891,7 +3895,28 @@ class CoordinationStore:
             and int(row["finalized_event_id"]) == int(row["dirty_event_id"])
             and int(row["observed_dirty_event_id"]) == int(row["dirty_event_id"])
             and row["verdict"] == "PASS"
+            and receipt_payload.get("schema")
+            == "twinfinity-kanban-readiness-receipt/v2"
             and digest_json(receipt_payload) == row["receipt_sha256"]
+            and receipt_payload.get("delivery_identity_sha256")
+            == plan_payload.get("delivery_identity_sha256")
+            and finalization_payload.get("delivery_identity")
+            == plan_payload.get("delivery_identity")
+            and finalization_payload.get("delivery_identity_sha256")
+            == plan_payload.get("delivery_identity_sha256")
+            and isinstance(finalization_payload.get("delivery_identity"), dict)
+            and finalization_payload.get("admission_transaction_sha256")
+            == finalization_payload.get("delivery_identity", {}).get(
+                "admission_transaction_sha256"
+            )
+            and isinstance(
+                finalization_payload.get("admission_transaction"), dict
+            )
+            and (
+                admission_transaction is None
+                or finalization_payload.get("admission_transaction")
+                == admission_transaction
+            )
             and row["candidate_state"] == "READY"
             and row["candidate_repository"] == repository
             and int(row["candidate_issue_number"]) == issue_number
@@ -3904,7 +3929,7 @@ class CoordinationStore:
             and int(row["readiness_receipt_id"]) == int(row["receipt_id"])
             and row["readiness_receipt_sha256"] == row["receipt_sha256"]
             and finalization_payload.get("schema")
-            == "twinfinity-kanban-ready-finalization/v1"
+            == "twinfinity-kanban-ready-finalization/v2"
             and finalization_payload.get("repository") == repository
             and finalization_payload.get("issue_number") == issue_number
             and finalization_payload.get("generation") == generation
@@ -3919,6 +3944,14 @@ class CoordinationStore:
             and finalization_payload.get("readiness_receipt_id")
             == int(row["receipt_id"])
             and digest_json(finalization_payload) == row["finalization_sha256"]
+            and delivery_identity_error(
+                finalization_payload.get("delivery_identity"),
+                admission=finalization_payload.get("admission_transaction"),
+                expected_sha256=finalization_payload.get(
+                    "delivery_identity_sha256"
+                ),
+            )
+            is None
         )
         if not exact:
             return "READY_FINALIZATION_ATTESTATION_DRIFT"
@@ -3973,6 +4006,7 @@ class CoordinationStore:
         generation: int,
         ready_item_version: int,
         source_payload_sha256: str,
+        admission_transaction: dict[str, Any] | None = None,
     ) -> None:
         error = self._ready_finalization_attestation_error(
             repository=repository,
@@ -3980,6 +4014,7 @@ class CoordinationStore:
             generation=generation,
             ready_item_version=ready_item_version,
             source_payload_sha256=source_payload_sha256,
+            admission_transaction=admission_transaction,
         )
         if error is not None:
             raise CoordinationError(error)
@@ -5689,6 +5724,7 @@ class CoordinationStore:
             now=now,
             transaction=_transaction,
             pending_claim=True,
+            require_ready_identity=True,
         )
 
     def _activate_admission_for_test_fixture(
@@ -5709,6 +5745,7 @@ class CoordinationStore:
             now=now,
             transaction=True,
             pending_claim=False,
+            require_ready_identity=False,
         )
 
     def _activate_admission_locked(
@@ -5721,6 +5758,7 @@ class CoordinationStore:
         now: str,
         transaction: bool,
         pending_claim: bool,
+        require_ready_identity: bool,
     ) -> tuple[dict[str, Any], int]:
         if (
             not isinstance(item, dict)
@@ -5752,7 +5790,6 @@ class CoordinationStore:
             ):
                 raise CoordinationError("MESSAGE_ROLE_MISMATCH")
             validate_admission_dispatch_bindings(payload, topic=message["topic"])
-            self._require_admission_readiness_approval_precondition(item)
             artifact_paths: list[Path] = []
             if artifact_observations is not None:
                 if not artifact_observations:
@@ -5887,6 +5924,99 @@ class CoordinationStore:
                 or manifest.get("worktree_path") != payload.get("worktree_path")
             ):
                 raise CoordinationError("ADMISSION_LEASE_LINEAGE_MISMATCH")
+            if require_ready_identity:
+                admission_transaction = {"item": item, "message": message}
+                if artifacts is not None:
+                    admission_transaction["artifacts"] = artifacts
+                self._require_ready_finalization_attestation(
+                    repository=str(item.get("repository")),
+                    issue_number=int(item.get("issue_number")),
+                    generation=int(item.get("generation")),
+                    ready_item_version=int(item.get("expected_version")),
+                    source_payload_sha256=str(
+                        item.get("expected_source_sha256")
+                    ),
+                    admission_transaction=admission_transaction,
+                )
+                current_item = self.connection.execute(
+                    "SELECT * FROM coordination_items "
+                    "WHERE repository=? AND issue_number=?",
+                    (item.get("repository"), item.get("issue_number")),
+                ).fetchone()
+                existing_message = self.connection.execute(
+                    "SELECT * FROM coordination_messages "
+                    "WHERE idempotency_key=?",
+                    (message.get("idempotency_key"),),
+                ).fetchone()
+                existing_watch = self.connection.execute(
+                    "SELECT * FROM coordination_terminal_watches "
+                    "WHERE watch_key=?",
+                    (
+                        terminal_watch_key(
+                            str(item.get("repository")),
+                            int(item.get("issue_number")),
+                            int(item.get("generation")),
+                        ),
+                    ),
+                ).fetchone()
+                exact_replay = bool(
+                    current_item is not None
+                    and current_item["status"] == item.get("status")
+                    and current_item["allocation_class"]
+                    == item.get("allocation_class")
+                    and int(current_item["generation"])
+                    == item.get("generation")
+                    and current_item["accountable_session_id"]
+                    == item.get("accountable_session_id")
+                    and current_item["lease_manifest_sha256"]
+                    == item.get("lease_manifest_sha256")
+                    and int(current_item["development_units"])
+                    == item.get("development_units")
+                    and int(current_item["shared_units"])
+                    == item.get("shared_units")
+                    and int(current_item["sre_units"])
+                    == item.get("sre_units")
+                    and current_item["source_payload_sha256"]
+                    == item.get("expected_source_sha256")
+                    and int(current_item["version"])
+                    == payload.get("item_version")
+                    and existing_message is not None
+                    and existing_message["recipient_session_id"]
+                    == message.get("recipient_session_id")
+                    and existing_message["topic"] == message.get("topic")
+                    and existing_message["state"] in {"PREPARED", "CLAIMED"}
+                    and existing_message["payload_sha256"]
+                    == digest_json(payload)
+                    and existing_watch is not None
+                    and existing_watch["state"] in {"PENDING_CLAIM", "ACTIVE"}
+                    and existing_watch["accountable_session_id"]
+                    == item.get("accountable_session_id")
+                    and existing_watch["lease_manifest_sha256"]
+                    == item.get("lease_manifest_sha256")
+                    and int(existing_watch["admission_message_id"] or 0)
+                    == int(existing_message["id"])
+                    and existing_watch["admission_payload_sha256"]
+                    == existing_message["payload_sha256"]
+                )
+                if exact_replay:
+                    self._validate_message_source(payload)
+                    return (
+                        {
+                            "repository": str(current_item["repository"]),
+                            "issue_number": int(current_item["issue_number"]),
+                            "status": str(current_item["status"]),
+                            "allocation_class": str(
+                                current_item["allocation_class"]
+                            ),
+                            "generation": int(current_item["generation"]),
+                            "version": int(current_item["version"]),
+                            "source_payload_sha256": str(
+                                current_item["source_payload_sha256"]
+                            ),
+                        },
+                        int(existing_message["id"]),
+                    )
+            self._require_admission_readiness_approval_precondition(item)
             repository_policy = policy_for_repository(item.get("repository"))
             if (
                 repository_policy is not None
@@ -6600,6 +6730,10 @@ class CoordinationStore:
             or message["updated_at"] != expected_message_updated_at
             or message["claimed_by"] != message["recipient_session_id"]
             or digest_json(payload) != message["payload_sha256"]
+            or immutable_admission_error(
+                self.connection, message=message, payload=payload
+            )
+            is not None
             or source.get("repository") != repository
             or source.get("object_kind") != "issue"
             or source.get("object_number") != issue_number
@@ -8474,6 +8608,13 @@ class CoordinationStore:
             payload=payload,
             message_id=message_id,
         )
+        admission_identity_error = (
+            immutable_admission_error(
+                self.connection, message=row, payload=payload
+            )
+            if row["topic"] in {"development.admission", "sre.admission"}
+            else None
+        )
         watch = None
         claim_attempt = None
         if row["topic"] in {"development.admission", "sre.admission"}:
@@ -8493,6 +8634,8 @@ class CoordinationStore:
                 and watch["claim_attempt_id"] is None
                 and Path("/tmp") in self.path.resolve().parents
             )
+            if admission_identity_error is not None and not fixture_preclaimed:
+                raise CoordinationError("ADMISSION_DELIVERY_IDENTITY_INVALID")
             if (
                 watch is None
                 or (

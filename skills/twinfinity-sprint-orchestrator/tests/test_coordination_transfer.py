@@ -4,6 +4,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -26,11 +27,14 @@ from coordination_transfer_ledger import (  # noqa: E402
     record_existing,
     record_sha256,
 )
+from canonical_ready_fixture import finalize_canonical_ready_candidate  # noqa: E402
 from delivery_guard import (  # noqa: E402
     GuardError,
     _message_context,
     _terminal_watch_context,
 )
+from delivery_identity import bind_delivery_identity  # noqa: E402
+from portfolio_graph import replace_graph  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
@@ -56,6 +60,7 @@ class CoordinationTransferTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
+        self.root = root
         self.store = CoordinationStore(root / "state.sqlite3")
         apply_reviewed_current_endpoint_catalog(
             self.store.connection,
@@ -88,11 +93,18 @@ class CoordinationTransferTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-23T17:00:02Z",
         )
-        self.parent_message = self.store.enqueue_message(
-            idempotency_key="issue314-generation8-parent-admission",
-            recipient_session_id=SRE_SESSION,
-            topic="sre.admission",
-            payload={
+        parent_admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": 314,
+                "generation": 8,
+                "expected_version": 0,
+            },
+            "message": {
+                "idempotency_key": "issue314-generation8-parent-admission",
+                "recipient_session_id": SRE_SESSION,
+                "topic": "sre.admission",
+                "payload": {
                 "source": {
                     "repository": REPOSITORY,
                     "object_kind": "issue",
@@ -112,6 +124,11 @@ class CoordinationTransferTests(unittest.TestCase):
                 "capacity": {"development_units": 0, "shared_units": 0, "sre_units": 1},
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+        }
+        bind_delivery_identity(parent_admission)
+        self.parent_message = self.store.enqueue_message(
+            **parent_admission["message"],
             now="2026-08-23T17:00:03Z",
         )
         parent = self.store.connection.execute(
@@ -169,12 +186,155 @@ class CoordinationTransferTests(unittest.TestCase):
         )
         self.comment_patch.start()
 
+        successor = self.store._set_issue_status_for_test_fixture(
+            repository=REPOSITORY,
+            issue_number=320,
+            status="PREPARED",
+            allocation_class="NONE",
+            generation=1,
+            accountable_session_id=SRE_SESSION,
+            lease_manifest_sha256=None,
+            development_units=0,
+            shared_units=0,
+            sre_units=1,
+            expected_source_sha256=self.sources[320].payload_sha256,
+            expected_version=0,
+            now="2026-08-23T17:00:07Z",
+        )
+        replace_graph(
+            self.store.connection,
+            {
+                "repository": REPOSITORY,
+                "accepted_main_sha": "a" * 40,
+                "expected_current_version": 0,
+                "scope_milestones": [{"title": "Transfer", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [
+                    {
+                        "node_key": "issue:320",
+                        "issue_number": 320,
+                        "role": "DELIVERY",
+                        "root_kind": "STANDALONE",
+                        "root_reason": "Canonical transfer successor",
+                        "lane_key": "transfer-successor",
+                        "lane_order": 0,
+                        "dispatchable": True,
+                        "priority_rank": 1,
+                        "estimate_units": 1,
+                        "development_units": 0,
+                        "shared_units": 0,
+                        "sre_units": 1,
+                        "source_payload_sha256": self.sources[320].payload_sha256,
+                        "ready_at": "2026-08-23T17:00:07Z",
+                    }
+                ],
+                "relations": [],
+            },
+            now="2026-08-23T17:00:07Z",
+        )
+        lease_dir = self.root / "leases"
+        lease_dir.mkdir()
+        lease_path = lease_dir / "issue-320-transfer-lease.json"
+        lease_payload = {
+            "repository": REPOSITORY,
+            "issue_number": 320,
+            "generation": 1,
+            "base_sha": "a" * 40,
+            "branch": "codex/314-ci-hardening",
+            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-314",
+            "no_additional_paths": True,
+            "paths": [
+                {
+                    "path": "backend/example.py",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "5" * 40,
+                }
+            ],
+        }
+        lease_path.write_text(
+            json.dumps(lease_payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        self.successor_lease_sha = hashlib.sha256(lease_path.read_bytes()).hexdigest()
+        self.store.register_artifacts(
+            [
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": 320,
+                    "generation": 1,
+                    "path": str(lease_path),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            ],
+            now="2026-08-23T17:00:07Z",
+        )
+        policy = self.store.capacity_policy(
+            REPOSITORY, now="2026-08-23T17:00:07Z"
+        )
+        canonical_transaction = self._build_transaction()
+        finalized = finalize_canonical_ready_candidate(
+            self.store,
+            database=self.database,
+            artifact_root=self.root,
+            prepared_packet={
+                "schema": "twinfinity-kanban-pull-buffer/v2",
+                "repository": REPOSITORY,
+                "issue_number": 320,
+                "generation": 1,
+                "item_version_at_preparation": int(successor["version"]),
+                "source_payload_sha256": self.sources[320].payload_sha256,
+                "accepted_main_at_preparation": "a" * 40,
+                "portfolio_graph_version": 1,
+                "state": "PREPARED_NOT_READY",
+                "verticality": "END_TO_END",
+                "owner_visible_outcome": "Continue the canonical SRE transfer.",
+                "capacity_policy": {
+                    "version": int(policy["version"]),
+                    "development_limit": int(policy["development_limit"]),
+                    "shared_limit": int(policy["shared_limit"]),
+                    "sre_limit": int(policy["sre_limit"]),
+                },
+                "capacity_on_activation": {
+                    "development_units": 0,
+                    "shared_units": 0,
+                    "sre_units": 1,
+                },
+                "precomputed_collision_matrix": [
+                    {
+                        "other_issue": 314,
+                        "disposition": "DISJOINT",
+                        "reason": "The predecessor is released atomically.",
+                    }
+                ],
+                "preparation_complete": ["The transfer admission is complete."],
+                "promotion_checks_after_predecessor": [
+                    "Revalidate predecessor provenance and comments."
+                ],
+                "hard_stops": ["Stop on any identity or transfer drift."],
+                "promotion_trigger": "The canonical transfer readiness gates pass.",
+            },
+            admission_transaction=canonical_transaction["activation"],
+            worker_role="sre",
+            worker_endpoint_id=SRE_SESSION,
+            now="2026-08-23T17:00:08Z",
+            suffix="coordination-transfer",
+        )
+        self.assertEqual(
+            ("READY", "NONE", 2),
+            (
+                finalized["item"]["status"],
+                finalized["item"]["allocation_class"],
+                finalized["item"]["version"],
+            ),
+        )
+        self.ready_transaction = copy.deepcopy(canonical_transaction)
+
     def tearDown(self) -> None:
         self.comment_patch.stop()
         self.store.close()
         self.temp.cleanup()
 
-    def transaction(self, *, payload_version: int = 1):
+    def _build_transaction(self, *, payload_version: int = 3):
         release = {
             "repository": REPOSITORY,
             "issue_number": 314,
@@ -196,12 +356,12 @@ class CoordinationTransferTests(unittest.TestCase):
             "allocation_class": "ACTIVE",
             "generation": 1,
             "accountable_session_id": SRE_SESSION,
-            "lease_manifest_sha256": "2" * 64,
+            "lease_manifest_sha256": self.successor_lease_sha,
             "development_units": 0,
             "shared_units": 0,
             "sre_units": 1,
             "expected_source_sha256": self.sources[320].payload_sha256,
-            "expected_version": 0,
+            "expected_version": 2,
         }
         payload = {
             "source": {
@@ -222,7 +382,7 @@ class CoordinationTransferTests(unittest.TestCase):
             "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-314",
             "opaque_worktree_id": "twinfinityapp-issue-314",
             "accountable_session_id": SRE_SESSION,
-            "lease_manifest_sha256": "2" * 64,
+            "lease_manifest_sha256": self.successor_lease_sha,
             "authority_sha256": "3" * 64,
             "capacity": {"development_units": 0, "shared_units": 0, "sre_units": 1},
         }
@@ -273,6 +433,17 @@ class CoordinationTransferTests(unittest.TestCase):
             },
         }
         self.refresh_transfer_intent_hash(transaction)
+        bind_delivery_identity(transaction["activation"])
+        return transaction
+
+    def transaction(self, *, payload_version: int = 3):
+        transaction = copy.deepcopy(self.ready_transaction)
+        if payload_version != 3:
+            transaction["activation"]["message"]["payload"][
+                "item_version"
+            ] = payload_version
+            self.refresh_transfer_intent_hash(transaction)
+            bind_delivery_identity(transaction["activation"])
         return transaction
 
     @staticmethod
@@ -328,6 +499,8 @@ class CoordinationTransferTests(unittest.TestCase):
         transaction["activation"]["message"]["payload"][
             "transfer_intent_sha256"
         ] = intent_sha256(cls.intent_record(transaction))
+        if "delivery_identity" in transaction["activation"]["message"]["payload"]:
+            bind_delivery_identity(transaction["activation"])
 
     def test_atomic_transfer_and_idempotent_replay(self) -> None:
         transaction = self.transaction()
@@ -380,7 +553,14 @@ class CoordinationTransferTests(unittest.TestCase):
             "SELECT * FROM coordination_terminal_watches WHERE repository=? AND issue_number=320 AND generation=1",
             (REPOSITORY,),
         ).fetchone()
-        self.assertEqual(("ACTIVE", SRE_SESSION, "2" * 64), (watch["state"], watch["accountable_session_id"], watch["lease_manifest_sha256"]))
+        self.assertEqual(
+            ("ACTIVE", SRE_SESSION, self.successor_lease_sha),
+            (
+                watch["state"],
+                watch["accountable_session_id"],
+                watch["lease_manifest_sha256"],
+            ),
+        )
         self.assertEqual(
             1,
             self.store.connection.execute(
@@ -456,7 +636,9 @@ class CoordinationTransferTests(unittest.TestCase):
                 )
 
     def test_binding_failure_rolls_back_release_and_activation(self) -> None:
-        with self.assertRaisesRegex(CoordinationError, "TRANSFER_ADMISSION_BINDING_MISMATCH"):
+        with self.assertRaisesRegex(
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_DRIFT"
+        ):
             activate_transfer(
                 self.store, self.transaction(payload_version=2), "2026-08-23T17:00:03Z"
             )
@@ -469,13 +651,133 @@ class CoordinationTransferTests(unittest.TestCase):
             (REPOSITORY,),
         ).fetchone()
         self.assertEqual(("HOLD", "RETAINED", 1), (parent["status"], parent["allocation_class"], parent["sre_units"]))
-        self.assertIsNone(child)
+        self.assertEqual(("READY", "NONE", 2), (
+            child["status"], child["allocation_class"], child["version"]
+        ))
         self.assertEqual(
             0,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM coordination_terminal_watches WHERE issue_number=320"
             ).fetchone()[0],
         )
+
+    def test_identity_or_ready_attestation_drift_has_zero_transfer_writes(self) -> None:
+        def writer_state() -> tuple:
+            return (
+                self.store.connection.total_changes,
+                tuple(
+                    self.store.connection.execute(
+                        "SELECT status,allocation_class,generation,version "
+                        "FROM coordination_items WHERE issue_number=314"
+                    ).fetchone()
+                ),
+                tuple(
+                    self.store.connection.execute(
+                        "SELECT status,allocation_class,generation,version "
+                        "FROM coordination_items WHERE issue_number=320"
+                    ).fetchone()
+                ),
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_messages "
+                    "WHERE idempotency_key LIKE 'issue320-admission-v1%'"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_terminal_watches "
+                    "WHERE issue_number=320"
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM coordination_events "
+                    "WHERE event_type LIKE 'TRANSFER_%'"
+                ).fetchone()[0],
+            )
+
+        missing_identity = self.transaction()
+        missing_identity["activation"]["message"]["payload"].pop(
+            "delivery_identity"
+        )
+        before = writer_state()
+        with self.assertRaisesRegex(
+            CoordinationError, "TRANSFER_DELIVERY_IDENTITY_INVALID"
+        ):
+            activate_transfer(
+                self.store, missing_identity, "2026-08-23T17:00:09Z"
+            )
+        self.assertEqual(before, writer_state())
+
+        substituted_message = self.transaction()
+        substituted_message["activation"]["message"][
+            "idempotency_key"
+        ] = "issue320-admission-v1-substituted"
+        bind_delivery_identity(substituted_message["activation"])
+        before = writer_state()
+        with self.assertRaisesRegex(
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_DRIFT"
+        ):
+            activate_transfer(
+                self.store, substituted_message, "2026-08-23T17:00:10Z"
+            )
+        self.assertEqual(before, writer_state())
+
+    def test_missing_ready_attestation_has_zero_transfer_writes(self) -> None:
+        trigger_sql = self.store.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='portfolio_ready_finalizations_immutable_delete'"
+        ).fetchone()[0]
+        with self.store.transaction():
+            self.store.connection.execute(
+                "DROP TRIGGER portfolio_ready_finalizations_immutable_delete"
+            )
+            self.store.connection.execute(
+                "DELETE FROM portfolio_ready_finalizations "
+                "WHERE repository=? AND issue_number=320",
+                (REPOSITORY,),
+            )
+            self.store.connection.execute(trigger_sql)
+        before = (
+            self.store.connection.total_changes,
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status,allocation_class,version FROM coordination_items "
+                    "WHERE issue_number=314"
+                ).fetchone()
+            ),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status,allocation_class,version FROM coordination_items "
+                    "WHERE issue_number=320"
+                ).fetchone()
+            ),
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE idempotency_key='issue320-admission-v1'"
+            ).fetchone()[0],
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_MISSING"
+        ):
+            activate_transfer(
+                self.store, self.transaction(), "2026-08-23T17:00:09Z"
+            )
+        after = (
+            self.store.connection.total_changes,
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status,allocation_class,version FROM coordination_items "
+                    "WHERE issue_number=314"
+                ).fetchone()
+            ),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT status,allocation_class,version FROM coordination_items "
+                    "WHERE issue_number=320"
+                ).fetchone()
+            ),
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE idempotency_key='issue320-admission-v1'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(before, after)
 
     def test_transferred_surface_requires_exact_parent_bindings(self) -> None:
         for mutate in (
@@ -492,10 +794,13 @@ class CoordinationTransferTests(unittest.TestCase):
                     activate_transfer(
                         self.store, transaction, "2026-08-23T17:00:03Z"
                     )
-                self.assertIsNone(
-                    self.store.connection.execute(
-                        "SELECT 1 FROM coordination_items WHERE issue_number=320"
-                    ).fetchone()
+                child = self.store.connection.execute(
+                    "SELECT status,allocation_class,version FROM coordination_items "
+                    "WHERE issue_number=320"
+                ).fetchone()
+                self.assertEqual(
+                    ("READY", "NONE", 2),
+                    tuple(child),
                 )
 
     def test_transfer_rejects_missing_predecessor_ownership_and_nonterminal_release(self) -> None:
@@ -503,7 +808,7 @@ class CoordinationTransferTests(unittest.TestCase):
         missing_admission["lineage"]["predecessor_admission_message_id"] = 999999
         self.refresh_transfer_intent_hash(missing_admission)
         with self.assertRaisesRegex(
-            CoordinationError, "TRANSFER_PREDECESSOR_OWNERSHIP_INVALID"
+            CoordinationError, "READY_FINALIZATION_ATTESTATION_DRIFT"
         ):
             activate_transfer(
                 self.store, missing_admission, "2026-08-23T17:00:07Z"
@@ -516,10 +821,13 @@ class CoordinationTransferTests(unittest.TestCase):
             "SELECT status, allocation_class FROM coordination_items WHERE issue_number=314"
         ).fetchone()
         self.assertEqual(("HOLD", "RETAINED"), tuple(parent))
-        self.assertIsNone(
-            self.store.connection.execute(
-                "SELECT 1 FROM coordination_items WHERE issue_number=320"
-            ).fetchone()
+        child = self.store.connection.execute(
+            "SELECT status,allocation_class,version FROM coordination_items "
+            "WHERE issue_number=320"
+        ).fetchone()
+        self.assertEqual(
+            ("READY", "NONE", 2),
+            tuple(child),
         )
 
     def test_transfer_rejects_stale_or_unavailable_comment_receipts(self) -> None:
@@ -642,7 +950,7 @@ class CoordinationTransferTests(unittest.TestCase):
                     transaction["releases"][0]["expected_source_sha256"] = value
                 self.refresh_transfer_intent_hash(transaction)
                 with self.assertRaisesRegex(
-                    CoordinationError, "TRANSFER_PREDECESSOR_OWNERSHIP_INVALID"
+                    CoordinationError, "READY_FINALIZATION_ATTESTATION_DRIFT"
                 ):
                     activate_transfer(
                         self.store, transaction, "2026-08-23T17:00:07Z"

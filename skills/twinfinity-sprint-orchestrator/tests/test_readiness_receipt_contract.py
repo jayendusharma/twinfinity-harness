@@ -26,7 +26,7 @@ from kanban_readiness import (  # noqa: E402
 
 REPOSITORY = "twinfinityai/twinfinityapp"
 SCHEMA_PATH = (
-    SKILL_ROOT / "references" / "twinfinity-kanban-readiness-receipt-v1.schema.json"
+    SKILL_ROOT / "references" / "twinfinity-kanban-readiness-receipt-v2.schema.json"
 )
 
 
@@ -160,6 +160,7 @@ class ReadinessReceiptContractTests(unittest.TestCase):
             "repository": REPOSITORY,
             "issue_number": 1,
             "readiness_plan_sha256": "a" * 64,
+            "delivery_identity_sha256": "b" * 64,
             "verdict": verdict,
             "worker_role": "sre",
             "message_id": 7,
@@ -215,6 +216,11 @@ class ReadinessReceiptContractTests(unittest.TestCase):
         missing = deepcopy(approval)
         del missing["resolution"]["approval"]["packet"]["decision_key"]
         adversarial["missing-packet-field"] = missing
+
+        historical = deepcopy(approval)
+        historical["schema"] = "twinfinity-kanban-readiness-receipt/v1"
+        del historical["delivery_identity_sha256"]
+        adversarial["historical-v1-unbound"] = historical
 
         for form, receipt in adversarial.items():
             with self.subTest(form=form):

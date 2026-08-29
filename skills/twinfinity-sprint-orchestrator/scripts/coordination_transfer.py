@@ -18,6 +18,7 @@ from coordination_store import (
     terminal_watch_key,
     utc_now,
 )
+from delivery_identity import delivery_identity_error
 from coordination_transfer_ledger import (
     activation_event_payload,
     create_schema as create_transfer_ledger_schema,
@@ -161,7 +162,6 @@ def activate_transfer(
         "ACTIVE_FENCED",
     }:
         raise CoordinationError("TRANSFER_ACTIVATION_INVALID")
-
     payload = message["payload"]
     if not isinstance(payload, dict) or payload.get("transfer_key") != transfer_key:
         raise CoordinationError("TRANSFER_KEY_BINDING_MISMATCH")
@@ -258,8 +258,24 @@ def activate_transfer(
     if payload.get("transfer_intent_sha256") != expected_transfer_intent_sha256:
         raise CoordinationError("TRANSFER_LEDGER_BINDING_MISMATCH")
     validate_comments(comment_record)
+    if (
+        delivery_identity_error(
+            message["payload"].get("delivery_identity"),
+            admission=activation,
+        )
+        is not None
+    ):
+        raise CoordinationError("TRANSFER_DELIVERY_IDENTITY_INVALID")
 
     with store.transaction():
+        store._require_ready_finalization_attestation(
+            repository=str(repository),
+            issue_number=int(item["issue_number"]),
+            generation=int(item["generation"]),
+            ready_item_version=int(item["expected_version"]),
+            source_payload_sha256=str(item["expected_source_sha256"]),
+            admission_transaction=activation,
+        )
         existing = store.connection.execute(
             "SELECT * FROM coordination_messages WHERE idempotency_key=?",
             (message["idempotency_key"],),
@@ -314,6 +330,20 @@ def activate_transfer(
                 "activated_issue_number": item["issue_number"],
                 "released_issue_numbers": [entry["issue_number"] for entry in releases],
             }
+        ready = store.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (repository, item["issue_number"]),
+        ).fetchone()
+        if (
+            ready is None
+            or ready["status"] != "READY"
+            or ready["allocation_class"] != "NONE"
+            or int(ready["generation"]) != item["generation"]
+            or int(ready["version"]) != item["expected_version"]
+            or ready["source_payload_sha256"]
+            != item["expected_source_sha256"]
+        ):
+            raise CoordinationError("TRANSFER_READY_REQUIRED")
         validate_predecessor_provenance(
             store,
             comment_record,

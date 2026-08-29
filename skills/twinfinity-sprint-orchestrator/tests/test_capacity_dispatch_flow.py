@@ -337,7 +337,7 @@ class _FlowHarness:
             "base_sha": MAIN,
             "branch": branch,
             "worktree_path": worktree,
-            "opaque_worktree_id": f"flow-{issue_number}",
+            "opaque_worktree_id": Path(worktree).name,
             "accountable_session_id": endpoint,
             "lease_manifest_sha256": lease_sha,
             "authority_sha256": "7" * 64,

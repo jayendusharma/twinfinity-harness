@@ -19,6 +19,7 @@ from approval_guard import (
     readiness_execution_scope_sha256,
     require_effective_approval,
 )
+from delivery_identity import delivery_identity_error, delivery_identity_sha256
 from approval_ledger import (
     acknowledge_decision_in_transaction,
     claim_decision_in_transaction,
@@ -41,14 +42,15 @@ from portfolio_graph import (
     graph_payload,
     replace_graph,
 )
+from repository_delivery_policy import delivery_branch_issue_number
 
 
 PLAN_SCHEMA = "twinfinity-kanban-readiness-phase/v1"
 SUCCESSOR_PLAN_SCHEMA = "twinfinity-kanban-readiness-phase/v2"
 TRANSITION_EVIDENCE_SCHEMA = "twinfinity-kanban-readiness-transition-evidence/v1"
-RECEIPT_SCHEMA = "twinfinity-kanban-readiness-receipt/v1"
+RECEIPT_SCHEMA = "twinfinity-kanban-readiness-receipt/v2"
 RECEIPT_JSON_SCHEMA_ID = (
-    "https://twinfinity.ai/schemas/twinfinity-kanban-readiness-receipt/v1"
+    "https://twinfinity.ai/schemas/twinfinity-kanban-readiness-receipt/v2"
 )
 RECEIPT_LOCATOR_SCHEMA = "twinfinity-kanban-readiness-receipt-locator/v1"
 READINESS_APPROVAL_INPUT_SCHEMA = "twinfinity-kanban-readiness-approval-input/v1"
@@ -1190,7 +1192,8 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         "schema", "repository", "issue_number", "generation", "item_version",
         "source_payload_sha256", "accepted_main_sha", "graph_version",
         "capacity_policy_version", "candidate_sha256", "worker_role",
-        "phase_summary", "gates",
+        "phase_summary", "gates", "delivery_identity",
+        "delivery_identity_sha256",
     }
     schema = plan.get("schema")
     if schema == SUCCESSOR_PLAN_SCHEMA:
@@ -1213,6 +1216,16 @@ def _validate_plan(plan: dict[str, Any]) -> None:
         raise ReadinessError("READINESS_WORKER_ROLE_INVALID")
     if not isinstance(plan.get("phase_summary"), str) or not plan["phase_summary"].strip():
         raise ReadinessError("READINESS_PLAN_INVALID")
+    identity = plan.get("delivery_identity")
+    identity_sha256 = plan.get("delivery_identity_sha256")
+    if (
+        delivery_identity_error(identity, expected_sha256=identity_sha256)
+        is not None
+        or identity["repository"] != plan["repository"]
+        or int(identity["issue_number"]) != int(plan["issue_number"])
+        or int(identity["generation"]) != int(plan["generation"])
+    ):
+        raise ReadinessError("READINESS_DELIVERY_IDENTITY_INVALID")
     gates = plan.get("gates")
     if not isinstance(gates, list) or not gates:
         raise ReadinessError("READINESS_GATES_REQUIRED")
@@ -2094,6 +2107,7 @@ def reopen_terminal_hold(
     expected_current_version: int,
     expected_terminal_receipt_id: int,
     expected_terminal_receipt_sha256: str,
+    delivery_identity: dict[str, Any],
     now: str,
 ) -> dict[str, Any]:
     """Create one fenced REFRESH successor for a newer prepared generation."""
@@ -2111,6 +2125,7 @@ def reopen_terminal_hold(
         or expected_terminal_receipt_id <= 0
         or not isinstance(expected_terminal_receipt_sha256, str)
         or SHA256.fullmatch(expected_terminal_receipt_sha256) is None
+        or delivery_identity_error(delivery_identity) is not None
     ):
         raise ReadinessError("READINESS_TERMINAL_HOLD_REOPEN_INPUT_INVALID")
     ensure_schema(connection)
@@ -2251,6 +2266,27 @@ def reopen_terminal_hold(
             raise ReadinessError("READINESS_TERMINAL_HOLD_ITEM_NOT_PREPARED")
         if int(item["generation"]) <= int(current["generation"]):
             raise ReadinessError("READINESS_TERMINAL_HOLD_NEW_GENERATION_REQUIRED")
+        if (
+            delivery_identity["repository"] != repository
+            or int(delivery_identity["issue_number"]) != issue_number
+            or int(delivery_identity["generation"]) != int(item["generation"])
+        ):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_BINDING_DRIFT")
+        parent_identity = parent_plan["delivery_identity"]
+        successor_surface_issue = delivery_branch_issue_number(
+            repository, delivery_identity["branch"]
+        )
+        parent_surface_issue = delivery_branch_issue_number(
+            repository, parent_identity["branch"]
+        )
+        if successor_surface_issue != issue_number and (
+            parent_surface_issue != successor_surface_issue
+            or any(
+                delivery_identity[field] != parent_identity[field]
+                for field in ("branch", "worktree_path", "opaque_worktree_id")
+            )
+        ):
+            raise ReadinessError("READINESS_TERMINAL_HOLD_BINDING_DRIFT")
 
         source = connection.execute(
             """
@@ -2318,6 +2354,10 @@ def reopen_terminal_hold(
             "graph_version": int(graph["version"]),
             "capacity_policy_version": int(policy["version"]),
             "candidate_sha256": str(candidate["candidate_sha256"]),
+            "delivery_identity": delivery_identity,
+            "delivery_identity_sha256": delivery_identity_sha256(
+                delivery_identity
+            ),
             "phase_summary": TERMINAL_HOLD_REFRESH_PHASE_SUMMARY,
             "gates": _terminal_hold_refresh_gates(),
             "transition": {
@@ -3419,6 +3459,7 @@ def _resolution_observations_and_successor(
     row: sqlite3.Row,
     parent_plan: dict[str, Any],
     actions: list[dict[str, Any]],
+    replacement_delivery_identity: dict[str, Any] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     successor = {
         key: value
@@ -3530,6 +3571,56 @@ def _resolution_observations_and_successor(
         raise ReadinessError(
             "READINESS_RESOLUTION_EVIDENCE_ACTION_RECEIPT_SET_INVALID"
         )
+    identity_bound_fields = (
+        "generation",
+        "item_version",
+        "source_payload_sha256",
+        "accepted_main_sha",
+        "graph_version",
+        "capacity_policy_version",
+        "candidate_sha256",
+    )
+    if any(
+        successor.get(field) != parent_plan.get(field)
+        for field in identity_bound_fields
+    ):
+        parent_identity = parent_plan["delivery_identity"]
+        if replacement_delivery_identity is None:
+            raise ReadinessError(
+                "READINESS_RESOLUTION_DELIVERY_IDENTITY_REFRESH_REQUIRED"
+            )
+        if (
+            delivery_identity_error(replacement_delivery_identity) is not None
+            or replacement_delivery_identity["repository"]
+            != successor["repository"]
+            or int(replacement_delivery_identity["issue_number"])
+            != int(successor["issue_number"])
+            or int(replacement_delivery_identity["generation"])
+            != int(successor["generation"])
+            or any(
+                replacement_delivery_identity[field] != parent_identity[field]
+                for field in (
+                    "lease_manifest_sha256",
+                    "branch",
+                    "worktree_path",
+                    "opaque_worktree_id",
+                )
+            )
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_DELIVERY_IDENTITY_INVALID"
+            )
+        if (
+            replacement_delivery_identity["admission_transaction_sha256"]
+            == parent_identity["admission_transaction_sha256"]
+        ):
+            raise ReadinessError(
+                "READINESS_RESOLUTION_DELIVERY_IDENTITY_REFRESH_REQUIRED"
+            )
+        successor["delivery_identity"] = replacement_delivery_identity
+        successor["delivery_identity_sha256"] = delivery_identity_sha256(
+            replacement_delivery_identity
+        )
     frozen_approval_values = {
         "proposal_sha256": row["approval_proposal_sha256"],
         "decision_sha256": row["approval_decision_sha256"],
@@ -3607,6 +3698,7 @@ def apply_readiness_resolution(
     planner_session_id: str,
     expected_context_sha256: str,
     now: str,
+    replacement_delivery_identity: dict[str, Any] | None = None,
     failpoint: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Consume one claimed context after all broker-owned prerequisites read back."""
@@ -3630,6 +3722,18 @@ def apply_readiness_resolution(
             )
             if digest_json(result) != row["cycle_result_sha256"]:
                 raise ReadinessError("READINESS_RESOLUTION_RESULT_INVALID")
+            result_identity_sha256 = result.get("delivery_identity_sha256")
+            if result_identity_sha256 is not None and (
+                replacement_delivery_identity is None
+                or delivery_identity_error(
+                    replacement_delivery_identity,
+                    expected_sha256=str(result_identity_sha256),
+                )
+                is not None
+            ):
+                raise ReadinessError(
+                    "READINESS_RESOLUTION_REPLAY_DELIVERY_IDENTITY_INVALID"
+                )
             return {**result, "replay": True}
         parent_plan, _receipt, actions = _validate_resolution_notice_binding(
             store.connection,
@@ -3660,7 +3764,11 @@ def apply_readiness_resolution(
             raise ReadinessError("READINESS_RESOLUTION_CONTEXT_INVALID")
         try:
             observations, successor = _resolution_observations_and_successor(
-                store.connection, row, parent_plan, actions
+                store.connection,
+                row,
+                parent_plan,
+                actions,
+                replacement_delivery_identity,
             )
             reasons = _binding_reasons(
                 store.connection, {**successor, "id": -1, "endpoint_id": None}
@@ -3760,6 +3868,9 @@ def apply_readiness_resolution(
             "changed_evidence_sha256": changed_evidence_sha256,
             "context_sha256": expected_context_sha256,
             "observation_set_sha256": digest_json(observations),
+            "delivery_identity_sha256": successor[
+                "delivery_identity_sha256"
+            ],
         }
         _insert_resolution_cycle(
             store.connection,
@@ -4654,6 +4765,16 @@ def _notice_payload(connection: sqlite3.Connection, campaign: sqlite3.Row) -> di
         + "; ".join(json.loads(gate["requested_evidence_json"]))
         for gate in gates
     ]
+    try:
+        plan = json.loads(campaign["plan_json"], object_pairs_hook=_strict_object)
+    except (TypeError, json.JSONDecodeError, ReadinessError) as exc:
+        raise ReadinessError("READINESS_PLAN_INVALID") from exc
+    identity = plan.get("delivery_identity") if isinstance(plan, dict) else None
+    identity_sha256 = (
+        plan.get("delivery_identity_sha256") if isinstance(plan, dict) else None
+    )
+    if delivery_identity_error(identity, expected_sha256=identity_sha256) is not None:
+        raise ReadinessError("READINESS_DELIVERY_IDENTITY_INVALID")
     return {
         "source": {
             "repository": campaign["repository"],
@@ -4671,6 +4792,8 @@ def _notice_payload(connection: sqlite3.Connection, campaign: sqlite3.Row) -> di
             "accepted_main_sha": campaign["accepted_main_sha"],
             "graph_version": int(campaign["graph_version"]),
             "capacity_policy_version": int(campaign["capacity_policy_version"]),
+            "delivery_identity": identity,
+            "delivery_identity_sha256": identity_sha256,
             "receipt_artifact": _receipt_locator_evidence(campaign),
         },
         "requested_evidence": requested,
@@ -4815,6 +4938,10 @@ def _validate_attempt(
     source = payload.get("source") if isinstance(payload, dict) else None
     evidence = payload.get("evidence") if isinstance(payload, dict) else None
     expected_locator = _receipt_locator_evidence(campaign)
+    try:
+        plan = json.loads(campaign["plan_json"], object_pairs_hook=_strict_object)
+    except (TypeError, json.JSONDecodeError, ReadinessError) as exc:
+        raise ReadinessError("READINESS_PLAN_INVALID") from exc
     message_states = {"COMPLETE"} if terminal else {"PREPARED", "CLAIMED", "COMPLETE"}
     attempt_states = {"COMPLETE"} if terminal else {
         "RESERVED", "LAUNCHING", "RUNNING", "COMPLETE"
@@ -4837,6 +4964,9 @@ def _validate_attempt(
         or evidence.get("graph_version") != int(campaign["graph_version"])
         or evidence.get("capacity_policy_version")
         != int(campaign["capacity_policy_version"])
+        or evidence.get("delivery_identity") != plan.get("delivery_identity")
+        or evidence.get("delivery_identity_sha256")
+        != plan.get("delivery_identity_sha256")
         or evidence.get("receipt_artifact") != expected_locator
         or message["state"] not in message_states
         or attempt["state"] not in attempt_states
@@ -4970,6 +5100,10 @@ def _stage_binding(
     campaign = _campaign(
         connection, str(receipt["repository"]), int(receipt["issue_number"])
     )
+    try:
+        plan = json.loads(campaign["plan_json"], object_pairs_hook=_strict_object)
+    except (TypeError, json.JSONDecodeError, ReadinessError) as exc:
+        raise ReadinessError("READINESS_PLAN_INVALID") from exc
     if (
         campaign["state"] != "RUNNING"
         or campaign["attempt_id"] != attempt_id
@@ -4977,6 +5111,8 @@ def _stage_binding(
         or receipt["attempt_id"] != attempt_id
         or int(receipt["message_id"]) != message_id
         or receipt["readiness_plan_sha256"] != campaign["plan_sha256"]
+        or receipt["delivery_identity_sha256"]
+        != plan.get("delivery_identity_sha256")
         or receipt["worker_role"] != campaign["worker_role"]
     ):
         raise ReadinessError("READINESS_RECEIPT_ATTEMPT_DRIFT")
@@ -5273,7 +5409,7 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
     expected = {
         "schema", "repository", "issue_number", "readiness_plan_sha256",
         "verdict", "worker_role", "message_id", "attempt_id", "gate_results",
-        "resolution", "summary", "observed_at",
+        "resolution", "summary", "observed_at", "delivery_identity_sha256",
     }
     if set(receipt) != expected or receipt.get("schema") != RECEIPT_SCHEMA:
         raise ReadinessError("READINESS_RECEIPT_INVALID")
@@ -5293,6 +5429,11 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
         raise ReadinessError("READINESS_RECEIPT_INVALID")
     if not isinstance(receipt.get("readiness_plan_sha256"), str) or not SHA256.fullmatch(
         receipt["readiness_plan_sha256"]
+    ):
+        raise ReadinessError("READINESS_RECEIPT_INVALID")
+    if (
+        not isinstance(receipt.get("delivery_identity_sha256"), str)
+        or not SHA256.fullmatch(receipt["delivery_identity_sha256"])
     ):
         raise ReadinessError("READINESS_RECEIPT_INVALID")
     if not isinstance(receipt.get("summary"), str) or not receipt["summary"].strip():

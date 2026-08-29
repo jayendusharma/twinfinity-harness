@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,11 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from delivery_guard import pre_tool  # noqa: E402
+from coordination_store import canonical_json, digest_json  # noqa: E402
+from delivery_identity import (  # noqa: E402
+    bind_delivery_identity,
+    delivery_identity_sha256,
+)
 from run_role_executor import build_child_environment  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
@@ -34,6 +40,10 @@ class RoleLeaseGuardTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.code_root = self.root / "code"
         self.code_root.mkdir(mode=0o700)
+        self.identity_root_patch = patch(
+            "delivery_identity.WORKSPACE_ROOT", self.code_root
+        )
+        self.identity_root_patch.start()
         self.database = self.root / "state.sqlite3"
         self.connection = sqlite3.connect(self.database)
         self.connection.row_factory = sqlite3.Row
@@ -49,6 +59,7 @@ class RoleLeaseGuardTests(unittest.TestCase):
         self.seed("development", ("scripts/allowed.py",))
 
     def tearDown(self) -> None:
+        self.identity_root_patch.stop()
         self.connection.close()
         self.temp.cleanup()
 
@@ -60,8 +71,9 @@ class RoleLeaseGuardTests(unittest.TestCase):
                 payload_sha256 TEXT
             );
             CREATE TABLE coordination_messages(
-                id INTEGER PRIMARY KEY, recipient_session_id TEXT, topic TEXT,
-                payload_json TEXT, state TEXT
+                id INTEGER PRIMARY KEY, idempotency_key TEXT,
+                recipient_session_id TEXT, topic TEXT, payload_sha256 TEXT,
+                payload_json TEXT, state TEXT, claimed_by TEXT
             );
             CREATE TABLE coordination_items(
                 repository TEXT, issue_number INTEGER, status TEXT,
@@ -80,6 +92,20 @@ class RoleLeaseGuardTests(unittest.TestCase):
                 accountable_session_id TEXT, lease_manifest_sha256 TEXT,
                 state TEXT
             );
+            CREATE TABLE portfolio_readiness_current(
+                repository TEXT, issue_number INTEGER, campaign_id INTEGER,
+                finalized_candidate_id INTEGER, finalized_event_id INTEGER,
+                state TEXT
+            );
+            CREATE TABLE portfolio_pull_buffer_candidates(
+                id INTEGER PRIMARY KEY, state TEXT
+            );
+            CREATE TABLE portfolio_ready_finalizations(
+                repository TEXT, issue_number INTEGER, generation INTEGER,
+                campaign_id INTEGER, ready_candidate_id INTEGER,
+                dirty_event_id INTEGER, finalization_sha256 TEXT,
+                payload_json TEXT
+            );
             CREATE TABLE hosted_operations(
                 id INTEGER PRIMARY KEY, recipient_session_id TEXT, state TEXT
             );
@@ -90,6 +116,8 @@ class RoleLeaseGuardTests(unittest.TestCase):
         for table in (
             "executor_attempts", "github_current", "coordination_messages",
             "coordination_items", "coordination_artifacts",
+            "portfolio_readiness_current", "portfolio_pull_buffer_candidates",
+            "portfolio_ready_finalizations",
         ):
             self.connection.execute(f"DELETE FROM {table}")
         endpoint = self.endpoints[role]
@@ -144,6 +172,34 @@ class RoleLeaseGuardTests(unittest.TestCase):
             "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
         }
         topic = f"{role}.admission"
+        admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": issue,
+                "generation": 3,
+                "expected_version": 0,
+            },
+            "message": {
+                "idempotency_key": f"role-lease-guard-{role}-{issue}",
+                "recipient_session_id": endpoint,
+                "topic": topic,
+                "payload": payload,
+            },
+        }
+        identity = bind_delivery_identity(admission)
+        identity_sha256 = delivery_identity_sha256(identity)
+        finalization = {
+            "schema": "twinfinity-kanban-ready-finalization/v2",
+            "repository": REPOSITORY,
+            "issue_number": issue,
+            "generation": 3,
+            "delivery_identity": identity,
+            "delivery_identity_sha256": identity_sha256,
+            "admission_transaction": admission,
+            "admission_transaction_sha256": identity[
+                "admission_transaction_sha256"
+            ],
+        }
         self.connection.execute(
             """
             INSERT INTO executor_attempts(
@@ -165,8 +221,17 @@ class RoleLeaseGuardTests(unittest.TestCase):
             (REPOSITORY, issue, SOURCE_SHA),
         )
         self.connection.execute(
-            "INSERT INTO coordination_messages VALUES (11, ?, ?, ?, 'PREPARED')",
-            (endpoint, topic, json.dumps(payload, sort_keys=True)),
+            "INSERT INTO coordination_messages("
+            "id,idempotency_key,recipient_session_id,topic,payload_sha256,"
+            "payload_json,state,claimed_by) "
+            "VALUES (11, ?, ?, ?, ?, ?, 'PREPARED', NULL)",
+            (
+                admission["message"]["idempotency_key"],
+                endpoint,
+                topic,
+                digest_json(payload),
+                canonical_json(payload),
+            ),
         )
         self.connection.execute(
             "INSERT INTO coordination_items VALUES (?, ?, 'ACTIVE_FENCED', "
@@ -179,6 +244,23 @@ class RoleLeaseGuardTests(unittest.TestCase):
             (
                 REPOSITORY, issue, digest, metadata.st_size, metadata.st_dev,
                 metadata.st_ino,
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO portfolio_pull_buffer_candidates VALUES (1, 'READY')"
+        )
+        self.connection.execute(
+            "INSERT INTO portfolio_readiness_current VALUES (?, ?, 1, 1, 1, 'FINALIZED')",
+            (REPOSITORY, issue),
+        )
+        self.connection.execute(
+            "INSERT INTO portfolio_ready_finalizations VALUES "
+            "(?, ?, 3, 1, 1, 1, ?, ?)",
+            (
+                REPOSITORY,
+                issue,
+                digest_json(finalization),
+                canonical_json(finalization),
             ),
         )
         self.connection.commit()
@@ -231,6 +313,93 @@ class RoleLeaseGuardTests(unittest.TestCase):
         self.assertEqual("11", environment["TWINFINITY_EXECUTOR_TARGET_KEY"])
         self.assertEqual(ATTEMPT_ID, environment["TWINFINITY_EXECUTOR_ATTEMPT_ID"])
         self.assertEqual(TOKEN, environment["TWINFINITY_EXECUTOR_TOKEN"])
+
+    def test_missing_delivery_identity_denies_writer_context(self) -> None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM coordination_messages WHERE id=11"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        del payload["delivery_identity"]
+        self.connection.execute(
+            "UPDATE coordination_messages SET payload_json=? WHERE id=11",
+            (json.dumps(payload, sort_keys=True),),
+        )
+        self.connection.commit()
+
+        output = self.decision(
+            self.event(
+                "apply_patch",
+                {
+                    "patch": "*** Begin Patch\n*** Update File: "
+                    + str(self.worktree / "scripts" / "allowed.py")
+                    + "\n@@\n-original\n+changed\n*** End Patch"
+                },
+            )
+        )
+
+        self.assert_denied(output, "DELIVERY_CONTEXT_INVALID")
+        self.assertEqual(
+            "original\n",
+            (self.worktree / "scripts" / "allowed.py").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_valid_shape_admission_substitution_denies_without_writes(self) -> None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM coordination_messages WHERE id=11"
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload["authority_sha256"] = "f" * 64
+        self.connection.execute(
+            "UPDATE coordination_messages SET payload_json=?,payload_sha256=? "
+            "WHERE id=11",
+            (canonical_json(payload), digest_json(payload)),
+        )
+        self.connection.commit()
+        before = (
+            self.connection.total_changes,
+            tuple(
+                self.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=11"
+                ).fetchone()
+            ),
+            tuple(
+                self.connection.execute(
+                    "SELECT * FROM coordination_items"
+                ).fetchone()
+            ),
+        )
+        output = self.decision(
+            self.event(
+                "apply_patch",
+                {
+                    "patch": "*** Begin Patch\n*** Update File: "
+                    + str(self.worktree / "scripts" / "allowed.py")
+                    + "\n@@\n-original\n+changed\n*** End Patch"
+                },
+            )
+        )
+        self.assert_denied(output, "DELIVERY_CONTEXT_INVALID")
+        self.assertEqual("original\n", (
+            self.worktree / "scripts" / "allowed.py"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(
+            before,
+            (
+                self.connection.total_changes,
+                tuple(
+                    self.connection.execute(
+                        "SELECT * FROM coordination_messages WHERE id=11"
+                    ).fetchone()
+                ),
+                tuple(
+                    self.connection.execute(
+                        "SELECT * FROM coordination_items"
+                    ).fetchone()
+                ),
+            ),
+        )
 
     def test_stale_endpoint_fails_closed_even_for_read_only_operation(self) -> None:
         self.connection.execute(

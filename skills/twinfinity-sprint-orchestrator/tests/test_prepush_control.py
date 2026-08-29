@@ -17,8 +17,11 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from coordination_store import canonical_json, digest_json  # noqa: E402
+from canonical_ready_fixture import finalize_canonical_ready_candidate  # noqa: E402
 from coordination_transfer import activate_transfer  # noqa: E402
 from coordination_transfer_ledger import intent_sha256  # noqa: E402
+from delivery_identity import bind_delivery_identity  # noqa: E402
+from portfolio_graph import replace_graph  # noqa: E402
 from prepush_control import (  # noqa: E402
     ExistingEnvironment,
     LeaseManifest,
@@ -49,6 +52,7 @@ class PrePushControlTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name) / "coordination"
         root.mkdir(mode=0o700)
+        self.root = root
         goal_raw = b"Pre-push control test planner goal.\n"
         (root / "product-planner-goal.md").write_bytes(goal_raw)
         self.goal_sha256 = hashlib.sha256(goal_raw).hexdigest()
@@ -84,14 +88,14 @@ class PrePushControlTests(unittest.TestCase):
             fetched_at="2026-08-23T00:00:01Z",
         )
         self.source_sha = source.payload_sha256
-        self.control.store._set_issue_status_for_test_fixture(
+        prepared_item = self.control.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=ISSUE,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
+            status="PREPARED",
+            allocation_class="NONE",
             generation=2,
             accountable_session_id=SESSION,
-            lease_manifest_sha256=LEASE,
+            lease_manifest_sha256=None,
             development_units=0,
             shared_units=0,
             sre_units=1,
@@ -99,11 +103,79 @@ class PrePushControlTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-23T00:00:02Z",
         )
-        self.message = self.control.store.enqueue_message(
-            idempotency_key="issue-314-generation-2-sre",
-            recipient_session_id=SESSION,
-            topic="sre.admission",
-            payload={
+        replace_graph(
+            self.control.connection,
+            {
+                "repository": REPOSITORY,
+                "accepted_main_sha": "a" * 40,
+                "expected_current_version": 0,
+                "scope_milestones": [{"title": "Pre-push", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [
+                    {
+                        "node_key": f"issue:{ISSUE}",
+                        "issue_number": ISSUE,
+                        "role": "DELIVERY",
+                        "root_kind": "STANDALONE",
+                        "root_reason": "Canonical pre-push test lineage",
+                        "lane_key": "prepush-sre",
+                        "lane_order": 0,
+                        "dispatchable": True,
+                        "priority_rank": 1,
+                        "estimate_units": 1,
+                        "development_units": 0,
+                        "shared_units": 0,
+                        "sre_units": 1,
+                        "source_payload_sha256": self.source_sha,
+                        "ready_at": "2026-08-23T00:00:02Z",
+                    }
+                ],
+                "relations": [],
+            },
+            now="2026-08-23T00:00:02Z",
+        )
+        lease_path = root / "issue-314-lease.json"
+        lease_payload = {
+            "repository": REPOSITORY,
+            "issue_number": ISSUE,
+            "generation": 2,
+            "base_sha": "a" * 40,
+            "branch": "codex/314-ci-hardening",
+            "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-314",
+            "no_additional_paths": True,
+            "paths": [
+                {
+                    "path": "backend/example.py",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "c" * 40,
+                }
+            ],
+        }
+        lease_path.write_text(
+            json.dumps(lease_payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        self.lease_sha = hashlib.sha256(lease_path.read_bytes()).hexdigest()
+        admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": ISSUE,
+                "status": "ACTIVE",
+                "allocation_class": "ACTIVE",
+                "generation": 2,
+                "accountable_session_id": SESSION,
+                "lease_manifest_sha256": self.lease_sha,
+                "development_units": 0,
+                "shared_units": 0,
+                "sre_units": 1,
+                "expected_source_sha256": self.source_sha,
+                "expected_version": int(prepared_item["version"]) + 1,
+            },
+            "message": {
+                "idempotency_key": "issue-314-generation-2-sre",
+                "recipient_session_id": SESSION,
+                "topic": "sre.admission",
+                "payload": {
                 "source": {
                     "repository": REPOSITORY,
                     "object_kind": "issue",
@@ -112,13 +184,13 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "issue_number": ISSUE,
                 "generation": 2,
-                "item_version": 1,
+                "item_version": int(prepared_item["version"]) + 2,
                 "base_sha": "a" * 40,
                 "branch": "codex/314-ci-hardening",
                 "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-314",
                 "opaque_worktree_id": "twinfinityapp-issue-314",
                 "accountable_session_id": SESSION,
-                "lease_manifest_sha256": LEASE,
+                "lease_manifest_sha256": self.lease_sha,
                 "authority_sha256": "7" * 64,
                 "capacity": {
                     "development_units": 0,
@@ -127,29 +199,88 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+            "artifacts": [
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": ISSUE,
+                    "generation": 2,
+                    "path": str(lease_path),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            ],
+        }
+        policy = self.control.store.capacity_policy(
+            REPOSITORY, now="2026-08-23T00:00:02Z"
+        )
+        finalized = finalize_canonical_ready_candidate(
+            self.control.store,
+            database=self.control.store.path,
+            artifact_root=root,
+            prepared_packet={
+                "schema": "twinfinity-kanban-pull-buffer/v2",
+                "repository": REPOSITORY,
+                "issue_number": ISSUE,
+                "generation": 2,
+                "item_version_at_preparation": int(prepared_item["version"]),
+                "source_payload_sha256": self.source_sha,
+                "accepted_main_at_preparation": "a" * 40,
+                "portfolio_graph_version": 1,
+                "state": "PREPARED_NOT_READY",
+                "verticality": "END_TO_END",
+                "owner_visible_outcome": "Validate the exact pre-push lineage.",
+                "capacity_policy": {
+                    "version": int(policy["version"]),
+                    "development_limit": int(policy["development_limit"]),
+                    "shared_limit": int(policy["shared_limit"]),
+                    "sre_limit": int(policy["sre_limit"]),
+                },
+                "capacity_on_activation": {
+                    "development_units": 0,
+                    "shared_units": 0,
+                    "sre_units": 1,
+                },
+                "precomputed_collision_matrix": [
+                    {
+                        "other_issue": 999999,
+                        "disposition": "DISJOINT",
+                        "reason": "The canonical test lease is issue-specific.",
+                    }
+                ],
+                "preparation_complete": ["The exact admission is complete."],
+                "promotion_checks_after_predecessor": [
+                    "Revalidate every pre-push control."
+                ],
+                "hard_stops": ["Stop on any immutable admission drift."],
+                "promotion_trigger": "All canonical readiness gates pass.",
+            },
+            admission_transaction=admission,
+            worker_role="sre",
+            worker_endpoint_id=SESSION,
             now="2026-08-23T00:00:03Z",
+            suffix="prepush-control",
+        )
+        self.assertEqual("READY", finalized["item"]["status"])
+        _active, self.message = self.control.store.activate_admission(
+            item=admission["item"],
+            message=admission["message"],
+            artifacts=admission.get("artifacts"),
+            now="2026-08-23T00:00:04Z",
         )
         message = self.control.connection.execute(
             "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
             (self.message,),
         ).fetchone()
         self.control.connection.execute(
-            "UPDATE coordination_terminal_watches "
-            "SET admission_message_id=?,admission_payload_sha256=? "
-            "WHERE watch_key=?",
-            (
-                self.message,
-                message["payload_sha256"],
-                f"terminal:{REPOSITORY}:issue:{ISSUE}:generation:2",
-            ),
-        )
-        self.control.store.claim_message(
-            self.message, SESSION, "2026-08-23T00:00:04Z"
+            "UPDATE coordination_messages "
+            "SET state='COMPLETE',claimed_by=?,updated_at=? "
+            "WHERE id=? AND state='PREPARED'",
+            (SESSION, "2026-08-23T00:00:06Z", self.message),
         )
         self.control.connection.execute(
-            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
-            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
-            ("2026-08-23T00:00:05Z", self.message, SESSION),
+            "UPDATE coordination_terminal_watches SET state='ACTIVE',updated_at=? "
+            "WHERE admission_message_id=? AND state='PENDING_CLAIM'",
+            ("2026-08-23T00:00:06Z", self.message),
         )
         row = self.control.connection.execute(
             "SELECT payload_json FROM coordination_messages WHERE id=?",
@@ -161,8 +292,12 @@ class PrePushControlTests(unittest.TestCase):
         self.control.close()
         self.temp.cleanup()
 
-    def rewrite_admission_payload(self, **updates: object) -> None:
+    def rewrite_admission_payload(
+        self, *, remove: tuple[str, ...] = (), **updates: object
+    ) -> None:
         payload = json.loads(canonical_json(self.admission_payload))
+        for field in remove:
+            payload.pop(field, None)
         payload.update(updates)
         payload_sha256 = digest_json(payload)
         self.control.connection.execute(
@@ -179,11 +314,119 @@ class PrePushControlTests(unittest.TestCase):
             (payload_sha256, self.message),
         )
 
+    def replace_test_graph(self, repository: str, *, now: str) -> int:
+        current = self.control.connection.execute(
+            "SELECT version FROM portfolio_graph_current WHERE repository=?",
+            (repository,),
+        ).fetchone()
+        expected_version = int(current["version"]) if current is not None else 0
+        items = self.control.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? ORDER BY issue_number",
+            (repository,),
+        ).fetchall()
+        replace_graph(
+            self.control.connection,
+            {
+                "repository": repository,
+                "accepted_main_sha": "a" * 40,
+                "expected_current_version": expected_version,
+                "scope_milestones": [{"title": "Canonical pre-push", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [
+                    {
+                        "node_key": f"issue:{int(item['issue_number'])}",
+                        "issue_number": int(item["issue_number"]),
+                        "role": "DELIVERY",
+                        "root_kind": "STANDALONE",
+                        "root_reason": "Canonical pre-push lineage fixture",
+                        "lane_key": f"prepush-{int(item['issue_number'])}",
+                        "lane_order": index,
+                        "dispatchable": True,
+                        "priority_rank": index + 1,
+                        "estimate_units": 1,
+                        "development_units": int(item["development_units"]),
+                        "shared_units": int(item["shared_units"]),
+                        "sre_units": int(item["sre_units"]),
+                        "source_payload_sha256": item["source_payload_sha256"],
+                        "ready_at": now,
+                    }
+                    for index, item in enumerate(items)
+                ],
+                "relations": [],
+            },
+            now=now,
+        )
+        return expected_version + 1
+
+    def finalize_test_admission(
+        self,
+        admission: dict,
+        *,
+        prepared_item: sqlite3.Row,
+        worker_role: str,
+        worker_endpoint_id: str,
+        now: str,
+        suffix: str,
+    ) -> dict:
+        payload = admission["message"]["payload"]
+        repository = admission["item"]["repository"]
+        graph_version = self.replace_test_graph(repository, now=now)
+        policy = self.control.store.capacity_policy(repository, now=now)
+        units = payload["capacity"]
+        return finalize_canonical_ready_candidate(
+            self.control.store,
+            database=self.control.store.path,
+            artifact_root=self.root,
+            prepared_packet={
+                "schema": "twinfinity-kanban-pull-buffer/v2",
+                "repository": repository,
+                "issue_number": int(admission["item"]["issue_number"]),
+                "generation": int(admission["item"]["generation"]),
+                "item_version_at_preparation": int(prepared_item["version"]),
+                "source_payload_sha256": payload["source"]["payload_sha256"],
+                "accepted_main_at_preparation": payload["base_sha"],
+                "portfolio_graph_version": graph_version,
+                "state": "PREPARED_NOT_READY",
+                "verticality": "END_TO_END",
+                "owner_visible_outcome": "Validate the exact pre-push lineage.",
+                "capacity_policy": {
+                    "version": int(policy["version"]),
+                    "development_limit": int(policy["development_limit"]),
+                    "shared_limit": int(policy["shared_limit"]),
+                    "sre_limit": int(policy["sre_limit"]),
+                },
+                "capacity_on_activation": units,
+                "precomputed_collision_matrix": (
+                    []
+                    if repository == HARNESS_REPOSITORY
+                    else [
+                        {
+                            "other_issue": 999999,
+                            "disposition": "DISJOINT",
+                            "reason": "Canonical fixture paths are issue-specific.",
+                        }
+                    ]
+                ),
+                "preparation_complete": ["The exact admission is complete."],
+                "promotion_checks_after_predecessor": [
+                    "Revalidate every immutable pre-push control."
+                ],
+                "hard_stops": payload.get(
+                    "hard_stops", ["Stop on any immutable admission drift."]
+                ),
+                "promotion_trigger": "All canonical readiness gates pass.",
+            },
+            admission_transaction=admission,
+            worker_role=worker_role,
+            worker_endpoint_id=worker_endpoint_id,
+            now=now,
+            suffix=suffix,
+        )
+
     def seed_issue_328_versioned_lineage(self) -> int:
         issue_number = 328
         generation = 6
         session_id = "role.development.v4"
-        lease_sha256 = "6" * 64
         source = self.control.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
@@ -195,14 +438,14 @@ class PrePushControlTests(unittest.TestCase):
             source_updated_at="2026-08-26T10:59:00Z",
             fetched_at="2026-08-26T10:59:01Z",
         )
-        self.control.store._set_issue_status_for_test_fixture(
+        prepared_item = self.control.store._set_issue_status_for_test_fixture(
             repository=REPOSITORY,
             issue_number=issue_number,
-            status="ACTIVE",
-            allocation_class="ACTIVE",
+            status="PREPARED",
+            allocation_class="NONE",
             generation=generation,
             accountable_session_id=session_id,
-            lease_manifest_sha256=lease_sha256,
+            lease_manifest_sha256=None,
             development_units=1,
             shared_units=0,
             sre_units=0,
@@ -210,11 +453,54 @@ class PrePushControlTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-26T10:59:02Z",
         )
-        message_id = self.control.store.enqueue_message(
-            idempotency_key="issue-328-generation-6-development-versioned",
-            recipient_session_id=session_id,
-            topic="development.admission",
-            payload={
+        lease_path = self.root / "issue-328-versioned-lease.json"
+        lease_path.write_text(
+            json.dumps(
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": issue_number,
+                    "generation": generation,
+                    "base_sha": "a" * 40,
+                    "branch": "codex/328-evaluation-client-validation-v3",
+                    "worktree_path": (
+                        "/home/ubuntu/code/twinfinityapp-issue-328-v3"
+                    ),
+                    "no_additional_paths": True,
+                    "paths": [
+                        {
+                            "path": "backend/issue328.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "6" * 40,
+                        }
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        lease_sha256 = hashlib.sha256(lease_path.read_bytes()).hexdigest()
+        admission = {
+            "item": {
+                "repository": REPOSITORY,
+                "issue_number": issue_number,
+                "status": "ACTIVE",
+                "allocation_class": "ACTIVE",
+                "generation": generation,
+                "accountable_session_id": session_id,
+                "lease_manifest_sha256": lease_sha256,
+                "development_units": 1,
+                "shared_units": 0,
+                "sre_units": 0,
+                "expected_source_sha256": source.payload_sha256,
+                "expected_version": int(prepared_item["version"]) + 1,
+            },
+            "message": {
+                "idempotency_key": "issue-328-generation-6-development-versioned",
+                "recipient_session_id": session_id,
+                "topic": "development.admission",
+                "payload": {
                 "source": {
                     "repository": REPOSITORY,
                     "object_kind": "issue",
@@ -223,8 +509,8 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "issue_number": issue_number,
                 "generation": generation,
-                "item_version": 1,
-                "base_sha": "c" * 40,
+                "item_version": int(prepared_item["version"]) + 2,
+                "base_sha": "a" * 40,
                 "branch": "codex/328-evaluation-client-validation-v3",
                 "worktree_path": (
                     "/home/ubuntu/code/twinfinityapp-issue-328-v3"
@@ -238,31 +524,51 @@ class PrePushControlTests(unittest.TestCase):
                     "shared_units": 0,
                     "sre_units": 0,
                 },
+                "writer": "issue-328-canonical-versioned-writer",
+                "reviewer_plan": ["Independent exact-head review."],
+                "collision_proof": ["The issue-328 lease is disjoint."],
+                "environment_rule": "Use only the issue-owned environment.",
+                "routine_chain": ["Run bounded gates and routine closeout."],
+                "hard_stops": ["Stop on source, lease, or capacity drift."],
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+            "artifacts": [
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": issue_number,
+                    "generation": generation,
+                    "path": str(lease_path),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            ],
+        }
+        bind_delivery_identity(admission)
+        finalized = self.finalize_test_admission(
+            admission,
+            prepared_item=prepared_item,
+            worker_role="development",
+            worker_endpoint_id=session_id,
             now="2026-08-26T10:59:03Z",
+            suffix="prepush-versioned-328",
         )
-        message = self.control.connection.execute(
-            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
-            (message_id,),
-        ).fetchone()
-        self.control.connection.execute(
-            "UPDATE coordination_terminal_watches "
-            "SET admission_message_id=?,admission_payload_sha256=? "
-            "WHERE watch_key=?",
-            (
-                message_id,
-                message["payload_sha256"],
-                f"terminal:{REPOSITORY}:issue:{issue_number}:generation:{generation}",
-            ),
-        )
-        self.control.store.claim_message(
-            message_id, session_id, "2026-08-26T10:59:04Z"
+        self.assertEqual("READY", finalized["item"]["status"])
+        _active, message_id = self.control.store.activate_admission(
+            item=admission["item"],
+            message=admission["message"],
+            artifacts=admission["artifacts"],
+            now="2026-08-26T10:59:04Z",
         )
         self.control.connection.execute(
-            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
-            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
-            ("2026-08-26T10:59:05Z", message_id, session_id),
+            "UPDATE coordination_messages "
+            "SET state='COMPLETE',claimed_by=?,updated_at=? "
+            "WHERE id=? AND state='PREPARED'",
+            (session_id, "2026-08-26T10:59:06Z", message_id),
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches SET state='ACTIVE',updated_at=? "
+            "WHERE admission_message_id=? AND state='PENDING_CLAIM'",
+            ("2026-08-26T10:59:06Z", message_id),
         )
         return message_id
 
@@ -270,7 +576,7 @@ class PrePushControlTests(unittest.TestCase):
         lineage = self.control._lineage(REPOSITORY, ISSUE)
         passed = state == "PASS"
         manifest = LeaseManifest(
-            content_sha256=LEASE,
+            content_sha256=self.lease_sha,
             changed_paths_sha256=digest_json(["backend/example.py"]),
             paths=("backend/example.py",),
         )
@@ -320,6 +626,32 @@ class PrePushControlTests(unittest.TestCase):
         ):
             self.control._lineage(REPOSITORY, ISSUE)
 
+    def test_missing_delivery_identity_cannot_reach_prepush(self) -> None:
+        self.rewrite_admission_payload(remove=("delivery_identity",))
+
+        with self.assertRaisesRegex(
+            PrePushError, "PREPUSH_ADMISSION_INVALID"
+        ):
+            self.control._lineage(REPOSITORY, ISSUE)
+
+    def test_valid_shape_authority_substitution_is_zero_write_before_prepush(self) -> None:
+        self.rewrite_admission_payload(authority_sha256="8" * 64)
+        before_changes = self.control.connection.total_changes
+        before_gates = self.control.connection.execute(
+            "SELECT COUNT(*) FROM coordination_pre_push_gates"
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(PrePushError, "PREPUSH_ADMISSION_INVALID"):
+            self.control._lineage(REPOSITORY, ISSUE)
+
+        self.assertEqual(before_changes, self.control.connection.total_changes)
+        self.assertEqual(
+            before_gates,
+            self.control.connection.execute(
+                "SELECT COUNT(*) FROM coordination_pre_push_gates"
+            ).fetchone()[0],
+        )
+
     def test_exact_issue_328_versioned_identity_reaches_ordinary_lineage(self) -> None:
         message_id = self.seed_issue_328_versioned_lineage()
 
@@ -341,7 +673,6 @@ class PrePushControlTests(unittest.TestCase):
         issue_number = 36
         generation = 1
         session_id = "role.development.v4"
-        lease_sha256 = "4" * 64
         source = self.control.store.ingest_snapshot(
             repository=HARNESS_REPOSITORY,
             object_kind="issue",
@@ -360,7 +691,7 @@ class PrePushControlTests(unittest.TestCase):
             allocation_class="ACTIVE",
             generation=generation,
             accountable_session_id=session_id,
-            lease_manifest_sha256=lease_sha256,
+            lease_manifest_sha256="4" * 64,
             development_units=0,
             shared_units=1,
             sre_units=0,
@@ -368,6 +699,52 @@ class PrePushControlTests(unittest.TestCase):
             expected_version=0,
             now="2026-08-27T00:00:02Z",
         )
+        lease_path = self.root / "issue-36-harness-lease.json"
+        lease_path.write_text(
+            json.dumps(
+                {
+                    "repository": HARNESS_REPOSITORY,
+                    "issue_number": issue_number,
+                    "generation": generation,
+                    "base_sha": "a" * 40,
+                    "branch": "change/36-bootstrap-harness-source-lane",
+                    "worktree_path": (
+                        "/home/ubuntu/code/twinfinity/"
+                        "twinfinity-harness-issue36-authorized"
+                    ),
+                    "no_additional_paths": True,
+                    "paths": [
+                        {
+                            "path": "skills/twinfinity-sprint-orchestrator/"
+                            "tests/test_prepush_control.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "4" * 40,
+                        }
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        lease_sha256 = hashlib.sha256(lease_path.read_bytes()).hexdigest()
+        self.control.connection.execute(
+            "UPDATE coordination_items SET status='PREPARED',allocation_class='NONE',"
+            "accountable_session_id=?,lease_manifest_sha256=NULL "
+            "WHERE repository=? AND issue_number=?",
+            (session_id, HARNESS_REPOSITORY, issue_number),
+        )
+        self.control.connection.execute(
+            "DELETE FROM coordination_terminal_watches "
+            "WHERE repository=? AND issue_number=? AND generation=?",
+            (HARNESS_REPOSITORY, issue_number, generation),
+        )
+        prepared_item = self.control.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (HARNESS_REPOSITORY, issue_number),
+        ).fetchone()
+        self.assertIsNotNone(prepared_item)
         controls = canonical_harness_standing_controls()
         routine_chain = controls["routine_chain"]
         source_scope = controls["source_scope"]
@@ -394,11 +771,26 @@ class PrePushControlTests(unittest.TestCase):
             "routine_chain": routine_chain,
             "hard_stops": hard_stops,
         }
-        message_id = self.control.store.enqueue_message(
-            idempotency_key="issue-36-generation-1-harness-source",
-            recipient_session_id=session_id,
-            topic="development.admission",
-            payload={
+        admission = {
+            "item": {
+                "repository": HARNESS_REPOSITORY,
+                "issue_number": issue_number,
+                "status": "ACTIVE",
+                "allocation_class": "ACTIVE",
+                "generation": generation,
+                "accountable_session_id": session_id,
+                "lease_manifest_sha256": lease_sha256,
+                "development_units": 0,
+                "shared_units": 1,
+                "sre_units": 0,
+                "expected_source_sha256": source.payload_sha256,
+                "expected_version": int(prepared_item["version"]) + 1,
+            },
+            "message": {
+                "idempotency_key": "issue-36-generation-1-harness-source",
+                "recipient_session_id": session_id,
+                "topic": "development.admission",
+                "payload": {
                 "source": {
                     "repository": HARNESS_REPOSITORY,
                     "object_kind": "issue",
@@ -407,7 +799,7 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "issue_number": issue_number,
                 "generation": generation,
-                "item_version": 1,
+                "item_version": int(prepared_item["version"]) + 2,
                 "base_sha": "a" * 40,
                 "branch": "change/36-bootstrap-harness-source-lane",
                 "worktree_path": (
@@ -439,32 +831,43 @@ class PrePushControlTests(unittest.TestCase):
                 },
                 "action": "CONTINUE_IMPLEMENTATION_TO_ROUTINE_CLOSEOUT",
             },
+            },
+            "artifacts": [
+                {
+                    "repository": HARNESS_REPOSITORY,
+                    "issue_number": issue_number,
+                    "generation": generation,
+                    "path": str(lease_path),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            ],
+        }
+        bind_delivery_identity(admission)
+        finalized = self.finalize_test_admission(
+            admission,
+            prepared_item=prepared_item,
+            worker_role="development",
+            worker_endpoint_id=session_id,
             now="2026-08-27T00:00:03Z",
+            suffix="prepush-harness-36",
         )
-        message = self.control.connection.execute(
-            "SELECT payload_sha256 FROM coordination_messages WHERE id=?",
-            (message_id,),
-        ).fetchone()
-        self.control.connection.execute(
-            "UPDATE coordination_terminal_watches "
-            "SET admission_message_id=?,admission_payload_sha256=? "
-            "WHERE watch_key=?",
-            (
-                message_id,
-                message["payload_sha256"],
-                (
-                    f"terminal:{HARNESS_REPOSITORY}:issue:{issue_number}:"
-                    f"generation:{generation}"
-                ),
-            ),
-        )
-        self.control.store.claim_message(
-            message_id, session_id, "2026-08-27T00:00:04Z"
+        self.assertEqual("READY", finalized["item"]["status"])
+        _active, message_id = self.control.store.activate_admission(
+            item=admission["item"],
+            message=admission["message"],
+            artifacts=admission["artifacts"],
+            now="2026-08-27T00:00:04Z",
         )
         self.control.connection.execute(
-            "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
-            "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
-            ("2026-08-27T00:00:05Z", message_id, session_id),
+            "UPDATE coordination_messages "
+            "SET state='COMPLETE',claimed_by=?,updated_at=? "
+            "WHERE id=? AND state='PREPARED'",
+            (session_id, "2026-08-27T00:00:05Z", message_id),
+        )
+        self.control.connection.execute(
+            "UPDATE coordination_terminal_watches SET state='ACTIVE',updated_at=? "
+            "WHERE admission_message_id=? AND state='PENDING_CLAIM'",
+            ("2026-08-27T00:00:05Z", message_id),
         )
 
         lineage = self.control._lineage(HARNESS_REPOSITORY, issue_number)
@@ -521,10 +924,6 @@ class PrePushControlTests(unittest.TestCase):
             (
                 "/home/ubuntu/code/twinfinityapp-issue-314",
                 "twinfinityapp-issue-314",
-            ),
-            (
-                "/home/ubuntu/code/twinfinityapp-issue-314-v7",
-                "issue-314-generation-2",
             ),
         )
         for worktree_path, opaque_worktree_id in accepted:
@@ -663,7 +1062,6 @@ class PrePushControlTests(unittest.TestCase):
 
     def test_reviewed_transfer_preserves_parent_branch_and_environment_ownership(self) -> None:
         child_issue = 320
-        child_lease = "6" * 64
         child_source = self.control.store.ingest_snapshot(
             repository=REPOSITORY,
             object_kind="issue",
@@ -672,6 +1070,65 @@ class PrePushControlTests(unittest.TestCase):
             source_updated_at="2026-08-23T00:01:00Z",
             fetched_at="2026-08-23T00:01:01Z",
         )
+        child_prepared = self.control.store._set_issue_status_for_test_fixture(
+            repository=REPOSITORY,
+            issue_number=child_issue,
+            status="PREPARED",
+            allocation_class="NONE",
+            generation=1,
+            accountable_session_id=SESSION,
+            lease_manifest_sha256=None,
+            development_units=0,
+            shared_units=0,
+            sre_units=1,
+            expected_source_sha256=child_source.payload_sha256,
+            expected_version=0,
+            now="2026-08-23T00:01:01Z",
+        )
+        child_lease_path = self.root / "issue-320-transfer-lease.json"
+        child_lease_path.write_text(
+            json.dumps(
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": child_issue,
+                    "generation": 1,
+                    "base_sha": "a" * 40,
+                    "branch": "codex/314-ci-hardening",
+                    "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-314",
+                    "no_additional_paths": True,
+                    "paths": [
+                        {
+                            "path": "backend/example.py",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": "6" * 40,
+                        }
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        child_lease = hashlib.sha256(child_lease_path.read_bytes()).hexdigest()
+        self.control.store.register_artifacts(
+            [
+                {
+                    "repository": REPOSITORY,
+                    "issue_number": child_issue,
+                    "generation": 1,
+                    "path": str(child_lease_path),
+                    "retention_class": "CLOSEOUT_EVIDENCE",
+                }
+            ],
+            now="2026-08-23T00:01:01Z",
+        )
+        parent_item = self.control.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (REPOSITORY, ISSUE),
+        ).fetchone()
+        self.assertIsNotNone(parent_item)
+        parent_version = int(parent_item["version"])
         transfer_key = "issue314-to-320-v1"
         authority = "8" * 64
         comment_bodies = {
@@ -687,13 +1144,15 @@ class PrePushControlTests(unittest.TestCase):
             "repository": REPOSITORY,
             "predecessor_issue_number": ISSUE,
             "predecessor_generation": 2,
-            "predecessor_item_version": 1,
-            "predecessor_admission_item_version": 1,
+            "predecessor_item_version": parent_version,
+            "predecessor_admission_item_version": int(
+                self.admission_payload["item_version"]
+            ),
             "predecessor_source_payload_sha256": self.source_sha,
             "predecessor_admission_message_id": self.message,
             "predecessor_admission_payload_sha256": parent_payload_sha256,
             "predecessor_accountable_session_id": SESSION,
-            "predecessor_lease_manifest_sha256": LEASE,
+            "predecessor_lease_manifest_sha256": self.lease_sha,
             "predecessor_development_units": 0,
             "predecessor_shared_units": 0,
             "predecessor_sre_units": 1,
@@ -703,7 +1162,7 @@ class PrePushControlTests(unittest.TestCase):
             "predecessor_release_allocation_class": "NONE",
             "successor_issue_number": child_issue,
             "successor_generation": 1,
-            "successor_item_version": 1,
+            "successor_item_version": int(child_prepared["version"]) + 2,
             "successor_source_payload_sha256": child_source.payload_sha256,
             "successor_admission_message_id": 1,
             "successor_admission_payload_sha256": "0" * 64,
@@ -719,7 +1178,7 @@ class PrePushControlTests(unittest.TestCase):
                     "status": "MONITOR",
                     "allocation_class": "NONE",
                     "generation": 3,
-                    "version": 2,
+                    "version": parent_version + 1,
                     "source_payload_sha256": self.source_sha,
                 }
             ],
@@ -729,7 +1188,7 @@ class PrePushControlTests(unittest.TestCase):
                 "status": "ACTIVE_FENCED",
                 "allocation_class": "ACTIVE",
                 "generation": 1,
-                "version": 1,
+                "version": int(child_prepared["version"]) + 2,
                 "source_payload_sha256": child_source.payload_sha256,
             },
             "activation_event_schema": "v2",
@@ -756,7 +1215,7 @@ class PrePushControlTests(unittest.TestCase):
             },
             "issue_number": child_issue,
             "generation": 1,
-            "item_version": 1,
+            "item_version": int(child_prepared["version"]) + 2,
             "base_sha": "a" * 40,
             "branch": "codex/314-ci-hardening",
             "worktree_path": "/home/ubuntu/code/twinfinityapp-issue-314",
@@ -818,7 +1277,7 @@ class PrePushControlTests(unittest.TestCase):
                     "shared_units": 0,
                     "sre_units": 0,
                     "expected_source_sha256": self.source_sha,
-                    "expected_version": 1,
+                    "expected_version": parent_version,
                 }
             ],
             "activation": {
@@ -834,7 +1293,7 @@ class PrePushControlTests(unittest.TestCase):
                     "shared_units": 0,
                     "sre_units": 1,
                     "expected_source_sha256": child_source.payload_sha256,
-                    "expected_version": 0,
+                    "expected_version": int(child_prepared["version"]) + 1,
                 },
                 "message": {
                     "idempotency_key": "issue-320-generation-1-sre",
@@ -844,6 +1303,18 @@ class PrePushControlTests(unittest.TestCase):
                 },
             },
         }
+        bind_delivery_identity(transaction["activation"])
+
+        finalized = self.finalize_test_admission(
+            transaction["activation"],
+            prepared_item=child_prepared,
+            worker_role="sre",
+            worker_endpoint_id=SESSION,
+            now="2026-08-23T00:01:02Z",
+            suffix="prepush-transfer-320",
+        )
+        self.assertEqual("READY", finalized["item"]["status"])
+
         def fetch_comment(repository: str, comment_id: int) -> dict:
             return {
                 "id": comment_id,
@@ -858,7 +1329,7 @@ class PrePushControlTests(unittest.TestCase):
             "coordination_transfer_ledger.fetch_comment", side_effect=fetch_comment
         ):
             result = activate_transfer(
-                self.control.store, transaction, "2026-08-23T00:01:02Z"
+                self.control.store, transaction, "2026-08-23T00:01:03Z"
             )
         child_message = result["message_id"]
         self.control.connection.execute(
@@ -867,12 +1338,12 @@ class PrePushControlTests(unittest.TestCase):
             (REPOSITORY, child_issue),
         )
         self.control.store.claim_message(
-            child_message, SESSION, "2026-08-23T00:01:03Z"
+            child_message, SESSION, "2026-08-23T00:01:04Z"
         )
         self.control.connection.execute(
             "UPDATE coordination_messages SET state='COMPLETE',updated_at=? "
             "WHERE id=? AND state='CLAIMED' AND claimed_by=?",
-            ("2026-08-23T00:01:04Z", child_message, SESSION),
+            ("2026-08-23T00:01:05Z", child_message, SESSION),
         )
         with patch(
             "coordination_transfer_ledger.fetch_comment", side_effect=fetch_comment
@@ -1103,6 +1574,24 @@ class PrePushControlTests(unittest.TestCase):
         )
         self.assertEqual(
             "PREPUSH_HARNESS_HERMETIC_GATE_FAILED", harness.final_failure
+        )
+        identity_only = self.control._gate_plan(
+            HARNESS_REPOSITORY,
+            (
+                "skills/twinfinity-sprint-orchestrator/"
+                "scripts/delivery_identity.py",
+            ),
+            run_id="p68-g1-dddddddddddd",
+            base_sha="a" * 40,
+        )
+        self.assertTrue(identity_only.metadata["baseline_required"])
+        self.assertIn(
+            "skills/twinfinity-sprint-orchestrator/scripts/delivery_identity.py",
+            identity_only.metadata["control_sha256"],
+        )
+        self.assertIn(
+            "tests.test_delivery_identity",
+            canonical_json(identity_only.lower_commands),
         )
         with self.assertRaisesRegex(
             PrePushError, "PREPUSH_HARNESS_FOCUSED_SELECTOR_MISSING"

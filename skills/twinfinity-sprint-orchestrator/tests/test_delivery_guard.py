@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import hashlib
+import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -53,6 +55,38 @@ class DeliveryGuardTests(unittest.TestCase):
         self.assertEqual(
             "deny", output["hookSpecificOutput"]["permissionDecision"]
         )
+
+    def test_invalid_bound_identity_fails_before_writer_context(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE coordination_messages ("
+            "id INTEGER PRIMARY KEY,state TEXT,topic TEXT,"
+            "recipient_session_id TEXT,payload_json TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO coordination_messages VALUES (?,'PREPARED',"
+            "'development.admission','role.development.v4',?)",
+            (
+                (1, json.dumps({"delivery_identity": {"schema": "invalid"}})),
+                (2, json.dumps({})),
+            ),
+        )
+        try:
+            for message_id in (1, 2):
+                with self.subTest(message_id=message_id), self.assertRaisesRegex(
+                    delivery_guard.GuardError, "DELIVERY_IDENTITY_INVALID"
+                ):
+                    delivery_guard._message_context(
+                        connection,
+                        Path("/tmp/disposable.sqlite3"),
+                        role="development",
+                        endpoint_id="role.development.v4",
+                        target_key=str(message_id),
+                        worktree_root=Path("/home/ubuntu/code"),
+                    )
+        finally:
+            connection.close()
 
     def test_denies_direct_and_code_mode_git_push(self) -> None:
         unsafe = (
@@ -747,7 +781,9 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "b41d588ff77ca5ee2ab19491dedc7f42ef1f217c648839c5d0bcbea2d4054ab1",
+                "48a3f8aa0466708d0ef6bb77ef71b05fadf4508cb9ff1e474de1c40ff01e4add",
+            SCRIPTS / "delivery_identity.py":
+                "463ae0e3409c3105c20d2f33d3278c768edaf46e68ab5351fea7fca0fb9f3efe",
             SCRIPTS / "repository_delivery_policy.py":
                 "d2e29d35bee26ef4d343ec845f8b33785cbff7f65a423b9684998dbe8f754ab8",
         }

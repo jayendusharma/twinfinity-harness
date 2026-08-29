@@ -25,6 +25,7 @@ from coordination_store import (
     parse_structured_lease_manifest,
     utc_now,
 )
+from delivery_identity import immutable_admission_error
 from coordination_transfer_ledger import (
     intent_sha256 as transfer_intent_sha256,
     load_record as load_transfer_record,
@@ -169,6 +170,7 @@ HARNESS_BASELINE_TRIGGER_PREFIXES = (
     "skills/twinfinity-sprint-orchestrator/references/control-plane.md",
     "skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md",
     "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/delivery_identity.py",
     "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
     "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
     "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py",
@@ -176,6 +178,7 @@ HARNESS_BASELINE_TRIGGER_PREFIXES = (
 )
 HARNESS_GATE_CONTROL_PATHS = (
     "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/delivery_identity.py",
     "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
     "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
     "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py",
@@ -375,6 +378,16 @@ class PrePushControl:
                 admission_payload = None
         if admission is None or admission_payload is None:
             raise PrePushError("PREPUSH_COMPLETED_ADMISSION_ABSENT")
+        if (
+            admission["topic"] in {"development.admission", "sre.admission"}
+            and immutable_admission_error(
+                self.connection,
+                message=admission,
+                payload=admission_payload,
+            )
+            is not None
+        ):
+            raise PrePushError("PREPUSH_ADMISSION_INVALID")
         branch = admission_payload.get("branch")
         worktree_path = admission_payload.get("worktree_path")
         opaque_worktree_id = admission_payload.get("opaque_worktree_id")

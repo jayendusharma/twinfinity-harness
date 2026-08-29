@@ -15,6 +15,7 @@ from unittest.mock import patch
 from typing import Any
 
 from coordination_store import CoordinationStore, canonical_json
+from delivery_identity import bind_delivery_identity, delivery_identity_sha256
 from executor_registry import (
     attempt_lineage_for_target,
     current_endpoint,
@@ -22,7 +23,7 @@ from executor_registry import (
     stable_systemd_unit,
     transition_attempt,
 )
-from kanban_pull_buffer import finalize_ready, register_candidate
+from kanban_pull_buffer import READY_SCHEMA, finalize_ready, register_candidate
 from kanban_readiness import (
     PLAN_SCHEMA,
     RECEIPT_SCHEMA,
@@ -64,6 +65,8 @@ def finalize_canonical_ready_candidate(
     issue_number = int(prepared_packet["issue_number"])
     generation = int(prepared_packet["generation"])
     item_version = int(prepared_packet["item_version_at_preparation"])
+    delivery_identity = bind_delivery_identity(admission_transaction)
+    delivery_identity_digest = delivery_identity_sha256(delivery_identity)
     plans = artifact_root / "plans"
     plans.mkdir(exist_ok=True)
     prepared_path = plans / f"issue-{issue_number}-{suffix}-prepared.json"
@@ -108,6 +111,8 @@ def finalize_canonical_ready_candidate(
         "candidate_sha256": prepared["candidate_sha256"],
         "worker_role": worker_role,
         "phase_summary": "Complete one canonical all-gates test readiness phase.",
+        "delivery_identity": delivery_identity,
+        "delivery_identity_sha256": delivery_identity_digest,
         "gates": [
             {
                 "gate_key": "complete-review",
@@ -200,6 +205,7 @@ def finalize_canonical_ready_candidate(
         "repository": repository,
         "issue_number": issue_number,
         "readiness_plan_sha256": campaign["plan_sha256"],
+        "delivery_identity_sha256": delivery_identity_digest,
         "verdict": "PASS",
         "worker_role": worker_role,
         "message_id": message_id,
@@ -261,9 +267,11 @@ def finalize_canonical_ready_candidate(
     ).fetchone()
     ready_packet = {
         **prepared_packet,
-        "schema": "twinfinity-kanban-pull-buffer/v3",
+        "schema": READY_SCHEMA,
         "state": "READY",
         "admission_transaction": admission_transaction,
+        "delivery_identity": delivery_identity,
+        "delivery_identity_sha256": delivery_identity_digest,
         "prepared_candidate": {
             "candidate_id": int(prepared["id"]),
             "candidate_sha256": prepared["candidate_sha256"],
@@ -311,6 +319,9 @@ def finalize_canonical_ready_candidate(
         "campaign_id": int(campaign["campaign_id"]),
         "message_id": message_id,
         "finalized": finalized,
+        "delivery_identity": delivery_identity,
+        "delivery_identity_sha256": delivery_identity_digest,
+        "admission_transaction": admission_transaction,
         "item": current_item,
     }
 
@@ -416,7 +427,14 @@ def finalize_canonical_ready_item(
     worktree_identity = expected_worktree_identity(repository, issue_number)
     if worktree_parent is None or worktree_identity is None:
         raise AssertionError("canonical READY fixture worktree policy missing")
-    worktree = str(worktree_parent / f"{worktree_identity}-{suffix}")
+    worktree = str(
+        worktree_parent
+        / (
+            f"{worktree_identity}-{suffix}"
+            if repository == HARNESS_REPOSITORY
+            else worktree_identity
+        )
+    )
     lease_path = plans / f"issue-{issue_number}-{suffix}-lease.json"
     lease_payload = {
         "repository": repository,
@@ -457,7 +475,7 @@ def finalize_canonical_ready_item(
         "opaque_worktree_id": (
             Path(worktree).name
             if repository == HARNESS_REPOSITORY
-            else f"canonical-ready-{issue_number}-{suffix}"
+            else worktree_identity
         ),
         "accountable_session_id": worker_endpoint_id,
         "lease_manifest_sha256": lease_sha,
