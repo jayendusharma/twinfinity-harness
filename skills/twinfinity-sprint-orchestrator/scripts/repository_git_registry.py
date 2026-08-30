@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
 from typing import Any
 
 
@@ -19,6 +20,23 @@ REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 CANONICAL_ORIGIN_FETCH = "+refs/heads/*:refs/remotes/origin/*"
+FIXED_GIT = "/usr/bin/git"
+_GIT_ENVIRONMENT_SUBSTITUTION = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    }
+)
 GITHUB_ORIGINS = (
     re.compile(
         r"^https://github\.com/(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$"
@@ -197,6 +215,121 @@ def _read_git_file(
             os.close(opened)
 
 
+def _git_entry_exists(git_descriptor: int, relative_path: str) -> bool:
+    """Observe one fixed Git-relative entry without following symlinks."""
+
+    parts = Path(relative_path).parts
+    if (
+        not parts
+        or Path(relative_path).is_absolute()
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise RepositoryGitRegistryError("REPOSITORY_GIT_DERIVED_STATE_PRESENT")
+    descriptor = os.dup(git_descriptor)
+    try:
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
+        for component in parts[:-1]:
+            try:
+                child = os.open(component, directory_flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise RepositoryGitRegistryError(
+                    "REPOSITORY_GIT_DERIVED_STATE_PRESENT"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child
+        try:
+            os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RepositoryGitRegistryError(
+                "REPOSITORY_GIT_DERIVED_STATE_PRESENT"
+            ) from exc
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _reject_derived_git_state(git_descriptor: int) -> None:
+    """Reject every supported source of derived or replacement Git history."""
+
+    for relative_path in (
+        "commondir",
+        "info/grafts",
+        "shallow",
+        "objects/info/alternates",
+        "refs/replace",
+    ):
+        if _git_entry_exists(git_descriptor, relative_path):
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_DERIVED_STATE_PRESENT")
+    packed = _read_git_file(
+        git_descriptor, "packed-refs", maximum_bytes=8 * 1024 * 1024
+    )
+    if packed is not None:
+        try:
+            lines = packed.decode("ascii").splitlines()
+        except UnicodeError as exc:
+            raise RepositoryGitRegistryError(
+                "REPOSITORY_GIT_DERIVED_STATE_PRESENT"
+            ) from exc
+        if any(
+            line
+            and not line.startswith(("#", "^"))
+            and line.partition(" ")[2].startswith("refs/replace/")
+            for line in lines
+        ):
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_DERIVED_STATE_PRESENT")
+
+
+def _closed_git_environment() -> dict[str, str]:
+    if any(name in os.environ for name in _GIT_ENVIRONMENT_SUBSTITUTION):
+        raise RepositoryGitRegistryError("REPOSITORY_GIT_ENVIRONMENT_SUBSTITUTED")
+    return {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def _fixed_git(git_descriptor: int, arguments: tuple[str, ...]) -> bytes:
+    """Run one internally selected, read-only Git proof command."""
+
+    try:
+        result = subprocess.run(
+            [
+                FIXED_GIT,
+                "--no-replace-objects",
+                f"--git-dir=/proc/self/fd/{git_descriptor}",
+                *arguments,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_closed_git_environment(),
+            pass_fds=(git_descriptor,),
+            close_fds=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RepositoryGitRegistryError("REPOSITORY_GIT_PROOF_FAILED") from exc
+    if result.returncode != 0 or len(result.stdout) > 4096 or len(result.stderr) > 4096:
+        raise RepositoryGitRegistryError("REPOSITORY_GIT_PROOF_FAILED")
+    return result.stdout
+
+
 def _repository_from_origin(origin_url: str) -> str | None:
     for pattern in GITHUB_ORIGINS:
         match = pattern.fullmatch(origin_url)
@@ -283,6 +416,7 @@ def _observe_git_directory(
         identity = _stable_directory_identity(initial)
         if expected_identity is not None and identity != expected_identity:
             raise RepositoryGitRegistryError("REPOSITORY_GIT_DIRECTORY_SUBSTITUTED")
+        _reject_derived_git_state(descriptor)
         origin_url = _origin_url(descriptor)
         if _repository_from_origin(origin_url) != repository:
             raise RepositoryGitRegistryError("REPOSITORY_GIT_ORIGIN_MISMATCH")
@@ -300,6 +434,118 @@ def _observe_git_directory(
         ):
             raise RepositoryGitRegistryError("REPOSITORY_GIT_DIRECTORY_SUBSTITUTED")
         return identity, origin_url, main_sha
+    except RepositoryGitRegistryError:
+        raise
+    except OSError as exc:
+        raise RepositoryGitRegistryError("REPOSITORY_GIT_DIRECTORY_INVALID") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def prove_repository_git_current_main(
+    git_dir: Path,
+    repository: str,
+    *,
+    prior_main_sha: str,
+    accepted_main_sha: str,
+    accepted_tree_sha: str,
+    expected_identity: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Prove a fixed accepted-main DAG through one retained Git descriptor."""
+
+    if (
+        not isinstance(repository, str)
+        or REPOSITORY.fullmatch(repository) is None
+        or any(
+            not isinstance(value, str) or GIT_SHA.fullmatch(value) is None
+            for value in (prior_main_sha, accepted_main_sha, accepted_tree_sha)
+        )
+    ):
+        raise RepositoryGitRegistryError("REPOSITORY_GIT_PROOF_INVALID")
+    path = Path(git_dir)
+    descriptor = -1
+    try:
+        descriptor = _open_absolute_directory(path)
+        initial = os.fstat(descriptor)
+        if not _owner_directory_valid(initial):
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_DIRECTORY_UNSAFE")
+        identity = _stable_directory_identity(initial)
+        if expected_identity is not None and identity != expected_identity:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_DIRECTORY_SUBSTITUTED")
+        # This fence deliberately precedes the first Git child.
+        _reject_derived_git_state(descriptor)
+        origin_url = _origin_url(descriptor)
+        if _repository_from_origin(origin_url) != repository:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_ORIGIN_MISMATCH")
+        remote_main = _remote_main(descriptor)
+        if remote_main != accepted_main_sha:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_SOURCE_MAIN_DRIFT")
+
+        try:
+            proved_remote = _fixed_git(
+                descriptor,
+                ("rev-parse", "--verify", "refs/remotes/origin/main^{commit}"),
+            ).decode("ascii").strip()
+            proved_tree = _fixed_git(
+                descriptor,
+                ("rev-parse", "--verify", f"{accepted_main_sha}^{{tree}}"),
+            ).decode("ascii").strip()
+        except UnicodeError as exc:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_PROOF_FAILED") from exc
+        if proved_remote != accepted_main_sha or proved_tree != accepted_tree_sha:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_PROOF_MISMATCH")
+        try:
+            ancestry = subprocess.run(
+                [
+                    FIXED_GIT,
+                    "--no-replace-objects",
+                    f"--git-dir=/proc/self/fd/{descriptor}",
+                    "merge-base",
+                    "--is-ancestor",
+                    prior_main_sha,
+                    accepted_main_sha,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_closed_git_environment(),
+                pass_fds=(descriptor,),
+                close_fds=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_PROOF_FAILED") from exc
+        if ancestry.returncode == 1:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_MAIN_NOT_DESCENDANT")
+        if ancestry.returncode != 0 or ancestry.stdout or len(ancestry.stderr) > 4096:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_PROOF_FAILED")
+
+        _reject_derived_git_state(descriptor)
+        if _remote_main(descriptor) != accepted_main_sha:
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_SOURCE_MAIN_DRIFT")
+        final = os.fstat(descriptor)
+        try:
+            named = path.lstat()
+        except OSError as exc:
+            raise RepositoryGitRegistryError(
+                "REPOSITORY_GIT_DIRECTORY_SUBSTITUTED"
+            ) from exc
+        if (
+            _metadata_identity(initial) != _metadata_identity(final)
+            or _metadata_identity(final) != _metadata_identity(named)
+        ):
+            raise RepositoryGitRegistryError("REPOSITORY_GIT_DIRECTORY_SUBSTITUTED")
+        return {
+            "repository": repository,
+            "origin_url": origin_url,
+            "main_sha": accepted_main_sha,
+            "tree_sha": accepted_tree_sha,
+            "prior_main_sha": prior_main_sha,
+            "git_dir": os.fspath(path),
+            "git_dir_identity": identity,
+        }
     except RepositoryGitRegistryError:
         raise
     except OSError as exc:
@@ -334,6 +580,29 @@ def ensure_repository_git_registry_schema(connection: sqlite3.Connection) -> Non
         );
         CREATE INDEX IF NOT EXISTS coordination_repository_git_registration_repository
             ON coordination_repository_git_registrations(repository);
+        CREATE TRIGGER IF NOT EXISTS coordination_bootstrap_provenance_immutable_insert_collision
+        BEFORE INSERT ON coordination_bootstrap_provenance
+        WHEN EXISTS(
+            SELECT 1 FROM coordination_bootstrap_provenance
+            WHERE bootstrap_id=NEW.bootstrap_id
+               OR manifest_sha256=NEW.manifest_sha256
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'BOOTSTRAP_PROVENANCE_IMMUTABLE');
+        END;
+        CREATE TRIGGER IF NOT EXISTS coordination_repository_git_registration_immutable_insert_collision
+        BEFORE INSERT ON coordination_repository_git_registrations
+        WHEN EXISTS(
+            SELECT 1 FROM coordination_repository_git_registrations
+            WHERE id=NEW.id
+               OR registration_sha256=NEW.registration_sha256
+               OR (device_id=NEW.device_id AND inode=NEW.inode)
+               OR repository=NEW.repository
+               OR git_dir=NEW.git_dir
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'REPOSITORY_GIT_REGISTRATION_IMMUTABLE');
+        END;
         CREATE TRIGGER IF NOT EXISTS coordination_repository_git_registration_unique
         BEFORE INSERT ON coordination_repository_git_registrations
         WHEN EXISTS(

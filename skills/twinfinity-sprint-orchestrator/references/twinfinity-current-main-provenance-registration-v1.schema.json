@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://twinfinity.ai/schemas/twinfinity-current-main-provenance-registration-v1.schema.json",
+  "title": "Twinfinity current-main provenance and read-only Git registration request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "operation_key",
+    "repository",
+    "bootstrap",
+    "accepted_source",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "twinfinity-current-main-provenance-registration/v1"
+    },
+    "operation_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bootstrap_id", "manifest_sha256"],
+      "properties": {
+        "bootstrap_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "accepted_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "merge_sha",
+        "main_sha",
+        "tree_sha",
+        "source_receipt_sha256",
+        "independent_review",
+        "ci",
+        "stopped_state_receipt_sha256",
+        "approval_execution_scope_sha256"
+      ],
+      "properties": {
+        "merge_sha": {
+          "$ref": "#/$defs/git_sha"
+        },
+        "main_sha": {
+          "$ref": "#/$defs/git_sha"
+        },
+        "tree_sha": {
+          "$ref": "#/$defs/git_sha"
+        },
+        "source_receipt_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "independent_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["receipt_id", "receipt_sha256"],
+          "properties": {
+            "receipt_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "receipt_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "ci": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["run_id", "job_id", "receipt_sha256"],
+          "properties": {
+            "run_id": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "job_id": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "receipt_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "stopped_state_receipt_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "approval_execution_scope_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "recorded_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    }
+  },
+  "$defs": {
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

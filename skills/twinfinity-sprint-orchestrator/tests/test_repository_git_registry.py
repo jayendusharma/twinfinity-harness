@@ -255,6 +255,122 @@ class RepositoryGitRegistryTests(unittest.TestCase):
         ):
             self.store.read_registered_repository_main(HARNESS_REPOSITORY)
 
+    def test_derived_git_state_is_rejected_before_any_git_child(self) -> None:
+        git_dir = self._git_dir("common", HARNESS_REPOSITORY, HARNESS_MAIN)
+        (git_dir / "commondir").write_text("../common\n", encoding="utf-8")
+
+        with patch("repository_git_registry.subprocess.run") as run:
+            with self.assertRaisesRegex(
+                CoordinationError, "REPOSITORY_GIT_DERIVED_STATE_PRESENT"
+            ):
+                self._register(HARNESS_REPOSITORY, git_dir, HARNESS_MAIN)
+
+        run.assert_not_called()
+
+    def test_insert_or_replace_cannot_replace_bootstrap_or_legacy_unique_keys(
+        self,
+    ) -> None:
+        git_dir = self._git_dir("common", HARNESS_REPOSITORY, HARNESS_MAIN)
+        self._register(HARNESS_REPOSITORY, git_dir, HARNESS_MAIN)
+        connection = self.store.connection
+        connection.execute("PRAGMA recursive_triggers=OFF")
+        bootstrap_before = tuple(
+            connection.execute(
+                "SELECT * FROM coordination_bootstrap_provenance"
+            ).fetchone()
+        )
+        registration_before = tuple(
+            connection.execute(
+                "SELECT * FROM coordination_repository_git_registrations"
+            ).fetchone()
+        )
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "BOOTSTRAP_PROVENANCE_IMMUTABLE"
+        ):
+            connection.execute(
+                "INSERT OR REPLACE INTO coordination_bootstrap_provenance "
+                "SELECT * FROM coordination_bootstrap_provenance"
+            )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "BOOTSTRAP_PROVENANCE_IMMUTABLE"
+        ):
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO coordination_bootstrap_provenance(
+                    bootstrap_id, manifest_sha256, manifest_json,
+                    source_harness_repository, source_harness_main_sha,
+                    source_registry_sha256, approved_goal_sha256,
+                    application_repository, application_main_sha,
+                    archived_database_sha256, created_at
+                )
+                SELECT 'other-bootstrap', manifest_sha256, manifest_json,
+                       source_harness_repository, source_harness_main_sha,
+                       source_registry_sha256, approved_goal_sha256,
+                       application_repository, application_main_sha,
+                       archived_database_sha256, created_at
+                FROM coordination_bootstrap_provenance
+                """
+            )
+
+        for label in ("primary", "digest", "inode", "repository", "path"):
+            with self.subTest(label=label):
+                select = {
+                    "id": "id + 100",
+                    "repository": "'other/other'",
+                    "git_dir": "git_dir || '-other'",
+                    "source_main_sha": "source_main_sha",
+                    "origin_url": "origin_url",
+                    "bootstrap_id": "bootstrap_id",
+                    "bootstrap_manifest_sha256": "bootstrap_manifest_sha256",
+                    "device_id": "device_id + 100",
+                    "inode": "inode + 100",
+                    "owner_uid": "owner_uid",
+                    "owner_gid": "owner_gid",
+                    "mode": "mode",
+                    "registration_sha256": "printf('%064x', 7)",
+                    "registration_json": "registration_json",
+                    "created_at": "created_at",
+                }
+                if label == "primary":
+                    select["id"] = "id"
+                elif label == "digest":
+                    select["registration_sha256"] = "registration_sha256"
+                elif label == "inode":
+                    select["device_id"] = "device_id"
+                    select["inode"] = "inode"
+                elif label == "repository":
+                    select["repository"] = "repository"
+                else:
+                    select["git_dir"] = "git_dir"
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "REPOSITORY_GIT_REGISTRATION_(?:IMMUTABLE|DUPLICATE)",
+                ):
+                    connection.execute(
+                        "INSERT OR REPLACE INTO "
+                        "coordination_repository_git_registrations "
+                        "SELECT " + ", ".join(select.values()) + " "
+                        "FROM coordination_repository_git_registrations"
+                    )
+
+        self.assertEqual(
+            bootstrap_before,
+            tuple(
+                connection.execute(
+                    "SELECT * FROM coordination_bootstrap_provenance"
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            registration_before,
+            tuple(
+                connection.execute(
+                    "SELECT * FROM coordination_repository_git_registrations"
+                ).fetchone()
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
