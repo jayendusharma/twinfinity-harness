@@ -213,6 +213,9 @@ class OperatorLifecycleTests(unittest.TestCase):
             "manifest_sha256": "0" * 64,
             "atom_id": "operator-lifecycle-test",
             "source_commit": self.source_commit,
+            "destination_root_identity": atom.destination_root_identity(
+                self.destination
+            ),
             "entries": entries,
         }
         value["manifest_sha256"] = atom.manifest_digest(value)
