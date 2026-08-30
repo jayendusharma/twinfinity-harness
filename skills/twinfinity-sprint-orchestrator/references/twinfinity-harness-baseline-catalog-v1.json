@@ -1,0 +1,217 @@
+{
+  "schema": "twinfinity-harness-baseline-catalog/v1",
+  "catalog_version": 1,
+  "entry_timeout_seconds": 120,
+  "maximum_output_bytes": 1048576,
+  "output_completeness_required": true,
+  "entries": [
+    {
+      "id": "skill:imagegen",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/.system/imagegen"
+      ]
+    },
+    {
+      "id": "skill:openai-docs",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/.system/openai-docs"
+      ]
+    },
+    {
+      "id": "skill:plugin-creator",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/.system/plugin-creator"
+      ]
+    },
+    {
+      "id": "skill:review-agent",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/.system/review-agent"
+      ]
+    },
+    {
+      "id": "skill:skill-creator",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/.system/skill-creator"
+      ]
+    },
+    {
+      "id": "skill:skill-installer",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/.system/skill-installer"
+      ]
+    },
+    {
+      "id": "skill:twinfinity-development-executor",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/twinfinity-development-executor"
+      ]
+    },
+    {
+      "id": "skill:twinfinity-devops-sre",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/twinfinity-devops-sre"
+      ]
+    },
+    {
+      "id": "skill:twinfinity-product-strategist",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/twinfinity-product-strategist"
+      ]
+    },
+    {
+      "id": "skill:twinfinity-skill-governor",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/twinfinity-skill-governor"
+      ]
+    },
+    {
+      "id": "skill:twinfinity-sprint-orchestrator",
+      "kind": "skill-validator",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/.system/skill-creator/scripts/quick_validate.py",
+        "skills/twinfinity-sprint-orchestrator"
+      ]
+    },
+    {
+      "id": "registry:audit-config",
+      "kind": "executor-registry-audit",
+      "executable": "{python}",
+      "working_directory": ".",
+      "arguments": [
+        "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
+        "--config",
+        "skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml",
+        "--profile-root",
+        "skills/twinfinity-sprint-orchestrator/references",
+        "audit-config"
+      ]
+    }
+  ],
+  "baseline_triggers": [
+    {
+      "kind": "prefix",
+      "value": ".github/workflows/"
+    },
+    {
+      "kind": "prefix",
+      "value": "skills/.system/skill-creator/"
+    },
+    {
+      "kind": "prefix",
+      "value": "skills/twinfinity-skill-governor/"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-development-executor/SKILL.md"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/SKILL.md"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/references/control-plane.md"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/references/twinfinity-harness-baseline-catalog-v1.json"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/scripts/delivery_identity.py"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py"
+    },
+    {
+      "kind": "path",
+      "value": "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py"
+    }
+  ],
+  "gate_control_paths": [
+    ".github/workflows/validate-skills.yml",
+    "skills/.system/skill-creator/scripts/quick_validate.py",
+    "skills/twinfinity-skill-governor/SKILL.md",
+    "skills/twinfinity-development-executor/SKILL.md",
+    "skills/twinfinity-sprint-orchestrator/SKILL.md",
+    "skills/twinfinity-sprint-orchestrator/references/control-plane.md",
+    "skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md",
+    "skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml",
+    "skills/twinfinity-sprint-orchestrator/references/twinfinity-harness-baseline-catalog-v1.json",
+    "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/delivery_identity.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py",
+    "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py"
+  ]
+}

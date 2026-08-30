@@ -27,6 +27,7 @@ from prepush_control import (  # noqa: E402
     LeaseManifest,
     PrePushControl,
     PrePushError,
+    REPOSITORY_ROOT,
     build_parser,
 )
 from repository_delivery_policy import (  # noqa: E402
@@ -37,6 +38,10 @@ from repository_delivery_policy import (  # noqa: E402
 )
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
+)
+from run_harness_baseline_validations import (  # noqa: E402
+    BaselineError,
+    PAIR_RECEIPT_SCHEMA,
 )
 
 
@@ -1547,8 +1552,26 @@ class PrePushControlTests(unittest.TestCase):
         self.assertEqual("harness/baseline-source-controls", names[0])
         self.assertEqual("harness/hermetic-focused", names[1])
         self.assertEqual(11, sum(name.startswith("harness/quick-validate/") for name in names))
+        self.assertEqual(1, names.count("harness/executor-registry-audit"))
         self.assertTrue(harness.metadata["baseline_required"])
+        catalog = self.control._require_harness_validator_catalog()
+        self.assertEqual(
+            catalog.pair_execution_budget_seconds,
+            harness.metadata["baseline_execution_budget_seconds"],
+        )
+        self.assertGreaterEqual(
+            harness.metadata["baseline_execution_budget_seconds"],
+            3 * len(catalog.entries) * catalog.entry_timeout_seconds,
+        )
         self.assertEqual("a" * 40, harness.metadata["base_sha"])
+        self.assertEqual(
+            12,
+            len(harness.metadata["baseline_catalog"]["ordered_entry_ids"]),
+        )
+        self.assertEqual(
+            "registry:audit-config",
+            harness.metadata["baseline_catalog"]["ordered_entry_ids"][-1],
+        )
         self.assertEqual(
             (
                 sys.executable,
@@ -1593,6 +1616,25 @@ class PrePushControlTests(unittest.TestCase):
             "tests.test_delivery_identity",
             canonical_json(identity_only.lower_commands),
         )
+        for baseline_path in (
+            ".github/workflows/validate-skills.yml",
+            "skills/twinfinity-sprint-orchestrator/references/"
+            "twinfinity-harness-baseline-catalog-v1.json",
+            "skills/twinfinity-sprint-orchestrator/scripts/"
+            "run_harness_baseline_validations.py",
+        ):
+            with self.subTest(baseline_path=baseline_path):
+                baseline_only = self.control._gate_plan(
+                    HARNESS_REPOSITORY,
+                    (baseline_path,),
+                    run_id="p92-g1-eeeeeeeeeeee",
+                    base_sha="a" * 40,
+                )
+                self.assertTrue(baseline_only.metadata["baseline_required"])
+                self.assertEqual(
+                    "harness/baseline-source-controls",
+                    baseline_only.lower_commands[0][0],
+                )
         with self.assertRaisesRegex(
             PrePushError, "PREPUSH_HARNESS_FOCUSED_SELECTOR_MISSING"
         ):
@@ -1606,8 +1648,8 @@ class PrePushControlTests(unittest.TestCase):
                 base_sha="a" * 40,
             )
         with patch(
-            "prepush_control.HARNESS_VALIDATOR_SKILL_ROOTS",
-            ("skills/missing-validator-skill",),
+            "prepush_control.load_catalog",
+            side_effect=BaselineError("BASELINE_CATALOG_MISSING"),
         ):
             with self.assertRaisesRegex(
                 PrePushError, "PREPUSH_HARNESS_VALIDATOR_CATALOG_INCOMPLETE"
@@ -1636,6 +1678,130 @@ class PrePushControlTests(unittest.TestCase):
                     base_sha="a" * 40,
                 )
         subprocess_run.assert_not_called()
+
+    @staticmethod
+    def _fake_pair_receipt(base_sha: str, head_sha: str) -> dict:
+        return {
+            "schema": PAIR_RECEIPT_SCHEMA,
+            "base_sha": base_sha,
+            "candidate_head_sha": head_sha,
+            "accepted_base_receipt_sha256": "1" * 64,
+            "trusted_candidate_receipt_sha256": "2" * 64,
+            "candidate_receipt_sha256": "3" * 64,
+            "pair_manifest_sha256": "4" * 64,
+        }
+
+    def test_baseline_trigger_has_trusted_self_governing_sentinel(self) -> None:
+        catalog = self.control._require_harness_validator_catalog()
+        candidate_without_triggers = replace(catalog, triggers=())
+        for relative in (
+            "skills/twinfinity-sprint-orchestrator/references/"
+            "twinfinity-harness-baseline-catalog-v1.json",
+            "skills/twinfinity-sprint-orchestrator/scripts/"
+            "run_harness_baseline_validations.py",
+            "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
+            ".github/workflows/validate-skills.yml",
+        ):
+            with self.subTest(relative=relative):
+                self.assertTrue(
+                    self.control._harness_baseline_required(
+                        (relative,), candidate_without_triggers
+                    )
+                )
+
+    def test_baseline_receipt_is_parsed_verified_and_bound_to_serialized_gate(self) -> None:
+        base_sha = "a" * 40
+        head_sha = "b" * 40
+        catalog = self.control._require_harness_validator_catalog()
+        pair = self._fake_pair_receipt(base_sha, head_sha)
+        plan = self.control._gate_plan(
+            HARNESS_REPOSITORY,
+            (
+                "skills/twinfinity-sprint-orchestrator/scripts/"
+                "run_harness_baseline_validations.py",
+            ),
+            run_id="p92-g1-bbbbbbbbbbbb",
+            base_sha=base_sha,
+        )
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            root.chmod(0o700)
+            admitted_worktree = root / "admitted-worktree"
+            admitted_worktree.mkdir()
+            path = root / "pair.json"
+            path.write_text(canonical_json(pair) + "\n", encoding="utf-8")
+            with patch("prepush_control.verify_pair_receipt") as verifier:
+                evidence = self.control._load_baseline_evidence(
+                    path,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    catalog=catalog,
+                    repository_root=admitted_worktree,
+                )
+                verifier.assert_called_once_with(
+                    pair,
+                    expected_base_sha=base_sha,
+                    expected_candidate_head=head_sha,
+                    catalog=catalog,
+                    repository_root=admitted_worktree,
+                )
+            serialized = self.control._serialize_lower_gate(plan, evidence)
+            with patch("prepush_control.verify_pair_receipt") as verifier:
+                self.control._verify_serialized_lower_gate(
+                    serialized,
+                    plan,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    repository_root=admitted_worktree,
+                )
+                verifier.assert_called_once()
+
+            tampered = json.loads(serialized)
+            tampered["baseline_evidence"]["receipt_sha256"] = "f" * 64
+            with self.assertRaisesRegex(PrePushError, "PREPUSH_RECEIPT_DRIFT"):
+                self.control._verify_serialized_lower_gate(
+                    canonical_json(tampered),
+                    plan,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    repository_root=admitted_worktree,
+                )
+            with self.assertRaisesRegex(
+                PrePushError, "PREPUSH_BASELINE_RECEIPT_INVALID"
+            ):
+                self.control._load_baseline_evidence(
+                    root / "missing.json",
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    catalog=catalog,
+                    repository_root=admitted_worktree,
+                )
+            path.write_text(canonical_json(pair) + "\nextra", encoding="utf-8")
+            with self.assertRaisesRegex(
+                PrePushError, "PREPUSH_BASELINE_RECEIPT_INVALID"
+            ):
+                self.control._load_baseline_evidence(
+                    path,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    catalog=catalog,
+                    repository_root=admitted_worktree,
+                )
+            path.write_text(canonical_json(pair) + "\n", encoding="utf-8")
+            with patch(
+                "prepush_control.verify_pair_receipt",
+                side_effect=BaselineError("STALE"),
+            ):
+                with self.assertRaisesRegex(
+                    PrePushError, "PREPUSH_BASELINE_RECEIPT_INVALID"
+                ):
+                    self.control._load_baseline_evidence(
+                        path,
+                        base_sha=base_sha,
+                        head_sha="c" * 40,
+                        catalog=catalog,
+                        repository_root=admitted_worktree,
+                    )
 
     def test_harness_gate_run_pass_and_each_failure_stage_never_publish(self) -> None:
         worktree = Path(self.temp.name) / "harness-worktree"
@@ -1760,6 +1926,89 @@ class PrePushControlTests(unittest.TestCase):
                         "SELECT COUNT(*) FROM coordination_pre_push_publications"
                     ).fetchone()[0],
                 )
+
+    def test_baseline_outer_timeout_cannot_undercut_catalog_budget(self) -> None:
+        worktree = Path(self.temp.name) / "harness-budget-worktree"
+        worktree.mkdir()
+        lineage = replace(
+            self.control._lineage(REPOSITORY, ISSUE),
+            repository=HARNESS_REPOSITORY,
+            issue_number=92,
+            surface_issue_number=92,
+            generation=1,
+            branch="change/92-baseline-validation-self-coverage",
+            worktree_path=str(worktree),
+            base_sha="a" * 40,
+            development_units=0,
+            shared_units=1,
+            sre_units=0,
+            admission_topic="development.admission",
+            environment_root=None,
+            existing_environment=None,
+        )
+        path = (
+            "skills/twinfinity-sprint-orchestrator/scripts/"
+            "run_harness_baseline_validations.py"
+        )
+        manifest = LeaseManifest(
+            content_sha256=LEASE,
+            changed_paths_sha256=digest_json([path]),
+            paths=(path,),
+        )
+        plan = self.control._gate_plan(
+            HARNESS_REPOSITORY,
+            manifest.paths,
+            run_id=f"p92-g1-{HEAD[:12]}",
+            base_sha=lineage.base_sha,
+        )
+        calls: list[dict] = []
+
+        def fail_baseline(argv, **kwargs):
+            calls.append({"argv": list(argv), "timeout": kwargs["timeout"]})
+            return subprocess.CompletedProcess(argv, 1)
+
+        with (
+            patch.object(self.control, "_lineage", return_value=lineage),
+            patch.object(
+                self.control,
+                "_validate_worktree",
+                return_value=(worktree, HEAD),
+            ),
+            patch.object(
+                self.control,
+                "_validate_manifest_file",
+                return_value=manifest,
+            ),
+            patch.object(
+                self.control,
+                "_validate_gate_environment",
+                return_value={"python": sys.executable},
+            ),
+            patch.object(
+                self.control,
+                "_git",
+                side_effect=lambda _root, *args: HEAD if args[-1] == "HEAD" else "",
+            ),
+            patch.object(
+                self.control,
+                "_record",
+                return_value={"state": "HOLD", "last_error": "PREPUSH_LOWER_GATE_FAILED"},
+            ),
+            patch("prepush_control.subprocess.run", side_effect=fail_baseline),
+        ):
+            with self.assertRaisesRegex(PrePushError, "PREPUSH_LOWER_GATE_FAILED"):
+                self.control.run(
+                    HARNESS_REPOSITORY,
+                    92,
+                    1,
+                    self.control.store.path.parent / "lease.json",
+                )
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            plan.metadata["baseline_execution_budget_seconds"],
+            calls[0]["timeout"],
+        )
+        self.assertGreater(calls[0]["timeout"], 1)
 
     @staticmethod
     def _make_backend_environment(root: Path, *, python_symlink: bool = True) -> Path:

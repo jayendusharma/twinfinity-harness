@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import Any, Sequence
 
 from coordination_store import (
@@ -44,6 +45,16 @@ from repository_delivery_policy import (
     worktree_identity_matches,
 )
 from admission_source_equivalence import admission_lineage_source_is_current
+from run_harness_baseline_validations import (
+    BaselineCatalog,
+    BaselineError,
+    PAIR_RECEIPT_SCHEMA,
+    REQUIRED_SELF_TRIGGERS,
+    catalog_command,
+    catalog_matches_path,
+    load_catalog,
+    verify_pair_receipt,
+)
 
 
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -88,6 +99,7 @@ SHELL_INJECTION_ENVIRONMENT_KEYS = {
     "ENV",
     "SHELLOPTS",
 }
+PREPUSH_BASELINE_BINDING_SCHEMA = "twinfinity-prepush-baseline-binding/v1"
 class PrePushError(RuntimeError):
     pass
 
@@ -148,44 +160,6 @@ class GatePlan:
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-HARNESS_VALIDATOR_SKILL_ROOTS = (
-    "skills/.system/imagegen",
-    "skills/.system/openai-docs",
-    "skills/.system/plugin-creator",
-    "skills/.system/review-agent",
-    "skills/.system/skill-creator",
-    "skills/.system/skill-installer",
-    "skills/twinfinity-development-executor",
-    "skills/twinfinity-devops-sre",
-    "skills/twinfinity-product-strategist",
-    "skills/twinfinity-skill-governor",
-    "skills/twinfinity-sprint-orchestrator",
-)
-HARNESS_BASELINE_TRIGGER_PREFIXES = (
-    ".github/workflows/",
-    "skills/.system/skill-creator/",
-    "skills/twinfinity-skill-governor/",
-    "skills/twinfinity-development-executor/SKILL.md",
-    "skills/twinfinity-sprint-orchestrator/SKILL.md",
-    "skills/twinfinity-sprint-orchestrator/references/control-plane.md",
-    "skills/twinfinity-sprint-orchestrator/references/harness-self-maintenance.md",
-    "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/delivery_identity.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py",
-)
-HARNESS_GATE_CONTROL_PATHS = (
-    "skills/twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/delivery_identity.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/executor_registry.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/prepush_control.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/repository_delivery_policy.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py",
-    "skills/twinfinity-sprint-orchestrator/scripts/run_hermetic_tests.py",
-    "skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml",
-)
 
 
 class PrePushControl:
@@ -898,8 +872,14 @@ class PrePushControl:
             raise PrePushError("PREPUSH_GATE_PROFILE_UNSUPPORTED") from exc
 
     @staticmethod
-    def _require_harness_validator_catalog() -> tuple[str, ...]:
-        for skill_root in HARNESS_VALIDATOR_SKILL_ROOTS:
+    def _require_harness_validator_catalog() -> BaselineCatalog:
+        try:
+            catalog = load_catalog(REPOSITORY_ROOT)
+        except BaselineError as exc:
+            raise PrePushError(
+                "PREPUSH_HARNESS_VALIDATOR_CATALOG_INCOMPLETE"
+            ) from exc
+        for skill_root in catalog.skill_roots:
             root = REPOSITORY_ROOT / skill_root
             skill = root / "SKILL.md"
             if (
@@ -909,7 +889,7 @@ class PrePushControl:
                 or skill.is_symlink()
             ):
                 raise PrePushError("PREPUSH_HARNESS_VALIDATOR_CATALOG_INCOMPLETE")
-        return HARNESS_VALIDATOR_SKILL_ROOTS
+        return catalog
 
     @staticmethod
     def _require_harness_focused_selectors(paths: tuple[str, ...]) -> tuple[str, ...]:
@@ -934,15 +914,25 @@ class PrePushControl:
         return tuple(sorted(selectors))
 
     @staticmethod
-    def _harness_baseline_required(paths: tuple[str, ...]) -> bool:
+    def _harness_baseline_required(
+        paths: tuple[str, ...], catalog: BaselineCatalog
+    ) -> bool:
+        def trusted_match(path: str) -> bool:
+            return any(
+                path == value if kind == "path" else path.startswith(value)
+                for kind, value in REQUIRED_SELF_TRIGGERS
+            )
+
         return any(
-            path == prefix or path.startswith(prefix)
+            trusted_match(path) or catalog_matches_path(catalog, path)
             for path in paths
-            for prefix in HARNESS_BASELINE_TRIGGER_PREFIXES
         )
 
     @staticmethod
-    def _serialize_lower_gate(gate_plan: GatePlan) -> str:
+    def _serialize_lower_gate(
+        gate_plan: GatePlan,
+        baseline_evidence: dict[str, Any] | None = None,
+    ) -> str:
         return canonical_json(
             {
                 "profile": gate_plan.profile,
@@ -951,8 +941,162 @@ class PrePushControl:
                     {"name": name, "cwd": cwd, "argv": list(argv)}
                     for name, cwd, argv in gate_plan.lower_commands
                 ],
+                "baseline_evidence": baseline_evidence,
             }
         )
+
+    @staticmethod
+    def _load_baseline_evidence(
+        path: Path,
+        *,
+        base_sha: str,
+        head_sha: str,
+        catalog: BaselineCatalog,
+        repository_root: Path,
+    ) -> dict[str, Any]:
+        try:
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or path.is_symlink()
+                or metadata.st_size > 4 * 1024 * 1024
+            ):
+                raise OSError
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            try:
+                observed = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or observed.st_uid != os.getuid()
+                ):
+                    raise OSError
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = os.read(descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 4 * 1024 * 1024:
+                        raise OSError
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+            receipt = json.loads(raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PrePushError("PREPUSH_BASELINE_RECEIPT_INVALID") from exc
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema") != PAIR_RECEIPT_SCHEMA
+            or raw != (canonical_json(receipt) + "\n").encode("utf-8")
+        ):
+            raise PrePushError("PREPUSH_BASELINE_RECEIPT_INVALID")
+        try:
+            verify_pair_receipt(
+                receipt,
+                expected_base_sha=base_sha,
+                expected_candidate_head=head_sha,
+                catalog=catalog,
+                repository_root=repository_root,
+            )
+        except BaselineError as exc:
+            raise PrePushError("PREPUSH_BASELINE_RECEIPT_INVALID") from exc
+        return {
+            "schema": PREPUSH_BASELINE_BINDING_SCHEMA,
+            "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+            "base_sha": base_sha,
+            "candidate_head_sha": head_sha,
+            "catalog_raw_sha256": catalog.raw_sha256,
+            "accepted_base_receipt_sha256": receipt[
+                "accepted_base_receipt_sha256"
+            ],
+            "trusted_candidate_receipt_sha256": receipt[
+                "trusted_candidate_receipt_sha256"
+            ],
+            "candidate_receipt_sha256": receipt["candidate_receipt_sha256"],
+            "pair_manifest_sha256": receipt["pair_manifest_sha256"],
+            "receipt": receipt,
+        }
+
+    @staticmethod
+    def _verify_serialized_lower_gate(
+        serialized: str,
+        gate_plan: GatePlan,
+        *,
+        base_sha: str,
+        head_sha: str,
+        repository_root: Path,
+    ) -> None:
+        try:
+            payload = json.loads(serialized)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise PrePushError("PREPUSH_RECEIPT_DRIFT") from exc
+        if not isinstance(payload, dict) or set(payload) != {
+            "profile",
+            "metadata",
+            "commands",
+            "baseline_evidence",
+        }:
+            raise PrePushError("PREPUSH_RECEIPT_DRIFT")
+        evidence = payload["baseline_evidence"]
+        catalog = None
+        if gate_plan.metadata.get("baseline_required") is True:
+            catalog = PrePushControl._require_harness_validator_catalog()
+            if not isinstance(evidence, dict) or set(evidence) != {
+                "schema",
+                "receipt_sha256",
+                "base_sha",
+                "candidate_head_sha",
+                "catalog_raw_sha256",
+                "accepted_base_receipt_sha256",
+                "trusted_candidate_receipt_sha256",
+                "candidate_receipt_sha256",
+                "pair_manifest_sha256",
+                "receipt",
+            }:
+                raise PrePushError("PREPUSH_RECEIPT_DRIFT")
+            receipt = evidence["receipt"]
+            raw = (canonical_json(receipt) + "\n").encode("utf-8")
+            if (
+                evidence["schema"] != PREPUSH_BASELINE_BINDING_SCHEMA
+                or evidence["receipt_sha256"] != hashlib.sha256(raw).hexdigest()
+                or evidence["base_sha"] != base_sha
+                or evidence["candidate_head_sha"] != head_sha
+                or evidence["catalog_raw_sha256"] != catalog.raw_sha256
+            ):
+                raise PrePushError("PREPUSH_RECEIPT_DRIFT")
+            try:
+                verify_pair_receipt(
+                    receipt,
+                    expected_base_sha=base_sha,
+                    expected_candidate_head=head_sha,
+                    catalog=catalog,
+                    repository_root=repository_root,
+                )
+            except BaselineError as exc:
+                raise PrePushError("PREPUSH_RECEIPT_DRIFT") from exc
+            for field in (
+                "accepted_base_receipt_sha256",
+                "trusted_candidate_receipt_sha256",
+                "candidate_receipt_sha256",
+                "pair_manifest_sha256",
+            ):
+                if evidence[field] != receipt[field]:
+                    raise PrePushError("PREPUSH_RECEIPT_DRIFT")
+        elif evidence is not None:
+            raise PrePushError("PREPUSH_RECEIPT_DRIFT")
+        if serialized != PrePushControl._serialize_lower_gate(gate_plan, evidence):
+            raise PrePushError("PREPUSH_RECEIPT_DRIFT")
 
     @staticmethod
     def _serialize_final_gate(gate_plan: GatePlan) -> str:
@@ -1035,18 +1179,45 @@ class PrePushControl:
                 metadata=metadata,
             )
         if policy.prepush_gate_profile == "harness-source-v1":
-            validator = "skills/.system/skill-creator/scripts/quick_validate.py"
-            validator_catalog = self._require_harness_validator_catalog()
+            baseline_catalog = self._require_harness_validator_catalog()
+            validator_catalog = baseline_catalog.skill_roots
             selectors = self._require_harness_focused_selectors(paths)
-            baseline_required = self._harness_baseline_required(paths)
+            baseline_required = self._harness_baseline_required(
+                paths, baseline_catalog
+            )
             metadata = {
                 "profile": policy.prepush_gate_profile,
                 "base_sha": base_sha,
                 "baseline_required": baseline_required,
+                "baseline_execution_budget_seconds": (
+                    baseline_catalog.pair_execution_budget_seconds
+                    if baseline_required
+                    else None
+                ),
                 "validator_catalog": list(validator_catalog),
+                "baseline_catalog": {
+                    "version": baseline_catalog.version,
+                    "raw_sha256": baseline_catalog.raw_sha256,
+                    "canonical_sha256": baseline_catalog.canonical_sha256,
+                    "command_manifest_sha256": (
+                        baseline_catalog.command_manifest_sha256
+                    ),
+                    "entry_timeout_seconds": (
+                        baseline_catalog.entry_timeout_seconds
+                    ),
+                    "root_execution_budget_seconds": (
+                        baseline_catalog.root_execution_budget_seconds
+                    ),
+                    "pair_execution_budget_seconds": (
+                        baseline_catalog.pair_execution_budget_seconds
+                    ),
+                    "ordered_entry_ids": [
+                        entry.entry_id for entry in baseline_catalog.entries
+                    ],
+                },
                 "control_sha256": {
                     relative: self._source_digest(relative)
-                    for relative in HARNESS_GATE_CONTROL_PATHS
+                    for relative in baseline_catalog.gate_control_paths
                 },
             }
             baseline_commands: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
@@ -1080,11 +1251,15 @@ class PrePushControl:
                 )
             validation_commands = tuple(
                 (
-                    f"harness/quick-validate/{Path(skill_root).name}",
-                    ".",
-                    (sys.executable, validator, skill_root),
+                    (
+                        f"harness/quick-validate/{Path(entry.arguments[1]).name}"
+                        if entry.kind == "skill-validator"
+                        else "harness/executor-registry-audit"
+                    ),
+                    entry.working_directory,
+                    catalog_command(entry, sys.executable),
                 )
-                for skill_root in validator_catalog
+                for entry in baseline_catalog.entries
             )
             lower_commands = baseline_commands + focused_commands + validation_commands
             final_argv = (
@@ -1756,7 +1931,17 @@ class PrePushControl:
             lineage.repository, manifest.paths, run_id=run_id, base_sha=lineage.base_sha
         )
         lower_commands = gate_plan.lower_commands
-        lower_gate = self._serialize_lower_gate(gate_plan)
+        baseline_evidence: dict[str, Any] | None = None
+        evidence_directory = tempfile.TemporaryDirectory(
+            prefix="tf-prepush-baseline-"
+        )
+        evidence_root = Path(evidence_directory.name)
+        evidence_root.chmod(0o700)
+        if worktree == evidence_root or worktree in evidence_root.parents:
+            evidence_directory.cleanup()
+            raise PrePushError("PREPUSH_BASELINE_RECEIPT_ROOT_UNSAFE")
+        baseline_receipt_path = evidence_root / "pair-receipt.json"
+        lower_gate = self._serialize_lower_gate(gate_plan, baseline_evidence)
         compose_gate = gate_plan.final_receipt
         started_at = utc_now()
         lower_exit: int | None = None
@@ -1781,17 +1966,47 @@ class PrePushControl:
                 flush=True,
             )
             lower_exit = 0
-            for _name, cwd, argv in lower_commands:
+            for name, cwd, argv in lower_commands:
+                run_argv = argv
+                command_timeout = timeout_seconds
+                if name == "harness/baseline-source-controls":
+                    run_argv = (*argv, "--receipt", str(baseline_receipt_path))
+                    command_timeout = max(
+                        timeout_seconds,
+                        int(
+                            gate_plan.metadata[
+                                "baseline_execution_budget_seconds"
+                            ]
+                        ),
+                    )
                 lower = subprocess.run(
-                    list(argv),
+                    list(run_argv),
                     cwd=worktree / cwd,
-                    timeout=timeout_seconds,
+                    timeout=command_timeout,
                     check=False,
                     env=gate_environment,
                 )
                 lower_exit = lower.returncode
                 if lower_exit != 0:
                     break
+                if name == "harness/baseline-source-controls":
+                    if baseline_evidence is not None:
+                        raise PrePushError(
+                            "PREPUSH_BASELINE_RECEIPT_DUPLICATE"
+                        )
+                    baseline_evidence = self._load_baseline_evidence(
+                        baseline_receipt_path,
+                        base_sha=lineage.base_sha,
+                        head_sha=head_sha,
+                        catalog=self._require_harness_validator_catalog(),
+                        repository_root=worktree,
+                    )
+            if (
+                lower_exit == 0
+                and gate_plan.metadata.get("baseline_required") is True
+                and baseline_evidence is None
+            ):
+                raise PrePushError("PREPUSH_BASELINE_RECEIPT_MISSING")
             if lower_exit == 0:
                 compose = subprocess.run(
                     list(gate_plan.final_argv),
@@ -1807,6 +2022,9 @@ class PrePushControl:
             error = "PREPUSH_GATE_EXEC_FAILED"
         except PrePushError as exc:
             error = str(exc)
+        finally:
+            evidence_directory.cleanup()
+        lower_gate = self._serialize_lower_gate(gate_plan, baseline_evidence)
         try:
             final_head = self._git(worktree, "rev-parse", "HEAD")
             clean = not self._git(
@@ -1900,7 +2118,6 @@ class PrePushControl:
             or receipt["base_sha"] != lineage.base_sha
             or receipt["changed_paths_sha256"] != digest_json(list(changed_paths))
             or int(receipt["changed_path_count"]) != len(changed_paths)
-            or receipt["lower_gate"] != self._serialize_lower_gate(gate_plan)
             or receipt["compose_gate"] != gate_plan.final_receipt
             or not isinstance(receipt["environment_provenance_sha256"], str)
             or len(receipt["environment_provenance_sha256"]) != 64
@@ -1910,6 +2127,13 @@ class PrePushControl:
             or not bool(receipt["cleanup_proven"])
         ):
             raise PrePushError("PREPUSH_RECEIPT_DRIFT")
+        self._verify_serialized_lower_gate(
+            receipt["lower_gate"],
+            gate_plan,
+            base_sha=lineage.base_sha,
+            head_sha=head_sha,
+            repository_root=worktree,
+        )
         return dict(receipt)
 
     def _reserve_publication(
