@@ -266,6 +266,27 @@ def _require_destination_root_identity(
     return expected
 
 
+def seal_manifest(
+    manifest: dict[str, Any], destination_root: Path
+) -> dict[str, Any]:
+    """Bind one reviewed schema-v2 template to an exact destination root."""
+
+    if set(manifest) != {
+        "schema",
+        "atom_id",
+        "source_commit",
+        "entries",
+    } or manifest.get("schema") != SCHEMA:
+        raise SourceInstallAtomError("INSTALL_ATOM_MANIFEST_SCHEMA_INVALID")
+    sealed = dict(manifest)
+    sealed["destination_root_identity"] = destination_root_identity(
+        destination_root
+    )
+    sealed["manifest_sha256"] = manifest_digest(sealed)
+    _validate_manifest(sealed)
+    return sealed
+
+
 def _seal_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     sealed = dict(receipt)
     sealed["receipt_sha256"] = receipt_digest(sealed)
@@ -738,6 +759,26 @@ def _write_file_exclusive(path: Path, contents: bytes, mode: int) -> None:
         os.fchmod(descriptor, mode)
     finally:
         os.close(descriptor)
+
+
+def _write_sealed_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    canonical = Path(os.path.abspath(path))
+    if (
+        not path.is_absolute()
+        or path != canonical
+        or path.exists()
+        or path.is_symlink()
+        or path.name in {"", ".", ".."}
+    ):
+        raise SourceInstallAtomError("INSTALL_ATOM_SEAL_OUTPUT_INVALID")
+    parent = _safe_root(path.parent)
+    contents = canonical_json(manifest).encode("utf-8")
+    try:
+        _write_file_exclusive(parent / path.name, contents, 0o600)
+    except OSError as exc:
+        raise SourceInstallAtomError(
+            "INSTALL_ATOM_SEAL_OUTPUT_INVALID"
+        ) from exc
 
 
 def _make_private_directory(path: Path) -> None:
@@ -1401,6 +1442,10 @@ def main(argv: list[str] | None = None) -> int:
     digest = subparsers.add_parser("digest")
     digest.add_argument("--manifest", type=Path, required=True)
     digest.add_argument("--destination-root", type=Path, required=True)
+    seal = subparsers.add_parser("seal-manifest")
+    seal.add_argument("--manifest", type=Path, required=True)
+    seal.add_argument("--destination-root", type=Path, required=True)
+    seal.add_argument("--output", type=Path, required=True)
     for command in ("stage", "validate", "apply"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--manifest", type=Path, required=True)
@@ -1430,6 +1475,19 @@ def main(argv: list[str] | None = None) -> int:
                 "manifest_sha256": candidate["manifest_sha256"],
                 "state": "PASS",
             }
+        elif args.command == "seal-manifest":
+            candidate = seal_manifest(manifest, args.destination_root)
+            _write_sealed_manifest(args.output, candidate)
+            result = _seal_receipt(
+                {
+                    "schema": SCHEMA,
+                    "destination_root_identity": candidate[
+                        "destination_root_identity"
+                    ],
+                    "manifest_sha256": candidate["manifest_sha256"],
+                    "state": "SEALED",
+                }
+            )
         elif args.command == "stage":
             result = stage_atom(manifest=manifest, source_root=args.source_root, destination_root=args.destination_root, stage_root=args.stage_root)
         elif args.command == "validate":

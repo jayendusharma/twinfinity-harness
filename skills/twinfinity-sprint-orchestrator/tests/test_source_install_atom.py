@@ -252,6 +252,79 @@ class SourceInstallAtomTests(unittest.TestCase):
         self.assertEqual(atom.manifest_digest(candidate), receipt["manifest_sha256"])
         self.assertNotIn(str(self.destination), result.stdout)
 
+    def test_schema_v2_sealing_workflow_writes_an_accepted_manifest_and_rejects_v1(
+        self,
+    ) -> None:
+        manifest = self.manifest()
+        template = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"destination_root_identity", "manifest_sha256"}
+        }
+        template_path = self.root / "reviewed-v2-template.json"
+        template_path.write_text(
+            atom.canonical_json(template), encoding="utf-8"
+        )
+        template_path.chmod(0o600)
+        sealed_path = self.root / "sealed-v2-manifest.json"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SKILL_ROOT / "scripts/source_install_atom.py"),
+                "seal-manifest",
+                "--manifest",
+                str(template_path),
+                "--destination-root",
+                str(self.destination),
+                "--output",
+                str(sealed_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        sealed = json.loads(sealed_path.read_text(encoding="utf-8"))
+        atom._validate_manifest(sealed)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(atom.SCHEMA, sealed["schema"])
+        self.assertEqual(
+            atom.destination_root_identity(self.destination),
+            sealed["destination_root_identity"],
+        )
+        self.assertEqual(atom.manifest_digest(sealed), sealed["manifest_sha256"])
+        self.assertEqual(sealed["manifest_sha256"], receipt["manifest_sha256"])
+        self.assertEqual("SEALED", receipt["state"])
+        self.assertEqual(receipt["receipt_sha256"], atom.receipt_digest(receipt))
+        self.assertEqual(0o600, stat.S_IMODE(sealed_path.stat().st_mode))
+        self.assertNotIn(str(self.destination), result.stdout)
+
+        legacy = dict(template)
+        legacy["schema"] = "twinfinity-source-install-atom/v1"
+        legacy_path = self.root / "substituted-v1-template.json"
+        legacy_path.write_text(atom.canonical_json(legacy), encoding="utf-8")
+        legacy_path.chmod(0o600)
+        rejected_output = self.root / "rejected-v1-manifest.json"
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(SKILL_ROOT / "scripts/source_install_atom.py"),
+                "seal-manifest",
+                "--manifest",
+                str(legacy_path),
+                "--destination-root",
+                str(self.destination),
+                "--output",
+                str(rejected_output),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(0, rejected.returncode)
+        self.assertIn("INSTALL_ATOM_MANIFEST_SCHEMA_INVALID", rejected.stderr)
+        self.assertFalse(rejected_output.exists())
+
     def test_shadow_alias_noncanonical_and_replaced_roots_fail_before_effect(
         self,
     ) -> None:
