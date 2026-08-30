@@ -56,11 +56,6 @@ class OperatorLifecycleTests(unittest.TestCase):
                 set -u
                 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
                 if [[ " $* " == *" is-enabled "* ]]; then
-                  if [[ "${FAKE_REPLACE_DESTINATION_ON_IS_ENABLED:-0}" == 1 && ! -e "${FAKE_REPLACEMENT_MARKER:?}" ]]; then
-                    : > "$FAKE_REPLACEMENT_MARKER"
-                    mv -- "$FAKE_DESTINATION_ROOT" "$FAKE_DISPLACED_DESTINATION_ROOT"
-                    cp -a -- "$FAKE_DISPLACED_DESTINATION_ROOT" "$FAKE_DESTINATION_ROOT"
-                  fi
                   unit=${!#}
                   if [[ "${FAKE_ENABLED_TIMER:-}" == "$unit" ]]; then
                     echo enabled
@@ -352,9 +347,25 @@ class OperatorLifecycleTests(unittest.TestCase):
         self._install()
         displaced = self.root / "displaced-destination"
         marker = self.root / "destination-replaced"
+        bash_env = self.root / "replace-after-installed-validation"
+        bash_env.write_text(
+            textwrap.dedent(
+                """\
+                trap '
+                  if [[ ${BASH_COMMAND:-} == timers=* && ! -e "${FAKE_REPLACEMENT_MARKER:?}" ]]; then
+                    trap - DEBUG
+                    : > "$FAKE_REPLACEMENT_MARKER"
+                    mv -- "$FAKE_DESTINATION_ROOT" "$FAKE_DISPLACED_DESTINATION_ROOT"
+                    cp -a -- "$FAKE_DISPLACED_DESTINATION_ROOT" "$FAKE_DESTINATION_ROOT"
+                  fi
+                ' DEBUG
+                """
+            ),
+            encoding="utf-8",
+        )
 
         result = self._start(
-            FAKE_REPLACE_DESTINATION_ON_IS_ENABLED="1",
+            BASH_ENV=str(bash_env),
             FAKE_REPLACEMENT_MARKER=str(marker),
             FAKE_DESTINATION_ROOT=str(self.destination),
             FAKE_DISPLACED_DESTINATION_ROOT=str(displaced),
@@ -364,13 +375,7 @@ class OperatorLifecycleTests(unittest.TestCase):
         self.assertIn("INSTALL_ATOM_ROOT_IDENTITY_MISMATCH", result.stderr)
         self.assertTrue(marker.is_file())
         self.assertTrue(displaced.is_dir())
-        lines = self.systemctl_log.read_text(encoding="utf-8").splitlines()
-        self.assertFalse(
-            any(
-                "daemon-reload" in line or " start " in f" {line} "
-                for line in lines
-            )
-        )
+        self.assertFalse(self.systemctl_log.exists())
 
     def test_start_rejects_manifest_missing_supervisor_entrypoint(self) -> None:
         self._install()

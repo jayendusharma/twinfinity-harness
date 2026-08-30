@@ -167,6 +167,8 @@ timers=(
   twinfinity-portfolio-graph-supervisor.timer
 )
 
+verify_destination_root_identity
+
 for timer in "${timers[@]}"; do
   enabled_state=
   if enabled_state=$("$systemctl_command" --user is-enabled "$timer" 2>/dev/null); then
@@ -181,5 +183,6 @@ done
 verify_destination_root_identity
 
 "$systemctl_command" --user daemon-reload
+verify_destination_root_identity
 "$systemctl_command" --user start "${timers[@]}"
 echo '{"state":"TIMERS_STARTED","enabled":false,"timer_count":3}'
