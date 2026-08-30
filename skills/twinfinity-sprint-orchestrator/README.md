@@ -293,6 +293,87 @@ python3 scripts/executor_registry.py \
 
 Also validate all Markdown links and scan installed Markdown for stale routing and historical executable terminology.
 
+### Self-governing harness baseline
+
+`references/twinfinity-harness-baseline-catalog-v1.json` is the sole ordered
+membership authority for the eleven skill validators and the final executor
+registry audit. The baseline runner rejects a missing, substituted, duplicated,
+or reordered entry and emits a deterministic receipt only after every declared
+command returns zero without timing out or exceeding the complete-output bound.
+The receipt binds the engine runner, trusted tool root, target byte root,
+catalog, command manifest, ordered results, root-relative argument roles,
+return codes, bounded complete-output digests, and both root identities.
+
+From a clean exact source candidate, compare immutable accepted-main bytes with
+the candidate head and place the owner-local receipt outside the checkout:
+
+```bash
+receipt_root="$(mktemp -d /tmp/twinfinity-harness-baseline.XXXXXX)"
+chmod 0700 "$receipt_root"
+python3 skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py \
+  --base-sha '<accepted-main-sha>' \
+  --receipt "$receipt_root/source-pair.json"
+```
+
+The first catalog landing retains the immutable legacy accepted-base run, then
+uses the v1 candidate engine with accepted-base validator and registry-tool
+bytes against both the accepted tree and candidate inputs. That bootstrap
+exception is explicit in the pair receipt. Once v1 is accepted, the immutable
+accepted-base runner and tools validate both the accepted tree and the exact
+candidate inputs; the candidate runner and tools separately validate the same
+candidate. The pair verifier resolves the accepted commit from fixed
+`refs/remotes/origin/main`, resolves the candidate from `HEAD`, and derives
+both trees, runner Git blobs, and runner SHA-256 values through scrubbed Git;
+caller-asserted base, head, tool-commit, or runner identities cannot select the
+trust anchor. The pair verifier requires all three root receipts and their
+cross-bindings. Byte-identical base and candidate catalog bytes are mandatory.
+Catalog membership changes require a separately reviewed successor contract;
+they do not fail open as an ordinary source edit. Pre-push writes the pair to
+an owner-only path outside the checkout, reads and verifies it, and binds the
+complete canonical receipt and its component digests into exact-head evidence.
+Its outer baseline timeout is derived from the complete catalog execution
+budget and cannot be shortened by a smaller general pre-push timeout.
+
+Staged-install and installed-runtime validation use runner and validator-tool
+bytes from the clean reviewed source commit, never from the target being
+attested. The reviewed `twinfinity-source-install-atom/v1` manifest must cover
+every catalog input derived from the reviewed source tree, even when a required
+file is absent from the target. The validator proves every
+manifest source and destination byte, mode, owner, schema-v2 manifest digest,
+source commit, and sealed `destination_root_identity`. Schema v1 is rejected.
+It also verifies each state receipt's `receipt_sha256` and binds the actual
+target directory identity to the sealed manifest. A staged root requires its exact fixed
+`.twinfinity-source-install-stage.json`; an installed root requires the
+external `INSTALLED` rollback receipt whose destination-parent identities
+match the target, and it rejects a staged marker. Unrelated mutable files or
+sockets elsewhere in the destination root are outside that finite
+manifest-owned byte set. Each state has a separate identity, and neither
+receipt can substitute for source evidence or for the other runtime state:
+
+```bash
+python3 '<reviewed-source-root>/skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py' \
+  --single-root '<staged-root>' \
+  --root-kind staged-install-atom \
+  --root-identity 'install:<manifest-atom-id>' \
+  --tool-root-identity 'git:<reviewed-source-commit>' \
+  --install-manifest '<sealed-schema-v2-install-manifest.json>' \
+  --installer-evidence '<staged-root>/.twinfinity-source-install-stage.json' \
+  --receipt "$receipt_root/staged.json"
+
+python3 '<reviewed-source-root>/skills/twinfinity-sprint-orchestrator/scripts/run_harness_baseline_validations.py' \
+  --single-root /home/ubuntu \
+  --root-kind installed-runtime \
+  --root-identity 'install:<manifest-atom-id>' \
+  --tool-root-identity 'git:<reviewed-source-commit>' \
+  --install-manifest '<sealed-schema-v2-install-manifest.json>' \
+  --installer-evidence '<rollback-root>/rollback.json' \
+  --receipt "$receipt_root/installed.json"
+```
+
+These commands are validation only. They do not install source, change an
+endpoint, mutate SQLite, start a service or timer, or prove that reviewed source
+is active.
+
 ## Archive gate
 
 Run:
@@ -317,6 +398,7 @@ Archive readiness never authorizes deletion. Deleting archives or other data req
 | `kanban_pull_buffer.py` / `kanban_readiness.py` / `portfolio_convergence.py` | Zero-WIP candidates, one-phase all-gates readiness, bounded resolution, READY binding, dirty events, and atomic successor admission. |
 | `approval_ledger.py` / `approval_guard.py` | Material proposal, user decision, delivery, revocation, and execution-effectivity checks. |
 | `prepush_control.py` / `delivery_guard.py` | Repository-derived exact-head gate receipts, guarded publication, and native delivery command enforcement. |
+| `run_harness_baseline_validations.py` / `twinfinity-harness-baseline-catalog-v1.json` | Fixed ordered validator catalog, accepted-base/candidate comparison, and noninterchangeable source/staged/installed receipts. |
 | `hosted_operation_control.py` / `hosted_operation_clearance.py` | Exact SRE provider-operation lifecycle and clearance. |
 | `coordination_supervisor.py` | Due work selection, wake ledger, and fresh role-attempt scheduling. |
 | `role_executor_transport.py` / `run_role_executor.py` | Target-specific transient systemd transport and attempt process lifecycle. |
