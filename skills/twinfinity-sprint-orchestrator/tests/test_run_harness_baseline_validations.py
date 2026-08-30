@@ -477,23 +477,80 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             timeout_seconds=self.catalog.root_execution_budget_seconds,
         )
 
-    def _valid_pair_receipt(self) -> dict:
-        base_sha = self._git(
-            self.repository_root,
-            "rev-parse",
-            f"{baseline_runner.TRUSTED_BASE_REF}^{{commit}}",
+    def _isolated_distinct_pair_repository(self) -> tuple[Path, str, str]:
+        temporary = tempfile.TemporaryDirectory(
+            prefix="twinfinity-harness-pair-receipt-test-"
         )
-        head_sha = self._git(self.repository_root, "rev-parse", "HEAD^{commit}")
+        root = Path(temporary.name)
+
+        def cleanup() -> None:
+            temporary.cleanup()
+            self.assertFalse(root.exists())
+
+        self.addCleanup(cleanup)
+        self._git(root, "init", "-q")
+        for source, relative in (
+            (self.runner_path, baseline_runner.RUNNER_RELATIVE_PATH),
+            (self.catalog_path, baseline_runner.CATALOG_RELATIVE_PATH),
+        ):
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+        self._normalize_fixture_modes(root)
+        self._git(root, "add", ".")
+        self._git(
+            root,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "accepted-base",
+        )
+        base_sha = self._git(root, "rev-parse", "HEAD^{commit}")
+        (root / "candidate-marker.txt").write_text(
+            "distinct descendant candidate\n", encoding="utf-8"
+        )
+        self._normalize_fixture_modes(root)
+        self._git(root, "add", ".")
+        self._git(
+            root,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "candidate-head",
+        )
+        head_sha = self._git(root, "rev-parse", "HEAD^{commit}")
+        self._git(root, "update-ref", baseline_runner.TRUSTED_BASE_REF, base_sha)
+        self.assertNotEqual(base_sha, head_sha)
+        self.assertEqual(
+            base_sha,
+            self._git(root, "rev-parse", baseline_runner.TRUSTED_BASE_REF),
+        )
+        self.assertEqual(head_sha, self._git(root, "rev-parse", "HEAD^{commit}"))
+        self.assertNotEqual(root.resolve(), self.repository_root.resolve())
+        self.assertTrue((root / ".git").is_dir())
+        self.assertEqual("", self._git(root, "status", "--porcelain=v1"))
+        return root, base_sha, head_sha
+
+    def _valid_pair_receipt(self) -> tuple[dict, Path]:
+        repository_root, base_sha, head_sha = (
+            self._isolated_distinct_pair_repository()
+        )
         git_identity = baseline_runner._derived_pair_git_identity(
-            self.repository_root, base_sha, head_sha
+            repository_root, base_sha, head_sha
         )
         base_runner_sha256 = git_identity["trusted_base_runner_sha256"]
         candidate_runner_sha256 = git_identity["candidate_runner_sha256"]
         base_manifest_sha256 = baseline_runner._git_commit_byte_manifest_sha256(
-            self.repository_root, base_sha
+            repository_root, base_sha
         )
         candidate_manifest_sha256 = baseline_runner._git_commit_byte_manifest_sha256(
-            self.repository_root, head_sha
+            repository_root, head_sha
         )
         base = self._valid_root_receipt(
             kind="accepted-base",
@@ -556,7 +613,7 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             "accepted_base_receipt": base,
             "trusted_candidate_receipt": trusted,
             "candidate_receipt": candidate,
-        }
+        }, repository_root
 
     def _rebind_pair_receipt(self, receipt: dict) -> None:
         compatibility = receipt["catalog_compatibility"]
@@ -614,8 +671,8 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
         }
         receipt["pair_manifest_sha256"] = baseline_runner.digest_json(pair_manifest)
 
-    def _valid_legacy_pair_receipt(self) -> dict:
-        receipt = self._valid_pair_receipt()
+    def _valid_legacy_pair_receipt(self) -> tuple[dict, Path]:
+        receipt, repository_root = self._valid_pair_receipt()
         receipt["catalog_compatibility"] = "legacy-bootstrap"
         accepted = receipt["accepted_base_receipt"]
         trusted = receipt["trusted_candidate_receipt"]
@@ -643,16 +700,16 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             "protocol": "legacy-base-sha",
         }
         self._rebind_pair_receipt(receipt)
-        return receipt
+        return receipt, repository_root
 
     def test_pair_receipt_requires_trusted_cross_proof_and_exact_cross_bindings(self) -> None:
-        receipt = self._valid_pair_receipt()
+        receipt, repository_root = self._valid_pair_receipt()
         baseline_runner.verify_pair_receipt(
             receipt,
             expected_base_sha=receipt["base_sha"],
             expected_candidate_head=receipt["candidate_head_sha"],
             catalog=self.catalog,
-            repository_root=self.repository_root,
+            repository_root=repository_root,
         )
         missing = copy.deepcopy(receipt)
         missing.pop("trusted_candidate_receipt")
@@ -665,7 +722,7 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                     expected_base_sha=receipt["base_sha"],
                     expected_candidate_head=receipt["candidate_head_sha"],
                     catalog=self.catalog,
-                    repository_root=self.repository_root,
+                    repository_root=repository_root,
                 )
 
         rebound = copy.deepcopy(receipt)
@@ -686,11 +743,11 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                 expected_base_sha=receipt["base_sha"],
                 expected_candidate_head=receipt["candidate_head_sha"],
                 catalog=self.catalog,
-                repository_root=self.repository_root,
+                repository_root=repository_root,
             )
 
     def test_pair_receipt_rejects_equal_base_and_forged_git_tool_identity(self) -> None:
-        receipt = self._valid_pair_receipt()
+        receipt, repository_root = self._valid_pair_receipt()
         equal_base = copy.deepcopy(receipt)
         equal_base["base_sha"] = equal_base["candidate_head_sha"]
         with self.assertRaisesRegex(
@@ -701,7 +758,7 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                 expected_base_sha=equal_base["candidate_head_sha"],
                 expected_candidate_head=equal_base["candidate_head_sha"],
                 catalog=self.catalog,
-                repository_root=self.repository_root,
+                repository_root=repository_root,
             )
 
         forged_git = copy.deepcopy(receipt)
@@ -718,7 +775,7 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                 expected_base_sha=receipt["base_sha"],
                 expected_candidate_head=receipt["candidate_head_sha"],
                 catalog=self.catalog,
-                repository_root=self.repository_root,
+                repository_root=repository_root,
             )
 
         forged_tool = copy.deepcopy(receipt)
@@ -732,17 +789,17 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                 expected_base_sha=receipt["base_sha"],
                 expected_candidate_head=receipt["candidate_head_sha"],
                 catalog=self.catalog,
-                repository_root=self.repository_root,
+                repository_root=repository_root,
             )
 
     def test_pair_receipt_rejects_rebound_unknown_and_scalar_substitutions(self) -> None:
-        receipt = self._valid_pair_receipt()
+        receipt, repository_root = self._valid_pair_receipt()
         baseline_runner.verify_pair_receipt(
             receipt,
             expected_base_sha=receipt["base_sha"],
             expected_candidate_head=receipt["candidate_head_sha"],
             catalog=self.catalog,
-            repository_root=self.repository_root,
+            repository_root=repository_root,
         )
         component_mutations: dict[str, dict] = {}
         extra_runner = copy.deepcopy(receipt)
@@ -802,7 +859,7 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                         expected_base_sha=receipt["base_sha"],
                         expected_candidate_head=receipt["candidate_head_sha"],
                         catalog=self.catalog,
-                        repository_root=self.repository_root,
+                        repository_root=repository_root,
                     )
 
         observation_mutations: dict[str, dict] = {}
@@ -829,16 +886,16 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                     expected_base_sha=receipt["base_sha"],
                     expected_candidate_head=receipt["candidate_head_sha"],
                     catalog=self.catalog,
-                    repository_root=self.repository_root,
+                    repository_root=repository_root,
                 )
 
-        legacy = self._valid_legacy_pair_receipt()
+        legacy, legacy_repository_root = self._valid_legacy_pair_receipt()
         baseline_runner.verify_pair_receipt(
             legacy,
             expected_base_sha=legacy["base_sha"],
             expected_candidate_head=legacy["candidate_head_sha"],
             catalog=self.catalog,
-            repository_root=self.repository_root,
+            repository_root=legacy_repository_root,
         )
         for name, field, value in (
             ("legacy-extra-field", "unexpected", True),
@@ -866,7 +923,7 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                     expected_base_sha=legacy["base_sha"],
                     expected_candidate_head=legacy["candidate_head_sha"],
                     catalog=self.catalog,
-                    repository_root=self.repository_root,
+                    repository_root=legacy_repository_root,
                 )
 
     def test_receipt_write_is_atomic_idempotent_and_concurrent_conflict_safe(self) -> None:
