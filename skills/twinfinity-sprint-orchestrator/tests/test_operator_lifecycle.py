@@ -213,6 +213,9 @@ class OperatorLifecycleTests(unittest.TestCase):
             "manifest_sha256": "0" * 64,
             "atom_id": "operator-lifecycle-test",
             "source_commit": self.source_commit,
+            "destination_root_identity": atom.destination_root_identity(
+                self.destination
+            ),
             "entries": entries,
         }
         value["manifest_sha256"] = atom.manifest_digest(value)
@@ -259,7 +262,12 @@ class OperatorLifecycleTests(unittest.TestCase):
             **values,
         }
 
-    def _start(self, **environment: str) -> subprocess.CompletedProcess[str]:
+    def _start(
+        self,
+        *,
+        destination_root: Path | None = None,
+        **environment: str,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 str(REPOSITORY_ROOT / "scripts/start.sh"),
@@ -268,7 +276,7 @@ class OperatorLifecycleTests(unittest.TestCase):
                 "--source-root",
                 str(self.source),
                 "--destination-root",
-                str(self.destination),
+                str(destination_root or self.destination),
                 "--systemctl",
                 str(self.systemctl),
             ],
@@ -323,6 +331,51 @@ class OperatorLifecycleTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         lines = self.systemctl_log.read_text(encoding="utf-8").splitlines()
         self.assertFalse(any("daemon-reload" in line or " start " in f" {line} " for line in lines))
+
+    def test_start_rejects_byte_identical_shadow_root_before_systemd(self) -> None:
+        self._install()
+        shadow = self.root / "shadow-destination"
+        shutil.copytree(self.destination, shadow)
+
+        result = self._start(destination_root=shadow)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("INSTALL_ATOM_ROOT_IDENTITY_MISMATCH", result.stderr)
+        self.assertFalse(self.systemctl_log.exists())
+
+    def test_start_rechecks_replaced_root_before_systemd_effects(self) -> None:
+        self._install()
+        displaced = self.root / "displaced-destination"
+        marker = self.root / "destination-replaced"
+        bash_env = self.root / "replace-after-installed-validation"
+        bash_env.write_text(
+            textwrap.dedent(
+                """\
+                trap '
+                  if [[ ${BASH_COMMAND:-} == timers=* && ! -e "${FAKE_REPLACEMENT_MARKER:?}" ]]; then
+                    trap - DEBUG
+                    : > "$FAKE_REPLACEMENT_MARKER"
+                    mv -- "$FAKE_DESTINATION_ROOT" "$FAKE_DISPLACED_DESTINATION_ROOT"
+                    cp -a -- "$FAKE_DISPLACED_DESTINATION_ROOT" "$FAKE_DESTINATION_ROOT"
+                  fi
+                ' DEBUG
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        result = self._start(
+            BASH_ENV=str(bash_env),
+            FAKE_REPLACEMENT_MARKER=str(marker),
+            FAKE_DESTINATION_ROOT=str(self.destination),
+            FAKE_DISPLACED_DESTINATION_ROOT=str(displaced),
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("INSTALL_ATOM_ROOT_IDENTITY_MISMATCH", result.stderr)
+        self.assertTrue(marker.is_file())
+        self.assertTrue(displaced.is_dir())
+        self.assertFalse(self.systemctl_log.exists())
 
     def test_start_rejects_manifest_missing_supervisor_entrypoint(self) -> None:
         self._install()

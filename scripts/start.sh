@@ -38,6 +38,35 @@ done
 
 [[ -n "$manifest" ]] || { usage; exit 2; }
 
+verify_destination_root_identity() {
+  /usr/bin/python3 - "$source_root" "$destination_root" "$manifest" <<'PY'
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+source_root = Path(sys.argv[1])
+destination_root = Path(sys.argv[2])
+manifest_path = Path(sys.argv[3])
+atom_path = source_root / "skills/twinfinity-sprint-orchestrator/scripts/source_install_atom.py"
+spec = importlib.util.spec_from_file_location("twinfinity_source_install_atom", atom_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("START_SOURCE_ATOM_UNAVAILABLE")
+atom = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = atom
+spec.loader.exec_module(atom)
+
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+atom._validate_manifest(manifest)
+destination_root = atom._safe_root(destination_root)
+atom._require_destination_root_identity(manifest, destination_root)
+PY
+}
+
+verify_destination_root_identity
+
 /usr/bin/python3 - "$source_root" "$destination_root" "$manifest" <<'PY'
 from __future__ import annotations
 
@@ -138,6 +167,8 @@ timers=(
   twinfinity-portfolio-graph-supervisor.timer
 )
 
+verify_destination_root_identity
+
 for timer in "${timers[@]}"; do
   enabled_state=
   if enabled_state=$("$systemctl_command" --user is-enabled "$timer" 2>/dev/null); then
@@ -149,6 +180,9 @@ for timer in "${timers[@]}"; do
   fi
 done
 
+verify_destination_root_identity
+
 "$systemctl_command" --user daemon-reload
+verify_destination_root_identity
 "$systemctl_command" --user start "${timers[@]}"
 echo '{"state":"TIMERS_STARTED","enabled":false,"timer_count":3}'
