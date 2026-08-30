@@ -336,7 +336,7 @@ budget and cannot be shortened by a smaller general pre-push timeout.
 
 Staged-install and installed-runtime validation use runner and validator-tool
 bytes from the clean reviewed source commit, never from the target being
-attested. The reviewed `twinfinity-source-install-atom/v1` manifest must cover
+attested. The reviewed `twinfinity-source-install-atom/v2` manifest must cover
 every catalog input derived from the reviewed source tree, even when a required
 file is absent from the target. The validator proves every
 manifest source and destination byte, mode, owner, schema-v2 manifest digest,
