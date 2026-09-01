@@ -83,8 +83,9 @@ COMMON_ROLE_KEYS = {
 PROFILED_ROLE_KEYS = COMMON_ROLE_KEYS | {"profile_sha256"}
 BROKERED_ROLE_KEYS = PROFILED_ROLE_KEYS | {"execution_protocol"}
 BROKERED_READINESS_PROTOCOL = "readiness/v1"
+PLANNER_PARK_PROTOCOL = "planner-park/v1"
 RUNTIME_ROLLBACK_ENDPOINT_IDS = frozenset(
-    {"role.development.v3", "role.sre.v3"}
+    {"role.planner.v2", "role.development.v3", "role.sre.v3"}
 )
 EXPECTED_CODEX_PROFILES = {
     "planner": "twinfinity-planner",
@@ -705,6 +706,10 @@ def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
         and allowed_topics != (NONMUTATING_MESSAGE_TOPIC,)
     ):
         raise RegistryError("REGISTRY_CONFIG_TOPICS_INVALID")
+    if role == "planner" and version == 3 and allowed_topics != (
+        NONMUTATING_MESSAGE_TOPIC,
+    ):
+        raise RegistryError("REGISTRY_CONFIG_TOPICS_INVALID")
     expected_name = EXPECTED_CODEX_PROFILES[role]
     expected_command = (
         "/home/ubuntu/.local/bin/codex",
@@ -745,7 +750,11 @@ def _parse_endpoint_config(role: str, value: Any) -> EndpointConfig:
         profile_sha256=profile_sha256,
         command_prefix=command_prefix,
         allowed_topics=allowed_topics,
-        execution_protocol=execution_protocol,
+        execution_protocol=(
+            PLANNER_PARK_PROTOCOL
+            if role == "planner" and version == 3
+            else execution_protocol
+        ),
     )
 
 

@@ -15,9 +15,14 @@ import shlex
 import sqlite3
 import stat
 import sys
+import time
 from typing import Any, Iterable, Mapping
 
-from coordination_store import terminal_watch_key
+from coordination_store import (
+    claimed_no_delivery_park_evidence,
+    parse_coordination_envelope,
+    terminal_watch_key,
+)
 from delivery_identity import immutable_admission_error
 from executor_registry import (
     RegistryError,
@@ -32,6 +37,12 @@ from repository_delivery_policy import (
     worktree_path_matches_owning_issue,
 )
 from admission_source_equivalence import admission_lineage_source_is_current
+from run_role_executor import (
+    PARK_CAPABILITY_SOCKET_ENV,
+    PARK_HOOK_EVENT_LIMIT,
+    authorize_park_nested_hook,
+    parse_park_hook_event,
+)
 
 
 DEFAULT_DATABASE = Path.home() / ".codex/twinfinity-coordination/ack-transactions.sqlite3"
@@ -39,6 +50,10 @@ DEFAULT_WORKTREE_ROOT = Path("/home/ubuntu/code")
 CANONICAL_PREPUSH_CONTROL = Path(
     "/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/"
     "scripts/prepush_control.py"
+)
+CANONICAL_PARK_CONTROLLER = Path(
+    "/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/"
+    "scripts/kanban_pull_buffer.py"
 )
 TRUSTED_PREPUSH_INTERPRETER = Path("/usr/bin/python3")
 SHELL_TOOL = re.compile(r"(?i)(?:exec|shell|bash|command)")
@@ -171,6 +186,8 @@ class DeliveryContext:
     base_sha: str | None = None
     repository: str | None = None
     owning_issue_number: int | None = None
+    park_request_sha256: str | None = None
+    park_repository_observation_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -596,10 +613,14 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
     if topic != "coordination.notice" and not topic.startswith(f"{role}."):
         raise GuardError("DELIVERY_ROLE_TARGET_MISMATCH")
     try:
-        payload = json.loads(row["payload_json"])
-    except json.JSONDecodeError as exc:
+        envelope = parse_coordination_envelope(row["payload_json"])
+        payload = envelope.payload
+    except Exception as exc:
         raise GuardError("DELIVERY_TARGET_INVALID") from exc
-    if not isinstance(payload, dict):
+    if (
+        "payload_sha256" in row.keys()
+        and envelope.payload_sha256 != row["payload_sha256"]
+    ):
         raise GuardError("DELIVERY_TARGET_INVALID")
     if (
         topic
@@ -608,6 +629,29 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
     ):
         raise GuardError("DELIVERY_TARGET_INVALID")
     if topic == "coordination.notice":
+        if envelope.reserved_handler == "claimed_no_delivery_park":
+            try:
+                park = claimed_no_delivery_park_evidence(payload)
+            except Exception as exc:
+                raise GuardError("PARK_TARGET_INVALID") from exc
+            if role != "planner" or payload.get("mutation_authority") is not False:
+                raise GuardError("PARK_TARGET_INVALID")
+            return DeliveryContext(
+                role=role,
+                endpoint_id=endpoint_id,
+                target_kind="message",
+                target_key=target_key,
+                topic=topic,
+                worktree=None,
+                lease_paths=frozenset(),
+                repository_writes=False,
+                repository=str(park["repository"]),
+                owning_issue_number=int(park["issue_number"]),
+                park_request_sha256=envelope.payload_sha256,
+                park_repository_observation_sha256=str(
+                    park["repository_observation_sha256"]
+                ),
+            )
         if not _source_is_current(connection, payload):
             raise GuardError("DELIVERY_TARGET_INVALID")
         if payload.get("mutation_authority") is not False:
@@ -783,6 +827,55 @@ def _hosted_context(connection: sqlite3.Connection, *, role: str, endpoint_id: s
     return DeliveryContext(role, endpoint_id, "hosted_operation", target_key, None, frozenset(), False)
 
 
+def _validate_runtime_profile_binding(
+    environ: Mapping[str, str], endpoint: sqlite3.Row
+) -> None:
+    path_value = environ.get("TWINFINITY_EXECUTOR_PROFILE_PATH", "")
+    expected_sha256 = environ.get("TWINFINITY_EXECUTOR_PROFILE_SHA256", "")
+    expected_config_sha256 = environ.get(
+        "TWINFINITY_EXECUTOR_ENDPOINT_CONFIG_SHA256", ""
+    )
+    path = Path(path_value)
+    if (
+        not path.is_absolute()
+        or path.name != "twinfinity-planner-v3.config.toml"
+        or SHA256.fullmatch(expected_sha256) is None
+        or SHA256.fullmatch(expected_config_sha256) is None
+        or expected_config_sha256 != endpoint["config_sha256"]
+    ):
+        raise GuardError("PARK_RUNTIME_PROFILE_DRIFT")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise GuardError("PARK_RUNTIME_PROFILE_DRIFT") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or before.st_size <= 0
+            or before.st_size > MAX_ARTIFACT_BYTES
+        ):
+            raise GuardError("PARK_RUNTIME_PROFILE_DRIFT")
+        raw = b""
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            raw += block
+        after = os.fstat(descriptor)
+        if (
+            before != after
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise GuardError("PARK_RUNTIME_PROFILE_DRIFT")
+    finally:
+        os.close(descriptor)
+
+
 def _load_context(environ: Mapping[str, str], database: Path, worktree_root: Path) -> DeliveryContext:
     names = ("TWINFINITY_EXECUTOR_ATTEMPT_ID", "TWINFINITY_EXECUTOR_INSTANCE_ID", "TWINFINITY_EXECUTOR_ROLE", "TWINFINITY_ROLE_ENDPOINT", "TWINFINITY_EXECUTOR_TOKEN", "TWINFINITY_EXECUTOR_TARGET_KIND", "TWINFINITY_EXECUTOR_TARGET_KEY")
     values = {name: environ.get(name, "") for name in names}
@@ -791,14 +884,16 @@ def _load_context(environ: Mapping[str, str], database: Path, worktree_root: Pat
     attempt_id, instance_id = values[names[0]], values[names[1]]
     role, endpoint_id, token = values[names[2]], values[names[3]], values[names[4]]
     target_kind, target_key = values[names[5]], values[names[6]]
-    if UUID.fullmatch(attempt_id) is None or UUID.fullmatch(instance_id) is None or role not in {"development", "sre"} or target_kind not in {"message", "terminal_watch", "hosted_operation"}:
+    if UUID.fullmatch(attempt_id) is None or UUID.fullmatch(instance_id) is None or role not in {"planner", "development", "sre"} or target_kind not in {"message", "terminal_watch", "hosted_operation"}:
         raise GuardError("DELIVERY_CONTEXT_INVALID")
     connection = _safe_database(database)
     try:
         connection.execute("BEGIN")
-        endpoint = connection.execute("SELECT current.endpoint_id,definitions.role FROM executor_role_endpoint_current current JOIN executor_role_endpoints definitions ON definitions.endpoint_id=current.endpoint_id WHERE current.role=?", (role,)).fetchone()
+        endpoint = connection.execute("SELECT current.endpoint_id,definitions.role,definitions.config_sha256 FROM executor_role_endpoint_current current JOIN executor_role_endpoints definitions ON definitions.endpoint_id=current.endpoint_id WHERE current.role=?", (role,)).fetchone()
         if endpoint is None or endpoint["endpoint_id"] != endpoint_id or endpoint["role"] != role:
             raise GuardError("DELIVERY_ENDPOINT_STALE")
+        if role == "planner" and endpoint_id == "role.planner.v3":
+            _validate_runtime_profile_binding(environ, endpoint)
         attempt = connection.execute("SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
         token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
         if attempt is None or attempt["instance_id"] != instance_id or attempt["role"] != role or attempt["endpoint_id"] != endpoint_id or attempt["target_kind"] != target_kind or attempt["target_key"] != target_key or attempt["state"] not in {"LAUNCHING", "RUNNING"} or not secrets.compare_digest(str(attempt["token_sha256"]), token_sha256):
@@ -2066,12 +2161,116 @@ def _enforce_nested_tools(
     return {}
 
 
-def pre_tool(event: dict[str, Any], *, environ: Mapping[str, str] | None = None, database_path: Path = DEFAULT_DATABASE, worktree_root: Path = DEFAULT_WORKTREE_ROOT) -> dict[str, Any]:
+PARK_CONTROLLER_WORKDIR = "/home/ubuntu"
+PARK_CONTROLLER_JUSTIFICATION = (
+    "Allow the exact owner-safe PARK controller to acquire current GitHub "
+    "and local Git evidence."
+)
+
+
+def _park_controller_argv(context: DeliveryContext) -> list[str]:
+    if (
+        context.park_request_sha256 is None
+        or context.park_repository_observation_sha256 is None
+    ):
+        raise GuardError("PARK_TARGET_INVALID")
+    return [
+        "/usr/bin/python3",
+        os.fspath(CANONICAL_PARK_CONTROLLER),
+        "park-commit",
+        "--message-id",
+        context.target_key,
+        "--request-sha256",
+        context.park_request_sha256,
+        "--repository-observation-sha256",
+        context.park_repository_observation_sha256,
+        "--planner-session-id",
+        context.endpoint_id,
+    ]
+
+
+def _park_controller_command() -> str:
+    return (
+        f"/usr/bin/python3 {CANONICAL_PARK_CONTROLLER} park-commit "
+        '--message-id "$TWINFINITY_EXECUTOR_TARGET_KEY" '
+        '--request-sha256 "$TWINFINITY_PARK_REQUEST_SHA256" '
+        '--repository-observation-sha256 '
+        '"$TWINFINITY_PARK_REPOSITORY_OBSERVATION_SHA256" '
+        '--planner-session-id "$TWINFINITY_ROLE_ENDPOINT"'
+    )
+
+
+def _park_exact_tool_input(
+    tool_input: Mapping[str, Any], context: DeliveryContext
+) -> bool:
+    return bool(
+        set(tool_input)
+        == {"cmd", "workdir", "sandbox_permissions", "justification"}
+        and tool_input.get("cmd") == _park_controller_command()
+        and tool_input.get("workdir") == PARK_CONTROLLER_WORKDIR
+        and tool_input.get("sandbox_permissions") == "require_escalated"
+        and tool_input.get("justification") == PARK_CONTROLLER_JUSTIFICATION
+    )
+
+
+def _park_outer_tool_input(
+    source: str, context: DeliveryContext
+) -> bool:
+    try:
+        calls = _direct_nested_calls(source)
+    except GuardError:
+        return False
+    if len(calls) != 1 or calls[0][0] != "exec_command":
+        return False
+    argument = calls[0][1]
+    try:
+        values = {
+            key: _js_object_literal_property(argument, key, required=True)
+            for key in ("cmd", "workdir", "sandbox_permissions", "justification")
+        }
+    except GuardError:
+        return False
+    keys = re.findall(r"(?:^|[{,])\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*:", argument)
+    return bool(
+        set(keys) == {"cmd", "workdir", "sandbox_permissions", "justification"}
+        and values["cmd"] == _park_controller_command()
+        and values["workdir"] == PARK_CONTROLLER_WORKDIR
+        and values["sandbox_permissions"] == "require_escalated"
+        and values["justification"] == PARK_CONTROLLER_JUSTIFICATION
+    )
+
+
+def _enforce_park_tool(
+    event: dict[str, Any],
+    *,
+    raw_event: bytes,
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    try:
+        parsed = parse_park_hook_event(raw_event)
+        if parsed != event:
+            raise RegistryError("PARK_HOOK_EVENT_INVALID")
+        authorize_park_nested_hook(raw_event, environ=dict(environ))
+        return {}
+    except (OSError, RegistryError, TypeError, ValueError):
+        return _deny("PARK_NESTED_BASH_CAPABILITY_DENIED")
+
+
+def pre_tool(event: dict[str, Any], *, raw_event: bytes | None = None, environ: Mapping[str, str] | None = None, database_path: Path = DEFAULT_DATABASE, worktree_root: Path = DEFAULT_WORKTREE_ROOT) -> dict[str, Any]:
     tool, tool_input = event.get("tool_name"), event.get("tool_input")
     if not isinstance(tool, str) or not isinstance(tool_input, dict):
         return _deny("DELIVERY_HOOK_EVENT_INVALID")
     try:
-        context = _load_context(environ or os.environ, database_path, worktree_root)
+        effective_environment = environ or os.environ
+        if effective_environment.get(PARK_CAPABILITY_SOCKET_ENV):
+            if raw_event is None:
+                return _deny("PARK_HOOK_RAW_EVENT_REQUIRED")
+            return _enforce_park_tool(
+                event,
+                raw_event=raw_event,
+                environ=effective_environment,
+            )
+        context = _load_context(effective_environment, database_path, worktree_root)
         cwd = _cwd(event, tool_input)
         source = tool_input.get("source")
         if not isinstance(source, str):
@@ -2124,13 +2323,17 @@ def pre_tool(event: dict[str, Any], *, environ: Mapping[str, str] | None = None,
 
 def main() -> int:
     try:
-        event = json.load(sys.stdin)
+        raw = sys.stdin.buffer.read(PARK_HOOK_EVENT_LIMIT + 1)
+        if os.environ.get(PARK_CAPABILITY_SOCKET_ENV):
+            event = parse_park_hook_event(raw)
+        else:
+            event = json.loads(raw)
         if not isinstance(event, dict):
             raise ValueError
-        output = pre_tool(event) if event.get("hook_event_name") == "PreToolUse" else {}
+        output = pre_tool(event, raw_event=raw) if event.get("hook_event_name") == "PreToolUse" else {}
         print(json.dumps(output, sort_keys=True, separators=(",", ":")))
         return 0
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, RegistryError, UnicodeDecodeError, ValueError):
         print(json.dumps(_deny("DELIVERY_HOOK_EVENT_INVALID"), separators=(",", ":")))
         return 0
 

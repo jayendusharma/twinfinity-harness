@@ -781,7 +781,7 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "48a3f8aa0466708d0ef6bb77ef71b05fadf4508cb9ff1e474de1c40ff01e4add",
+                "28a03a0f83962f1dfd1addb8fddeeaea52343df4078b89d100ad84803a06a49c",
             SCRIPTS / "delivery_identity.py":
                 "463ae0e3409c3105c20d2f33d3278c768edaf46e68ab5351fea7fca0fb9f3efe",
             SCRIPTS / "repository_delivery_policy.py":

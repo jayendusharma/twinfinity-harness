@@ -359,6 +359,7 @@ class ExecutorRegistryTests(unittest.TestCase):
         codex_home.mkdir(exist_ok=True)
         for profile in (
             "twinfinity-planner-v2",
+            "twinfinity-planner-v3",
             "twinfinity-development-v3",
             "twinfinity-development-v4",
             "twinfinity-development-v6",
@@ -1548,8 +1549,9 @@ class ExecutorRegistryTests(unittest.TestCase):
         now = "2026-08-24T09:00:00Z"
         for endpoint in v6_config.endpoints.values():
             _verify_or_insert_endpoint(self.store.connection, endpoint.payload, now)
+        current_planner_endpoint = v6_config.roles["planner"].endpoint_id
         initial = {
-            "planner": PLANNER_ENDPOINT,
+            "planner": current_planner_endpoint,
             "development": DEVELOPMENT_V3_ENDPOINT,
             "sre": SRE_V3_ENDPOINT,
         }
@@ -1643,7 +1645,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             )
         }
         self.assertEqual((DEVELOPMENT_V6_ENDPOINT, 2), cutover_pointers["development"])
-        self.assertEqual((PLANNER_ENDPOINT, 1), cutover_pointers["planner"])
+        self.assertEqual((current_planner_endpoint, 1), cutover_pointers["planner"])
         self.assertEqual((SRE_V6_ENDPOINT, 2), cutover_pointers["sre"])
         launch(
             "development",
@@ -1672,7 +1674,7 @@ class ExecutorRegistryTests(unittest.TestCase):
             )
         }
         self.assertEqual((DEVELOPMENT_V3_ENDPOINT, 3), rollback_pointers["development"])
-        self.assertEqual((PLANNER_ENDPOINT, 1), rollback_pointers["planner"])
+        self.assertEqual((current_planner_endpoint, 1), rollback_pointers["planner"])
         self.assertEqual((SRE_V3_ENDPOINT, 3), rollback_pointers["sre"])
         for endpoint_id, expected_profile in (
             (DEVELOPMENT_V3_ENDPOINT, "twinfinity-development-v3"),

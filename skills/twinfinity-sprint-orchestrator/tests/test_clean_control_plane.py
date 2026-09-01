@@ -571,6 +571,7 @@ class CleanControlPlaneTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "role.planner.v2",
+                    "role.planner.v3",
                     "role.development.v3",
                     "role.development.v4",
                     "role.development.v5",

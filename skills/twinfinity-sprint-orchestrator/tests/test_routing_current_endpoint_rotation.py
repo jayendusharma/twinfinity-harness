@@ -94,7 +94,7 @@ class CurrentEndpointOwnerRotationTests(unittest.TestCase):
         for endpoint in self.config.endpoints.values():
             _verify_or_insert_endpoint(self.connection, endpoint.payload, NOW)
         for role, endpoint_id in (
-            ("planner", "role.planner.v2"),
+            ("planner", self.config.roles["planner"].endpoint_id),
             ("development", DEVELOPMENT_V3),
             ("sre", SRE_V3),
         ):

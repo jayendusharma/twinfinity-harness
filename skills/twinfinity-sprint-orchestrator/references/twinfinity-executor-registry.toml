@@ -2,6 +2,23 @@ schema_version = 2
 staged_endpoints = []
 
 [roles.planner]
+endpoint_id = "role.planner.v3"
+version = 3
+executor_profile = "planner"
+codex_profile = "twinfinity-planner"
+profile_sha256 = "171f222f746e99c16182e38957eefb012576720c7d0dd8ebe01e2096bec45e1b"
+command_prefix = [
+  "/home/ubuntu/.local/bin/codex",
+  "exec",
+  "--profile",
+  "twinfinity-planner",
+  "--strict-config",
+  "--json",
+]
+allowed_topics = ["coordination.notice"]
+
+[[historical_endpoints]]
+role = "planner"
 endpoint_id = "role.planner.v2"
 version = 2
 executor_profile = "planner"

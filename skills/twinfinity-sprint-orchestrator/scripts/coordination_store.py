@@ -9,6 +9,8 @@ status, inbox messages, and an idempotent GitHub outbox.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
@@ -166,6 +168,66 @@ UNCLAIMED_ADMISSION_TOPICS = {"development.admission", "sre.admission"}
 UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA = (
     "twinfinity-unclaimed-admission-recovery-notice/v1"
 )
+CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA = (
+    "twinfinity-claimed-no-delivery-park-notice/v1"
+)
+COORDINATION_ENVELOPE_MAX_BYTES = 1024 * 1024
+COORDINATION_ENVELOPE_MAX_DEPTH = 48
+COORDINATION_ENVELOPE_MAX_NODES = 8192
+COORDINATION_ENVELOPE_MAX_STRING_BYTES = 512 * 1024
+CLAIMED_NO_DELIVERY_PRESERVATION_SCHEMA = (
+    "twinfinity-claimed-no-delivery-preservation/v1"
+)
+CLAIMED_NO_DELIVERY_PRESERVATION_KEYS = frozenset(
+    {
+        "schema",
+        "repository",
+        "issue_number",
+        "generation",
+        "lease_manifest_sha256",
+        "dirty_paths",
+        "dirty_bytes_base64",
+        "dirty_bytes_sha256",
+        "preserved_by_endpoint_id",
+        "preservation_attempt_id",
+        "cleanup_receipt_sha256",
+        "preserved_at",
+    }
+)
+CLAIMED_NO_DELIVERY_PARK_EVIDENCE_KEYS = frozenset(
+    {
+        "schema",
+        "disposition",
+        "repository",
+        "issue_number",
+        "generation",
+        "item_version",
+        "admission_message_id",
+        "admission_payload_sha256",
+        "admission_updated_at",
+        "watch_key",
+        "watch_updated_at",
+        "claim_attempt_id",
+        "preservation_attempt_id",
+        "endpoint_id",
+        "lease_manifest_sha256",
+        "bound_source_sha256",
+        "current_source_sha256",
+        "source_equivalence_receipt_sha256",
+        "stable_source_sha256",
+        "capacity",
+        "retained_artifact_key",
+        "retained_artifact_sha256",
+        "cleanup_receipt_sha256",
+        "repository_observation_sha256",
+        "graph_version",
+        "graph_sha256",
+        "graph_main_sha",
+        "capacity_policy_version",
+        "capacity_policy_sha256",
+        "prepared_at",
+    }
+)
 ACTIVE_EXECUTION_STATUSES = {
     "ACTIVE",
     "ACTIVE_FENCED",
@@ -178,6 +240,7 @@ _READINESS_RESOLUTION_GATEWAY = object()
 _ADMISSION_ACTIVATION_GATEWAY = object()
 _TRANSFER_ACTIVATION_GATEWAY = object()
 _TERMINAL_FINALIZATION_GATEWAY = object()
+_CLAIMED_NO_DELIVERY_PARK_GATEWAY = object()
 _TEST_FIXTURE_GATEWAY = object()
 _TEST_FIXTURE_FORBIDDEN_ITEM_STATES = {
     "READY",
@@ -437,6 +500,330 @@ ARTIFACT_REGISTRY_IDENTITY_FIELDS = (
 
 class CoordinationError(RuntimeError):
     """Typed, value-free coordination failure."""
+
+
+@dataclass(frozen=True)
+class ParsedCoordinationEnvelope:
+    """One strictly parsed message payload shared by every claim gateway."""
+
+    payload: dict[str, Any]
+    payload_sha256: str
+    reserved_handler: str | None
+
+
+def _coordination_envelope_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CoordinationError("COORDINATION_ENVELOPE_DUPLICATE_KEY")
+        value[key] = item
+    return value
+
+
+def _coordination_envelope_constant(_value: str) -> None:
+    raise CoordinationError("COORDINATION_ENVELOPE_NONFINITE")
+
+
+def _coordination_envelope_budget(value: Any) -> None:
+    """Bound traversal work after the C decoder has produced one value."""
+
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    nodes = 0
+    string_bytes = 0
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if nodes > COORDINATION_ENVELOPE_MAX_NODES:
+            raise CoordinationError("COORDINATION_ENVELOPE_RESOURCE_LIMIT")
+        if depth > COORDINATION_ENVELOPE_MAX_DEPTH:
+            raise CoordinationError("COORDINATION_ENVELOPE_DEPTH_EXCEEDED")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise CoordinationError("COORDINATION_ENVELOPE_MALFORMED")
+                string_bytes += len(key.encode("utf-8"))
+                pending.append((child, depth + 1))
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            string_bytes += len(item.encode("utf-8"))
+        if string_bytes > COORDINATION_ENVELOPE_MAX_STRING_BYTES:
+            raise CoordinationError("COORDINATION_ENVELOPE_RESOURCE_LIMIT")
+
+
+def _coordination_reserved_handler(payload: dict[str, Any]) -> str | None:
+    """Classify decoded reserved intent without scanning raw JSON markers."""
+
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    schema = evidence.get("schema")
+    disposition = evidence.get("disposition")
+    park_schema = schema == CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA
+    park_disposition = disposition in {"PARK", "PARKED_NO_DELIVERY"}
+    if park_schema and disposition not in {None, "PARK", "PARKED_NO_DELIVERY"}:
+        raise CoordinationError("COORDINATION_ENVELOPE_AMBIGUOUS_RESERVED_INTENT")
+    if park_disposition and not park_schema:
+        raise CoordinationError("COORDINATION_ENVELOPE_AMBIGUOUS_RESERVED_INTENT")
+    return "claimed_no_delivery_park" if park_schema else None
+
+
+def parse_coordination_envelope(raw: str | bytes) -> ParsedCoordinationEnvelope:
+    """Parse one coordination payload exactly once with closed JSON semantics."""
+
+    if not isinstance(raw, (str, bytes)):
+        raise CoordinationError("COORDINATION_ENVELOPE_MALFORMED")
+    raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+    if len(raw_bytes) > COORDINATION_ENVELOPE_MAX_BYTES:
+        raise CoordinationError("COORDINATION_ENVELOPE_RESOURCE_LIMIT")
+    try:
+        value = json.loads(
+            raw_bytes,
+            object_pairs_hook=_coordination_envelope_object,
+            parse_constant=_coordination_envelope_constant,
+        )
+    except CoordinationError:
+        raise
+    except RecursionError as exc:
+        raise CoordinationError("COORDINATION_ENVELOPE_DEPTH_EXCEEDED") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CoordinationError("COORDINATION_ENVELOPE_MALFORMED") from exc
+    if not isinstance(value, dict):
+        raise CoordinationError("COORDINATION_ENVELOPE_NON_OBJECT")
+    _coordination_envelope_budget(value)
+    return ParsedCoordinationEnvelope(
+        payload=value,
+        payload_sha256=digest_json(value),
+        reserved_handler=_coordination_reserved_handler(value),
+    )
+
+
+COORDINATION_ENVELOPE_ZERO_WRITE_ERRORS = frozenset(
+    {
+        "COORDINATION_ENVELOPE_AMBIGUOUS_RESERVED_INTENT",
+        "COORDINATION_ENVELOPE_DEPTH_EXCEEDED",
+        "COORDINATION_ENVELOPE_DUPLICATE_KEY",
+        "COORDINATION_ENVELOPE_MALFORMED",
+        "COORDINATION_ENVELOPE_NONFINITE",
+        "COORDINATION_ENVELOPE_NON_OBJECT",
+        "COORDINATION_ENVELOPE_RESOURCE_LIMIT",
+        "CLAIMED_NO_DELIVERY_PARK_HANDLER_REQUIRED",
+    }
+)
+COORDINATION_RESERVED_PARK_ZERO_WRITE_VALIDATION_ERRORS = frozenset(
+    {
+        "INVALID_REPOSITORY",
+        "MESSAGE_PAYLOAD_MISMATCH",
+        "MESSAGE_ROLE_MISMATCH",
+        "MESSAGE_TOPIC_INVALID",
+        "NOTICE_MUST_BE_NON_MUTATING",
+        "NOTICE_KIND_INVALID",
+        "NOTICE_MUTATION_FIELDS_FORBIDDEN",
+        "NOTICE_SCHEMA_INVALID",
+    }
+)
+
+
+def coordination_envelope_error_is_zero_write(
+    error: str, *, payload_json: str | bytes | None = None
+) -> bool:
+    """Classify supervisor denials that must never create durable evidence."""
+
+    if error in COORDINATION_ENVELOPE_ZERO_WRITE_ERRORS or error in {
+        "PARK_ENVELOPE_INVALID",
+        "PARK_SOURCE_BINDING_INVALID",
+    }:
+        return True
+    if payload_json is None:
+        return False
+    if error not in COORDINATION_RESERVED_PARK_ZERO_WRITE_VALIDATION_ERRORS:
+        return False
+    try:
+        envelope = parse_coordination_envelope(payload_json)
+    except CoordinationError:
+        return False
+    return envelope.reserved_handler == "claimed_no_delivery_park"
+
+
+def claimed_no_delivery_park_evidence(payload: Any) -> dict[str, Any]:
+    """Return the closed PARK evidence object or one stable typed denial."""
+
+    if not isinstance(payload, dict):
+        raise CoordinationError("PARK_ENVELOPE_INVALID")
+    evidence = payload.get("evidence")
+    source = payload.get("source")
+    if (
+        payload.get("notice_kind") != "planning_request"
+        or payload.get("mutation_authority") is not False
+        or not isinstance(evidence, dict)
+        or set(evidence) != CLAIMED_NO_DELIVERY_PARK_EVIDENCE_KEYS
+        or evidence.get("schema") != CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA
+        or evidence.get("disposition") != "PARK"
+        or not isinstance(source, dict)
+        or source.get("object_kind") != "issue"
+    ):
+        raise CoordinationError("PARK_ENVELOPE_INVALID")
+    repository = evidence.get("repository")
+    issue_number = evidence.get("issue_number")
+    if (
+        source.get("repository") != repository
+        or source.get("object_number") != issue_number
+        or source.get("payload_sha256") != evidence.get("bound_source_sha256")
+        or not isinstance(repository, str)
+    ):
+        raise CoordinationError("PARK_SOURCE_BINDING_INVALID")
+    _validate_repository(repository)
+    integer_fields = (
+        "issue_number",
+        "generation",
+        "item_version",
+        "admission_message_id",
+        "graph_version",
+        "capacity_policy_version",
+    )
+    if any(type(evidence.get(field)) is not int for field in integer_fields):
+        raise CoordinationError("PARK_ENVELOPE_INVALID")
+    if (
+        evidence["issue_number"] <= 0
+        or evidence["generation"] < 0
+        or evidence["item_version"] <= 0
+        or evidence["admission_message_id"] <= 0
+        or evidence["graph_version"] <= 0
+        or evidence["capacity_policy_version"] <= 0
+    ):
+        raise CoordinationError("PARK_ENVELOPE_INVALID")
+    digest_fields = (
+        "admission_payload_sha256",
+        "lease_manifest_sha256",
+        "bound_source_sha256",
+        "current_source_sha256",
+        "source_equivalence_receipt_sha256",
+        "stable_source_sha256",
+        "retained_artifact_key",
+        "retained_artifact_sha256",
+        "cleanup_receipt_sha256",
+        "repository_observation_sha256",
+        "graph_sha256",
+        "capacity_policy_sha256",
+    )
+    if any(
+        not isinstance(evidence.get(field), str)
+        or SHA256.fullmatch(str(evidence[field])) is None
+        for field in digest_fields
+    ):
+        raise CoordinationError("PARK_ENVELOPE_INVALID")
+    strings = (
+        "admission_updated_at",
+        "watch_key",
+        "watch_updated_at",
+        "claim_attempt_id",
+        "preservation_attempt_id",
+        "endpoint_id",
+        "graph_main_sha",
+        "prepared_at",
+    )
+    if any(not isinstance(evidence.get(field), str) or not evidence[field] for field in strings):
+        raise CoordinationError("PARK_ENVELOPE_INVALID")
+    if (
+        SESSION.fullmatch(evidence["claim_attempt_id"]) is None
+        or SESSION.fullmatch(evidence["preservation_attempt_id"]) is None
+        or GIT_SHA.fullmatch(evidence["graph_main_sha"]) is None
+        or not isinstance(evidence.get("capacity"), dict)
+        or set(evidence["capacity"])
+        != {"development_units", "shared_units", "sre_units"}
+        or any(
+            type(evidence["capacity"].get(field)) is not int
+            or evidence["capacity"][field] < 0
+            for field in ("development_units", "shared_units", "sre_units")
+        )
+    ):
+        raise CoordinationError("PARK_ENVELOPE_INVALID")
+    return evidence
+
+
+def validate_claimed_no_delivery_preservation(
+    raw: bytes,
+    *,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove a RETAINED artifact contains the actual dirty bytes, not a label."""
+
+    try:
+        manifest = json.loads(
+            raw,
+            object_pairs_hook=_coordination_envelope_object,
+            parse_constant=_coordination_envelope_constant,
+        )
+    except CoordinationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CoordinationError("PARK_PRESERVATION_INVALID") from exc
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != CLAIMED_NO_DELIVERY_PRESERVATION_KEYS
+        or manifest.get("schema") != CLAIMED_NO_DELIVERY_PRESERVATION_SCHEMA
+        or manifest.get("repository") != evidence.get("repository")
+        or manifest.get("issue_number") != evidence.get("issue_number")
+        or manifest.get("generation") != evidence.get("generation")
+        or manifest.get("lease_manifest_sha256")
+        != evidence.get("lease_manifest_sha256")
+        or manifest.get("preserved_by_endpoint_id") != evidence.get("endpoint_id")
+        or manifest.get("preservation_attempt_id")
+        != evidence.get("preservation_attempt_id")
+        or manifest.get("cleanup_receipt_sha256")
+        != evidence.get("cleanup_receipt_sha256")
+        or not isinstance(manifest.get("preserved_at"), str)
+        or not manifest["preserved_at"]
+        or not isinstance(manifest.get("dirty_paths"), list)
+        or not manifest["dirty_paths"]
+        or any(
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in Path(path).parts)
+            for path in manifest["dirty_paths"]
+        )
+        or len(set(manifest["dirty_paths"])) != len(manifest["dirty_paths"])
+        or not isinstance(manifest.get("dirty_bytes_base64"), str)
+        or not isinstance(manifest.get("dirty_bytes_sha256"), str)
+        or SHA256.fullmatch(manifest["dirty_bytes_sha256"]) is None
+    ):
+        raise CoordinationError("PARK_PRESERVATION_INVALID")
+    try:
+        dirty_bytes = base64.b64decode(
+            manifest["dirty_bytes_base64"], validate=True
+        )
+    except (ValueError, binascii.Error) as exc:
+        raise CoordinationError("PARK_PRESERVATION_INVALID") from exc
+    if (
+        not dirty_bytes
+        or len(dirty_bytes) > 32 * 1024 * 1024
+        or hashlib.sha256(dirty_bytes).hexdigest()
+        != manifest["dirty_bytes_sha256"]
+    ):
+        raise CoordinationError("PARK_PRESERVATION_BYTES_MISMATCH")
+    expected_headers = {
+        b"diff --git a/"
+        + path.encode("utf-8")
+        + b" b/"
+        + path.encode("utf-8")
+        for path in manifest["dirty_paths"]
+    }
+    observed_headers = {
+        line
+        for line in dirty_bytes.splitlines()
+        if line.startswith(b"diff --git ")
+    }
+    if (
+        b"\x00" in dirty_bytes
+        or observed_headers != expected_headers
+        or not dirty_bytes.endswith(b"\n")
+    ):
+        raise CoordinationError("PARK_PRESERVATION_CONTENT_INVALID")
+    return manifest
 
 
 def validate_admission_dispatch_bindings(payload: Any, *, topic: str) -> None:
@@ -1147,6 +1534,153 @@ class SourceSnapshot:
     source_updated_at: str
     fetched_at: str
     payload: dict[str, Any]
+
+
+class _ClaimedNoDeliveryParkSnapshotView:
+    """Expose only the read primitives needed by the shared PARK validator."""
+
+    def __init__(self, connection: sqlite3.Connection, artifact_root: Path):
+        self.connection = connection
+        self.artifact_root = artifact_root
+
+    def current_snapshot(
+        self, repository: str, object_kind: str, object_number: int
+    ) -> SourceSnapshot | None:
+        return CoordinationStore.current_snapshot(
+            self, repository, object_kind, object_number
+        )
+
+    def read_registered_artifact(self, **arguments: Any) -> tuple[dict[str, Any], bytes]:
+        if arguments.get("_transaction") is not False:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+        return CoordinationStore.read_registered_artifact(self, **arguments)
+
+
+def validate_claimed_no_delivery_park_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    artifact_root: Path,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate every authoritative PARK fact on a caller-owned snapshot."""
+
+    if not connection.in_transaction:
+        raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+    view = _ClaimedNoDeliveryParkSnapshotView(
+        connection, Path(artifact_root).resolve()
+    )
+    return CoordinationStore._claimed_no_delivery_park_snapshot_core(view, evidence)
+
+
+def committed_claimed_no_delivery_park_receipt(
+    connection: sqlite3.Connection,
+    *,
+    payload_sha256: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Read one exact committed PARK receipt without opening a writer."""
+
+    completed = connection.execute(
+        "SELECT * FROM coordination_messages WHERE topic='coordination.notice' "
+        "AND payload_sha256=? AND state='COMPLETE' ORDER BY id LIMIT 1",
+        (payload_sha256,),
+    ).fetchone()
+    if completed is None:
+        return None
+    try:
+        completed_envelope = parse_coordination_envelope(completed["payload_json"])
+    except CoordinationError as exc:
+        raise CoordinationError("PARK_REPLAY_CONFLICT") from exc
+    if (
+        completed_envelope.reserved_handler != "claimed_no_delivery_park"
+        or completed_envelope.payload_sha256 != payload_sha256
+        or completed["claimed_by"] is None
+        or coordination_identity_role(connection, str(completed["claimed_by"]))
+        != "planner"
+    ):
+        raise CoordinationError("PARK_REPLAY_CONFLICT")
+    item = connection.execute(
+        "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+        (evidence["repository"], evidence["issue_number"]),
+    ).fetchone()
+    admission = connection.execute(
+        "SELECT * FROM coordination_messages WHERE id=?",
+        (evidence["admission_message_id"],),
+    ).fetchone()
+    watch = connection.execute(
+        "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+        (evidence["watch_key"],),
+    ).fetchone()
+    dirty = connection.execute(
+        "SELECT * FROM portfolio_dirty_events WHERE repository=? "
+        "AND issue_number=? AND release_item_version=? "
+        "AND release_source_sha256=? ORDER BY id LIMIT 1",
+        (
+            evidence["repository"],
+            evidence["issue_number"],
+            evidence["item_version"] + 1,
+            evidence["current_source_sha256"],
+        ),
+    ).fetchone()
+    if (
+        item is None
+        or admission is None
+        or watch is None
+        or dirty is None
+        or item["status"] != "PREPARED"
+        or item["allocation_class"] != "NONE"
+        or int(item["generation"]) != evidence["generation"] + 1
+        or int(item["version"]) != evidence["item_version"] + 1
+        or item["accountable_session_id"] is not None
+        or item["lease_manifest_sha256"] is not None
+        or item["source_payload_sha256"] != evidence["current_source_sha256"]
+        or {
+            "development_units": int(item["development_units"]),
+            "shared_units": int(item["shared_units"]),
+            "sre_units": int(item["sre_units"]),
+        }
+        != evidence["capacity"]
+        or admission["state"] != "CLAIMED"
+        or admission["payload_sha256"] != evidence["admission_payload_sha256"]
+        or admission["claimed_by"] != evidence["endpoint_id"]
+        or watch["state"] != "COMPLETE"
+        or watch["last_error"] != "PARKED_NO_DELIVERY"
+        or int(watch["admission_message_id"] or 0)
+        != evidence["admission_message_id"]
+        or watch["admission_payload_sha256"]
+        != evidence["admission_payload_sha256"]
+    ):
+        raise CoordinationError("PARK_REPLAY_CONFLICT")
+    receipt = {
+        "schema": "twinfinity-claimed-no-delivery-park-receipt/v1",
+        "disposition": "PARKED_NO_DELIVERY",
+        "request_message_id": int(completed["id"]),
+        "request_payload_sha256": payload_sha256,
+        "repository": evidence["repository"],
+        "issue_number": evidence["issue_number"],
+        "prior_generation": evidence["generation"],
+        "prepared_generation": evidence["generation"] + 1,
+        "prior_item_version": evidence["item_version"],
+        "prepared_item_version": evidence["item_version"] + 1,
+        "admission_message_id": evidence["admission_message_id"],
+        "admission_payload_sha256": evidence["admission_payload_sha256"],
+        "terminal_watch_key": evidence["watch_key"],
+        "bound_source_sha256": evidence["bound_source_sha256"],
+        "current_source_sha256": evidence["current_source_sha256"],
+        "source_equivalence_receipt_sha256": evidence[
+            "source_equivalence_receipt_sha256"
+        ],
+        "retained_artifact_key": evidence["retained_artifact_key"],
+        "retained_artifact_sha256": evidence["retained_artifact_sha256"],
+        "cleanup_receipt_sha256": evidence["cleanup_receipt_sha256"],
+        "repository_observation_sha256": evidence[
+            "repository_observation_sha256"
+        ],
+        "prior_capacity": evidence["capacity"],
+        "portfolio_dirty_event_id": int(dirty["id"]),
+        "parked_at": str(completed["updated_at"]),
+    }
+    return {**receipt, "receipt_sha256": digest_json(receipt)}
 
 
 class CoordinationStore:
@@ -4223,6 +4757,7 @@ class CoordinationStore:
                 and (allocation_class == "NONE" or status == "DONE")
                 and gateway not in {
                     _TERMINAL_FINALIZATION_GATEWAY,
+                    _CLAIMED_NO_DELIVERY_PARK_GATEWAY,
                     _TEST_FIXTURE_GATEWAY,
                 }
                 and not (
@@ -4633,6 +5168,8 @@ class CoordinationStore:
                 or not payload["next_observation"]
             ):
                 raise CoordinationError("NOTICE_SCHEMA_INVALID")
+            if _coordination_reserved_handler(payload) == "claimed_no_delivery_park":
+                claimed_no_delivery_park_evidence(payload)
             return
         if not recipient_matches_topic(
             self.connection, topic=topic, recipient=recipient_session_id
@@ -5157,6 +5694,545 @@ class CoordinationStore:
             ):
                 if prior_payload.get(field) != payload.get(field):
                     raise CoordinationError("RECOVERY_CONTRACT_DRIFT")
+
+    def _claimed_no_delivery_park_snapshot_core(
+        self, evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Revalidate every durable PARK fence inside the caller transaction."""
+
+        if not self.connection.in_transaction:
+            raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
+        repository = str(evidence["repository"])
+        issue_number = int(evidence["issue_number"])
+        item = self.connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        admission = self.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (evidence["admission_message_id"],),
+        ).fetchone()
+        watch = self.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+            (evidence["watch_key"],),
+        ).fetchone()
+        try:
+            admission_envelope = (
+                None
+                if admission is None
+                else parse_coordination_envelope(admission["payload_json"])
+            )
+        except CoordinationError as exc:
+            raise CoordinationError("PARK_ADMISSION_INVALID") from exc
+        admission_payload = (
+            None if admission_envelope is None else admission_envelope.payload
+        )
+        admission_source = (
+            admission_payload.get("source")
+            if isinstance(admission_payload, dict)
+            else None
+        )
+        if (
+            item is None
+            or admission is None
+            or watch is None
+            or not isinstance(admission_payload, dict)
+            or not isinstance(admission_source, dict)
+            or item["status"] not in {"ACTIVE", "ACTIVE_FENCED"}
+            or item["allocation_class"] != "ACTIVE"
+            or int(item["generation"]) != evidence["generation"]
+            or int(item["version"]) != evidence["item_version"]
+            or item["accountable_session_id"] != evidence["endpoint_id"]
+            or item["lease_manifest_sha256"] != evidence["lease_manifest_sha256"]
+            or item["source_payload_sha256"] != evidence["bound_source_sha256"]
+            or {
+                "development_units": int(item["development_units"]),
+                "shared_units": int(item["shared_units"]),
+                "sre_units": int(item["sre_units"]),
+            }
+            != evidence["capacity"]
+            or admission["topic"] not in {"development.admission", "sre.admission"}
+            or admission["state"] != "CLAIMED"
+            or admission["claimed_by"] != evidence["endpoint_id"]
+            or admission["recipient_session_id"] != evidence["endpoint_id"]
+            or admission["payload_sha256"] != evidence["admission_payload_sha256"]
+            or admission["updated_at"] != evidence["admission_updated_at"]
+            or admission_envelope is None
+            or admission_envelope.payload_sha256
+            != evidence["admission_payload_sha256"]
+            or admission_source.get("repository") != repository
+            or admission_source.get("object_kind") != "issue"
+            or admission_source.get("object_number") != issue_number
+            or admission_source.get("payload_sha256")
+            != evidence["bound_source_sha256"]
+            or admission_payload.get("issue_number") != issue_number
+            or admission_payload.get("generation") != evidence["generation"]
+            or admission_payload.get("lease_manifest_sha256")
+            != evidence["lease_manifest_sha256"]
+            or watch["repository"] != repository
+            or int(watch["issue_number"]) != issue_number
+            or int(watch["generation"]) != evidence["generation"]
+            or watch["state"] != "ACTIVE"
+            or watch["process_id"] is not None
+            or watch["accountable_session_id"] != evidence["endpoint_id"]
+            or watch["lease_manifest_sha256"] != evidence["lease_manifest_sha256"]
+            or int(watch["admission_message_id"] or 0)
+            != evidence["admission_message_id"]
+            or watch["admission_payload_sha256"]
+            != evidence["admission_payload_sha256"]
+            or watch["claim_attempt_id"] != evidence["claim_attempt_id"]
+            or watch["updated_at"] != evidence["watch_updated_at"]
+        ):
+            raise CoordinationError("PARK_LINEAGE_DRIFT")
+
+        current = self.current_snapshot(repository, "issue", issue_number)
+        equivalence = self.connection.execute(
+            "SELECT * FROM coordination_admission_source_equivalence "
+            "WHERE receipt_sha256=?",
+            (evidence["source_equivalence_receipt_sha256"],),
+        ).fetchone()
+        if (
+            current is None
+            or current.payload_sha256 != evidence["current_source_sha256"]
+            or evidence["bound_source_sha256"] == evidence["current_source_sha256"]
+            or equivalence is None
+            or equivalence["repository"] != repository
+            or int(equivalence["issue_number"]) != issue_number
+            or int(equivalence["generation"]) != evidence["generation"]
+            or int(equivalence["message_id"])
+            != evidence["admission_message_id"]
+            or equivalence["watch_key"] != evidence["watch_key"]
+            or int(equivalence["item_version"]) != evidence["item_version"]
+            or equivalence["bound_source_sha256"]
+            != evidence["bound_source_sha256"]
+            or equivalence["current_source_sha256"]
+            != evidence["current_source_sha256"]
+            or equivalence["stable_source_sha256"]
+            != evidence["stable_source_sha256"]
+            or equivalence["endpoint_id"] != evidence["endpoint_id"]
+            or equivalence["claim_attempt_id"] != evidence["claim_attempt_id"]
+            or equivalence["lease_manifest_sha256"]
+            != evidence["lease_manifest_sha256"]
+            or not active_admission_source_equivalence(
+                self.connection,
+                repository=repository,
+                issue_number=issue_number,
+                generation=evidence["generation"],
+                message_id=evidence["admission_message_id"],
+                watch_key=evidence["watch_key"],
+                item_version=evidence["item_version"],
+                bound_source_sha256=evidence["bound_source_sha256"],
+                current_source_sha256=evidence["current_source_sha256"],
+                endpoint_id=evidence["endpoint_id"],
+                claimant=evidence["endpoint_id"],
+                claim_attempt_id=evidence["claim_attempt_id"],
+                lease_manifest_sha256=evidence["lease_manifest_sha256"],
+            )
+        ):
+            raise CoordinationError("PARK_SOURCE_EQUIVALENCE_DRIFT")
+
+        graph = self.connection.execute(
+            "SELECT c.version,c.observed_main_sha,c.health,r.graph_sha256 "
+            "FROM portfolio_graph_current c JOIN portfolio_graph_revisions r "
+            "ON r.repository=c.repository AND r.version=c.version "
+            "WHERE c.repository=?",
+            (repository,),
+        ).fetchone()
+        graph_node = self.connection.execute(
+            "SELECT source_payload_sha256 FROM portfolio_graph_nodes "
+            "WHERE repository=? AND graph_version=? AND issue_number=?",
+            (repository, evidence["graph_version"], issue_number),
+        ).fetchone()
+        if (
+            graph is None
+            or graph["health"] != "CURRENT"
+            or int(graph["version"]) != evidence["graph_version"]
+            or graph["graph_sha256"] != evidence["graph_sha256"]
+            or graph["observed_main_sha"] != evidence["graph_main_sha"]
+            or graph_node is None
+            or graph_node["source_payload_sha256"]
+            != evidence["current_source_sha256"]
+        ):
+            raise CoordinationError("PARK_GRAPH_DRIFT")
+        policy = self.connection.execute(
+            "SELECT p.* FROM coordination_capacity_current c "
+            "JOIN coordination_capacity_policies p "
+            "ON p.repository=c.repository AND p.version=c.version "
+            "WHERE c.repository=?",
+            (repository,),
+        ).fetchone()
+        if (
+            policy is None
+            or int(policy["version"]) != evidence["capacity_policy_version"]
+            or digest_json(dict(policy)) != evidence["capacity_policy_sha256"]
+        ):
+            raise CoordinationError("PARK_CAPACITY_POLICY_DRIFT")
+
+        artifact, raw_artifact = self.read_registered_artifact(
+            artifact_key=evidence["retained_artifact_key"],
+            repository=repository,
+            issue_number=issue_number,
+            generation=evidence["generation"],
+            expected_content_sha256=evidence["retained_artifact_sha256"],
+            expected_retention_class="RETAINED",
+            _transaction=False,
+        )
+        preservation = validate_claimed_no_delivery_preservation(
+            raw_artifact, evidence=evidence
+        )
+
+        claim_attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?",
+            (evidence["claim_attempt_id"],),
+        ).fetchone()
+        preservation_attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?",
+            (evidence["preservation_attempt_id"],),
+        ).fetchone()
+        development_endpoint = current_endpoint(self.connection, "development")
+        preservation_lineage_sha256 = digest_json(
+            {
+                "generation": evidence["generation"],
+                "issue_number": issue_number,
+                "lease_manifest_sha256": evidence["lease_manifest_sha256"],
+                "repository": repository,
+            }
+        )
+        if (
+            claim_attempt is None
+            or claim_attempt["endpoint_id"] != evidence["endpoint_id"]
+            or claim_attempt["state"] not in {"COMPLETE", "HOLD"}
+            or claim_attempt["target_kind"] != "message"
+            or claim_attempt["target_key"] != str(evidence["admission_message_id"])
+            or claim_attempt["lineage_repository"] != repository
+            or int(claim_attempt["lineage_issue_number"] or -1) != issue_number
+            or claim_attempt["lineage_generation"] is None
+            or int(claim_attempt["lineage_generation"])
+            != evidence["generation"]
+            or claim_attempt["lineage_lease_sha256"]
+            != evidence["lease_manifest_sha256"]
+            or preservation_attempt is None
+            or preservation_attempt["role"] != "development"
+            or development_endpoint is None
+            or development_endpoint["endpoint_id"] != evidence["endpoint_id"]
+            or preservation_attempt["endpoint_id"] != evidence["endpoint_id"]
+            or preservation_attempt["state"] not in {"COMPLETE", "HOLD"}
+            or preservation_attempt["attempt_id"] == claim_attempt["attempt_id"]
+            or preservation_attempt["target_kind"] != "terminal_watch"
+            or preservation_attempt["target_key"] != evidence["watch_key"]
+            or preservation_attempt["repository_scope"]
+            != repository.casefold()
+            or preservation_attempt["lineage_repository"] != repository
+            or int(preservation_attempt["lineage_issue_number"] or -1)
+            != issue_number
+            or preservation_attempt["lineage_generation"] is None
+            or int(preservation_attempt["lineage_generation"])
+            != evidence["generation"]
+            or preservation_attempt["lineage_lease_sha256"]
+            != evidence["lease_manifest_sha256"]
+            or preservation_attempt["lineage_sha256"]
+            != preservation_lineage_sha256
+            or self.connection.execute(
+                "SELECT 1 FROM executor_attempts WHERE state IN "
+                "('RESERVED','LAUNCHING','RUNNING') AND ("
+                "(lineage_repository=? AND lineage_issue_number=? AND lineage_generation=?) "
+                "OR (target_kind='message' AND target_key=?) "
+                "OR (target_kind='terminal_watch' AND target_key=?)) LIMIT 1",
+                (
+                    repository,
+                    issue_number,
+                    evidence["generation"],
+                    str(evidence["admission_message_id"]),
+                    evidence["watch_key"],
+                ),
+            ).fetchone()
+            is not None
+        ):
+            raise CoordinationError("PARK_ATTEMPT_LIVENESS_CONFLICT")
+
+        delivery_tables = (
+            ("coordination_pre_push_gates", "admission_message_id=?"),
+            ("coordination_pre_push_publications", "admission_message_id=?"),
+            ("coordination_terminal_closeout_packets", "activation_message_id=?"),
+        )
+        for table, predicate in delivery_tables:
+            if self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() is not None and self.connection.execute(
+                f"SELECT 1 FROM {table} WHERE {predicate} LIMIT 1",
+                (evidence["admission_message_id"],),
+            ).fetchone() is not None:
+                raise CoordinationError("PARK_DELIVERY_EVIDENCE_PRESENT")
+
+        outboxes = self.connection.execute(
+            "SELECT * FROM github_outbox WHERE repository=? "
+            "AND object_kind='issue' AND object_number=? AND created_at>=?",
+            (repository, issue_number, admission["created_at"]),
+        ).fetchall()
+        approval_table = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='approval_decisions'"
+        ).fetchone()
+        for outbox in outboxes:
+            approval_control = bool(
+                approval_table is not None
+                and outbox["state"] == "COMPLETE"
+                and outbox["operation"] == "comment"
+                and self.connection.execute(
+                    "SELECT 1 FROM approval_decisions WHERE owner_outbox_id=?",
+                    (outbox["id"],),
+                ).fetchone()
+                is not None
+            )
+            if not approval_control:
+                raise CoordinationError("PARK_DELIVERY_OUTBOX_PRESENT")
+        return {
+            "item": dict(item),
+            "admission": dict(admission),
+            "watch": dict(watch),
+            "current_source": current.payload_sha256,
+            "equivalence": dict(equivalence),
+            "graph": dict(graph),
+            "policy": dict(policy),
+            "artifact": artifact,
+            "preservation": preservation,
+        }
+
+    def _claimed_no_delivery_park_snapshot_locked(
+        self, evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run the shared validator inside this store's atomic transaction."""
+
+        return validate_claimed_no_delivery_park_snapshot(
+            self.connection,
+            artifact_root=self.artifact_root,
+            evidence=evidence,
+        )
+
+    def enqueue_claimed_no_delivery_park_message(
+        self,
+        *,
+        idempotency_key: str,
+        recipient_session_id: str,
+        payload: dict[str, Any],
+        now: str,
+        _transaction: bool = True,
+    ) -> int:
+        """Prepare reserved PARK only from the exact equivalence-bound gateway."""
+
+        recipient_session_id = canonicalize_coordination_identity(
+            self.connection, recipient_session_id
+        )
+        if (
+            not idempotency_key
+            or coordination_identity_role(self.connection, recipient_session_id)
+            != "planner"
+        ):
+            raise CoordinationError("PARK_PREPARER_INVALID")
+        payload = copy.deepcopy(payload)
+        envelope = parse_coordination_envelope(canonical_json(payload))
+        if envelope.reserved_handler != "claimed_no_delivery_park":
+            raise CoordinationError("PARK_ENVELOPE_INVALID")
+        evidence = claimed_no_delivery_park_evidence(envelope.payload)
+        payload_json = canonical_json(envelope.payload)
+        with (self.transaction() if _transaction else nullcontext()):
+            self._validate_message_contract(
+                topic="coordination.notice",
+                recipient_session_id=recipient_session_id,
+                payload=envelope.payload,
+                current_write=True,
+            )
+            try:
+                self._claimed_no_delivery_park_snapshot_locked(evidence)
+            except CoordinationError as exc:
+                replay = self._committed_claimed_no_delivery_park_receipt_locked(
+                    payload_sha256=envelope.payload_sha256,
+                    evidence=evidence,
+                )
+                if replay is None:
+                    raise
+            current = self.connection.execute(
+                "SELECT id,recipient_session_id,topic,payload_sha256 "
+                "FROM coordination_messages WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if current is not None:
+                if (
+                    current["recipient_session_id"] != recipient_session_id
+                    or current["topic"] != "coordination.notice"
+                    or current["payload_sha256"] != envelope.payload_sha256
+                ):
+                    raise CoordinationError("IDEMPOTENCY_CONFLICT")
+                return int(current["id"])
+            cursor = self.connection.execute(
+                "INSERT INTO coordination_messages(idempotency_key,"
+                "recipient_session_id,topic,payload_sha256,payload_json,state,"
+                "created_at,updated_at) VALUES (?,?,'coordination.notice',?,?,"
+                "'PREPARED',?,?)",
+                (
+                    idempotency_key,
+                    recipient_session_id,
+                    envelope.payload_sha256,
+                    payload_json,
+                    now,
+                    now,
+                ),
+            )
+            message_id = int(cursor.lastrowid)
+            self._event(
+                "CLAIMED_NO_DELIVERY_PARK_PREPARED",
+                f"message:{message_id}",
+                {
+                    "request_sha256": envelope.payload_sha256,
+                    "repository": evidence["repository"],
+                    "issue_number": evidence["issue_number"],
+                },
+                now,
+            )
+        return message_id
+
+    def _committed_claimed_no_delivery_park_receipt_locked(
+        self,
+        *,
+        payload_sha256: str,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reconstruct the canonical receipt solely from immutable bindings."""
+        return committed_claimed_no_delivery_park_receipt(
+            self.connection,
+            payload_sha256=payload_sha256,
+            evidence=evidence,
+        )
+
+    def commit_claimed_no_delivery_park(
+        self,
+        *,
+        message_id: int,
+        session_id: str,
+        attempt_id: str,
+        executor_token: str,
+        expected_repository_observation_sha256: str,
+        repository_observer: Callable[[], str],
+        now: str,
+        _test_failpoint: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Commit or replay one exact no-delivery PARK transaction."""
+
+        _validate_sha256(expected_repository_observation_sha256)
+        session_id = canonicalize_coordination_identity(
+            self.connection, session_id
+        )
+        with self.transaction():
+            row = self.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()
+            if row is None or row["topic"] != "coordination.notice":
+                raise CoordinationError("PARK_MESSAGE_NOT_FOUND")
+            envelope = parse_coordination_envelope(row["payload_json"])
+            if (
+                envelope.payload_sha256 != row["payload_sha256"]
+                or envelope.reserved_handler != "claimed_no_delivery_park"
+            ):
+                raise CoordinationError("PARK_ENVELOPE_INVALID")
+            evidence = claimed_no_delivery_park_evidence(envelope.payload)
+            if (
+                evidence["repository_observation_sha256"]
+                != expected_repository_observation_sha256
+            ):
+                raise CoordinationError("PARK_REPOSITORY_OBSERVATION_DRIFT")
+            replay = self._committed_claimed_no_delivery_park_receipt_locked(
+                payload_sha256=envelope.payload_sha256,
+                evidence=evidence,
+            )
+            if replay is None:
+                observed_sha256 = repository_observer()
+                if observed_sha256 != expected_repository_observation_sha256:
+                    raise CoordinationError("PARK_REPOSITORY_OBSERVATION_DRIFT")
+            claimed = self.claim_claimed_no_delivery_park_message_in_transaction(
+                message_id,
+                session_id,
+                now,
+                attempt_id=attempt_id,
+                executor_token=executor_token,
+                _parsed_envelope=envelope,
+            )
+            if _test_failpoint is not None:
+                _test_failpoint("park.after_claim")
+            if replay is not None:
+                self._complete_message_in_transaction(
+                    message_id,
+                    session_id,
+                    now,
+                    gateway=_CLAIMED_NO_DELIVERY_PARK_GATEWAY,
+                )
+                if _test_failpoint is not None:
+                    _test_failpoint("park.after_replay_complete")
+                return replay
+            snapshot = self._claimed_no_delivery_park_snapshot_locked(evidence)
+            item_result = self._set_issue_status_locked(
+                repository=evidence["repository"],
+                issue_number=evidence["issue_number"],
+                status="PREPARED",
+                allocation_class="NONE",
+                generation=evidence["generation"] + 1,
+                accountable_session_id=None,
+                lease_manifest_sha256=None,
+                development_units=evidence["capacity"]["development_units"],
+                shared_units=evidence["capacity"]["shared_units"],
+                sre_units=evidence["capacity"]["sre_units"],
+                expected_source_sha256=evidence["current_source_sha256"],
+                expected_version=evidence["item_version"],
+                now=now,
+                transaction=False,
+                gateway=_CLAIMED_NO_DELIVERY_PARK_GATEWAY,
+            )
+            if _test_failpoint is not None:
+                _test_failpoint("park.after_item")
+            watch_update = self.connection.execute(
+                "UPDATE coordination_terminal_watches "
+                "SET last_error='PARKED_NO_DELIVERY', process_id=NULL, updated_at=? "
+                "WHERE watch_key=? AND state='COMPLETE' "
+                "AND admission_message_id=? AND admission_payload_sha256=?",
+                (
+                    now,
+                    evidence["watch_key"],
+                    evidence["admission_message_id"],
+                    evidence["admission_payload_sha256"],
+                ),
+            )
+            if watch_update.rowcount != 1:
+                raise CoordinationError("PARK_WATCH_CONFLICT")
+            if _test_failpoint is not None:
+                _test_failpoint("park.after_watch")
+            self._complete_message_in_transaction(
+                message_id,
+                session_id,
+                now,
+                gateway=_CLAIMED_NO_DELIVERY_PARK_GATEWAY,
+            )
+            receipt = self._committed_claimed_no_delivery_park_receipt_locked(
+                payload_sha256=envelope.payload_sha256,
+                evidence=evidence,
+            )
+            if receipt is None:
+                raise CoordinationError("PARK_RECEIPT_MISSING")
+            if item_result.get("portfolio_dirty_event_id") != receipt[
+                "portfolio_dirty_event_id"
+            ]:
+                raise CoordinationError("PARK_DIRTY_EVENT_CONFLICT")
+            self._event(
+                "CLAIMED_NO_DELIVERY_PARKED",
+                f"{evidence['repository']}:issue:{evidence['issue_number']}",
+                {
+                    "message_id": int(claimed["id"]),
+                    "receipt_sha256": receipt["receipt_sha256"],
+                },
+                now,
+            )
+            if _test_failpoint is not None:
+                _test_failpoint("park.after_receipt_event")
+            return receipt
 
     def enqueue_message(
         self,
@@ -6445,6 +7521,42 @@ class CoordinationStore:
             or not isinstance(attempt["lineage_sha256"], str)
         ):
             raise CoordinationError("TERMINAL_ATTEMPT_LINEAGE_MISMATCH")
+        return dict(attempt)
+
+    def _require_current_planner_message_attempt(
+        self,
+        *,
+        attempt_id: str | None,
+        executor_token: str | None,
+        message_id: int,
+    ) -> dict[str, Any]:
+        """Authenticate the current Planner's exact RUNNING message attempt."""
+
+        if (
+            not isinstance(attempt_id, str)
+            or SESSION.fullmatch(attempt_id) is None
+            or not isinstance(executor_token, str)
+            or not executor_token
+        ):
+            raise CoordinationError("PARK_ATTEMPT_REQUIRED")
+        attempt = self.connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        if attempt is None:
+            raise CoordinationError("PARK_ATTEMPT_NOT_FOUND")
+        token_sha256 = hashlib.sha256(executor_token.encode("utf-8")).hexdigest()
+        endpoint = current_endpoint(self.connection, "planner")
+        if not hmac.compare_digest(str(attempt["token_sha256"]), token_sha256):
+            raise CoordinationError("PARK_ATTEMPT_TOKEN_MISMATCH")
+        if (
+            attempt["role"] != "planner"
+            or attempt["state"] != "RUNNING"
+            or attempt["target_kind"] != "message"
+            or attempt["target_key"] != str(message_id)
+            or endpoint is None
+            or attempt["endpoint_id"] != endpoint["endpoint_id"]
+        ):
+            raise CoordinationError("PARK_ATTEMPT_TARGET_MISMATCH")
         return dict(attempt)
 
     def _require_terminal_lineage_attempt(
@@ -8568,6 +9680,7 @@ class CoordinationStore:
         gateway: object | None = None,
         attempt_id: str | None = None,
         executor_token: str | None = None,
+        _parsed_envelope: ParsedCoordinationEnvelope | None = None,
     ) -> dict[str, Any]:
         if not self.connection.in_transaction:
             raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
@@ -8580,6 +9693,33 @@ class CoordinationStore:
         ).fetchone()
         if row is None:
             raise CoordinationError("MESSAGE_NOT_FOUND")
+        if (
+            _parsed_envelope is not None
+            and gateway is not _CLAIMED_NO_DELIVERY_PARK_GATEWAY
+        ):
+            raise CoordinationError("PARK_PARSED_ENVELOPE_GATEWAY_REQUIRED")
+        envelope = (
+            parse_coordination_envelope(row["payload_json"])
+            if _parsed_envelope is None
+            else _parsed_envelope
+        )
+        if envelope.payload_sha256 != row["payload_sha256"]:
+            raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
+        if (
+            _parsed_envelope is not None
+            and canonical_json(envelope.payload) != row["payload_json"]
+        ):
+            raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
+        if (
+            envelope.reserved_handler == "claimed_no_delivery_park"
+            and gateway is not _CLAIMED_NO_DELIVERY_PARK_GATEWAY
+        ):
+            raise CoordinationError("CLAIMED_NO_DELIVERY_PARK_HANDLER_REQUIRED")
+        if (
+            gateway is _CLAIMED_NO_DELIVERY_PARK_GATEWAY
+            and envelope.reserved_handler != "claimed_no_delivery_park"
+        ):
+            raise CoordinationError("CLAIMED_NO_DELIVERY_PARK_ENVELOPE_REQUIRED")
         readiness_bound = self._readiness_decision_notice_bound(message_id)
         resolution_bound = self._readiness_resolution_notice_bound(message_id)
         if readiness_bound and gateway is not _READINESS_DECISION_GATEWAY:
@@ -8597,10 +9737,12 @@ class CoordinationStore:
             )
         ):
             raise CoordinationError("MESSAGE_STATE_CONFLICT")
-        payload = json.loads(row["payload_json"])
-        if digest_json(payload) != row["payload_sha256"]:
-            raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
-        if not readiness_bound and not resolution_bound:
+        payload = envelope.payload
+        if (
+            not readiness_bound
+            and not resolution_bound
+            and gateway is not _CLAIMED_NO_DELIVERY_PARK_GATEWAY
+        ):
             self._validate_message_source(payload)
         self._validate_message_contract(
             topic=row["topic"],
@@ -8608,6 +9750,14 @@ class CoordinationStore:
             payload=payload,
             message_id=message_id,
         )
+        if gateway is _CLAIMED_NO_DELIVERY_PARK_GATEWAY:
+            planner_attempt = self._require_current_planner_message_attempt(
+                attempt_id=attempt_id,
+                executor_token=executor_token,
+                message_id=message_id,
+            )
+            if planner_attempt["endpoint_id"] != canonical_session_id:
+                raise CoordinationError("PARK_ATTEMPT_TARGET_MISMATCH")
         admission_identity_error = (
             immutable_admission_error(
                 self.connection, message=row, payload=payload
@@ -8761,6 +9911,28 @@ class CoordinationStore:
             gateway=_READINESS_RESOLUTION_GATEWAY,
         )
 
+    def claim_claimed_no_delivery_park_message_in_transaction(
+        self,
+        message_id: int,
+        session_id: str,
+        now: str,
+        *,
+        attempt_id: str,
+        executor_token: str,
+        _parsed_envelope: ParsedCoordinationEnvelope | None = None,
+    ) -> dict[str, Any]:
+        """Claim one strictly routed PARK notice inside its atomic handler."""
+
+        return self._claim_message_in_transaction(
+            message_id,
+            session_id,
+            now,
+            gateway=_CLAIMED_NO_DELIVERY_PARK_GATEWAY,
+            attempt_id=attempt_id,
+            executor_token=executor_token,
+            _parsed_envelope=_parsed_envelope,
+        )
+
     def claim_message(
         self,
         message_id: int,
@@ -8870,7 +10042,11 @@ class CoordinationStore:
                 or not outbox["remote_receipt"]
             ):
                 raise CoordinationError("TERMINAL_OUTBOX_NOT_COMPLETE")
-        if not readiness_bound and not resolution_bound:
+        if (
+            not readiness_bound
+            and not resolution_bound
+            and gateway is not _CLAIMED_NO_DELIVERY_PARK_GATEWAY
+        ):
             self._validate_message_source(payload)
         self._validate_message_contract(
             topic=row["topic"],
