@@ -1587,6 +1587,59 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                         tool_root, target_root, self.catalog, manifest
                     )
 
+    def test_install_manifest_rejects_two_complete_source_suffix_matches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tool_name:
+            tool_root = Path(tool_name)
+            relative = "skills/example/profile.config.toml"
+            source = tool_root / relative
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"profile = true\n")
+            source.chmod(0o644)
+            source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+            destinations = (
+                f"first/{relative}",
+                f"second/{relative}",
+            )
+            self.assertEqual(2, len(set(destinations)))
+            self.assertTrue(
+                all(value.endswith(relative) for value in destinations)
+            )
+            manifest = baseline_runner.InstallManifest(
+                atom_id="ambiguous-source-suffix",
+                source_commit="1" * 40,
+                manifest_sha256="2" * 64,
+                raw_sha256="3" * 64,
+                entries=tuple(
+                    {
+                        "source_path": relative,
+                        "destination_path": destination,
+                        "source_sha256": source_sha256,
+                        "source_mode": 0o644,
+                        "destination_mode": 0o644,
+                        "destination_uid": os.getuid(),
+                        "destination_gid": os.getgid(),
+                        "destination_prior": {"state": "ABSENT"},
+                    }
+                    for destination in destinations
+                ),
+            )
+            with (
+                patch.object(
+                    baseline_runner,
+                    "_required_target_files",
+                    return_value={relative},
+                ),
+                self.assertRaisesRegex(
+                    baseline_runner.BaselineError,
+                    "BASELINE_INSTALL_MANIFEST_COVERAGE_INCOMPLETE",
+                ),
+            ):
+                baseline_runner._install_manifest_target_paths(
+                    tool_root, self.catalog, manifest
+                )
+
     def test_exact_planner_v3_catalog_mapping_accepts_attested_profile_fanout(
         self,
     ) -> None:
@@ -1855,6 +1908,284 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                         tool_root, self.catalog, manifest
                     )
 
+    def test_installed_runtime_public_entrypoint_accepts_exact_profile_fanout(
+        self,
+    ) -> None:
+        planner_profile = (
+            "skills/twinfinity-sprint-orchestrator/references/"
+            "twinfinity-planner-v3.config.toml"
+        )
+        root_profile_destination = ".codex/twinfinity-planner-v3.config.toml"
+        with tempfile.TemporaryDirectory() as name:
+            fixture_root = Path(name)
+            tool_root = fixture_root / "reviewed-source"
+            target_root = fixture_root / "installed-target"
+            evidence_root = fixture_root / "evidence"
+            runtime_root = fixture_root / "runtime"
+            for root in (tool_root, target_root, evidence_root, runtime_root):
+                root.mkdir(mode=0o700)
+
+            required = baseline_runner._required_target_files(
+                self.repository_root, self.catalog
+            )
+            self.assertEqual(215, len(required))
+            self.assertEqual(
+                "efcf4db0af3443a30748b98882093e24926e83230829bd52cb36046e4730b5a8",
+                baseline_runner.digest_json(sorted(required)),
+            )
+            entries: list[dict] = []
+            catalog_destinations: dict[str, str] = {}
+            for relative in sorted(required):
+                source_path = self.repository_root / relative
+                source_bytes = source_path.read_bytes()
+                source_mode = stat.S_IMODE(source_path.stat().st_mode)
+                reviewed_source = tool_root / relative
+                reviewed_source.parent.mkdir(parents=True, exist_ok=True)
+                reviewed_source.write_bytes(source_bytes)
+                reviewed_source.chmod(source_mode)
+
+                destination_path = f".codex/{relative}"
+                catalog_destinations[relative] = destination_path
+                installed = target_root / destination_path
+                installed.parent.mkdir(parents=True, exist_ok=True)
+                installed.write_bytes(source_bytes)
+                installed.chmod(source_mode)
+                entries.append(
+                    {
+                        "source_path": relative,
+                        "destination_path": destination_path,
+                        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                        "source_mode": source_mode,
+                        "destination_mode": source_mode,
+                        "destination_uid": os.getuid(),
+                        "destination_gid": os.getgid(),
+                        "destination_prior": {"state": "ABSENT"},
+                    }
+                )
+
+            profile_entry = next(
+                entry
+                for entry in entries
+                if entry["source_path"] == planner_profile
+            )
+            extra_profile = {
+                **profile_entry,
+                "destination_path": root_profile_destination,
+                "destination_mode": 0o600,
+            }
+            installed_profile = target_root / root_profile_destination
+            installed_profile.parent.mkdir(parents=True, exist_ok=True)
+            installed_profile.write_bytes((tool_root / planner_profile).read_bytes())
+            installed_profile.chmod(extra_profile["destination_mode"])
+
+            self._git(tool_root, "init", "-q")
+            self._git(tool_root, "add", ".")
+            self._git(
+                tool_root,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "installed-runtime-source",
+            )
+            source_commit = self._git(tool_root, "rev-parse", "HEAD")
+
+            manifest_payload = {
+                "schema": baseline_runner.INSTALL_MANIFEST_SCHEMA,
+                "manifest_sha256": "0" * 64,
+                "atom_id": "planner-v3-public-fanout",
+                "source_commit": source_commit,
+                "destination_root_identity": (
+                    baseline_runner._destination_root_identity(target_root)
+                ),
+                "entries": [extra_profile, *reversed(entries)],
+            }
+            manifest_payload["manifest_sha256"] = (
+                baseline_runner._install_manifest_digest(manifest_payload)
+            )
+            manifest_bytes = baseline_runner.canonical_json(manifest_payload).encode(
+                "utf-8"
+            )
+            manifest_path = evidence_root / "install-manifest.json"
+            manifest_path.write_bytes(manifest_bytes)
+            manifest_path.chmod(0o600)
+            manifest = baseline_runner.load_install_manifest(manifest_path)
+            self.assertEqual(216, len(manifest.entries))
+            self.assertEqual(
+                215, len({entry["source_path"] for entry in manifest.entries})
+            )
+            self.assertEqual(
+                216,
+                len({entry["destination_path"] for entry in manifest.entries}),
+            )
+            self.assertEqual(
+                manifest_payload["manifest_sha256"], manifest.manifest_sha256
+            )
+            self.assertEqual(
+                hashlib.sha256(manifest_bytes).hexdigest(), manifest.raw_sha256
+            )
+            self.assertEqual(
+                manifest_payload["destination_root_identity"],
+                manifest.destination_root_identity,
+            )
+
+            mapping = baseline_runner._install_manifest_target_paths(
+                tool_root, self.catalog, manifest
+            )
+            self.assertEqual(
+                catalog_destinations[planner_profile], mapping[planner_profile]
+            )
+            self.assertNotEqual(root_profile_destination, mapping[planner_profile])
+
+            installed_payload = {
+                "schema": baseline_runner.INSTALL_MANIFEST_SCHEMA,
+                "manifest_sha256": manifest.manifest_sha256,
+                "destination_root_identity": manifest.destination_root_identity,
+                "entries": [
+                    {
+                        "destination_path": entry["destination_path"],
+                        "destination_prior": entry["destination_prior"],
+                        "installed_sha256": entry["source_sha256"],
+                        "installed_mode": entry["destination_mode"],
+                        "installed_uid": entry["destination_uid"],
+                        "installed_gid": entry["destination_gid"],
+                        "destination_parent_identity": (
+                            baseline_runner._destination_parent_identity(
+                                target_root, entry["destination_path"]
+                            )
+                        ),
+                    }
+                    for entry in manifest.entries
+                ],
+                "state": "INSTALLED",
+            }
+            installed_payload["receipt_sha256"] = (
+                baseline_runner._install_receipt_digest(installed_payload)
+            )
+            installer_evidence = evidence_root / "rollback.json"
+            installer_evidence.write_text(
+                baseline_runner.canonical_json(installed_payload),
+                encoding="utf-8",
+            )
+            installer_evidence.chmod(0o600)
+
+            def run_public_entrypoint(receipt_path: Path) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        os.fspath(tool_root / baseline_runner.RUNNER_RELATIVE_PATH),
+                        "--single-root",
+                        os.fspath(target_root),
+                        "--root-kind",
+                        "installed-runtime",
+                        "--root-identity",
+                        f"install:{manifest.atom_id}",
+                        "--tool-root-identity",
+                        f"git:{source_commit}",
+                        "--install-manifest",
+                        os.fspath(manifest_path),
+                        "--installer-evidence",
+                        os.fspath(installer_evidence),
+                        "--receipt",
+                        os.fspath(receipt_path),
+                    ],
+                    check=False,
+                    cwd=tool_root,
+                    env=baseline_runner._environment(runtime_root),
+                    capture_output=True,
+                    timeout=120,
+                )
+
+            receipt_path = evidence_root / "installed-runtime-receipt.json"
+            result = run_public_entrypoint(receipt_path)
+            self.assertEqual(
+                0, result.returncode, result.stderr.decode("utf-8", errors="replace")
+            )
+            receipt = json.loads(result.stdout)
+            self.assertEqual("PASS", receipt["verdict"])
+            self.assertEqual(len(self.catalog.entries), receipt["result_count"])
+            self.assertEqual(
+                (baseline_runner.canonical_json(receipt) + "\n").encode("utf-8"),
+                result.stdout,
+            )
+            self.assertEqual(result.stdout, receipt_path.read_bytes())
+            self.assertEqual(
+                manifest.manifest_sha256,
+                receipt["target_root"]["install_manifest_sha256"],
+            )
+            self.assertEqual(
+                manifest.raw_sha256,
+                receipt["target_root"]["install_manifest_raw_sha256"],
+            )
+            self.assertEqual(
+                baseline_runner._install_manifest_byte_manifest(
+                    tool_root, target_root, self.catalog, manifest
+                ),
+                receipt["target_root"]["byte_manifest_sha256"],
+            )
+            self.assertEqual(
+                baseline_runner._target_filesystem_identity_sha256(target_root),
+                receipt["target_root"]["filesystem_identity_sha256"],
+            )
+            self.assertEqual(
+                hashlib.sha256(installer_evidence.read_bytes()).hexdigest(),
+                receipt["target_root"]["installer_state_evidence_sha256"],
+            )
+            self.assertEqual(
+                self.catalog.raw_sha256, receipt["catalog"]["target_raw_sha256"]
+            )
+            self.assertEqual(
+                [entry.entry_id for entry in self.catalog.entries],
+                [entry["id"] for entry in receipt["results"]],
+            )
+
+            repeated_entries = tuple(
+                entry
+                for entry in manifest.entries
+                if entry["source_path"] == planner_profile
+            )
+            self.assertEqual(2, len(repeated_entries))
+            evidence_by_destination = {
+                entry["destination_path"]: entry
+                for entry in installed_payload["entries"]
+            }
+            for entry in repeated_entries:
+                attestation = evidence_by_destination[entry["destination_path"]]
+                self.assertEqual(entry["source_sha256"], attestation["installed_sha256"])
+                self.assertEqual(entry["destination_mode"], attestation["installed_mode"])
+                self.assertEqual(entry["destination_uid"], attestation["installed_uid"])
+                self.assertEqual(entry["destination_gid"], attestation["installed_gid"])
+
+            drift_index = 0
+            for entry in repeated_entries:
+                destination = target_root / entry["destination_path"]
+                original_bytes = destination.read_bytes()
+                original_mode = entry["destination_mode"]
+                for drift_kind in ("bytes", "mode"):
+                    drift_index += 1
+                    drift_receipt = evidence_root / f"drift-{drift_index}.json"
+                    try:
+                        if drift_kind == "bytes":
+                            destination.write_bytes(b"drifted\n")
+                        else:
+                            destination.chmod(
+                                0o600 if original_mode != 0o600 else 0o644
+                            )
+                        drifted = run_public_entrypoint(drift_receipt)
+                        self.assertEqual(1, drifted.returncode)
+                        self.assertEqual(b"", drifted.stdout)
+                        self.assertIn(
+                            b"BASELINE_INSTALL_MANIFEST_BYTE_MISMATCH",
+                            drifted.stderr,
+                        )
+                        self.assertFalse(drift_receipt.exists())
+                    finally:
+                        destination.write_bytes(original_bytes)
+                        destination.chmod(original_mode)
+
     def test_documented_installed_runtime_uses_common_destination_root(self) -> None:
         readme = (
             self.repository_root
@@ -1995,14 +2326,21 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                     ):
                         baseline_runner.load_install_manifest(path)
 
-            payload["entries"][0]["destination_uid"] = os.getuid()
+            payload["entries"] = [{**first}]
             payload["entries"][0]["destination_prior"] = {
                 "state": "PRESENT",
                 "sha256": "3" * 64,
                 "mode": 0o644,
-                "uid": os.getuid() + 1,
+                "uid": os.getuid(),
                 "gid": os.getgid(),
             }
+            payload["manifest_sha256"] = baseline_runner._install_manifest_digest(payload)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest = baseline_runner.load_install_manifest(path)
+            self.assertEqual(
+                os.getuid(), manifest.entries[0]["destination_prior"]["uid"]
+            )
+            payload["entries"][0]["destination_prior"]["uid"] = os.getuid() + 1
             payload["manifest_sha256"] = baseline_runner._install_manifest_digest(payload)
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(
