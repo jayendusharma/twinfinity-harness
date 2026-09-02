@@ -654,7 +654,7 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     entries = manifest["entries"]
     if not isinstance(entries, list) or not entries:
         raise SourceInstallAtomError("INSTALL_ATOM_MANIFEST_SCHEMA_INVALID")
-    seen_sources: set[str] = set()
+    source_bindings: dict[str, tuple[str, int]] = {}
     seen_destinations: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != {
@@ -666,8 +666,7 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         destination = _relative(entry["destination_path"])
         prior = entry["destination_prior"]
         if (
-            source.as_posix() in seen_sources
-            or destination.as_posix() in seen_destinations
+            destination.as_posix() in seen_destinations
             or not isinstance(entry["source_sha256"], str)
             or SHA256.fullmatch(entry["source_sha256"]) is None
             or entry["source_mode"] not in (0o600, 0o644, 0o700, 0o755)
@@ -694,7 +693,14 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             )
         ):
             raise SourceInstallAtomError("INSTALL_ATOM_ENTRY_SCHEMA_INVALID")
-        seen_sources.add(source.as_posix())
+        source_key = source.as_posix()
+        source_binding = (entry["source_sha256"], entry["source_mode"])
+        if (
+            source_key in source_bindings
+            and source_bindings[source_key] != source_binding
+        ):
+            raise SourceInstallAtomError("INSTALL_ATOM_ENTRY_SCHEMA_INVALID")
+        source_bindings[source_key] = source_binding
         seen_destinations.add(destination.as_posix())
     return entries
 
