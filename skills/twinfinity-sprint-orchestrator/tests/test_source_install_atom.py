@@ -202,6 +202,149 @@ class SourceInstallAtomTests(unittest.TestCase):
             self.assertEqual(receipt["receipt_sha256"], atom.receipt_digest(receipt))
             self.assertNotIn(str(self.destination), atom.canonical_json(receipt))
 
+    def test_identical_source_fanout_stages_applies_and_rolls_back_each_destination(
+        self,
+    ) -> None:
+        manifest = self.manifest(two_entries=True)
+        first, second = manifest["entries"]  # type: ignore[misc]
+        for key in ("source_path", "source_sha256", "source_mode"):
+            second[key] = first[key]
+        manifest["manifest_sha256"] = atom.manifest_digest(manifest)  # type: ignore[arg-type]
+
+        stage = self.root / "fanout-stage"
+        rollback = self.root / "fanout-rollback"
+        staged = atom.stage_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=self.destination,
+            stage_root=stage,
+        )
+        validation = atom.validate_stage(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=self.destination,
+            stage_root=stage,
+        )
+        installed = atom.apply_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=self.destination,
+            stage_root=stage,
+            rollback_root=rollback,
+            confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+        )
+
+        self.assertEqual("STAGED", staged["state"])
+        self.assertEqual("PASS", validation["state"])
+        self.assertEqual("INSTALLED", installed["state"])
+        self.assertEqual(
+            ["installed.txt", "second-installed.txt"],
+            [entry["destination_path"] for entry in installed["entries"]],
+        )
+        self.assertEqual(
+            ["new\n", "new\n"],
+            [
+                (self.destination / "installed.txt").read_text(encoding="utf-8"),
+                (self.destination / "second-installed.txt").read_text(
+                    encoding="utf-8"
+                ),
+            ],
+        )
+
+        rolled_back = atom.rollback_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            destination_root=self.destination,
+            rollback_root=rollback,
+            confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+        )
+        self.assertEqual("ROLLED_BACK", rolled_back["state"])
+        self.assertEqual(
+            ["old\n", "second-old\n"],
+            [
+                (self.destination / "installed.txt").read_text(encoding="utf-8"),
+                (self.destination / "second-installed.txt").read_text(
+                    encoding="utf-8"
+                ),
+            ],
+        )
+        for receipt in (staged, validation, installed, rolled_back):
+            self.assertEqual(receipt["receipt_sha256"], atom.receipt_digest(receipt))
+
+    def test_conflicting_repeated_source_binding_fails_before_stage_creation(
+        self,
+    ) -> None:
+        for field, conflicting_value in (
+            ("source_sha256", "0" * 64),
+            ("source_mode", 0o644),
+        ):
+            with self.subTest(field=field):
+                manifest = self.manifest(two_entries=True)
+                first, second = manifest["entries"]  # type: ignore[misc]
+                for key in ("source_path", "source_sha256", "source_mode"):
+                    second[key] = first[key]
+                second[field] = conflicting_value
+                manifest["manifest_sha256"] = atom.manifest_digest(manifest)  # type: ignore[arg-type]
+                stage = self.root / f"conflicting-{field}-stage"
+
+                with self.assertRaisesRegex(
+                    atom.SourceInstallAtomError,
+                    "INSTALL_ATOM_ENTRY_SCHEMA_INVALID",
+                ):
+                    atom.stage_atom(
+                        manifest=manifest,  # type: ignore[arg-type]
+                        source_root=self.source,
+                        destination_root=self.destination,
+                        stage_root=stage,
+                    )
+
+                self.assertFalse(stage.exists())
+                self.assertEqual(
+                    "old\n",
+                    (self.destination / "installed.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                )
+                self.assertEqual(
+                    "second-old\n",
+                    (self.destination / "second-installed.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                )
+
+    def test_duplicate_destination_stays_rejected_before_stage_creation(
+        self,
+    ) -> None:
+        manifest = self.manifest(two_entries=True)
+        first, second = manifest["entries"]  # type: ignore[misc]
+        for key in ("source_path", "source_sha256", "source_mode"):
+            second[key] = first[key]
+        second["destination_path"] = first["destination_path"]
+        manifest["manifest_sha256"] = atom.manifest_digest(manifest)  # type: ignore[arg-type]
+        stage = self.root / "duplicate-destination-stage"
+
+        with self.assertRaisesRegex(
+            atom.SourceInstallAtomError,
+            "INSTALL_ATOM_ENTRY_SCHEMA_INVALID",
+        ):
+            atom.stage_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                source_root=self.source,
+                destination_root=self.destination,
+                stage_root=stage,
+            )
+
+        self.assertFalse(stage.exists())
+        self.assertEqual(
+            "old\n",
+            (self.destination / "installed.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "second-old\n",
+            (self.destination / "second-installed.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     def test_root_identity_is_versioned_opaque_and_stable_across_root_contents(
         self,
     ) -> None:
