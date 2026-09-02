@@ -19,8 +19,10 @@ from coordination_store import (
     DEFAULT_DATABASE,
     MUTATING_MESSAGE_TOPICS,
     canonical_json,
+    coordination_envelope_error_is_zero_write,
     coordination_identity_role,
     digest_json,
+    parse_coordination_envelope,
     recipient_matches_topic,
     terminal_watch_key,
     timestamp_after,
@@ -1018,10 +1020,12 @@ class CoordinationSupervisor:
         if row["state"] not in {"PREPARED", "CLAIMED"}:
             return None
         try:
-            payload = json.loads(row["payload_json"])
-            if digest_json(payload) != row["payload_sha256"]:
+            envelope = parse_coordination_envelope(row["payload_json"])
+            payload = envelope.payload
+            if envelope.payload_sha256 != row["payload_sha256"]:
                 raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
-            self.store._validate_message_source(payload)
+            if envelope.reserved_handler != "claimed_no_delivery_park":
+                self.store._validate_message_source(payload)
             self.store._validate_message_contract(
                 topic=row["topic"],
                 recipient_session_id=row["recipient_session_id"],
@@ -1054,15 +1058,23 @@ class CoordinationSupervisor:
                     and watch["admission_payload_sha256"] != row["payload_sha256"]
                 ):
                     raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
-        except (CoordinationError, RegistryError, json.JSONDecodeError) as exc:
+        except (CoordinationError, RegistryError) as exc:
             return str(exc) if isinstance(exc, CoordinationError) else "INVALID_MESSAGE"
         return None
 
     def _hold_stale_message(self, row: object, error: str, now: str) -> None:
+        if coordination_envelope_error_is_zero_write(
+            error, payload_json=row["payload_json"]
+        ):
+            return
         with self.store.transaction():
             self._hold_stale_message_locked(row, error, now)
 
     def _hold_stale_message_locked(self, row: object, error: str, now: str) -> None:
+        if coordination_envelope_error_is_zero_write(
+            error, payload_json=row["payload_json"]
+        ):
+            return
         cursor = self.store.connection.execute(
             "UPDATE coordination_messages SET state='HOLD', updated_at=?, last_error=? WHERE id=? AND state IN ('PREPARED', 'CLAIMED')",
             (now, error, row["id"]),
@@ -1233,6 +1245,10 @@ class CoordinationSupervisor:
             or wake["message_payload_sha256"] == row["payload_sha256"]
         ):
             return False
+        if coordination_envelope_error_is_zero_write(
+            "MESSAGE_PAYLOAD_MISMATCH", payload_json=row["payload_json"]
+        ):
+            return True
         with self.store.transaction():
             current = self.store.connection.execute(
                 "SELECT * FROM coordination_messages WHERE id=?", (row["id"],)
@@ -1249,6 +1265,11 @@ class CoordinationSupervisor:
                 == current["payload_sha256"]
             ):
                 return False
+            if coordination_envelope_error_is_zero_write(
+                "MESSAGE_PAYLOAD_MISMATCH",
+                payload_json=current["payload_json"],
+            ):
+                return True
             self._hold_stale_message_locked(current, "MESSAGE_PAYLOAD_MISMATCH", now)
             self.store.connection.execute(
                 """UPDATE coordination_wakes
@@ -1265,6 +1286,23 @@ class CoordinationSupervisor:
         return True
 
     def _reserve_wake(self, row: object, now: str) -> tuple[str | None, bool]:
+        if row["state"] in {"PREPARED", "CLAIMED"}:
+            if (
+                not recipient_matches_topic(
+                    self.store.connection,
+                    topic=row["topic"],
+                    recipient=row["recipient_session_id"],
+                )
+                and coordination_envelope_error_is_zero_write(
+                    "MESSAGE_ROLE_MISMATCH", payload_json=row["payload_json"]
+                )
+            ):
+                return None, False
+            advisory_error = self._message_contract_error(row)
+            if advisory_error is not None and coordination_envelope_error_is_zero_write(
+                advisory_error, payload_json=row["payload_json"]
+            ):
+                return None, False
         with self.store.transaction():
             # Re-read and validate at the reservation linearization point. The
             # earlier scan is advisory only; a source/item change between scan
@@ -1324,6 +1362,11 @@ class CoordinationSupervisor:
                 )
                 return wake_key, True
             if current["message_payload_sha256"] != current_row["payload_sha256"]:
+                if coordination_envelope_error_is_zero_write(
+                    "MESSAGE_PAYLOAD_MISMATCH",
+                    payload_json=current_row["payload_json"],
+                ):
+                    return wake_key, False
                 self._hold_stale_message_locked(
                     current_row, "MESSAGE_PAYLOAD_MISMATCH", now
                 )
@@ -1379,6 +1422,29 @@ class CoordinationSupervisor:
             )
 
     def _record_launch_failure(self, wake_key: str, now: str) -> None:
+        preview_wake = self.store.connection.execute(
+            "SELECT * FROM coordination_wakes WHERE wake_key=?",
+            (wake_key,),
+        ).fetchone()
+        preview_message = (
+            None
+            if preview_wake is None
+            else self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?",
+                (preview_wake["message_id"],),
+            ).fetchone()
+        )
+        if preview_wake is not None and preview_message is not None:
+            preview_error = (
+                "MESSAGE_PAYLOAD_MISMATCH"
+                if preview_wake["message_payload_sha256"]
+                != preview_message["payload_sha256"]
+                else self._message_contract_error(preview_message)
+            )
+            if preview_error is not None and coordination_envelope_error_is_zero_write(
+                preview_error, payload_json=preview_message["payload_json"]
+            ):
+                return
         with self.store.transaction():
             wake = self.store.connection.execute(
                 "SELECT * FROM coordination_wakes WHERE wake_key=?",
@@ -1400,6 +1466,11 @@ class CoordinationSupervisor:
                 self.store._event("WAKE_COMPLETED", wake_key, {}, now)
                 return
             if wake["message_payload_sha256"] != message["payload_sha256"]:
+                if coordination_envelope_error_is_zero_write(
+                    "MESSAGE_PAYLOAD_MISMATCH",
+                    payload_json=message["payload_json"],
+                ):
+                    return
                 self._hold_stale_message_locked(
                     message, "MESSAGE_PAYLOAD_MISMATCH", now
                 )
@@ -1419,6 +1490,10 @@ class CoordinationSupervisor:
                 return
             contract_error = self._message_contract_error(message)
             if contract_error is not None:
+                if coordination_envelope_error_is_zero_write(
+                    contract_error, payload_json=message["payload_json"]
+                ):
+                    return
                 self._hold_stale_message_locked(message, contract_error, now)
                 self.store.connection.execute(
                     """UPDATE coordination_wakes

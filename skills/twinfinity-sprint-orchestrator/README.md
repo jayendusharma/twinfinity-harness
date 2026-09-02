@@ -34,11 +34,17 @@ systemctl --user is-system-running
 | Canonical repository checkout | `/home/ubuntu/code/twinfinityapp` |
 | User unit directory | `/home/ubuntu/.config/systemd/user` |
 | Endpoint registry config | `/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/references/twinfinity-executor-registry.toml` |
-| Planner current profile | `/home/ubuntu/.codex/twinfinity-planner-v2.config.toml` |
+| Planner source-current profile | `/home/ubuntu/.codex/twinfinity-planner-v3.config.toml` |
 | Development source-current profile | `/home/ubuntu/.codex/twinfinity-development-v6.config.toml` |
 | SRE source-current profile | `/home/ubuntu/.codex/twinfinity-sre-v6.config.toml` |
 
-Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The reviewed source catalog targets Planner v2, Development v6, and SRE v6; each execution role preserves v3 as its exact direct rollback endpoint, and v5 alone remains broker-only. A source-catalog target is not evidence that the corresponding profile is installed or that the live pointer has moved. A current runtime launch validates only its exact selected current installed profile. An explicit catalog audit or staged activation boundary uses `executor_registry.py --profile-root <absolute-staged-reference-root> audit-config` and validates the complete catalog without reading or writing live `CODEX_HOME`. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
+Codex profile files follow the official `$CODEX_HOME/profile-name.config.toml` convention and are selected by `--profile profile-name`. The reviewed source catalog targets Planner v3, Development v6, and SRE v6; Planner preserves v2 as its exact direct rollback endpoint, each execution role preserves v3, and v5 alone remains broker-only. Planner v3 uses the read-only `planner-park/v1` protocol described below. A source-catalog target is not evidence that the corresponding profile is installed or that the live pointer has moved. A current runtime launch validates only its exact selected current installed profile. An explicit catalog audit or staged activation boundary uses `executor_registry.py --profile-root <absolute-staged-reference-root> audit-config` and validates the complete catalog without reading or writing live `CODEX_HOME`. Recreate authentication separately on a new machine; never copy secrets into endpoint config, SQLite plans, unit files, archives, or this guide.
+
+### Planner v3 claimed-no-delivery PARK
+
+An ordinary Planner v3 `coordination.notice` remains non-authorizing and read-only. Only the closed claimed-no-delivery PARK schema may request the fixed controller command. The runner removes the raw attempt token and database path from the Codex child, binds the exact Codex/profile/config/managed-hook/controller/source bytes and process identities, pauses heartbeats behind a zero-WAL `BEGIN IMMEDIATE` barrier, and releases the prompt only after the one-use local capability is armed. The actual synchronous nested Bash `PreToolUse` hook must validate the exact raw command and session/turn/tool identity; the controller then reauthenticates, performs two byte-identical current Git/GitHub observations, adopts the capability, and alone opens the writable store for the atomic PARK or official replay.
+
+Missing, duplicate, malformed, expired, replayed, wrong-process, command-drifted, configuration-drifted, or specialized-tool events are terminal `HOLD`. No alternate tool path receives mutation authority. Crash, hook absence/failure, timeout, barrier failure, or denial leaves the PARK target and controller-owned allocation, lease, watch, dirty-event, and release state unchanged. This source protocol never authorizes installing the profile, advancing a live endpoint pointer, or PARKing a live lineage.
 
 ## Clean control-plane bootstrap
 

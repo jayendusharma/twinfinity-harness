@@ -735,6 +735,429 @@ class DeliveryGuardTests(unittest.TestCase):
                     )
                 )
 
+    def test_ordinary_planner_denies_escalation_and_sqlite_mutation_without_effect(self) -> None:
+        self.load_context.return_value = DeliveryContext(
+            role="planner",
+            endpoint_id="role.planner.v3",
+            target_kind="message",
+            target_key="1",
+            topic="coordination.notice",
+            worktree=None,
+            lease_paths=frozenset(),
+            repository_writes=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "synthetic-coordination.sqlite3"
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE fixture (id INTEGER PRIMARY KEY,value TEXT)"
+                )
+                connection.execute("INSERT INTO fixture(value) VALUES ('bound')")
+                connection.commit()
+            finally:
+                connection.close()
+
+            def database_snapshot() -> dict[str, tuple[int, int, str]]:
+                snapshot: dict[str, tuple[int, int, str]] = {}
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    path = Path(f"{database}{suffix}")
+                    if path.exists():
+                        metadata = path.stat()
+                        snapshot[path.name] = (
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            hashlib.sha256(path.read_bytes()).hexdigest(),
+                        )
+                return snapshot
+
+            before = database_snapshot()
+            commands = (
+                (
+                    f"sqlite3 {database} 'UPDATE fixture SET value=\"direct\"'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    "rg -n fixture .\n"
+                    f"sqlite3 {database} 'DELETE FROM fixture'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"bash -lc \"sqlite3 {database} 'DELETE FROM fixture'\"",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"env sqlite3 {database} 'INSERT INTO fixture(value) VALUES (\"wrapped\")'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"env --split-string=\"sqlite3 {database} 'DELETE FROM fixture'\"",
+                    "DELIVERY_WRAPPED_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"command -p sqlite3 {database} 'DELETE FROM fixture'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"sudo -n sqlite3 {database} 'VACUUM'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"/usr/bin/time sqlite3 {database} 'CREATE TABLE escaped(value)'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"/usr/bin/time -o {database} rg -n fixture .",
+                    "DELIVERY_WRAPPED_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"/usr/bin/time --output={database} rg -n fixture .",
+                    "DELIVERY_WRAPPED_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"find {database.parent} -exec sqlite3 {database} 'DELETE FROM fixture' ';'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"taskset 0x1 sqlite3 {database} 'DELETE FROM fixture'",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"ionice sqlite3 {database} 'DELETE FROM fixture'",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    "awk 'BEGIN { system(\"sqlite3 "
+                    f"{database} \\\"DELETE FROM fixture\\\"\") }}'",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"builtin eval \"sqlite3 {database} 'DELETE FROM fixture'\"",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"busybox sh -c \"sqlite3 {database} 'DELETE FROM fixture'\"",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    "./synthetic-sqlite-mutator",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"sed -n '1e sqlite3 {database} \"DELETE FROM fixture\"' /etc/hostname",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"sort -o{database} /etc/hostname",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"find {database.parent} -maxdepth 0 -fprintf {database} escaped",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                (
+                    f"xxd -r /etc/hostname {database}",
+                    "PLANNER_NON_PARK_COMMAND_UNDETERMINED",
+                ),
+                ((
+                    "python3 -c 'import sqlite3; "
+                    f"sqlite3.connect(\"{database}\").execute(\"DELETE FROM fixture\")'"
+                ), "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN"),
+                (
+                    "python3 -m unittest synthetic_sqlite_mutator",
+                    "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN",
+                ),
+                ((
+                    "/usr/bin/python3.12 -c 'import sqlite3; "
+                    f"sqlite3.connect(\"{database}\").execute(\"UPDATE fixture SET value=1\")'"
+                ), "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN"),
+                ((
+                    "python3 -c 'import _sqlite3; "
+                    f"_sqlite3.connect(\"{database}\").execute(\"CREATE TABLE escaped(value)\")'"
+                ), "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN"),
+                ((
+                    "python3 -c 'm=__import__(\"sql\"+\"ite3\");"
+                    f"m.connect(\"{database}\").execute(\"DELETE FROM fixture\")'"
+                ), "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN"),
+                ((
+                    "node -e 'require(\"better-sqlite3\")"
+                    f"(\"{database}\").prepare(\"DELETE FROM fixture\").run()'"
+                ), "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN"),
+                ((
+                    "node --eval='require(\"child_process\").execFileSync("
+                    f"\"sqlite3\",[\"{database}\",\"DELETE FROM fixture\"])'"
+                ), "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN"),
+                ((
+                    "printf 'require(\"child_process\").execFileSync("
+                    f"\"sqlite3\",[\"{database}\",\"DELETE FROM fixture\"])' | node"
+                ), "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN"),
+                (
+                    "ruby -r./synthetic_sqlite_mutator",
+                    "PLANNER_NON_PARK_INTERPRETER_FORBIDDEN",
+                ),
+                (
+                    f"sqlite3 -readonly {database} 'PRAGMA user_version(7)'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"sqlite3 -readonly {database} 'PRAGMA schema_version(7)'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"sqlite3 -readonly {database} 'SELECT writefile/**/(\"{database.parent / 'escaped.txt'}\",\"x\")'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    f"sqlite3 -readonly {database} 'SELECT \"writefile\"(\"{database.parent / 'escaped-quoted.txt'}\",\"x\")'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+                (
+                    "VISUAL='sh -c \"sqlite3 "
+                    f"{database} \\\"DELETE FROM fixture\\\"\" sh' "
+                    f"sqlite3 -readonly {database} 'SELECT edit(\"x\")'",
+                    "PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN",
+                ),
+            )
+            for command, expected_reason in commands:
+                with self.subTest(command=command):
+                    output = pre_tool(self.event("exec_command", {"cmd": command}))
+                    self.assert_denied(output)
+                    self.assertEqual(
+                        expected_reason,
+                        output["hookSpecificOutput"]["permissionDecisionReason"],
+                    )
+                    self.assertEqual(before, database_snapshot())
+
+            escalated = pre_tool(
+                self.event(
+                    "exec_command",
+                    {
+                        "cmd": "rg -n fixture .",
+                        "sandbox_permissions": "require_escalated",
+                        "justification": "synthetic test",
+                    },
+                )
+            )
+            self.assert_denied(escalated)
+            self.assertEqual(
+                "PLANNER_NON_PARK_ESCALATION_FORBIDDEN",
+                escalated["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            nested = pre_tool(
+                self.event(
+                    "functions.exec",
+                    {
+                        "source": (
+                            "const r = await tools.exec_command({"
+                            "cmd:\"rg -n fixture .\","
+                            "sandbox_permissions:\"require_escalated\","
+                            "justification:\"synthetic test\"});"
+                        )
+                    },
+                )
+            )
+            self.assert_denied(nested)
+            self.assertEqual(
+                "PLANNER_NON_PARK_ESCALATION_FORBIDDEN",
+                nested["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            spread = pre_tool(
+                self.event(
+                    "functions.exec",
+                    {
+                        "source": (
+                            "const options = {sandbox_permissions:"
+                            "\"require_escalated\"};"
+                            "const r = await tools.exec_command({"
+                            "cmd:\"rg -n fixture .\",...options});"
+                        )
+                    },
+                )
+            )
+            self.assert_denied(spread)
+            self.assertEqual(
+                "DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED",
+                spread["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            computed = pre_tool(
+                self.event(
+                    "functions.exec",
+                    {
+                        "source": (
+                            "const r = await tools.exec_command({"
+                            "cmd:\"rg -n fixture .\","
+                            "[\"sandbox_\"+\"permissions\"]:"
+                            "\"require_escalated\"});"
+                        )
+                    },
+                )
+            )
+            self.assert_denied(computed)
+            self.assertEqual(
+                "DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED",
+                computed["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            unicode_identifiers = pre_tool(
+                self.event(
+                    "functions.exec",
+                    {
+                        "source": (
+                            "const r = await to\\u006fls.exec_command({"
+                            "c\\u006dd:\"touch /synthetic-forbidden\","
+                            "sandbox_permissions:\"require_escalated\","
+                            "justification:\"synthetic test\"});"
+                        )
+                    },
+                )
+            )
+            self.assert_denied(unicode_identifiers)
+            self.assertEqual(
+                "DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED",
+                unicode_identifiers["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            cooked_template = pre_tool(
+                self.event(
+                    "functions.exec",
+                    {
+                        "source": (
+                            "const r = await tools.exec_command({"
+                            "cmd:\"rg -n fixture .\","
+                            "sandbox_permissions:`require\\u005fescalated`,"
+                            "justification:\"synthetic test\"});"
+                        )
+                    },
+                )
+            )
+            self.assert_denied(cooked_template)
+            self.assertEqual(
+                "DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED",
+                cooked_template["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            identity_escape = pre_tool(
+                self.event(
+                    "functions.exec",
+                    {
+                        "source": (
+                            "const r = await tools.exec_command({"
+                            "cmd:'rg -n fixture .',"
+                            "sandbox_permissions:'require\\_escalated',"
+                            "justification:'synthetic test'});"
+                        )
+                    },
+                )
+            )
+            self.assert_denied(identity_escape)
+            self.assertEqual(
+                "DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED",
+                identity_escape["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            quoted_escalation = pre_tool(
+                self.event(
+                    "functions.exec",
+                    {
+                        "source": (
+                            "const r = await tools.exec_command({"
+                            "\"cmd\":\"rg -n fixture .\","
+                            "\"sandbox_permissions\":\"require_escalated\","
+                            "\"justification\":\"synthetic test\"});"
+                        )
+                    },
+                )
+            )
+            self.assert_denied(quoted_escalation)
+            self.assertEqual(
+                "PLANNER_NON_PARK_ESCALATION_FORBIDDEN",
+                quoted_escalation["hookSpecificOutput"]["permissionDecisionReason"],
+            )
+            self.assertEqual(before, database_snapshot())
+
+            for command in (
+                "rg -n fixture .",
+                "printf 'line one\nline two'",
+                "/usr/bin/time -f '%e' rg -n fixture .",
+                "gh issue view 144 --repo jayendusharma/twinfinity-harness",
+                f"sqlite3 -readonly {database} 'SELECT value FROM fixture'",
+                f"sqlite3 -readonly {database} 'PRAGMA integrity_check;'",
+                (
+                    f"sqlite3 -readonly {database} 'WITH rows(value) AS "
+                    "(SELECT value FROM fixture) SELECT * FROM rows'"
+                ),
+                f"sqlite3 -readonly {database} '.schema fixture'",
+            ):
+                with self.subTest(read_only=command):
+                    self.assertEqual(
+                        {}, pre_tool(self.event("exec_command", {"cmd": command}))
+                    )
+                    self.assertEqual(before, database_snapshot())
+            self.assertEqual(
+                {},
+                pre_tool(
+                    self.event(
+                        "functions.exec",
+                        {
+                            "source": (
+                                "const r = await tools.exec_command({"
+                                "cmd:\"rg -n fixture .\"});"
+                            )
+                        },
+                    )
+                ),
+            )
+            self.assertEqual(before, database_snapshot())
+            for source in (
+                (
+                    "const r = await tools.exec_command({"
+                    "cmd:\"rg -n fixture .\",});"
+                ),
+                (
+                    "const r = await tools.exec_command({"
+                    "\"cmd\":\"rg -n fixture .\"});"
+                ),
+            ):
+                with self.subTest(read_only_nested_source=source):
+                    self.assertEqual(
+                        {},
+                        pre_tool(
+                            self.event("functions.exec", {"source": source})
+                        ),
+                    )
+                    self.assertEqual(before, database_snapshot())
+
+            for command in (
+                f"python3 {SCRIPTS / 'archive_readiness_audit.py'}",
+                (
+                    f"python3 {SCRIPTS / 'executor_registry.py'} "
+                    f"--config {SCRIPTS.parent / 'references' / 'twinfinity-executor-registry.toml'} "
+                    f"--profile-root {SCRIPTS.parent / 'references'} audit-config"
+                ),
+                (
+                    f"python3 {SCRIPTS / 'executor_registry.py'} \\\n"
+                    f"  --config {SCRIPTS.parent / 'references' / 'twinfinity-executor-registry.toml'} \\\n"
+                    f"  --profile-root {SCRIPTS.parent / 'references'} \\\n"
+                    "  audit-config"
+                ),
+            ):
+                with self.subTest(read_only_python_diagnostic=command):
+                    self.assertEqual(
+                        {}, pre_tool(self.event("exec_command", {"cmd": command}))
+                    )
+                    self.assertEqual(before, database_snapshot())
+            self.assertEqual(
+                {},
+                pre_tool(
+                    self.event(
+                        "functions.exec",
+                        {
+                            "source": (
+                                "const r = await tools.exec_command({"
+                                "cmd:\"rg -n sandbox_permissions .\"});"
+                            )
+                        },
+                    )
+                ),
+            )
+            self.assertEqual(before, database_snapshot())
+
     def test_native_delivery_guard_remains_scoped_to_native_controls(self) -> None:
         """The native hook guards delivery flow without disabling role capabilities."""
         native_only = (
@@ -781,7 +1204,7 @@ class DeliveryGuardTests(unittest.TestCase):
     def test_canonical_delivery_guard_bytes_are_unchanged(self) -> None:
         expected = {
             SCRIPTS / "delivery_guard.py":
-                "48a3f8aa0466708d0ef6bb77ef71b05fadf4508cb9ff1e474de1c40ff01e4add",
+                "538627f0be2ddf26794bba5b3d15e49856f844e4f4fab3396c13fd0a0b96eef3",
             SCRIPTS / "delivery_identity.py":
                 "463ae0e3409c3105c20d2f33d3278c768edaf46e68ab5351fea7fca0fb9f3efe",
             SCRIPTS / "repository_delivery_policy.py":

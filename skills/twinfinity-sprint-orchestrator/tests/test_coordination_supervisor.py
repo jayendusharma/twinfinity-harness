@@ -312,6 +312,57 @@ class CoordinationSupervisorTests(unittest.TestCase):
             now="2026-08-22T10:00:02Z",
         )
 
+    def test_depth_and_resource_denials_create_no_target_wake_attempt_or_event(self) -> None:
+        cases = (
+            (
+                '{"value":' + "[" * 50 + "0" + "]" * 50 + "}",
+                "COORDINATION_ENVELOPE_DEPTH_EXCEEDED",
+            ),
+            (
+                '{"value":[' + ",".join("0" for _ in range(8200)) + "]}",
+                "COORDINATION_ENVELOPE_RESOURCE_LIMIT",
+            ),
+        )
+        for index, (raw, expected_error) in enumerate(cases, start=1):
+            with self.subTest(expected_error=expected_error):
+                cursor = self.store.connection.execute(
+                    "INSERT INTO coordination_messages(idempotency_key,"
+                    "recipient_session_id,topic,payload_sha256,payload_json,state,"
+                    "created_at,updated_at) VALUES (?,?,'coordination.notice',?,?,"
+                    "'PREPARED',?,?)",
+                    (
+                        f"strict-supervisor-{index}",
+                        PLANNER_SESSION,
+                        "0" * 64,
+                        raw,
+                        "2026-08-22T10:00:02Z",
+                        "2026-08-22T10:00:02Z",
+                    ),
+                )
+                message_id = int(cursor.lastrowid)
+                self.store.connection.commit()
+                row = self.store.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=?",
+                    (message_id,),
+                ).fetchone()
+                self.assertEqual(
+                    expected_error, self.supervisor._message_contract_error(row)
+                )
+                before = list(self.store.connection.iterdump())
+                with patch(
+                    "coordination_supervisor.target_progress_digest",
+                    side_effect=AssertionError("target progress must not run"),
+                ):
+                    self.assertEqual(
+                        (None, False),
+                        self.supervisor._reserve_wake(
+                            row, "2026-08-22T10:00:03Z"
+                        ),
+                    )
+                self.assertEqual(before, list(self.store.connection.iterdump()))
+                self.assertEqual([], self.launches)
+                self.assertEqual([], self.terminal_watch_launches)
+
     def test_default_liveness_query_reuses_store_and_aborts_before_reservation(self) -> None:
         message_id = self.notice(idempotency_key="liveness-query", issue_number=37)
         supervisor = CoordinationSupervisor(

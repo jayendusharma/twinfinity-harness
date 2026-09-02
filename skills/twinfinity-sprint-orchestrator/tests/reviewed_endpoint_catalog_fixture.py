@@ -43,7 +43,11 @@ allowed_topics = ["coordination.notice"]
 _PLANNER_V3 = _PLANNER_V2.replace(
     'endpoint_id = "role.planner.v2"',
     'endpoint_id = "role.planner.v3"',
-).replace("version = 2", "version = 3", 1)
+).replace("version = 2", "version = 3", 1).replace(
+    "38d39166c7573d676206a0f70efd4ebbc68c2d74cd743bab85f48de56b5128cf",
+    "171f222f746e99c16182e38957eefb012576720c7d0dd8ebe01e2096bec45e1b",
+    1,
+)
 
 _PLANNER_HISTORY = """
 
@@ -203,7 +207,7 @@ def reviewed_planner_rotation_catalog(
         shutil.copy2(source, template_root / source.name)
         shutil.copy2(source, codex_home / source.name)
     planner_v2 = source_references / "twinfinity-planner-v2.config.toml"
-    for version in (1, 3):
+    for version in (1,):
         filename = f"twinfinity-planner-v{version}.config.toml"
         shutil.copy2(planner_v2, template_root / filename)
         shutil.copy2(planner_v2, codex_home / filename)

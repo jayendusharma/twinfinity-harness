@@ -15,9 +15,14 @@ import shlex
 import sqlite3
 import stat
 import sys
+import time
 from typing import Any, Iterable, Mapping
 
-from coordination_store import terminal_watch_key
+from coordination_store import (
+    claimed_no_delivery_park_evidence,
+    parse_coordination_envelope,
+    terminal_watch_key,
+)
 from delivery_identity import immutable_admission_error
 from executor_registry import (
     RegistryError,
@@ -32,6 +37,12 @@ from repository_delivery_policy import (
     worktree_path_matches_owning_issue,
 )
 from admission_source_equivalence import admission_lineage_source_is_current
+from run_role_executor import (
+    PARK_CAPABILITY_SOCKET_ENV,
+    PARK_HOOK_EVENT_LIMIT,
+    authorize_park_nested_hook,
+    parse_park_hook_event,
+)
 
 
 DEFAULT_DATABASE = Path.home() / ".codex/twinfinity-coordination/ack-transactions.sqlite3"
@@ -39,6 +50,10 @@ DEFAULT_WORKTREE_ROOT = Path("/home/ubuntu/code")
 CANONICAL_PREPUSH_CONTROL = Path(
     "/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/"
     "scripts/prepush_control.py"
+)
+CANONICAL_PARK_CONTROLLER = Path(
+    "/home/ubuntu/.codex/skills/twinfinity-sprint-orchestrator/"
+    "scripts/kanban_pull_buffer.py"
 )
 TRUSTED_PREPUSH_INTERPRETER = Path("/usr/bin/python3")
 SHELL_TOOL = re.compile(r"(?i)(?:exec|shell|bash|command)")
@@ -94,8 +109,86 @@ PREFIX_WRAPPERS = {
     "setsid",
     "stdbuf",
     "sudo",
+    "time",
 }
 INTERPRETER_WRAPPERS = {"node", "nodejs", "perl", "php", "python", "python3", "ruby"}
+PYTHON_EXECUTABLE = re.compile(
+    r"(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)\Z", re.IGNORECASE
+)
+SQLITE_MUTATION = re.compile(
+    r"\b(?:alter|analyze|attach|begin|commit|create|delete|detach|drop|end|"
+    r"insert|reindex|release|replace|rollback|savepoint|update|vacuum)\b",
+    re.IGNORECASE,
+)
+SQLITE_SIDE_EFFECT_FUNCTION = re.compile(
+    r"(?is)(?<![A-Za-z0-9_])(?:edit|load_extension|writefile|"
+    r"[\"'`](?:edit|load_extension|writefile)[\"'`]|"
+    r"\[(?:edit|load_extension|writefile)\])"
+    r"(?:\s|/\*.*?\*/|--[^\r\n]*(?:\r?\n|\Z))*\("
+)
+SQLITE_READ_ONLY_PRAGMA = re.compile(
+    r"(?is)^pragma\s+(?:(?:compile_options|database_list|freelist_count|"
+    r"page_count|schema_version|user_version)|"
+    r"(?:foreign_key_check|index_info|index_list|index_xinfo|"
+    r"integrity_check|quick_check|table_info|table_list|table_xinfo)"
+    r"(?:\s*\([^;]*\))?)\s*\Z"
+)
+JS_COOKED_ESCAPE = re.compile(
+    r"\\(?:u(?:[0-9A-Fa-f]{4}|\{[0-9A-Fa-f]{1,6}\})|"
+    r"x[0-9A-Fa-f]{2}|[0-7]{1,3})"
+)
+PLANNER_READ_ONLY_EXECUTABLES = frozenset(
+    {
+        "basename",
+        "cat",
+        "cmp",
+        "cut",
+        "date",
+        "diff",
+        "dirname",
+        "du",
+        "echo",
+        "env",
+        "false",
+        "file",
+        "find",
+        "gh",
+        "git",
+        "grep",
+        "head",
+        "hexdump",
+        "id",
+        "jq",
+        "ls",
+        "nl",
+        "od",
+        "paste",
+        "pgrep",
+        "ps",
+        "printf",
+        "pwd",
+        "readlink",
+        "realpath",
+        "rg",
+        "sha256sum",
+        "sort",
+        "sqlite3",
+        "stat",
+        "tail",
+        "test",
+        "tr",
+        "true",
+        "uname",
+        "uniq",
+        "wc",
+        "whereis",
+        "which",
+        "xxd",
+    }
+)
+PLANNER_READ_ONLY_PYTHON_SCRIPTS = frozenset(
+    {"archive_readiness_audit.py", "executor_registry.py"}
+)
 PROCESS_EXECUTION = re.compile(
     r"(?i)(?:\bsubprocess\b|\bos\.system\s*\(|\bos\.popen\s*\(|"
     r"\bchild_process\b|\bexec(?:File|Sync)?\s*\(|\bspawn(?:Sync)?\s*\()"
@@ -171,6 +264,8 @@ class DeliveryContext:
     base_sha: str | None = None
     repository: str | None = None
     owning_issue_number: int | None = None
+    park_request_sha256: str | None = None
+    park_repository_observation_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +283,7 @@ class CommandLeaf:
     bounded_wait: bool = False
     interpreter: str | None = None
     direct_launch: bool = True
+    planner_read_only_script: bool = False
 
 
 class GuardError(RuntimeError):
@@ -217,24 +313,47 @@ def _commands(tool_input: dict[str, Any]) -> Iterable[str]:
         yield from (match.group(1) for match in JS_BACKTICK_CMD.finditer(source))
 
 
-def _shell_tokens(command: str) -> tuple[str, ...] | None:
+def _shell_tokens(
+    command: str,
+    *,
+    preserve_newline_separators: bool = False,
+) -> tuple[str, ...] | None:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|>")
+        command = re.sub(r"\\\r?\n", "", command)
+        punctuation = ";&|>\n" if preserve_newline_separators else ";&|>"
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=punctuation)
+        if preserve_newline_separators:
+            lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
-        return tuple(lexer)
+        tokens: list[str] = []
+        for token in lexer:
+            if (
+                preserve_newline_separators
+                and "\n" in token
+                and all(character in punctuation for character in token)
+            ):
+                pieces = token.split("\n")
+                for index, piece in enumerate(pieces):
+                    if piece:
+                        tokens.append(piece)
+                    if index + 1 < len(pieces):
+                        tokens.append("\n")
+            else:
+                tokens.append(token)
+        return tuple(tokens)
     except ValueError:
         return None
 
 
 def _command_segments(command: str) -> tuple[str, ...] | None:
-    tokens = _shell_tokens(command)
+    tokens = _shell_tokens(command, preserve_newline_separators=True)
     if tokens is None:
         return None
     segments: list[str] = []
     current: list[str] = []
     for token in tokens:
-        if token in {";", "&&", "||", "|", "&"}:
+        if token in {";", "&&", "||", "|", "&", "\n"}:
             if current:
                 segments.append(
                     " ".join(
@@ -596,10 +715,14 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
     if topic != "coordination.notice" and not topic.startswith(f"{role}."):
         raise GuardError("DELIVERY_ROLE_TARGET_MISMATCH")
     try:
-        payload = json.loads(row["payload_json"])
-    except json.JSONDecodeError as exc:
+        envelope = parse_coordination_envelope(row["payload_json"])
+        payload = envelope.payload
+    except Exception as exc:
         raise GuardError("DELIVERY_TARGET_INVALID") from exc
-    if not isinstance(payload, dict):
+    if (
+        "payload_sha256" in row.keys()
+        and envelope.payload_sha256 != row["payload_sha256"]
+    ):
         raise GuardError("DELIVERY_TARGET_INVALID")
     if (
         topic
@@ -608,6 +731,29 @@ def _message_context(connection: sqlite3.Connection, database: Path, *, role: st
     ):
         raise GuardError("DELIVERY_TARGET_INVALID")
     if topic == "coordination.notice":
+        if envelope.reserved_handler == "claimed_no_delivery_park":
+            try:
+                park = claimed_no_delivery_park_evidence(payload)
+            except Exception as exc:
+                raise GuardError("PARK_TARGET_INVALID") from exc
+            if role != "planner" or payload.get("mutation_authority") is not False:
+                raise GuardError("PARK_TARGET_INVALID")
+            return DeliveryContext(
+                role=role,
+                endpoint_id=endpoint_id,
+                target_kind="message",
+                target_key=target_key,
+                topic=topic,
+                worktree=None,
+                lease_paths=frozenset(),
+                repository_writes=False,
+                repository=str(park["repository"]),
+                owning_issue_number=int(park["issue_number"]),
+                park_request_sha256=envelope.payload_sha256,
+                park_repository_observation_sha256=str(
+                    park["repository_observation_sha256"]
+                ),
+            )
         if not _source_is_current(connection, payload):
             raise GuardError("DELIVERY_TARGET_INVALID")
         if payload.get("mutation_authority") is not False:
@@ -783,6 +929,55 @@ def _hosted_context(connection: sqlite3.Connection, *, role: str, endpoint_id: s
     return DeliveryContext(role, endpoint_id, "hosted_operation", target_key, None, frozenset(), False)
 
 
+def _validate_runtime_profile_binding(
+    environ: Mapping[str, str], endpoint: sqlite3.Row
+) -> None:
+    path_value = environ.get("TWINFINITY_EXECUTOR_PROFILE_PATH", "")
+    expected_sha256 = environ.get("TWINFINITY_EXECUTOR_PROFILE_SHA256", "")
+    expected_config_sha256 = environ.get(
+        "TWINFINITY_EXECUTOR_ENDPOINT_CONFIG_SHA256", ""
+    )
+    path = Path(path_value)
+    if (
+        not path.is_absolute()
+        or path.name != "twinfinity-planner-v3.config.toml"
+        or SHA256.fullmatch(expected_sha256) is None
+        or SHA256.fullmatch(expected_config_sha256) is None
+        or expected_config_sha256 != endpoint["config_sha256"]
+    ):
+        raise GuardError("PARK_RUNTIME_PROFILE_DRIFT")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise GuardError("PARK_RUNTIME_PROFILE_DRIFT") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or before.st_size <= 0
+            or before.st_size > MAX_ARTIFACT_BYTES
+        ):
+            raise GuardError("PARK_RUNTIME_PROFILE_DRIFT")
+        raw = b""
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            raw += block
+        after = os.fstat(descriptor)
+        if (
+            before != after
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise GuardError("PARK_RUNTIME_PROFILE_DRIFT")
+    finally:
+        os.close(descriptor)
+
+
 def _load_context(environ: Mapping[str, str], database: Path, worktree_root: Path) -> DeliveryContext:
     names = ("TWINFINITY_EXECUTOR_ATTEMPT_ID", "TWINFINITY_EXECUTOR_INSTANCE_ID", "TWINFINITY_EXECUTOR_ROLE", "TWINFINITY_ROLE_ENDPOINT", "TWINFINITY_EXECUTOR_TOKEN", "TWINFINITY_EXECUTOR_TARGET_KIND", "TWINFINITY_EXECUTOR_TARGET_KEY")
     values = {name: environ.get(name, "") for name in names}
@@ -791,14 +986,16 @@ def _load_context(environ: Mapping[str, str], database: Path, worktree_root: Pat
     attempt_id, instance_id = values[names[0]], values[names[1]]
     role, endpoint_id, token = values[names[2]], values[names[3]], values[names[4]]
     target_kind, target_key = values[names[5]], values[names[6]]
-    if UUID.fullmatch(attempt_id) is None or UUID.fullmatch(instance_id) is None or role not in {"development", "sre"} or target_kind not in {"message", "terminal_watch", "hosted_operation"}:
+    if UUID.fullmatch(attempt_id) is None or UUID.fullmatch(instance_id) is None or role not in {"planner", "development", "sre"} or target_kind not in {"message", "terminal_watch", "hosted_operation"}:
         raise GuardError("DELIVERY_CONTEXT_INVALID")
     connection = _safe_database(database)
     try:
         connection.execute("BEGIN")
-        endpoint = connection.execute("SELECT current.endpoint_id,definitions.role FROM executor_role_endpoint_current current JOIN executor_role_endpoints definitions ON definitions.endpoint_id=current.endpoint_id WHERE current.role=?", (role,)).fetchone()
+        endpoint = connection.execute("SELECT current.endpoint_id,definitions.role,definitions.config_sha256 FROM executor_role_endpoint_current current JOIN executor_role_endpoints definitions ON definitions.endpoint_id=current.endpoint_id WHERE current.role=?", (role,)).fetchone()
         if endpoint is None or endpoint["endpoint_id"] != endpoint_id or endpoint["role"] != role:
             raise GuardError("DELIVERY_ENDPOINT_STALE")
+        if role == "planner" and endpoint_id == "role.planner.v3":
+            _validate_runtime_profile_binding(environ, endpoint)
         attempt = connection.execute("SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
         token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
         if attempt is None or attempt["instance_id"] != instance_id or attempt["role"] != role or attempt["endpoint_id"] != endpoint_id or attempt["target_kind"] != target_kind or attempt["target_key"] != target_key or attempt["state"] not in {"LAUNCHING", "RUNNING"} or not secrets.compare_digest(str(attempt["token_sha256"]), token_sha256):
@@ -1524,7 +1721,7 @@ def _shell_write(command: str) -> ShellWrite:
         return ShellWrite(True, ambiguous=True)
     if executable in {"apply_patch", "patch"} or SCRIPT_WRITE.search(command) or FORMAT_WRITE.search(command):
         return ShellWrite(True, ambiguous=True)
-    if executable in {"npm", "npx", "pnpm", "yarn", "pip", "pip3", "pytest", "ruff", "mypy", "tox", "make", "cargo", "go", "docker", "python", "python3"}:
+    if executable in {"npm", "npx", "pnpm", "yarn", "pip", "pip3", "pytest", "ruff", "mypy", "tox", "make", "cargo", "go", "docker"} or _is_python_executable(executable):
         return ShellWrite(True, worktree_only=True)
     return ShellWrite()
 
@@ -1666,12 +1863,14 @@ def _js_literal(value: str) -> str:
         except json.JSONDecodeError as exc:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED") from exc
     elif value[0] == "'":
+        if re.search(r"\\(?![\\'\"nrtbfv])", value):
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
         try:
             decoded = ast.literal_eval(value)
         except (SyntaxError, ValueError) as exc:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED") from exc
     else:
-        if "${" in value or "\\`" in value:
+        if "${" in value or "\\" in value:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
         decoded = value[1:-1]
     if not isinstance(decoded, str):
@@ -1679,41 +1878,85 @@ def _js_literal(value: str) -> str:
     return decoded
 
 
-def _js_object_literal_property(argument: str, name: str, *, required: bool) -> str | None:
+def _js_static_object_members(argument: str) -> tuple[tuple[str, str], ...]:
     stripped = argument.strip()
     if not stripped.startswith("{") or not stripped.endswith("}"):
         raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+    if JS_COOKED_ESCAPE.search(stripped):
+        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
     masked = _mask_js_noncode(stripped)
-    matches = tuple(re.finditer(rf"\b{re.escape(name)}\s*:", masked))
-    if not matches:
+    slices: list[tuple[str, str]] = []
+    start = 1
+    depth = 0
+    for index, character in enumerate(masked[1:-1], start=1):
+        if character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+            if depth < 0:
+                raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        elif character == "," and depth == 0:
+            slices.append((stripped[start:index], masked[start:index]))
+            start = index + 1
+    if depth != 0:
+        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+    slices.append((stripped[start:-1], masked[start:-1]))
+    if slices and not slices[-1][0].strip():
+        slices.pop()
+    if any(not source.strip() for source, _masked_source in slices):
+        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+
+    members: list[tuple[str, str]] = []
+    keys: set[str] = set()
+    for source, masked_source in slices:
+        colon: int | None = None
+        member_depth = 0
+        for index, character in enumerate(masked_source):
+            if character in "([{":
+                member_depth += 1
+            elif character in ")]}":
+                member_depth -= 1
+                if member_depth < 0:
+                    raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+            elif character == ":" and member_depth == 0:
+                colon = index
+                break
+        if colon is None or member_depth != 0:
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        key_source = source[:colon].strip()
+        if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", key_source):
+            key = key_source
+        elif (
+            len(key_source) >= 2
+            and key_source[0] in {'"', "'", "`"}
+            and key_source[-1] == key_source[0]
+        ):
+            key = _js_literal(key_source)
+        else:
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        value = source[colon + 1:].strip()
+        if not value or key in keys:
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        keys.add(key)
+        members.append((key, value))
+    return tuple(members)
+
+
+def _js_object_literal_property(argument: str, name: str, *, required: bool) -> str | None:
+    values = tuple(
+        value for key, value in _js_static_object_members(argument) if key == name
+    )
+    if not values:
         if required:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
         return None
-    if len(matches) != 1:
+    if len(values) != 1:
         raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    start = matches[0].end()
-    while start < len(stripped) and stripped[start].isspace():
-        start += 1
-    if start >= len(stripped) or stripped[start] not in {'"', "'", "`"}:
-        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    quote = stripped[start]
-    escaped = False
-    end = start + 1
-    while end < len(stripped):
-        character = stripped[end]
-        if escaped:
-            escaped = False
-        elif character == "\\":
-            escaped = True
-        elif character == quote:
-            break
-        end += 1
-    if end >= len(stripped):
-        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    trailing = stripped[end + 1:].lstrip()
-    if not trailing or trailing[0] not in {",", "}"}:
-        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    return _js_literal(stripped[start:end + 1])
+    return _js_literal(values[0])
+
+
+def _js_static_object_keys(argument: str) -> tuple[str, ...]:
+    return tuple(key for key, _value in _js_static_object_members(argument))
 
 
 def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool] | None:
@@ -1749,8 +1992,32 @@ def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool]
         return shlex.join(tokens[index + 1:]), seconds <= MAX_PASSIVE_WAIT_SECONDS
     if executable in PREFIX_WRAPPERS:
         index = 1
+        options_with_values = {
+            "env": {"-C", "--chdir", "-S", "--split-string", "-u", "--unset"},
+            "exec": {"-a"},
+            "nice": {"-n", "--adjustment"},
+            "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
+            "sudo": {
+                "-C", "--close-from", "-D", "--chdir", "-g", "--group",
+                "-h", "--host", "-p", "--prompt", "-r", "--role",
+                "-t", "--type", "-u", "--user",
+            },
+            "time": {"-f", "--format", "-o", "--output"},
+        }
         while index < len(tokens):
             token = tokens[index]
+            if executable == "time" and (
+                token in {"-a", "--append", "-o", "--output"}
+                or token.startswith("-o")
+                or token.startswith("--output=")
+            ):
+                raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
+            if executable == "env" and (
+                token in {"-S", "--split-string"}
+                or token.startswith("-S")
+                or token.startswith("--split-string=")
+            ):
+                raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
             if executable == "env" and "=" in token and not token.startswith("="):
                 index += 1
                 continue
@@ -1759,7 +2026,10 @@ def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool]
                 break
             if token.startswith("-"):
                 index += 1
-                if token in {"-C", "-D", "-g", "-h", "-n", "-o", "-p", "-r", "-t", "-u"}:
+                if (
+                    "=" not in token
+                    and token in options_with_values.get(executable, set())
+                ):
                     index += 1
                 continue
             break
@@ -1767,6 +2037,10 @@ def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool]
             return None
         return shlex.join(tokens[index:]), False
     return None
+
+
+def _is_python_executable(executable: str) -> bool:
+    return PYTHON_EXECUTABLE.fullmatch(executable) is not None
 
 
 def _command_leaves(
@@ -1855,8 +2129,8 @@ def _command_leaves(
                 )
                 continue
             raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
-        if executable in INTERPRETER_WRAPPERS:
-            code_flag = "-c" if executable in {"python", "python3"} else "-e"
+        if executable in INTERPRETER_WRAPPERS or _is_python_executable(executable):
+            code_flag = "-c" if _is_python_executable(executable) else "-e"
             if code_flag in tokens:
                 index = tokens.index(code_flag)
                 if index + 1 >= len(tokens) or index + 2 != len(tokens):
@@ -1870,7 +2144,7 @@ def _command_leaves(
                     )
                 )
                 continue
-            if executable in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {"pytest", "unittest"}:
+            if _is_python_executable(executable) and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {"pytest", "unittest"}:
                 leaves.append(
                     CommandLeaf(
                         segment,
@@ -1889,6 +2163,20 @@ def _command_leaves(
                         segment,
                         bounded_wait,
                         direct_launch=leaf_direct_launch,
+                    )
+                )
+                continue
+            if (
+                _is_python_executable(executable)
+                and len(tokens) >= 2
+                and Path(tokens[1]).name in PLANNER_READ_ONLY_PYTHON_SCRIPTS
+            ):
+                leaves.append(
+                    CommandLeaf(
+                        segment,
+                        bounded_wait,
+                        direct_launch=leaf_direct_launch,
+                        planner_read_only_script=True,
                     )
                 )
                 continue
@@ -1946,6 +2234,111 @@ def _python_interpreter_write(source: str) -> ShellWrite:
     return ShellWrite(writes, tuple(paths), ambiguous=ambiguous or (writes and not paths))
 
 
+def _planner_sqlite_leaf_denied(leaf: CommandLeaf) -> bool:
+    tokens = _shell_tokens(leaf.command)
+    if not tokens:
+        return False
+    executable = tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    if executable == "find" and any(
+        token in {"-exec", "-execdir", "-ok", "-okdir"} for token in tokens[1:]
+    ):
+        return True
+    if executable != "sqlite3":
+        return False
+    if len(tokens) != 4 or tokens[1] != "-readonly" or tokens[2].startswith("-"):
+        return True
+    statement = tokens[3].strip()
+    if statement.endswith(";"):
+        statement = statement[:-1].rstrip()
+    if (
+        ";" in statement
+        or SQLITE_MUTATION.search(statement)
+        or SQLITE_SIDE_EFFECT_FUNCTION.search(statement)
+    ):
+        return True
+    if re.match(r"(?is)^(?:select|with|explain)\b.+\Z", statement):
+        return False
+    if SQLITE_READ_ONLY_PRAGMA.fullmatch(statement):
+        return False
+    return re.fullmatch(r"(?is)\.(?:schema(?:\s+[A-Za-z0-9_]+)?|tables)", statement) is None
+
+
+def _planner_read_only_python_script_allowed(
+    leaf: CommandLeaf,
+    cwd: Path,
+) -> bool:
+    if not leaf.planner_read_only_script:
+        return False
+    tokens = _shell_tokens(leaf.command)
+    if not tokens or len(tokens) < 2 or not _is_python_executable(
+        tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    ):
+        return False
+    script = Path(tokens[1])
+    script = Path(os.path.abspath(script if script.is_absolute() else cwd / script))
+    script_root = Path(__file__).resolve().parent
+    if script == script_root / "archive_readiness_audit.py":
+        return len(tokens) == 2
+    if script != script_root / "executor_registry.py":
+        return False
+    arguments = list(tokens[2:])
+    seen_options: set[str] = set()
+    while arguments and arguments[0] in {"--config", "--profile-root"}:
+        option = arguments.pop(0)
+        if option in seen_options or not arguments or arguments[0].startswith("-"):
+            return False
+        seen_options.add(option)
+        arguments.pop(0)
+    return arguments == ["audit-config"]
+
+
+def _planner_read_only_leaf_allowed(leaf: CommandLeaf, cwd: Path) -> bool:
+    if _planner_read_only_python_script_allowed(leaf, cwd):
+        return True
+    tokens = _shell_tokens(leaf.command)
+    if not tokens:
+        return False
+    executable = tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    if executable not in PLANNER_READ_ONLY_EXECUTABLES:
+        return False
+    arguments = tokens[1:]
+    if executable == "sort" and any(
+        token in {"-o", "--output"}
+        or token.startswith("--output=")
+        or (token.startswith("-o") and not token.startswith("--"))
+        for token in arguments
+    ):
+        return False
+    if executable == "find" and any(
+        token in {
+            "-delete",
+            "-exec",
+            "-execdir",
+            "-fls",
+            "-fprint",
+            "-fprint0",
+            "-fprintf",
+            "-ok",
+            "-okdir",
+        }
+        for token in arguments
+    ):
+        return False
+    if executable == "xxd" and any(
+        token in {"-r", "-revert"} or token.startswith("-r")
+        for token in arguments
+    ):
+        return False
+    if executable == "date" and any(
+        token in {"-s", "--set"}
+        or token.startswith("--set=")
+        or (token.startswith("-") and not token.startswith("--") and "s" in token[1:])
+        for token in arguments
+    ):
+        return False
+    return True
+
+
 def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[str, Any]:
     if GIT_METADATA_ENV.search(command):
         return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
@@ -1960,6 +2353,30 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
     except GuardError:
         return _deny("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
     for leaf in leaves:
+        if context.role == "planner":
+            if _planner_read_only_python_script_allowed(leaf, cwd):
+                continue
+            leaf_tokens = _shell_tokens(leaf.command)
+            leaf_executable = (
+                leaf_tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+                if leaf_tokens
+                else ""
+            )
+            if (
+                leaf.interpreter is not None
+                or (
+                    not leaf.planner_read_only_script
+                    and (
+                        leaf_executable in INTERPRETER_WRAPPERS
+                        or _is_python_executable(leaf_executable)
+                    )
+                )
+            ):
+                return _deny("PLANNER_NON_PARK_INTERPRETER_FORBIDDEN")
+            if _planner_sqlite_leaf_denied(leaf):
+                return _deny("PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN")
+            if not _planner_read_only_leaf_allowed(leaf, cwd):
+                return _deny("PLANNER_NON_PARK_COMMAND_UNDETERMINED")
         if GIT_EXTERNAL_HELPER_ENV.search(leaf.command):
             return _deny("DELIVERY_GIT_EXTERNAL_HELPER_FORBIDDEN")
         if _contains_raw_push(leaf.command):
@@ -2003,7 +2420,7 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
                 return _deny("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
             assessment = (
                 _python_interpreter_write(leaf.command)
-                if leaf.interpreter in {"python", "python3"}
+                if _is_python_executable(leaf.interpreter)
                 else ShellWrite(
                     bool(SCRIPT_WRITE.search(leaf.command) or INTERPRETER_WRITE.search(leaf.command)),
                     ambiguous=True,
@@ -2043,11 +2460,30 @@ def _enforce_nested_tools(
             continue
         if name == "exec_command":
             try:
+                static_keys = (
+                    _js_static_object_keys(argument)
+                    if context.role == "planner"
+                    else ()
+                )
                 command = _js_object_literal_property(argument, "cmd", required=True)
                 workdir = _js_object_literal_property(argument, "workdir", required=False)
+                sandbox_permissions = _js_object_literal_property(
+                    argument, "sandbox_permissions", required=False
+                )
+                if (
+                    context.role == "planner"
+                    and "sandbox_permissions" in static_keys
+                    and sandbox_permissions is None
+                ):
+                    raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
                 nested_cwd = cwd if workdir is None else _path_value(workdir, cwd)
             except GuardError:
                 return _deny("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+            if (
+                context.role == "planner"
+                and sandbox_permissions == "require_escalated"
+            ):
+                return _deny("PLANNER_NON_PARK_ESCALATION_FORBIDDEN")
             decision = _enforce_command(command or "", context, nested_cwd)
             if decision:
                 return decision
@@ -2066,18 +2502,128 @@ def _enforce_nested_tools(
     return {}
 
 
-def pre_tool(event: dict[str, Any], *, environ: Mapping[str, str] | None = None, database_path: Path = DEFAULT_DATABASE, worktree_root: Path = DEFAULT_WORKTREE_ROOT) -> dict[str, Any]:
+PARK_CONTROLLER_WORKDIR = "/home/ubuntu"
+PARK_CONTROLLER_JUSTIFICATION = (
+    "Allow the exact owner-safe PARK controller to acquire current GitHub "
+    "and local Git evidence."
+)
+
+
+def _park_controller_argv(context: DeliveryContext) -> list[str]:
+    if (
+        context.park_request_sha256 is None
+        or context.park_repository_observation_sha256 is None
+    ):
+        raise GuardError("PARK_TARGET_INVALID")
+    return [
+        "/usr/bin/python3",
+        os.fspath(CANONICAL_PARK_CONTROLLER),
+        "park-commit",
+        "--message-id",
+        context.target_key,
+        "--request-sha256",
+        context.park_request_sha256,
+        "--repository-observation-sha256",
+        context.park_repository_observation_sha256,
+        "--planner-session-id",
+        context.endpoint_id,
+    ]
+
+
+def _park_controller_command() -> str:
+    return (
+        f"/usr/bin/python3 {CANONICAL_PARK_CONTROLLER} park-commit "
+        '--message-id "$TWINFINITY_EXECUTOR_TARGET_KEY" '
+        '--request-sha256 "$TWINFINITY_PARK_REQUEST_SHA256" '
+        '--repository-observation-sha256 '
+        '"$TWINFINITY_PARK_REPOSITORY_OBSERVATION_SHA256" '
+        '--planner-session-id "$TWINFINITY_ROLE_ENDPOINT"'
+    )
+
+
+def _park_exact_tool_input(
+    tool_input: Mapping[str, Any], context: DeliveryContext
+) -> bool:
+    return bool(
+        set(tool_input)
+        == {"cmd", "workdir", "sandbox_permissions", "justification"}
+        and tool_input.get("cmd") == _park_controller_command()
+        and tool_input.get("workdir") == PARK_CONTROLLER_WORKDIR
+        and tool_input.get("sandbox_permissions") == "require_escalated"
+        and tool_input.get("justification") == PARK_CONTROLLER_JUSTIFICATION
+    )
+
+
+def _park_outer_tool_input(
+    source: str, context: DeliveryContext
+) -> bool:
+    try:
+        calls = _direct_nested_calls(source)
+    except GuardError:
+        return False
+    if len(calls) != 1 or calls[0][0] != "exec_command":
+        return False
+    argument = calls[0][1]
+    try:
+        values = {
+            key: _js_object_literal_property(argument, key, required=True)
+            for key in ("cmd", "workdir", "sandbox_permissions", "justification")
+        }
+    except GuardError:
+        return False
+    keys = re.findall(r"(?:^|[{,])\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*:", argument)
+    return bool(
+        set(keys) == {"cmd", "workdir", "sandbox_permissions", "justification"}
+        and values["cmd"] == _park_controller_command()
+        and values["workdir"] == PARK_CONTROLLER_WORKDIR
+        and values["sandbox_permissions"] == "require_escalated"
+        and values["justification"] == PARK_CONTROLLER_JUSTIFICATION
+    )
+
+
+def _enforce_park_tool(
+    event: dict[str, Any],
+    *,
+    raw_event: bytes,
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    try:
+        parsed = parse_park_hook_event(raw_event)
+        if parsed != event:
+            raise RegistryError("PARK_HOOK_EVENT_INVALID")
+        authorize_park_nested_hook(raw_event, environ=dict(environ))
+        return {}
+    except (OSError, RegistryError, TypeError, ValueError):
+        return _deny("PARK_NESTED_BASH_CAPABILITY_DENIED")
+
+
+def pre_tool(event: dict[str, Any], *, raw_event: bytes | None = None, environ: Mapping[str, str] | None = None, database_path: Path = DEFAULT_DATABASE, worktree_root: Path = DEFAULT_WORKTREE_ROOT) -> dict[str, Any]:
     tool, tool_input = event.get("tool_name"), event.get("tool_input")
     if not isinstance(tool, str) or not isinstance(tool_input, dict):
         return _deny("DELIVERY_HOOK_EVENT_INVALID")
     try:
-        context = _load_context(environ or os.environ, database_path, worktree_root)
+        effective_environment = environ or os.environ
+        if effective_environment.get(PARK_CAPABILITY_SOCKET_ENV):
+            if raw_event is None:
+                return _deny("PARK_HOOK_RAW_EVENT_REQUIRED")
+            return _enforce_park_tool(
+                event,
+                raw_event=raw_event,
+                environ=effective_environment,
+            )
+        context = _load_context(effective_environment, database_path, worktree_root)
         cwd = _cwd(event, tool_input)
+        if (
+            context.role == "planner"
+            and tool_input.get("sandbox_permissions") == "require_escalated"
+        ):
+            return _deny("PLANNER_NON_PARK_ESCALATION_FORBIDDEN")
         source = tool_input.get("source")
         if not isinstance(source, str):
             source = tool_input.get("input")
         if isinstance(source, str) and (
             "${" in source
+            or JS_COOKED_ESCAPE.search(source)
             or re.search(
                 r"(?:\b(?:eval|Function|globalThis|Proxy|Reflect)\b|\.constructor\b|\bthis\s*\[)",
                 source,
@@ -2124,13 +2670,17 @@ def pre_tool(event: dict[str, Any], *, environ: Mapping[str, str] | None = None,
 
 def main() -> int:
     try:
-        event = json.load(sys.stdin)
+        raw = sys.stdin.buffer.read(PARK_HOOK_EVENT_LIMIT + 1)
+        if os.environ.get(PARK_CAPABILITY_SOCKET_ENV):
+            event = parse_park_hook_event(raw)
+        else:
+            event = json.loads(raw)
         if not isinstance(event, dict):
             raise ValueError
-        output = pre_tool(event) if event.get("hook_event_name") == "PreToolUse" else {}
+        output = pre_tool(event, raw_event=raw) if event.get("hook_event_name") == "PreToolUse" else {}
         print(json.dumps(output, sort_keys=True, separators=(",", ":")))
         return 0
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, RegistryError, UnicodeDecodeError, ValueError):
         print(json.dumps(_deny("DELIVERY_HOOK_EVENT_INVALID"), separators=(",", ":")))
         return 0
 

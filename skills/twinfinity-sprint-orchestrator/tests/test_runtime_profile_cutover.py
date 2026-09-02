@@ -16,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from executor_registry import (  # noqa: E402
+    PLANNER_PARK_PROTOCOL,
     RegistryError,
     _parse_endpoint_config,
     _validate_profile_directory,
@@ -27,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = ROOT.parents[1]
 CODEX_HOME = Path(os.environ["CODEX_HOME"])
 EXPECTED_ENDPOINTS = {
-    "planner": ("role.planner.v2", 2),
+    "planner": ("role.planner.v3", 3),
     "development": ("role.development.v6", 6),
     "sre": ("role.sre.v6", 6),
 }
@@ -64,7 +65,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             self.assertEqual("PASS", result["phase"])
             self.assertEqual(
                 {
-                    "planner": "role.planner.v2",
+                    "planner": "role.planner.v3",
                     "development": "role.development.v6",
                     "sre": "role.sre.v6",
                 },
@@ -119,6 +120,26 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                         role,
                         {**direct_v6, "execution_protocol": "readiness/v1"},
                     )
+
+    def test_planner_v3_derives_park_protocol_from_base_compatible_identity(self) -> None:
+        registry = tomllib.loads(
+            (ROOT / "references" / "twinfinity-executor-registry.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        planner_v3 = registry["roles"]["planner"]
+        self.assertNotIn("execution_protocol", planner_v3)
+        self.assertEqual(
+            PLANNER_PARK_PROTOCOL,
+            _parse_endpoint_config("planner", planner_v3).execution_protocol,
+        )
+        with self.assertRaisesRegex(
+            RegistryError, "REGISTRY_CONFIG_ROLE_INVALID"
+        ):
+            _parse_endpoint_config(
+                "planner",
+                {**planner_v3, "execution_protocol": PLANNER_PARK_PROTOCOL},
+            )
 
     def test_runtime_selection_allows_v6_and_v3_but_rejects_v4_and_v5(self) -> None:
         config_path = ROOT / "references" / "twinfinity-executor-registry.toml"
@@ -293,7 +314,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             codex_home = Path(temporary) / "current-only"
             codex_home.mkdir(mode=0o700)
             for profile in (
-                "twinfinity-planner-v2.config.toml",
+                "twinfinity-planner-v3.config.toml",
                 "twinfinity-development-v6.config.toml",
                 "twinfinity-sre-v6.config.toml",
             ):
@@ -304,7 +325,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
             )
             self.assertEqual(
                 {
-                    "role.planner.v2",
+                    "role.planner.v3",
                     "role.development.v6",
                     "role.sre.v6",
                 },
@@ -377,8 +398,6 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                     (endpoint["endpoint_id"], endpoint["version"]),
                 )
                 profile = tomllib.loads(template.read_text(encoding="utf-8"))
-                self.assertEqual("workspace-write", profile["sandbox_mode"])
-                self.assertFalse(profile["sandbox_workspace_write"]["network_access"])
                 self.assertFalse(profile["features"]["multi_agent"])
                 role_label = {
                     "planner": "Product Planner",
@@ -387,13 +406,28 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 }[role]
                 self.assertIn(f"Twinfinity {role_label}", profile["developer_instructions"])
                 if role == "planner":
-                    self.assertEqual("on-request", profile["approval_policy"])
-                    self.assertNotIn("hooks", profile)
+                    self.assertNotIn("execution_protocol", endpoint)
                     self.assertEqual(
-                        ["/home/ubuntu/.codex/twinfinity-coordination"],
-                        profile["sandbox_workspace_write"]["writable_roots"],
+                        PLANNER_PARK_PROTOCOL,
+                        loaded.roles["planner"].execution_protocol,
+                    )
+                    self.assertEqual("read-only", profile["sandbox_mode"])
+                    self.assertNotIn("sandbox_workspace_write", profile)
+                    self.assertEqual("on-request", profile["approval_policy"])
+                    self.assertTrue(profile["features"]["hooks"])
+                    self.assertEqual(
+                        "*", profile["hooks"]["PreToolUse"][0]["matcher"]
+                    )
+                    self.assertEqual(
+                        "/usr/bin/python3 /home/ubuntu/.codex/skills/"
+                        "twinfinity-sprint-orchestrator/scripts/delivery_guard.py",
+                        profile["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
                     )
                 else:
+                    self.assertEqual("workspace-write", profile["sandbox_mode"])
+                    self.assertFalse(
+                        profile["sandbox_workspace_write"]["network_access"]
+                    )
                     self.assertEqual("legacy", endpoint.get("execution_protocol", "legacy"))
                     self.assertEqual("on-request", profile["approval_policy"])
                     self.assertTrue(profile["features"]["hooks"])
@@ -420,6 +454,7 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
         }
         self.assertEqual(
             {
+                "role.planner.v2",
                 "role.development.v3",
                 "role.development.v4",
                 "role.development.v5",
@@ -467,7 +502,10 @@ class RuntimeProfileCutoverTests(unittest.TestCase):
                 self.assertIn("brokered readiness/v1 boundary", staged_profile["developer_instructions"])
             else:
                 self.assertEqual("on-request", staged_profile["approval_policy"])
-                self.assertIn("hooks", staged_profile)
+                if endpoint["endpoint_id"] == "role.planner.v2":
+                    self.assertNotIn("hooks", staged_profile)
+                else:
+                    self.assertIn("hooks", staged_profile)
 
     def test_obsolete_runtime_artifacts_are_absent_and_uncalled(self) -> None:
         obsolete = (

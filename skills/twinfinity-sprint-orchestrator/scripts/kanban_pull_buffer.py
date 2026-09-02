@@ -13,8 +13,11 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 from typing import Any, Callable
+from urllib.parse import quote
 
 from delivery_identity import (
     admission_transaction_sha256,
@@ -22,6 +25,7 @@ from delivery_identity import (
     delivery_identity_sha256,
 )
 from coordination_store import (
+    CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA,
     DEFAULT_DATABASE,
     UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA,
     UNCLAIMED_ADMISSION_RETRY_REASON,
@@ -30,11 +34,15 @@ from coordination_store import (
     artifact_registry_identity,
     artifact_registry_identity_matches,
     canonical_json,
+    claimed_no_delivery_park_evidence,
+    committed_claimed_no_delivery_park_receipt,
+    parse_coordination_envelope,
     parse_structured_lease_manifest,
     terminal_watch_key,
     unclaimed_admission_exhaustion_payload,
     unclaimed_admission_recovery_notice_payload,
     validate_admission_dispatch_bindings,
+    validate_claimed_no_delivery_park_snapshot,
 )
 from executor_registry import (
     RegistryError,
@@ -63,6 +71,14 @@ from repository_delivery_policy import (
     canonical_harness_standing_controls,
     harness_standing_authority_error,
     harness_standing_authority_provenance_error,
+)
+from repository_git_registry import (
+    RepositoryGitRegistryError,
+    load_repository_git_registration,
+)
+from run_role_executor import (
+    adopt_park_controller_capability,
+    consume_park_controller_capability,
 )
 
 
@@ -146,6 +162,22 @@ CUTOVER_HELD_RECOVERY_CAPACITY_KEYS = {
 STATES = {"PREPARED_NOT_READY", "READY"}
 VERTICALITY = {"END_TO_END", "BOUNDED_ENABLER"}
 ZERO_WIP_STATUSES = {"PREPARED", "QUEUED", "READY"}
+PARK_REPOSITORY_OBSERVATION_SCHEMA = (
+    "twinfinity-claimed-no-delivery-repository-observation/v1"
+)
+PARK_REPOSITORY_OBSERVER_CALL_TIMEOUT_SECONDS = 15
+PARK_REPOSITORY_OBSERVATION_CALLS_PER_PASS = 5
+PARK_REPOSITORY_OBSERVATION_PASSES_BEFORE_ADOPTION = 2
+PARK_REPOSITORY_OBSERVATION_ADOPTION_MARGIN_SECONDS = 30
+PARK_ISSUE_MATERIAL_KEYS = {
+    "number",
+    "state",
+    "state_reason",
+    "title",
+    "body",
+    "closed_at",
+    "html_url",
+}
 
 
 class PullBufferError(ValueError):
@@ -167,6 +199,464 @@ def utc_now() -> str:
 
 def digest_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _park_issue_material_projection(payload: Any) -> dict[str, Any]:
+    """Normalize the exact GitHub issue fields that can change delivery scope."""
+
+    if not isinstance(payload, dict) or "pull_request" in payload:
+        raise PullBufferError("PARK_PROVIDER_ISSUE_INVALID")
+    labels = payload.get("labels")
+    assignees = payload.get("assignees")
+    if not isinstance(labels, list) or not isinstance(assignees, list):
+        raise PullBufferError("PARK_PROVIDER_ISSUE_INVALID")
+    label_names: list[str] = []
+    for label in labels:
+        name = label if isinstance(label, str) else label.get("name") if isinstance(label, dict) else None
+        if not isinstance(name, str) or not name:
+            raise PullBufferError("PARK_PROVIDER_ISSUE_INVALID")
+        label_names.append(name)
+    assignee_logins: list[str] = []
+    for assignee in assignees:
+        login = assignee if isinstance(assignee, str) else assignee.get("login") if isinstance(assignee, dict) else None
+        if not isinstance(login, str) or not login:
+            raise PullBufferError("PARK_PROVIDER_ISSUE_INVALID")
+        assignee_logins.append(login)
+    milestone = payload.get("milestone")
+    if milestone is not None and not isinstance(milestone, dict):
+        raise PullBufferError("PARK_PROVIDER_ISSUE_INVALID")
+    projection = {key: payload.get(key) for key in PARK_ISSUE_MATERIAL_KEYS}
+    projection["label_names"] = sorted(label_names)
+    projection["assignee_logins"] = sorted(assignee_logins)
+    projection["milestone"] = (
+        None
+        if milestone is None
+        else {
+            "number": milestone.get("number"),
+            "title": milestone.get("title"),
+            "state": milestone.get("state"),
+        }
+    )
+    if type(projection["number"]) is not int or projection["number"] <= 0:
+        raise PullBufferError("PARK_PROVIDER_ISSUE_INVALID")
+    return projection
+
+
+def _park_run_readonly(
+    argv: list[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GH_PROMPT_DISABLED": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    try:
+        return runner(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PARK_REPOSITORY_OBSERVER_CALL_TIMEOUT_SECONDS,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PullBufferError("PARK_REPOSITORY_OBSERVER_FAILED") from exc
+
+
+def _park_matching_open_pull_requests(
+    pull_rows: list[Any],
+    *,
+    branch: str,
+    repository: str,
+) -> list[int]:
+    """Match retained delivery PRs by exact branch and canonical repository."""
+
+    try:
+        normalized_repository = canonical_repository_scope(repository)
+    except RegistryError as exc:
+        raise PullBufferError("PARK_REPOSITORY_OBSERVER_TARGET_DRIFT") from exc
+    matches: set[int] = set()
+    for row in pull_rows:
+        if (
+            not isinstance(row, dict)
+            or type(row.get("number")) is not int
+            or not isinstance(row.get("head"), dict)
+            or row["head"].get("ref") != branch
+        ):
+            continue
+        head_repository = row["head"].get("repo")
+        if not isinstance(head_repository, dict):
+            continue
+        full_name = head_repository.get("full_name")
+        if not isinstance(full_name, str):
+            continue
+        try:
+            normalized_head_repository = canonical_repository_scope(full_name)
+        except RegistryError:
+            continue
+        if normalized_head_repository == normalized_repository:
+            matches.add(int(row["number"]))
+    return sorted(matches)
+
+
+def acquire_claimed_no_delivery_repository_observation(
+    connection: sqlite3.Connection,
+    evidence: dict[str, Any],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Acquire current provider and local Git absence from registered identity."""
+
+    repository = str(evidence["repository"])
+    issue_number = int(evidence["issue_number"])
+    admission = connection.execute(
+        "SELECT payload_json,payload_sha256 FROM coordination_messages WHERE id=?",
+        (evidence["admission_message_id"],),
+    ).fetchone()
+    if admission is None:
+        raise PullBufferError("PARK_REPOSITORY_OBSERVER_TARGET_DRIFT")
+    try:
+        admission_envelope = parse_coordination_envelope(admission["payload_json"])
+    except CoordinationError as exc:
+        raise PullBufferError("PARK_REPOSITORY_OBSERVER_TARGET_DRIFT") from exc
+    payload = admission_envelope.payload
+    branch = payload.get("branch")
+    worktree_value = payload.get("worktree_path")
+    if (
+        admission_envelope.payload_sha256 != evidence["admission_payload_sha256"]
+        or admission["payload_sha256"] != evidence["admission_payload_sha256"]
+        or not isinstance(branch, str)
+        or not branch
+        or not isinstance(worktree_value, str)
+        or not Path(worktree_value).is_absolute()
+    ):
+        raise PullBufferError("PARK_REPOSITORY_OBSERVER_TARGET_DRIFT")
+    try:
+        registration = load_repository_git_registration(connection, repository)
+    except RepositoryGitRegistryError as exc:
+        raise PullBufferError(str(exc)) from exc
+    git_dir = str(registration["git_dir"])
+    local_branch = _park_run_readonly(
+        [
+            "/usr/bin/git",
+            "--git-dir",
+            git_dir,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        runner=runner,
+    )
+    if local_branch.returncode not in {0, 1}:
+        raise PullBufferError("PARK_LOCAL_GIT_OBSERVER_FAILED")
+    try:
+        os.lstat(worktree_value)
+    except FileNotFoundError:
+        worktree_absent = True
+    except OSError as exc:
+        raise PullBufferError("PARK_WORKTREE_OBSERVER_FAILED") from exc
+    else:
+        worktree_absent = False
+
+    encoded_branch = quote(branch, safe="")
+    remote_refs = _park_run_readonly(
+        [
+            "/usr/bin/gh",
+            "api",
+            f"repos/{repository}/git/matching-refs/heads/{encoded_branch}",
+        ],
+        runner=runner,
+    )
+    remote_main = _park_run_readonly(
+        [
+            "/usr/bin/gh",
+            "api",
+            f"repos/{repository}/git/matching-refs/heads/main",
+        ],
+        runner=runner,
+    )
+    open_pulls = _park_run_readonly(
+        [
+            "/usr/bin/gh",
+            "api",
+            "--method",
+            "GET",
+            f"repos/{repository}/pulls",
+            "-f",
+            "state=open",
+            "-f",
+            "per_page=100",
+        ],
+        runner=runner,
+    )
+    live_issue = _park_run_readonly(
+        [
+            "/usr/bin/gh",
+            "api",
+            f"repos/{repository}/issues/{issue_number}",
+        ],
+        runner=runner,
+    )
+    if any(
+        completed.returncode != 0
+        for completed in (remote_refs, remote_main, open_pulls, live_issue)
+    ):
+        raise PullBufferError("PARK_PROVIDER_OBSERVER_FAILED")
+    try:
+        ref_rows = json.loads(remote_refs.stdout, object_pairs_hook=_strict_object)
+        main_rows = json.loads(remote_main.stdout, object_pairs_hook=_strict_object)
+        pull_rows = json.loads(open_pulls.stdout, object_pairs_hook=_strict_object)
+        live_issue_payload = json.loads(
+            live_issue.stdout, object_pairs_hook=_strict_object
+        )
+    except (json.JSONDecodeError, PullBufferError) as exc:
+        raise PullBufferError("PARK_PROVIDER_OBSERVER_INVALID") from exc
+    if (
+        not isinstance(ref_rows, list)
+        or not isinstance(main_rows, list)
+        or not isinstance(pull_rows, list)
+        or not isinstance(live_issue_payload, dict)
+        or len(pull_rows) >= 100
+    ):
+        raise PullBufferError("PARK_PROVIDER_OBSERVER_AMBIGUOUS")
+    exact_refs = sorted(
+        {
+            str(row.get("ref"))
+            for row in ref_rows
+            if isinstance(row, dict) and row.get("ref") == f"refs/heads/{branch}"
+        }
+    )
+    main_shas = {
+        row.get("object", {}).get("sha")
+        for row in main_rows
+        if isinstance(row, dict)
+        and row.get("ref") == "refs/heads/main"
+        and isinstance(row.get("object"), dict)
+    }
+    matching_pulls = _park_matching_open_pull_requests(
+        pull_rows,
+        branch=branch,
+        repository=repository,
+    )
+    if len(main_shas) != 1 or next(iter(main_shas)) != evidence["graph_main_sha"]:
+        raise PullBufferError("PARK_PROVIDER_MAIN_DRIFT")
+    current_source = connection.execute(
+        "SELECT c.payload_sha256,s.payload_json FROM github_current c "
+        "JOIN github_snapshots s USING(repository,object_kind,object_number,payload_sha256) "
+        "WHERE c.repository=? AND c.object_kind='issue' AND c.object_number=?",
+        (repository, issue_number),
+    ).fetchone()
+    if current_source is None:
+        raise PullBufferError("PARK_REPOSITORY_OBSERVER_TARGET_DRIFT")
+    try:
+        current_source_payload = json.loads(
+            current_source["payload_json"], object_pairs_hook=_strict_object
+        )
+        cached_issue_material = _park_issue_material_projection(
+            current_source_payload
+        )
+        live_issue_material = _park_issue_material_projection(live_issue_payload)
+    except (json.JSONDecodeError, PullBufferError) as exc:
+        raise PullBufferError("PARK_PROVIDER_ISSUE_INVALID") from exc
+    if (
+        current_source["payload_sha256"] != evidence["current_source_sha256"]
+        or live_issue_material != cached_issue_material
+    ):
+        raise PullBufferError("PARK_PROVIDER_ISSUE_DRIFT")
+    if exact_refs or matching_pulls or local_branch.returncode == 0 or not worktree_absent:
+        raise PullBufferError("PARK_CANDIDATE_STILL_PRESENT")
+    observation = {
+        "schema": PARK_REPOSITORY_OBSERVATION_SCHEMA,
+        "repository": repository,
+        "issue_number": issue_number,
+        "generation": evidence["generation"],
+        "registration_sha256": registration["registration_sha256"],
+        "origin_url_sha256": hashlib.sha256(
+            str(registration["origin_url"]).encode("utf-8")
+        ).hexdigest(),
+        "remote_main_sha": next(iter(main_shas)),
+        "current_source_sha256": evidence["current_source_sha256"],
+        "issue_material_sha256": digest_json(live_issue_material),
+        "candidate_branch": branch,
+        "remote_candidate_refs": exact_refs,
+        "matching_open_pull_requests": matching_pulls,
+        "local_branch_absent": True,
+        "worktree_absent": True,
+        "cleanup_receipt_sha256": evidence["cleanup_receipt_sha256"],
+    }
+    return {**observation, "observation_sha256": digest_json(observation)}
+
+
+def _authenticate_park_controller_readonly(
+    connection: sqlite3.Connection,
+    *,
+    message_id: int,
+    planner_session_id: str,
+    request_sha256: str,
+    repository_observation_sha256: str,
+    environ: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Authenticate exact current attempt and request without a writable open."""
+
+    attempt_id = environ.get("TWINFINITY_EXECUTOR_ATTEMPT_ID", "")
+    instance_id = environ.get("TWINFINITY_EXECUTOR_INSTANCE_ID", "")
+    token = environ.get("TWINFINITY_EXECUTOR_TOKEN", "")
+    endpoint = current_endpoint(connection, "planner")
+    message = connection.execute(
+        "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+    ).fetchone()
+    attempt = connection.execute(
+        "SELECT * FROM executor_attempts WHERE attempt_id=?", (attempt_id,)
+    ).fetchone()
+    if message is None or attempt is None or endpoint is None or not token:
+        raise PullBufferError("PARK_CONTROLLER_AUTHENTICATION_FAILED")
+    try:
+        envelope = parse_coordination_envelope(message["payload_json"])
+        evidence = claimed_no_delivery_park_evidence(envelope.payload)
+    except CoordinationError as exc:
+        raise PullBufferError("PARK_CONTROLLER_REQUEST_INVALID") from exc
+    if (
+        envelope.payload_sha256 != request_sha256
+        or message["payload_sha256"] != request_sha256
+        or evidence["repository_observation_sha256"]
+        != repository_observation_sha256
+        or environ.get("TWINFINITY_PARK_REQUEST_SHA256") != request_sha256
+        or environ.get("TWINFINITY_PARK_REPOSITORY_OBSERVATION_SHA256")
+        != repository_observation_sha256
+        or message["state"] not in {"PREPARED", "CLAIMED"}
+        or message["recipient_session_id"] != planner_session_id
+        or endpoint["endpoint_id"] != planner_session_id
+        or attempt["instance_id"] != instance_id
+        or attempt["role"] != "planner"
+        or attempt["endpoint_id"] != planner_session_id
+        or attempt["state"] != "RUNNING"
+        or attempt["target_kind"] != "message"
+        or attempt["target_key"] != str(message_id)
+        or not hmac.compare_digest(
+            str(attempt["token_sha256"]),
+            hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        )
+    ):
+        raise PullBufferError("PARK_CONTROLLER_AUTHENTICATION_FAILED")
+    return envelope.payload, evidence
+
+
+def park_claimed_no_delivery_controller(
+    *,
+    database: Path,
+    message_id: int,
+    planner_session_id: str,
+    request_sha256: str,
+    repository_observation_sha256: str,
+    environ: dict[str, str] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Consume the one-use gate, authenticate read-only, then open writable."""
+
+    effective_environment = dict(os.environ if environ is None else environ)
+    try:
+        capability = consume_park_controller_capability(
+            environ=effective_environment
+        )
+    except RegistryError as exc:
+        raise PullBufferError("PARK_CONTROLLER_REAUTHENTICATION_FAILED") from exc
+    binding = capability["binding"]
+    if (
+        binding.get("target_key") != str(message_id)
+        or binding.get("endpoint_id") != planner_session_id
+        or binding.get("request_payload_sha256") != request_sha256
+        or binding.get("repository_observation_sha256")
+        != repository_observation_sha256
+    ):
+        raise PullBufferError("PARK_CONTROLLER_REAUTHENTICATION_FAILED")
+    authenticated_environment = {
+        **effective_environment,
+        "TWINFINITY_EXECUTOR_ATTEMPT_ID": str(binding["attempt_id"]),
+        "TWINFINITY_EXECUTOR_INSTANCE_ID": str(binding["instance_id"]),
+        "TWINFINITY_EXECUTOR_TOKEN": capability["credential"],
+    }
+    readonly = open_owner_database_readonly(database)
+    replay: dict[str, Any] | None = None
+    commit_observation_sha256: str | None = None
+    try:
+        readonly.execute("BEGIN")
+        _payload, evidence = _authenticate_park_controller_readonly(
+            readonly,
+            message_id=message_id,
+            planner_session_id=planner_session_id,
+            request_sha256=request_sha256,
+            repository_observation_sha256=repository_observation_sha256,
+            environ=authenticated_environment,
+        )
+        replay = committed_claimed_no_delivery_park_receipt(
+            readonly,
+            payload_sha256=request_sha256,
+            evidence=evidence,
+        )
+        if replay is None:
+            try:
+                validate_claimed_no_delivery_park_snapshot(
+                    readonly,
+                    artifact_root=Path(database).parent.resolve(),
+                    evidence=evidence,
+                )
+            except CoordinationError as exc:
+                raise PullBufferError(str(exc)) from exc
+            first_observation = acquire_claimed_no_delivery_repository_observation(
+                readonly, evidence, runner=runner
+            )
+            if (
+                first_observation["observation_sha256"]
+                != repository_observation_sha256
+            ):
+                raise PullBufferError("PARK_REPOSITORY_OBSERVATION_DRIFT")
+        readonly.execute("ROLLBACK")
+        if replay is None:
+            second_observation = acquire_claimed_no_delivery_repository_observation(
+                readonly, evidence, runner=runner
+            )
+            if (
+                second_observation["observation_sha256"]
+                != repository_observation_sha256
+                or second_observation != first_observation
+            ):
+                raise PullBufferError("PARK_REPOSITORY_OBSERVATION_DRIFT")
+            commit_observation_sha256 = second_observation["observation_sha256"]
+    finally:
+        readonly.close()
+
+    try:
+        adopt_park_controller_capability(environ=effective_environment)
+    except RegistryError as exc:
+        raise PullBufferError("PARK_CONTROLLER_ADOPTION_FAILED") from exc
+
+    def repository_observer() -> str:
+        if replay is not None:
+            raise PullBufferError("PARK_REPLAY_OBSERVER_FORBIDDEN")
+        if commit_observation_sha256 is None:
+            raise PullBufferError("PARK_REPOSITORY_OBSERVATION_DRIFT")
+        return commit_observation_sha256
+
+    store = CoordinationStore(database)
+    try:
+        return store.commit_claimed_no_delivery_park(
+            message_id=message_id,
+            session_id=planner_session_id,
+            attempt_id=authenticated_environment["TWINFINITY_EXECUTOR_ATTEMPT_ID"],
+            executor_token=authenticated_environment["TWINFINITY_EXECUTOR_TOKEN"],
+            expected_repository_observation_sha256=(
+                repository_observation_sha256
+            ),
+            repository_observer=repository_observer,
+            now=utc_now(),
+        )
+    finally:
+        store.close()
 
 
 def _legacy_recovery_stable_source(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5395,6 +5885,13 @@ def main() -> int:
     recover = subparsers.add_parser("recover-unclaimed-admission")
     recover.add_argument("--transaction-file", type=Path, required=True)
     recover.add_argument("--compatibility-descriptor-file", type=Path)
+    park_commit = subparsers.add_parser("park-commit")
+    park_commit.add_argument("--message-id", type=int, required=True)
+    park_commit.add_argument("--request-sha256", required=True)
+    park_commit.add_argument(
+        "--repository-observation-sha256", required=True
+    )
+    park_commit.add_argument("--planner-session-id", required=True)
     subparsers.add_parser("initialize")
     audit = subparsers.add_parser("audit")
     audit.add_argument("--repository", required=True)
@@ -5464,6 +5961,29 @@ def main() -> int:
     readiness_show = subparsers.add_parser("readiness-show")
     readiness_show.add_argument("--repository", required=True)
     args = parser.parse_args()
+    if args.command == "park-commit":
+        try:
+            result = park_claimed_no_delivery_controller(
+                database=DEFAULT_DATABASE,
+                message_id=args.message_id,
+                planner_session_id=args.planner_session_id,
+                request_sha256=args.request_sha256,
+                repository_observation_sha256=(
+                    args.repository_observation_sha256
+                ),
+            )
+            print(canonical_json({"phase": "COMPLETE", "result": result}))
+            return 0
+        except (
+            CoordinationError,
+            PullBufferError,
+            RegistryError,
+            OSError,
+            sqlite3.Error,
+            ValueError,
+        ) as exc:
+            print(canonical_json({"phase": "HOLD", "error": str(exc)}))
+            return 1
     read_only = (
         args.command in {
             "show", "readiness-discover", "readiness-show",
