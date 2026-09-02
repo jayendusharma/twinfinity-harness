@@ -109,8 +109,86 @@ PREFIX_WRAPPERS = {
     "setsid",
     "stdbuf",
     "sudo",
+    "time",
 }
 INTERPRETER_WRAPPERS = {"node", "nodejs", "perl", "php", "python", "python3", "ruby"}
+PYTHON_EXECUTABLE = re.compile(
+    r"(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)\Z", re.IGNORECASE
+)
+SQLITE_MUTATION = re.compile(
+    r"\b(?:alter|analyze|attach|begin|commit|create|delete|detach|drop|end|"
+    r"insert|reindex|release|replace|rollback|savepoint|update|vacuum)\b",
+    re.IGNORECASE,
+)
+SQLITE_SIDE_EFFECT_FUNCTION = re.compile(
+    r"(?is)(?<![A-Za-z0-9_])(?:edit|load_extension|writefile|"
+    r"[\"'`](?:edit|load_extension|writefile)[\"'`]|"
+    r"\[(?:edit|load_extension|writefile)\])"
+    r"(?:\s|/\*.*?\*/|--[^\r\n]*(?:\r?\n|\Z))*\("
+)
+SQLITE_READ_ONLY_PRAGMA = re.compile(
+    r"(?is)^pragma\s+(?:(?:compile_options|database_list|freelist_count|"
+    r"page_count|schema_version|user_version)|"
+    r"(?:foreign_key_check|index_info|index_list|index_xinfo|"
+    r"integrity_check|quick_check|table_info|table_list|table_xinfo)"
+    r"(?:\s*\([^;]*\))?)\s*\Z"
+)
+JS_COOKED_ESCAPE = re.compile(
+    r"\\(?:u(?:[0-9A-Fa-f]{4}|\{[0-9A-Fa-f]{1,6}\})|"
+    r"x[0-9A-Fa-f]{2}|[0-7]{1,3})"
+)
+PLANNER_READ_ONLY_EXECUTABLES = frozenset(
+    {
+        "basename",
+        "cat",
+        "cmp",
+        "cut",
+        "date",
+        "diff",
+        "dirname",
+        "du",
+        "echo",
+        "env",
+        "false",
+        "file",
+        "find",
+        "gh",
+        "git",
+        "grep",
+        "head",
+        "hexdump",
+        "id",
+        "jq",
+        "ls",
+        "nl",
+        "od",
+        "paste",
+        "pgrep",
+        "ps",
+        "printf",
+        "pwd",
+        "readlink",
+        "realpath",
+        "rg",
+        "sha256sum",
+        "sort",
+        "sqlite3",
+        "stat",
+        "tail",
+        "test",
+        "tr",
+        "true",
+        "uname",
+        "uniq",
+        "wc",
+        "whereis",
+        "which",
+        "xxd",
+    }
+)
+PLANNER_READ_ONLY_PYTHON_SCRIPTS = frozenset(
+    {"archive_readiness_audit.py", "executor_registry.py"}
+)
 PROCESS_EXECUTION = re.compile(
     r"(?i)(?:\bsubprocess\b|\bos\.system\s*\(|\bos\.popen\s*\(|"
     r"\bchild_process\b|\bexec(?:File|Sync)?\s*\(|\bspawn(?:Sync)?\s*\()"
@@ -205,6 +283,7 @@ class CommandLeaf:
     bounded_wait: bool = False
     interpreter: str | None = None
     direct_launch: bool = True
+    planner_read_only_script: bool = False
 
 
 class GuardError(RuntimeError):
@@ -234,24 +313,47 @@ def _commands(tool_input: dict[str, Any]) -> Iterable[str]:
         yield from (match.group(1) for match in JS_BACKTICK_CMD.finditer(source))
 
 
-def _shell_tokens(command: str) -> tuple[str, ...] | None:
+def _shell_tokens(
+    command: str,
+    *,
+    preserve_newline_separators: bool = False,
+) -> tuple[str, ...] | None:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|>")
+        command = re.sub(r"\\\r?\n", "", command)
+        punctuation = ";&|>\n" if preserve_newline_separators else ";&|>"
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=punctuation)
+        if preserve_newline_separators:
+            lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
-        return tuple(lexer)
+        tokens: list[str] = []
+        for token in lexer:
+            if (
+                preserve_newline_separators
+                and "\n" in token
+                and all(character in punctuation for character in token)
+            ):
+                pieces = token.split("\n")
+                for index, piece in enumerate(pieces):
+                    if piece:
+                        tokens.append(piece)
+                    if index + 1 < len(pieces):
+                        tokens.append("\n")
+            else:
+                tokens.append(token)
+        return tuple(tokens)
     except ValueError:
         return None
 
 
 def _command_segments(command: str) -> tuple[str, ...] | None:
-    tokens = _shell_tokens(command)
+    tokens = _shell_tokens(command, preserve_newline_separators=True)
     if tokens is None:
         return None
     segments: list[str] = []
     current: list[str] = []
     for token in tokens:
-        if token in {";", "&&", "||", "|", "&"}:
+        if token in {";", "&&", "||", "|", "&", "\n"}:
             if current:
                 segments.append(
                     " ".join(
@@ -1619,7 +1721,7 @@ def _shell_write(command: str) -> ShellWrite:
         return ShellWrite(True, ambiguous=True)
     if executable in {"apply_patch", "patch"} or SCRIPT_WRITE.search(command) or FORMAT_WRITE.search(command):
         return ShellWrite(True, ambiguous=True)
-    if executable in {"npm", "npx", "pnpm", "yarn", "pip", "pip3", "pytest", "ruff", "mypy", "tox", "make", "cargo", "go", "docker", "python", "python3"}:
+    if executable in {"npm", "npx", "pnpm", "yarn", "pip", "pip3", "pytest", "ruff", "mypy", "tox", "make", "cargo", "go", "docker"} or _is_python_executable(executable):
         return ShellWrite(True, worktree_only=True)
     return ShellWrite()
 
@@ -1761,12 +1863,14 @@ def _js_literal(value: str) -> str:
         except json.JSONDecodeError as exc:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED") from exc
     elif value[0] == "'":
+        if re.search(r"\\(?![\\'\"nrtbfv])", value):
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
         try:
             decoded = ast.literal_eval(value)
         except (SyntaxError, ValueError) as exc:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED") from exc
     else:
-        if "${" in value or "\\`" in value:
+        if "${" in value or "\\" in value:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
         decoded = value[1:-1]
     if not isinstance(decoded, str):
@@ -1774,41 +1878,85 @@ def _js_literal(value: str) -> str:
     return decoded
 
 
-def _js_object_literal_property(argument: str, name: str, *, required: bool) -> str | None:
+def _js_static_object_members(argument: str) -> tuple[tuple[str, str], ...]:
     stripped = argument.strip()
     if not stripped.startswith("{") or not stripped.endswith("}"):
         raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+    if JS_COOKED_ESCAPE.search(stripped):
+        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
     masked = _mask_js_noncode(stripped)
-    matches = tuple(re.finditer(rf"\b{re.escape(name)}\s*:", masked))
-    if not matches:
+    slices: list[tuple[str, str]] = []
+    start = 1
+    depth = 0
+    for index, character in enumerate(masked[1:-1], start=1):
+        if character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+            if depth < 0:
+                raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        elif character == "," and depth == 0:
+            slices.append((stripped[start:index], masked[start:index]))
+            start = index + 1
+    if depth != 0:
+        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+    slices.append((stripped[start:-1], masked[start:-1]))
+    if slices and not slices[-1][0].strip():
+        slices.pop()
+    if any(not source.strip() for source, _masked_source in slices):
+        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+
+    members: list[tuple[str, str]] = []
+    keys: set[str] = set()
+    for source, masked_source in slices:
+        colon: int | None = None
+        member_depth = 0
+        for index, character in enumerate(masked_source):
+            if character in "([{":
+                member_depth += 1
+            elif character in ")]}":
+                member_depth -= 1
+                if member_depth < 0:
+                    raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+            elif character == ":" and member_depth == 0:
+                colon = index
+                break
+        if colon is None or member_depth != 0:
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        key_source = source[:colon].strip()
+        if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", key_source):
+            key = key_source
+        elif (
+            len(key_source) >= 2
+            and key_source[0] in {'"', "'", "`"}
+            and key_source[-1] == key_source[0]
+        ):
+            key = _js_literal(key_source)
+        else:
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        value = source[colon + 1:].strip()
+        if not value or key in keys:
+            raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+        keys.add(key)
+        members.append((key, value))
+    return tuple(members)
+
+
+def _js_object_literal_property(argument: str, name: str, *, required: bool) -> str | None:
+    values = tuple(
+        value for key, value in _js_static_object_members(argument) if key == name
+    )
+    if not values:
         if required:
             raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
         return None
-    if len(matches) != 1:
+    if len(values) != 1:
         raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    start = matches[0].end()
-    while start < len(stripped) and stripped[start].isspace():
-        start += 1
-    if start >= len(stripped) or stripped[start] not in {'"', "'", "`"}:
-        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    quote = stripped[start]
-    escaped = False
-    end = start + 1
-    while end < len(stripped):
-        character = stripped[end]
-        if escaped:
-            escaped = False
-        elif character == "\\":
-            escaped = True
-        elif character == quote:
-            break
-        end += 1
-    if end >= len(stripped):
-        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    trailing = stripped[end + 1:].lstrip()
-    if not trailing or trailing[0] not in {",", "}"}:
-        raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
-    return _js_literal(stripped[start:end + 1])
+    return _js_literal(values[0])
+
+
+def _js_static_object_keys(argument: str) -> tuple[str, ...]:
+    return tuple(key for key, _value in _js_static_object_members(argument))
 
 
 def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool] | None:
@@ -1844,8 +1992,32 @@ def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool]
         return shlex.join(tokens[index + 1:]), seconds <= MAX_PASSIVE_WAIT_SECONDS
     if executable in PREFIX_WRAPPERS:
         index = 1
+        options_with_values = {
+            "env": {"-C", "--chdir", "-S", "--split-string", "-u", "--unset"},
+            "exec": {"-a"},
+            "nice": {"-n", "--adjustment"},
+            "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
+            "sudo": {
+                "-C", "--close-from", "-D", "--chdir", "-g", "--group",
+                "-h", "--host", "-p", "--prompt", "-r", "--role",
+                "-t", "--type", "-u", "--user",
+            },
+            "time": {"-f", "--format", "-o", "--output"},
+        }
         while index < len(tokens):
             token = tokens[index]
+            if executable == "time" and (
+                token in {"-a", "--append", "-o", "--output"}
+                or token.startswith("-o")
+                or token.startswith("--output=")
+            ):
+                raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
+            if executable == "env" and (
+                token in {"-S", "--split-string"}
+                or token.startswith("-S")
+                or token.startswith("--split-string=")
+            ):
+                raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
             if executable == "env" and "=" in token and not token.startswith("="):
                 index += 1
                 continue
@@ -1854,7 +2026,10 @@ def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool]
                 break
             if token.startswith("-"):
                 index += 1
-                if token in {"-C", "-D", "-g", "-h", "-n", "-o", "-p", "-r", "-t", "-u"}:
+                if (
+                    "=" not in token
+                    and token in options_with_values.get(executable, set())
+                ):
                     index += 1
                 continue
             break
@@ -1862,6 +2037,10 @@ def _wrapper_child(tokens: tuple[str, ...], executable: str) -> tuple[str, bool]
             return None
         return shlex.join(tokens[index:]), False
     return None
+
+
+def _is_python_executable(executable: str) -> bool:
+    return PYTHON_EXECUTABLE.fullmatch(executable) is not None
 
 
 def _command_leaves(
@@ -1950,8 +2129,8 @@ def _command_leaves(
                 )
                 continue
             raise GuardError("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
-        if executable in INTERPRETER_WRAPPERS:
-            code_flag = "-c" if executable in {"python", "python3"} else "-e"
+        if executable in INTERPRETER_WRAPPERS or _is_python_executable(executable):
+            code_flag = "-c" if _is_python_executable(executable) else "-e"
             if code_flag in tokens:
                 index = tokens.index(code_flag)
                 if index + 1 >= len(tokens) or index + 2 != len(tokens):
@@ -1965,7 +2144,7 @@ def _command_leaves(
                     )
                 )
                 continue
-            if executable in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {"pytest", "unittest"}:
+            if _is_python_executable(executable) and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in {"pytest", "unittest"}:
                 leaves.append(
                     CommandLeaf(
                         segment,
@@ -1984,6 +2163,20 @@ def _command_leaves(
                         segment,
                         bounded_wait,
                         direct_launch=leaf_direct_launch,
+                    )
+                )
+                continue
+            if (
+                _is_python_executable(executable)
+                and len(tokens) >= 2
+                and Path(tokens[1]).name in PLANNER_READ_ONLY_PYTHON_SCRIPTS
+            ):
+                leaves.append(
+                    CommandLeaf(
+                        segment,
+                        bounded_wait,
+                        direct_launch=leaf_direct_launch,
+                        planner_read_only_script=True,
                     )
                 )
                 continue
@@ -2041,6 +2234,111 @@ def _python_interpreter_write(source: str) -> ShellWrite:
     return ShellWrite(writes, tuple(paths), ambiguous=ambiguous or (writes and not paths))
 
 
+def _planner_sqlite_leaf_denied(leaf: CommandLeaf) -> bool:
+    tokens = _shell_tokens(leaf.command)
+    if not tokens:
+        return False
+    executable = tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    if executable == "find" and any(
+        token in {"-exec", "-execdir", "-ok", "-okdir"} for token in tokens[1:]
+    ):
+        return True
+    if executable != "sqlite3":
+        return False
+    if len(tokens) != 4 or tokens[1] != "-readonly" or tokens[2].startswith("-"):
+        return True
+    statement = tokens[3].strip()
+    if statement.endswith(";"):
+        statement = statement[:-1].rstrip()
+    if (
+        ";" in statement
+        or SQLITE_MUTATION.search(statement)
+        or SQLITE_SIDE_EFFECT_FUNCTION.search(statement)
+    ):
+        return True
+    if re.match(r"(?is)^(?:select|with|explain)\b.+\Z", statement):
+        return False
+    if SQLITE_READ_ONLY_PRAGMA.fullmatch(statement):
+        return False
+    return re.fullmatch(r"(?is)\.(?:schema(?:\s+[A-Za-z0-9_]+)?|tables)", statement) is None
+
+
+def _planner_read_only_python_script_allowed(
+    leaf: CommandLeaf,
+    cwd: Path,
+) -> bool:
+    if not leaf.planner_read_only_script:
+        return False
+    tokens = _shell_tokens(leaf.command)
+    if not tokens or len(tokens) < 2 or not _is_python_executable(
+        tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    ):
+        return False
+    script = Path(tokens[1])
+    script = Path(os.path.abspath(script if script.is_absolute() else cwd / script))
+    script_root = Path(__file__).resolve().parent
+    if script == script_root / "archive_readiness_audit.py":
+        return len(tokens) == 2
+    if script != script_root / "executor_registry.py":
+        return False
+    arguments = list(tokens[2:])
+    seen_options: set[str] = set()
+    while arguments and arguments[0] in {"--config", "--profile-root"}:
+        option = arguments.pop(0)
+        if option in seen_options or not arguments or arguments[0].startswith("-"):
+            return False
+        seen_options.add(option)
+        arguments.pop(0)
+    return arguments == ["audit-config"]
+
+
+def _planner_read_only_leaf_allowed(leaf: CommandLeaf, cwd: Path) -> bool:
+    if _planner_read_only_python_script_allowed(leaf, cwd):
+        return True
+    tokens = _shell_tokens(leaf.command)
+    if not tokens:
+        return False
+    executable = tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+    if executable not in PLANNER_READ_ONLY_EXECUTABLES:
+        return False
+    arguments = tokens[1:]
+    if executable == "sort" and any(
+        token in {"-o", "--output"}
+        or token.startswith("--output=")
+        or (token.startswith("-o") and not token.startswith("--"))
+        for token in arguments
+    ):
+        return False
+    if executable == "find" and any(
+        token in {
+            "-delete",
+            "-exec",
+            "-execdir",
+            "-fls",
+            "-fprint",
+            "-fprint0",
+            "-fprintf",
+            "-ok",
+            "-okdir",
+        }
+        for token in arguments
+    ):
+        return False
+    if executable == "xxd" and any(
+        token in {"-r", "-revert"} or token.startswith("-r")
+        for token in arguments
+    ):
+        return False
+    if executable == "date" and any(
+        token in {"-s", "--set"}
+        or token.startswith("--set=")
+        or (token.startswith("-") and not token.startswith("--") and "s" in token[1:])
+        for token in arguments
+    ):
+        return False
+    return True
+
+
 def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[str, Any]:
     if GIT_METADATA_ENV.search(command):
         return _deny("DELIVERY_GIT_METADATA_OUTSIDE_EXACT_ADMISSION")
@@ -2055,6 +2353,30 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
     except GuardError:
         return _deny("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
     for leaf in leaves:
+        if context.role == "planner":
+            if _planner_read_only_python_script_allowed(leaf, cwd):
+                continue
+            leaf_tokens = _shell_tokens(leaf.command)
+            leaf_executable = (
+                leaf_tokens[0].rstrip("/").rsplit("/", 1)[-1].casefold()
+                if leaf_tokens
+                else ""
+            )
+            if (
+                leaf.interpreter is not None
+                or (
+                    not leaf.planner_read_only_script
+                    and (
+                        leaf_executable in INTERPRETER_WRAPPERS
+                        or _is_python_executable(leaf_executable)
+                    )
+                )
+            ):
+                return _deny("PLANNER_NON_PARK_INTERPRETER_FORBIDDEN")
+            if _planner_sqlite_leaf_denied(leaf):
+                return _deny("PLANNER_NON_PARK_SQLITE_MUTATION_FORBIDDEN")
+            if not _planner_read_only_leaf_allowed(leaf, cwd):
+                return _deny("PLANNER_NON_PARK_COMMAND_UNDETERMINED")
         if GIT_EXTERNAL_HELPER_ENV.search(leaf.command):
             return _deny("DELIVERY_GIT_EXTERNAL_HELPER_FORBIDDEN")
         if _contains_raw_push(leaf.command):
@@ -2098,7 +2420,7 @@ def _enforce_command(command: str, context: DeliveryContext, cwd: Path) -> dict[
                 return _deny("DELIVERY_WRAPPED_COMMAND_UNDETERMINED")
             assessment = (
                 _python_interpreter_write(leaf.command)
-                if leaf.interpreter in {"python", "python3"}
+                if _is_python_executable(leaf.interpreter)
                 else ShellWrite(
                     bool(SCRIPT_WRITE.search(leaf.command) or INTERPRETER_WRITE.search(leaf.command)),
                     ambiguous=True,
@@ -2138,11 +2460,30 @@ def _enforce_nested_tools(
             continue
         if name == "exec_command":
             try:
+                static_keys = (
+                    _js_static_object_keys(argument)
+                    if context.role == "planner"
+                    else ()
+                )
                 command = _js_object_literal_property(argument, "cmd", required=True)
                 workdir = _js_object_literal_property(argument, "workdir", required=False)
+                sandbox_permissions = _js_object_literal_property(
+                    argument, "sandbox_permissions", required=False
+                )
+                if (
+                    context.role == "planner"
+                    and "sandbox_permissions" in static_keys
+                    and sandbox_permissions is None
+                ):
+                    raise GuardError("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
                 nested_cwd = cwd if workdir is None else _path_value(workdir, cwd)
             except GuardError:
                 return _deny("DELIVERY_NESTED_TOOL_INPUT_UNDETERMINED")
+            if (
+                context.role == "planner"
+                and sandbox_permissions == "require_escalated"
+            ):
+                return _deny("PLANNER_NON_PARK_ESCALATION_FORBIDDEN")
             decision = _enforce_command(command or "", context, nested_cwd)
             if decision:
                 return decision
@@ -2272,11 +2613,17 @@ def pre_tool(event: dict[str, Any], *, raw_event: bytes | None = None, environ: 
             )
         context = _load_context(effective_environment, database_path, worktree_root)
         cwd = _cwd(event, tool_input)
+        if (
+            context.role == "planner"
+            and tool_input.get("sandbox_permissions") == "require_escalated"
+        ):
+            return _deny("PLANNER_NON_PARK_ESCALATION_FORBIDDEN")
         source = tool_input.get("source")
         if not isinstance(source, str):
             source = tool_input.get("input")
         if isinstance(source, str) and (
             "${" in source
+            or JS_COOKED_ESCAPE.search(source)
             or re.search(
                 r"(?:\b(?:eval|Function|globalThis|Proxy|Reflect)\b|\.constructor\b|\bthis\s*\[)",
                 source,

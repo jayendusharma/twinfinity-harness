@@ -76,7 +76,9 @@ PARK_CAPABILITY_STATES = {
     "ADOPTED",
     "FAILED",
 }
-PARK_ADOPTION_WAIT_SECONDS = 10.0
+PARK_SOCKET_REQUEST_TIMEOUT_SECONDS = 10.0
+PARK_PRE_CONSUMPTION_WAIT_SECONDS = 10.0
+PARK_POST_CONSUMPTION_ADOPTION_SECONDS = 180.0
 PARK_SOCKET_REQUEST_LIMIT = 64 * 1024
 PARK_HOOK_EVENT_LIMIT = 32 * 1024
 PARK_CODEX_VERSION = "codex-cli 0.147.0"
@@ -166,7 +168,7 @@ def _park_socket_request(
     if len(request) > PARK_SOCKET_REQUEST_LIMIT:
         raise RegistryError("PARK_CAPABILITY_REQUEST_INVALID")
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(PARK_ADOPTION_WAIT_SECONDS)
+    client.settimeout(PARK_SOCKET_REQUEST_TIMEOUT_SECONDS)
     try:
         client.connect(path_value)
         client.sendall(request)
@@ -419,6 +421,8 @@ class ParkCapabilityBroker:
             self._error: str | None = None
             self._manifest: dict[str, Any] | None = None
             self._manifest_sha256: str | None = None
+            self._deadline_monotonic: float | None = None
+            self._deadline_phase: str | None = None
             self._events: list[dict[str, Any]] = []
             self._hook_identity: tuple[str, str, str] | None = None
             self._hook_process_identity: tuple[int, int] | None = None
@@ -476,6 +480,7 @@ class ParkCapabilityBroker:
             "systemd_invocation_id",
             "systemd_control_group",
             "expires_monotonic",
+            "post_consumption_adoption_seconds",
             "one_use",
         }
         with self._lock:
@@ -486,12 +491,19 @@ class ParkCapabilityBroker:
                 or manifest.get("one_use") is not True
                 or not isinstance(manifest.get("expires_monotonic"), float)
                 or manifest["expires_monotonic"] <= time.monotonic()
+                or not isinstance(
+                    manifest.get("post_consumption_adoption_seconds"), float
+                )
+                or manifest.get("post_consumption_adoption_seconds")
+                != PARK_POST_CONSUMPTION_ADOPTION_SECONDS
                 or not self._immutable_manifest_matches(manifest)
             ):
                 self._fail_locked("PARK_RUNTIME_MANIFEST_DRIFT")
                 raise RegistryError("PARK_RUNTIME_MANIFEST_DRIFT")
             self._manifest = json.loads(canonical_json(manifest))
             self._manifest_sha256 = digest_json(manifest)
+            self._deadline_monotonic = float(manifest["expires_monotonic"])
+            self._deadline_phase = "PRE_CONSUMPTION"
             self._state = "ARMED"
             self._events.append(
                 {
@@ -499,17 +511,45 @@ class ParkCapabilityBroker:
                     "pid": os.getpid(),
                     "monotonic": time.monotonic(),
                     "manifest_sha256": self._manifest_sha256,
+                    "deadline_monotonic": self._deadline_monotonic,
+                    "deadline_phase": self._deadline_phase,
                 }
             )
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "state": self._state,
-                "error": self._error,
-                "events": json.loads(canonical_json(self._events)),
-                "manifest_sha256": self._manifest_sha256,
-            }
+            return self._snapshot_locked()
+
+    def expire_if_due(self) -> dict[str, Any]:
+        """Atomically expire a non-adopted capability at its active deadline."""
+
+        with self._lock:
+            if (
+                self._state not in {"ADOPTED", "FAILED"}
+                and self._deadline_monotonic is not None
+                and time.monotonic() >= self._deadline_monotonic
+            ):
+                self._fail_locked("PARK_CAPABILITY_ADOPTION_TIMEOUT")
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, Any]:
+        return {
+            "state": self._state,
+            "error": self._error,
+            "events": json.loads(canonical_json(self._events)),
+            "manifest_sha256": self._manifest_sha256,
+            "deadline_monotonic": self._deadline_monotonic,
+            "deadline_phase": self._deadline_phase,
+        }
+
+    def _require_unexpired_locked(self) -> float:
+        observed = time.monotonic()
+        if (
+            self._deadline_monotonic is None
+            or observed >= self._deadline_monotonic
+        ):
+            raise RegistryError("PARK_CAPABILITY_ADOPTION_TIMEOUT")
+        return observed
 
     def release_prompt(self, stream: Any, prompt: bytes) -> None:
         """Release stdin while holding the same lock that adopts the first hook."""
@@ -523,12 +563,22 @@ class ParkCapabilityBroker:
                 self._fail_locked("PARK_PROMPT_RELEASE_STATE_CONFLICT")
                 raise RegistryError("PARK_PROMPT_RELEASE_STATE_CONFLICT")
             try:
+                self._require_unexpired_locked()
+            except RegistryError:
+                self._fail_locked("PARK_CAPABILITY_ADOPTION_TIMEOUT")
+                raise
+            try:
                 stream.write(prompt)
                 stream.flush()
                 stream.close()
             except (AttributeError, OSError, ValueError) as exc:
                 self._fail_locked("PARK_PROMPT_RELEASE_FAILED")
                 raise RegistryError("PARK_PROMPT_RELEASE_FAILED") from exc
+            try:
+                self._require_unexpired_locked()
+            except RegistryError:
+                self._fail_locked("PARK_CAPABILITY_ADOPTION_TIMEOUT")
+                raise
             self._state = "PROMPT_RELEASED"
             self._events.append(
                 {
@@ -719,13 +769,19 @@ class ParkCapabilityBroker:
             manifest is None
             or self._state == "FAILED"
             or peer_uid != os.getuid()
-            or time.monotonic() >= manifest["expires_monotonic"]
-            or not self._immutable_manifest_matches(manifest)
+        ):
+            raise RegistryError("PARK_CAPABILITY_BINDING_MISMATCH")
+        if self._state != "ADOPTED":
+            self._require_unexpired_locked()
+        if (
+            not self._immutable_manifest_matches(manifest)
             or not _process_descends_from(
                 peer_pid, manifest["codex_pid"], manifest["codex_start_time"]
             )
         ):
             raise RegistryError("PARK_CAPABILITY_BINDING_MISMATCH")
+        if self._state != "ADOPTED":
+            self._require_unexpired_locked()
         kind = request.get("kind")
         if kind == "nested_hook":
             return self._authorize_hook_locked(request, peer_pid, manifest)
@@ -784,6 +840,7 @@ class ParkCapabilityBroker:
             or _process_control_group(peer_pid) != manifest["codex_control_group"]
         ):
             raise RegistryError("PARK_HOOK_BINDING_MISMATCH")
+        self._require_unexpired_locked()
         self._hook_identity = identity
         self._hook_process_identity = (peer_pid, peer_start)
         self._state = "INNER_SEEN"
@@ -834,7 +891,12 @@ class ParkCapabilityBroker:
         ):
             raise RegistryError("PARK_CONTROLLER_REAUTHENTICATION_FAILED")
         _parent, start = _process_identity(peer_pid)
+        consumed_at = self._require_unexpired_locked()
         self._controller_identity = (peer_pid, start)
+        self._deadline_monotonic = (
+            consumed_at + manifest["post_consumption_adoption_seconds"]
+        )
+        self._deadline_phase = "POST_CONSUMPTION"
         self._state = "CONSUMED"
         self._events.append(
             {
@@ -843,7 +905,9 @@ class ParkCapabilityBroker:
                 "start_time": start,
                 "executable": _process_executable(peer_pid),
                 "control_group": _process_control_group(peer_pid),
-                "monotonic": time.monotonic(),
+                "monotonic": consumed_at,
+                "deadline_monotonic": self._deadline_monotonic,
+                "deadline_phase": self._deadline_phase,
             }
         )
         binding = {
@@ -876,12 +940,15 @@ class ParkCapabilityBroker:
             or not self._controller_peer_matches(peer_pid, manifest)
         ):
             raise RegistryError("PARK_CONTROLLER_ADOPTION_FAILED")
+        adopted_at = self._require_unexpired_locked()
         self._state = "ADOPTED"
+        self._deadline_monotonic = None
+        self._deadline_phase = None
         self._events.append(
             {
                 "kind": "CONTROLLER_ADOPTED",
                 "pid": peer_pid,
-                "monotonic": time.monotonic(),
+                "monotonic": adopted_at,
             }
         )
         return {"ok": True, "state": self._state}
@@ -1315,7 +1382,10 @@ def build_park_launch_manifest(
         "codex_control_group": _process_control_group(process_id),
         "systemd_invocation_id": systemd_invocation_id,
         "systemd_control_group": systemd_control_group,
-        "expires_monotonic": time.monotonic() + PARK_ADOPTION_WAIT_SECONDS,
+        "expires_monotonic": time.monotonic() + PARK_PRE_CONSUMPTION_WAIT_SECONDS,
+        "post_consumption_adoption_seconds": (
+            PARK_POST_CONSUMPTION_ADOPTION_SECONDS
+        ),
         "one_use": True,
     }
     return manifest
@@ -2035,7 +2105,6 @@ def execute_role(
             pass
         raise RegistryError("EXECUTOR_POST_LAUNCH_TRANSITION_FAILED") from exc
     park_setup_error: str | None = None
-    park_deadline: float | None = None
     park_barrier_active = False
     if park_broker is not None and park_binding is not None:
         try:
@@ -2056,7 +2125,6 @@ def execute_role(
                 systemd_invocation_id=systemd_invocation_id,
                 systemd_control_group=systemd_evidence.control_group,
             )
-            park_deadline = float(manifest["expires_monotonic"])
             park_broker.arm(manifest)
             if process.stdin is None:
                 raise RegistryError("PARK_PROMPT_PIPE_REQUIRED")
@@ -2097,7 +2165,7 @@ def execute_role(
                 process_id=int(process.pid),
             )
             continue
-        capability = park_broker.snapshot()
+        capability = park_broker.expire_if_due()
         if capability["state"] == "ADOPTED" and park_barrier_active:
             try:
                 connection.execute("ROLLBACK")
@@ -2109,11 +2177,7 @@ def execute_role(
                 exit_code = process.poll()
                 break
             park_barrier_active = False
-        if capability["state"] == "FAILED" or (
-            capability["state"] != "ADOPTED"
-            and park_deadline is not None
-            and time.monotonic() >= park_deadline
-        ):
+        if capability["state"] == "FAILED":
             if park_setup_error is None:
                 park_setup_error = (
                     capability["error"] or "PARK_CAPABILITY_ADOPTION_TIMEOUT"

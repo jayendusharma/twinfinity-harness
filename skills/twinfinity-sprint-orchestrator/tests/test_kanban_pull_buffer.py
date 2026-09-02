@@ -15,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS))
 from coordination_store import CoordinationError, CoordinationStore  # noqa: E402
 from kanban_pull_buffer import (  # noqa: E402
     PullBufferError,
+    _park_matching_open_pull_requests,
     audit_pull_buffer,
     register_candidate,
     show_pull_buffer,
@@ -130,6 +131,85 @@ class KanbanPullBufferTests(unittest.TestCase):
                 }
             ],
         }
+
+    def test_park_open_pull_matching_requires_branch_and_repository_identity(self) -> None:
+        rows = [
+            {
+                "number": 145,
+                "head": {
+                    "ref": "change/144-exact",
+                    "repo": {"full_name": "JayEnduSharma/Twinfinity-Harness"},
+                },
+            },
+            {
+                "number": 146,
+                "head": {
+                    "ref": "change/144-exact",
+                    "repo": {"full_name": "fork-owner/twinfinity-harness"},
+                },
+            },
+            {
+                "number": 147,
+                "head": {
+                    "ref": "change/other",
+                    "repo": {"full_name": "jayendusharma/twinfinity-harness"},
+                },
+            },
+        ]
+        self.assertEqual(
+            [145],
+            _park_matching_open_pull_requests(
+                rows,
+                branch="change/144-exact",
+                repository="jayendusharma/twinfinity-harness",
+            ),
+        )
+
+    def test_park_open_pull_matching_ignores_missing_or_deleted_head_repository(self) -> None:
+        rows = [
+            {"number": 145},
+            {"number": 146, "head": {"ref": "change/144-exact"}},
+            {
+                "number": 147,
+                "head": {"ref": "change/144-exact", "repo": None},
+            },
+            {
+                "number": 148,
+                "head": {"ref": "change/144-exact", "repo": {}},
+            },
+            {
+                "number": 149,
+                "head": {
+                    "ref": "change/144-exact",
+                    "repo": {"full_name": 149},
+                },
+            },
+            {
+                "number": 150,
+                "head": {
+                    "ref": "change/144-exact",
+                    "repo": {"full_name": "not-a-repository"},
+                },
+            },
+        ]
+        self.assertEqual(
+            [],
+            _park_matching_open_pull_requests(
+                rows,
+                branch="change/144-exact",
+                repository="jayendusharma/twinfinity-harness",
+            ),
+        )
+
+    def test_park_open_pull_matching_rejects_invalid_target_repository(self) -> None:
+        with self.assertRaisesRegex(
+            PullBufferError, "PARK_REPOSITORY_OBSERVER_TARGET_DRIFT"
+        ):
+            _park_matching_open_pull_requests(
+                [],
+                branch="change/144-exact",
+                repository=" jayendusharma/twinfinity-harness ",
+            )
 
     def _packet(self, number: int, verticality: str, mutator=None) -> Path:
         item = self.store.connection.execute(

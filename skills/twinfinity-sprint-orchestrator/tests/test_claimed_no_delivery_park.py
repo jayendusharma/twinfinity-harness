@@ -54,6 +54,8 @@ from run_role_executor import (  # noqa: E402
     PARK_CAPABILITY_SOCKET_ENV,
     PARK_CODEX_SHA256,
     PARK_CODEX_VERSION,
+    PARK_POST_CONSUMPTION_ADOPTION_SECONDS,
+    PARK_PRE_CONSUMPTION_WAIT_SECONDS,
     ParkCapabilityBroker,
     _owned_process_group,
     _process_argv,
@@ -88,6 +90,8 @@ ACTUAL_CODEX_TEST_ENV = "TWINFINITY_RUN_ACTUAL_CODEX_PARK_TEST"
 ACTUAL_CODEX_IN_NAMESPACE_ENV = "TWINFINITY_ACTUAL_CODEX_PARK_NAMESPACE"
 ACTUAL_CODEX_FIXTURE_ROOT_ENV = "TWINFINITY_ACTUAL_CODEX_PARK_FIXTURE_ROOT"
 ACTUAL_CODEX_GH_LOG_ENV = "TWINFINITY_ACTUAL_CODEX_PARK_GH_LOG"
+FIXTURE_HOOK_INTERPRETER = Path("/usr/bin/python3")
+FIXTURE_HOOK_EXECUTABLE = FIXTURE_HOOK_INTERPRETER.resolve(strict=True)
 
 
 class ClaimedNoDeliveryParkTests(unittest.TestCase):
@@ -401,7 +405,7 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
                     "path": os.fspath(
                         guard
                         if kind == "guard"
-                        else Path(_process_executable(pid))
+                        else FIXTURE_HOOK_EXECUTABLE
                         if kind == "python"
                         else Path(__file__)
                     ),
@@ -425,7 +429,12 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
             "codex_control_group": _process_control_group(pid),
             "systemd_invocation_id": "8" * 32,
             "systemd_control_group": "/user.slice/fixture.service",
-            "expires_monotonic": time.monotonic() + 2.0,
+            "expires_monotonic": (
+                time.monotonic() + PARK_PRE_CONSUMPTION_WAIT_SECONDS
+            ),
+            "post_consumption_adoption_seconds": (
+                PARK_POST_CONSUMPTION_ADOPTION_SECONDS
+            ),
             "one_use": True,
         }
 
@@ -441,6 +450,35 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+        def fixture_controller_peer_matches(
+            candidate: ParkCapabilityBroker,
+            peer_pid: int,
+            manifest: dict,
+        ) -> bool:
+            try:
+                _parent, peer_start = _process_identity(peer_pid)
+                return bool(
+                    peer_pid == manifest["runner_pid"]
+                    and peer_start == manifest["runner_start_time"]
+                    and _process_argv(peer_pid) == manifest["controller_argv"]
+                    and _process_cwd(peer_pid) == manifest["controller_cwd"]
+                    and _process_control_group(peer_pid)
+                    == manifest["codex_control_group"]
+                    and candidate._hook_process_identity is not None
+                    and (peer_pid, peer_start)
+                    != candidate._hook_process_identity
+                )
+            except Exception:
+                return False
+
+        controller_patcher = mock.patch.object(
+            ParkCapabilityBroker,
+            "_controller_peer_matches",
+            new=fixture_controller_peer_matches,
+        )
+        controller_patcher.start()
+        self.addCleanup(controller_patcher.stop)
         broker = ParkCapabilityBroker(self.store.path.parent, credential=credential)
         broker.arm(
             {
@@ -479,83 +517,96 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
         message_id = int(cursor.lastrowid)
         self.store.connection.commit()
         attempt, token = self._running_planner_attempt(message_id, process_id)
-        evidence = payload["evidence"]
-        command = _park_controller_command()
-        broker, environment = self._new_capability_broker(
-            command=command,
-            credential=token,
-            manifest_updates={
-                "attempt_id": attempt["attempt_id"],
-                "instance_id": attempt["instance_id"],
-                "endpoint_id": PLANNER_ENDPOINT,
-                "target_key": str(message_id),
-                "request_payload_sha256": request_sha256,
-                "repository_observation_sha256": self.repository_observation_sha256,
-                "repository": REPOSITORY,
-                "issue_number": ISSUE,
-                "generation": GENERATION,
-                "lease_manifest_sha256": evidence["lease_manifest_sha256"],
-                "source_payload_sha256": self.bound_sha,
-            },
-        )
-        environment.update(
-            {
-                "TWINFINITY_EXECUTOR_ROLE": "planner",
-                "TWINFINITY_ROLE_ENDPOINT": PLANNER_ENDPOINT,
-                "TWINFINITY_EXECUTOR_TARGET_KIND": "message",
-                "TWINFINITY_EXECUTOR_TARGET_KEY": str(message_id),
-                "TWINFINITY_PARK_REQUEST_SHA256": request_sha256,
-                "TWINFINITY_PARK_REPOSITORY_OBSERVATION_SHA256": (
-                    self.repository_observation_sha256
-                ),
-            }
-        )
-        hook = self._run_candidate_guard(
-            self._park_hook_event(command=command), environment
-        )
-        self.assertEqual({}, json.loads(hook.stdout))
-        before = self._durable_coordination_snapshot()
-        with (
-            mock.patch.object(
-                pull_buffer,
-                "acquire_claimed_no_delivery_repository_observation",
-                side_effect=AssertionError("provider observation must not run"),
-            ),
-            mock.patch.object(
-                pull_buffer,
-                "adopt_park_controller_capability",
-                side_effect=AssertionError("capability adoption must not run"),
-            ),
-            mock.patch.object(
-                pull_buffer,
-                "CoordinationStore",
-                side_effect=AssertionError("writable store must not be constructed"),
-            ),
-            self.assertRaisesRegex(pull_buffer.PullBufferError, expected_error),
-        ):
-            pull_buffer.park_claimed_no_delivery_controller(
-                database=self.store.path,
-                message_id=message_id,
-                planner_session_id=PLANNER_ENDPOINT,
-                request_sha256=request_sha256,
-                repository_observation_sha256=self.repository_observation_sha256,
-                environ=environment,
+        try:
+            evidence = payload["evidence"]
+            command = _park_controller_command()
+            broker, environment = self._new_capability_broker(
+                command=command,
+                credential=token,
+                manifest_updates={
+                    "attempt_id": attempt["attempt_id"],
+                    "instance_id": attempt["instance_id"],
+                    "endpoint_id": PLANNER_ENDPOINT,
+                    "target_key": str(message_id),
+                    "request_payload_sha256": request_sha256,
+                    "repository_observation_sha256": (
+                        self.repository_observation_sha256
+                    ),
+                    "repository": REPOSITORY,
+                    "issue_number": ISSUE,
+                    "generation": GENERATION,
+                    "lease_manifest_sha256": evidence["lease_manifest_sha256"],
+                    "source_payload_sha256": self.bound_sha,
+                },
             )
-        self.assertEqual("CONSUMED", broker.snapshot()["state"])
-        self.assertEqual(before, self._durable_coordination_snapshot())
-        current = self.store.connection.execute(
-            "SELECT * FROM executor_attempts WHERE attempt_id=?",
-            (attempt["attempt_id"],),
-        ).fetchone()
-        transition_attempt(
-            self.store.connection,
-            attempt_id=attempt["attempt_id"],
-            token=token,
-            expected_version=int(current["version"]),
-            new_state="HOLD",
-            last_error=expected_error,
-            now="2026-08-26T20:00:25Z",
-        )
+            environment.update(
+                {
+                    "TWINFINITY_EXECUTOR_ROLE": "planner",
+                    "TWINFINITY_ROLE_ENDPOINT": PLANNER_ENDPOINT,
+                    "TWINFINITY_EXECUTOR_TARGET_KIND": "message",
+                    "TWINFINITY_EXECUTOR_TARGET_KEY": str(message_id),
+                    "TWINFINITY_PARK_REQUEST_SHA256": request_sha256,
+                    "TWINFINITY_PARK_REPOSITORY_OBSERVATION_SHA256": (
+                        self.repository_observation_sha256
+                    ),
+                }
+            )
+            hook = self._run_candidate_guard(
+                self._park_hook_event(command=command), environment
+            )
+            self.assertEqual({}, json.loads(hook.stdout))
+            before = self._durable_coordination_snapshot()
+            with (
+                mock.patch.object(
+                    pull_buffer,
+                    "acquire_claimed_no_delivery_repository_observation",
+                    side_effect=AssertionError("provider observation must not run"),
+                ),
+                mock.patch.object(
+                    pull_buffer,
+                    "adopt_park_controller_capability",
+                    side_effect=AssertionError("capability adoption must not run"),
+                ),
+                mock.patch.object(
+                    pull_buffer,
+                    "CoordinationStore",
+                    side_effect=AssertionError(
+                        "writable store must not be constructed"
+                    ),
+                ),
+                self.assertRaisesRegex(pull_buffer.PullBufferError, expected_error),
+            ):
+                pull_buffer.park_claimed_no_delivery_controller(
+                    database=self.store.path,
+                    message_id=message_id,
+                    planner_session_id=PLANNER_ENDPOINT,
+                    request_sha256=request_sha256,
+                    repository_observation_sha256=(
+                        self.repository_observation_sha256
+                    ),
+                    environ=environment,
+                )
+            self.assertEqual("CONSUMED", broker.snapshot()["state"])
+            self.assertEqual(before, self._durable_coordination_snapshot())
+        finally:
+            current = self.store.connection.execute(
+                "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                (attempt["attempt_id"],),
+            ).fetchone()
+            if current is not None and current["state"] in {
+                "RESERVED",
+                "LAUNCHING",
+                "RUNNING",
+            }:
+                transition_attempt(
+                    self.store.connection,
+                    attempt_id=attempt["attempt_id"],
+                    token=token,
+                    expected_version=int(current["version"]),
+                    new_state="HOLD",
+                    last_error=expected_error,
+                    now="2026-08-26T20:00:25Z",
+                )
 
     def _park_hook_event(
         self, *, command: str = "/usr/bin/true", tool_name: str = "Bash"
@@ -577,7 +628,7 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
 
     def _run_candidate_guard(self, raw: bytes, environment: dict[str, str]):
         return subprocess.run(
-            ["/usr/bin/python3", os.fspath(SCRIPTS / "delivery_guard.py")],
+            [os.fspath(FIXTURE_HOOK_INTERPRETER), os.fspath(SCRIPTS / "delivery_guard.py")],
             input=raw,
             capture_output=True,
             env={**os.environ, **environment},
@@ -667,6 +718,12 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
         hook = self._run_candidate_guard(self._park_hook_event(), environment)
         self.assertEqual(0, hook.returncode, hook.stderr.decode())
         self.assertEqual({}, json.loads(hook.stdout))
+        nested = next(
+            event
+            for event in broker.snapshot()["events"]
+            if event["kind"] == "NESTED_BASH_PRETOOLUSE"
+        )
+        self.assertEqual(os.fspath(FIXTURE_HOOK_EXECUTABLE), nested["executable"])
         consumed = consume_park_controller_capability(environ=environment)
         self.assertEqual("secret", consumed["credential"])
         self.assertEqual("CONSUMED", broker.snapshot()["state"])
@@ -674,6 +731,104 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
             "ADOPTED", adopt_park_controller_capability(environ=environment)["state"]
         )
         self.assertEqual("ADOPTED", broker.snapshot()["state"])
+        with self.assertRaisesRegex(Exception, "PARK_CAPABILITY_DENIED"):
+            adopt_park_controller_capability(environ=environment)
+        replayed = broker.snapshot()
+        self.assertEqual("FAILED", replayed["state"])
+        self.assertEqual("PARK_CONTROLLER_ADOPTION_FAILED", replayed["error"])
+
+    def test_consumption_starts_bounded_observation_deadline_and_late_adoption_fails(self) -> None:
+        broker, environment = self._new_capability_broker()
+        armed = broker.snapshot()
+        arm_event = next(
+            event for event in armed["events"] if event["kind"] == "CAPABILITY_ARMED"
+        )
+        self.assertEqual("PRE_CONSUMPTION", armed["deadline_phase"])
+        self.assertGreater(armed["deadline_monotonic"], arm_event["monotonic"])
+        self.assertLessEqual(
+            armed["deadline_monotonic"] - arm_event["monotonic"],
+            PARK_PRE_CONSUMPTION_WAIT_SECONDS,
+        )
+        hook = self._run_candidate_guard(self._park_hook_event(), environment)
+        self.assertEqual({}, json.loads(hook.stdout))
+        consume_park_controller_capability(environ=environment)
+        consumed = broker.snapshot()
+        consumed_event = next(
+            event
+            for event in consumed["events"]
+            if event["kind"] == "CONTROLLER_CONSUMED"
+        )
+        observation_budget = (
+            pull_buffer.PARK_REPOSITORY_OBSERVATION_PASSES_BEFORE_ADOPTION
+            * pull_buffer.PARK_REPOSITORY_OBSERVATION_CALLS_PER_PASS
+            * pull_buffer.PARK_REPOSITORY_OBSERVER_CALL_TIMEOUT_SECONDS
+        )
+        self.assertEqual(150, observation_budget)
+        self.assertEqual("POST_CONSUMPTION", consumed["deadline_phase"])
+        self.assertAlmostEqual(
+            PARK_POST_CONSUMPTION_ADOPTION_SECONDS,
+            consumed["deadline_monotonic"] - consumed_event["monotonic"],
+        )
+        self.assertGreaterEqual(
+            PARK_POST_CONSUMPTION_ADOPTION_SECONDS,
+            observation_budget
+            + pull_buffer.PARK_REPOSITORY_OBSERVATION_ADOPTION_MARGIN_SECONDS,
+        )
+        with mock.patch(
+            "run_role_executor.time.monotonic",
+            return_value=consumed_event["monotonic"] + observation_budget,
+        ):
+            adopted = adopt_park_controller_capability(environ=environment)
+        self.assertEqual("ADOPTED", adopted["state"])
+
+        late_broker, late_environment = self._new_capability_broker(
+            credential="late-secret"
+        )
+        late_hook = self._run_candidate_guard(
+            self._park_hook_event(), late_environment
+        )
+        self.assertEqual({}, json.loads(late_hook.stdout))
+        consume_park_controller_capability(environ=late_environment)
+        late_deadline = late_broker.snapshot()["deadline_monotonic"]
+        with mock.patch(
+            "run_role_executor.time.monotonic", return_value=late_deadline
+        ):
+            with self.assertRaisesRegex(Exception, "PARK_CAPABILITY_DENIED"):
+                adopt_park_controller_capability(environ=late_environment)
+        late = late_broker.snapshot()
+        self.assertEqual("FAILED", late["state"])
+        self.assertEqual("PARK_CAPABILITY_ADOPTION_TIMEOUT", late["error"])
+
+    def test_controller_adoption_peer_mismatch_fails_closed(self) -> None:
+        broker, environment = self._new_capability_broker(
+            credential="mismatch-secret"
+        )
+        hook = self._run_candidate_guard(self._park_hook_event(), environment)
+        self.assertEqual({}, json.loads(hook.stdout))
+        consume_park_controller_capability(environ=environment)
+        source = (
+            "from run_role_executor import adopt_park_controller_capability\n"
+            "try:\n"
+            "    adopt_park_controller_capability(environ=dict(__import__('os').environ))\n"
+            "except Exception as exc:\n"
+            "    print(str(exc))\n"
+        )
+        mismatched = subprocess.run(
+            [os.fspath(FIXTURE_HOOK_INTERPRETER), "-c", source],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                **environment,
+                "PYTHONPATH": os.fspath(SCRIPTS),
+            },
+        )
+        self.assertEqual(0, mismatched.returncode, mismatched.stderr)
+        self.assertIn("PARK_CAPABILITY_DENIED", mismatched.stdout)
+        mismatch = broker.snapshot()
+        self.assertEqual("FAILED", mismatch["state"])
+        self.assertEqual("PARK_CONTROLLER_ADOPTION_FAILED", mismatch["error"])
 
     def test_controller_consumes_before_readonly_and_adopts_before_writable_open(self) -> None:
         message_id = self._enqueue_park("brokered-controller")
@@ -889,6 +1044,63 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
                     suffix=name,
                     expected_error=expected_error,
                     process_id=290 + index,
+                )
+
+    def test_fixture_assertion_failure_terminalizes_planner_attempt(self) -> None:
+        stale = copy.deepcopy(self.payload)
+        stale["evidence"]["item_version"] += 1
+        malformed_hook = subprocess.CompletedProcess(
+            [os.fspath(FIXTURE_HOOK_INTERPRETER)],
+            0,
+            b'{"unexpected":"hook-output"}',
+            b"",
+        )
+        with (
+            mock.patch.object(
+                self, "_run_candidate_guard", return_value=malformed_hook
+            ),
+            self.assertRaises(AssertionError),
+        ):
+            self._assert_controller_payload_denied_before_writable(
+                stale,
+                suffix="terminalized-assertion",
+                expected_error="PARK_LINEAGE_DRIFT",
+                process_id=399,
+            )
+        active = self.store.connection.execute(
+            "SELECT COUNT(*) FROM executor_attempts WHERE role='planner' "
+            "AND state IN ('RESERVED','LAUNCHING','RUNNING')"
+        ).fetchone()[0]
+        self.assertEqual(0, active)
+
+        probe_message_id = self._enqueue_park("terminalization-probe")
+        probe_attempt, probe_token = self._running_planner_attempt(
+            probe_message_id, 400
+        )
+        try:
+            current = self.store.connection.execute(
+                "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                (probe_attempt["attempt_id"],),
+            ).fetchone()
+            self.assertEqual("RUNNING", current["state"])
+        finally:
+            current = self.store.connection.execute(
+                "SELECT * FROM executor_attempts WHERE attempt_id=?",
+                (probe_attempt["attempt_id"],),
+            ).fetchone()
+            if current is not None and current["state"] in {
+                "RESERVED",
+                "LAUNCHING",
+                "RUNNING",
+            }:
+                transition_attempt(
+                    self.store.connection,
+                    attempt_id=probe_attempt["attempt_id"],
+                    token=probe_token,
+                    expected_version=int(current["version"]),
+                    new_state="HOLD",
+                    last_error="FIXTURE_TERMINALIZATION_PROBE",
+                    now="2026-08-26T20:00:26Z",
                 )
 
     def test_shared_readonly_snapshot_rejects_delivery_evidence_without_mutation(self) -> None:
@@ -1246,6 +1458,88 @@ class ClaimedNoDeliveryParkTests(unittest.TestCase):
                 runner=drifted_provider,
             )
         self.assertEqual(5, len(invocations))
+        self.assertEqual(before, list(self.store.connection.iterdump()))
+
+    def test_repository_observation_blocks_only_same_repository_exact_branch_pr(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {ACTUAL_CODEX_FIXTURE_ROOT_ENV: self.temp.name},
+        ):
+            self._register_actual_repository_observation()
+        before = list(self.store.connection.iterdump())
+        live_issue = self.store.current_snapshot(
+            REPOSITORY, "issue", ISSUE
+        ).payload
+
+        def runner_for(pull_rows):
+            def run(argv, **_kwargs):
+                if argv[0] == "/usr/bin/git":
+                    return subprocess.CompletedProcess(argv, 1, "", "")
+                target = next(
+                    (value for value in argv if value.startswith("repos/")), ""
+                )
+                if target.endswith("/git/matching-refs/heads/main"):
+                    payload = [
+                        {
+                            "ref": "refs/heads/main",
+                            "object": {"sha": MAIN_SHA},
+                        }
+                    ]
+                elif target.endswith("/pulls"):
+                    payload = pull_rows
+                elif target.endswith(f"/issues/{ISSUE}"):
+                    payload = live_issue
+                else:
+                    payload = []
+                return subprocess.CompletedProcess(
+                    argv, 0, canonical_json(payload), ""
+                )
+
+            return run
+
+        def observe(pull_rows):
+            with mock.patch.object(
+                pull_buffer.os,
+                "lstat",
+                side_effect=FileNotFoundError,
+            ):
+                return pull_buffer.acquire_claimed_no_delivery_repository_observation(
+                    self.store.connection,
+                    self.payload["evidence"],
+                    runner=runner_for(pull_rows),
+                )
+
+        ignored = [
+            {
+                "number": 144,
+                "head": {
+                    "ref": self.delivery_branch,
+                    "repo": {"full_name": "fork-owner/twinfinityapp"},
+                },
+            },
+            {
+                "number": 145,
+                "head": {"ref": self.delivery_branch, "repo": None},
+            },
+        ]
+        observed = observe(ignored)
+        self.assertEqual([], observed["matching_open_pull_requests"])
+        self.assertEqual(self.repository_observation_sha256, observed["observation_sha256"])
+        self.assertEqual(before, list(self.store.connection.iterdump()))
+
+        same_repository = [
+            {
+                "number": 146,
+                "head": {
+                    "ref": self.delivery_branch,
+                    "repo": {"full_name": REPOSITORY.upper()},
+                },
+            }
+        ]
+        with self.assertRaisesRegex(
+            pull_buffer.PullBufferError, "PARK_CANDIDATE_STILL_PRESENT"
+        ):
+            observe(same_repository)
         self.assertEqual(before, list(self.store.connection.iterdump()))
 
     def test_nested_hook_replay_fails_closed_before_controller(self) -> None:

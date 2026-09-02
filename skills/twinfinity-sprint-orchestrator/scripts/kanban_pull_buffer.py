@@ -165,6 +165,10 @@ ZERO_WIP_STATUSES = {"PREPARED", "QUEUED", "READY"}
 PARK_REPOSITORY_OBSERVATION_SCHEMA = (
     "twinfinity-claimed-no-delivery-repository-observation/v1"
 )
+PARK_REPOSITORY_OBSERVER_CALL_TIMEOUT_SECONDS = 15
+PARK_REPOSITORY_OBSERVATION_CALLS_PER_PASS = 5
+PARK_REPOSITORY_OBSERVATION_PASSES_BEFORE_ADOPTION = 2
+PARK_REPOSITORY_OBSERVATION_ADOPTION_MARGIN_SECONDS = 30
 PARK_ISSUE_MATERIAL_KEYS = {
     "number",
     "state",
@@ -256,11 +260,47 @@ def _park_run_readonly(
             check=False,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=PARK_REPOSITORY_OBSERVER_CALL_TIMEOUT_SECONDS,
             env=environment,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PullBufferError("PARK_REPOSITORY_OBSERVER_FAILED") from exc
+
+
+def _park_matching_open_pull_requests(
+    pull_rows: list[Any],
+    *,
+    branch: str,
+    repository: str,
+) -> list[int]:
+    """Match retained delivery PRs by exact branch and canonical repository."""
+
+    try:
+        normalized_repository = canonical_repository_scope(repository)
+    except RegistryError as exc:
+        raise PullBufferError("PARK_REPOSITORY_OBSERVER_TARGET_DRIFT") from exc
+    matches: set[int] = set()
+    for row in pull_rows:
+        if (
+            not isinstance(row, dict)
+            or type(row.get("number")) is not int
+            or not isinstance(row.get("head"), dict)
+            or row["head"].get("ref") != branch
+        ):
+            continue
+        head_repository = row["head"].get("repo")
+        if not isinstance(head_repository, dict):
+            continue
+        full_name = head_repository.get("full_name")
+        if not isinstance(full_name, str):
+            continue
+        try:
+            normalized_head_repository = canonical_repository_scope(full_name)
+        except RegistryError:
+            continue
+        if normalized_head_repository == normalized_repository:
+            matches.add(int(row["number"]))
+    return sorted(matches)
 
 
 def acquire_claimed_no_delivery_repository_observation(
@@ -398,15 +438,10 @@ def acquire_claimed_no_delivery_repository_observation(
         and row.get("ref") == "refs/heads/main"
         and isinstance(row.get("object"), dict)
     }
-    matching_pulls = sorted(
-        {
-            int(row["number"])
-            for row in pull_rows
-            if isinstance(row, dict)
-            and type(row.get("number")) is int
-            and isinstance(row.get("head"), dict)
-            and row["head"].get("ref") == branch
-        }
+    matching_pulls = _park_matching_open_pull_requests(
+        pull_rows,
+        branch=branch,
+        repository=repository,
     )
     if len(main_shas) != 1 or next(iter(main_shas)) != evidence["graph_main_sha"]:
         raise PullBufferError("PARK_PROVIDER_MAIN_DRIFT")
