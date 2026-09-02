@@ -18,7 +18,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -34,6 +34,8 @@ from coordination_store import (  # noqa: E402
 )
 import coordination_store as coordination_store_module  # noqa: E402
 import coordination_supervisor as coordination_supervisor_module  # noqa: E402
+import executor_registry as executor_registry_module  # noqa: E402
+import role_executor_transport as role_executor_transport_module  # noqa: E402
 from coordination_supervisor import (  # noqa: E402
     CoordinationSupervisor,
     SchedulerLaunchPolicy,
@@ -122,13 +124,23 @@ class CoordinationSupervisorTests(unittest.TestCase):
         self.launches: list[tuple[str, int]] = []
         self.terminal_watch_launches: list[tuple[str, str]] = []
 
-        def launcher(session_id: str, message_id: int) -> int:
+        def launcher(session_id: str, message_id: int):
             self.launches.append((session_id, message_id))
-            return 1000 + len(self.launches)
+            return self.synthetic_manager_submission(
+                session_id,
+                "message",
+                str(message_id),
+                1000 + len(self.launches),
+            )
 
-        def terminal_watch_launcher(session_id: str, watch_key: str) -> int:
+        def terminal_watch_launcher(session_id: str, watch_key: str):
             self.terminal_watch_launches.append((session_id, watch_key))
-            return 2000 + len(self.terminal_watch_launches)
+            return self.synthetic_manager_submission(
+                session_id,
+                "terminal_watch",
+                watch_key,
+                2000 + len(self.terminal_watch_launches),
+            )
 
         self.supervisor = CoordinationSupervisor(
             self.store,
@@ -151,6 +163,157 @@ class CoordinationSupervisorTests(unittest.TestCase):
             runtime_directory=f"/run/user/{effective_uid}",
             runtime_identity=(1, 2 + generation, 0o40700, effective_uid, 1),
             bus_identity=(1, 3 + generation, 0o140600, effective_uid, 1),
+        )
+
+    def manager_intent_event(
+        self, *, target_kind: str, target_key: str
+    ) -> tuple[sqlite3.Row, dict[str, object]]:
+        event_type = (
+            "SESSION_WAKE_MANAGER_SUBMISSION_INTENT"
+            if target_kind == "message"
+            else "TERMINAL_WATCH_MANAGER_SUBMISSION_INTENT"
+        )
+        for row in self.store.connection.execute(
+            "SELECT * FROM coordination_events WHERE event_type=? ORDER BY id DESC",
+            (event_type,),
+        ).fetchall():
+            try:
+                envelope = json.loads(str(row["entity_key"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            fence = envelope.get("fence") if isinstance(envelope, dict) else None
+            if (
+                isinstance(fence, dict)
+                and envelope.get("target_kind") == target_kind
+                and fence.get("target_key") == target_key
+            ):
+                return row, envelope
+        self.fail(f"manager intent missing for {target_kind}:{target_key}")
+
+    def manager_submission_events_for_intent(
+        self, *, target_kind: str, intent_event_key: str
+    ) -> list[tuple[sqlite3.Row, dict[str, object]]]:
+        event_type = (
+            "SESSION_WAKE_MANAGER_SUBMITTED"
+            if target_kind == "message"
+            else "TERMINAL_WATCH_MANAGER_SUBMITTED"
+        )
+        matches: list[tuple[sqlite3.Row, dict[str, object]]] = []
+        for row in self.store.connection.execute(
+            "SELECT * FROM coordination_events WHERE event_type=? ORDER BY id",
+            (event_type,),
+        ).fetchall():
+            try:
+                envelope = json.loads(str(row["entity_key"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(envelope, dict)
+                and envelope.get("intent_event_key") == intent_event_key
+            ):
+                matches.append((row, envelope))
+        return matches
+
+    def seed_role_executor_child(
+        self,
+        *,
+        role: str,
+        endpoint_id: str,
+        target_kind: str,
+        target_key: str,
+        invocation_id: str,
+        process_id: int,
+        reserved_at: str | None = None,
+        launching_at: str | None = None,
+        running_at: str | None = None,
+        terminal_state: str | None = "COMPLETE",
+        terminal_at: str | None = None,
+    ) -> tuple[dict[str, object], str]:
+        missing_timestamp = any(
+            value is None for value in (reserved_at, launching_at, running_at)
+        ) or (terminal_state is not None and terminal_at is None)
+        intent_at = None
+        if missing_timestamp:
+            intent, _envelope = self.manager_intent_event(
+                target_kind=target_kind, target_key=target_key
+            )
+            intent_at = str(intent["created_at"])
+        reserved_at = reserved_at or intent_at
+        launching_at = launching_at or intent_at
+        running_at = running_at or intent_at
+        if terminal_state is not None:
+            terminal_at = terminal_at or intent_at
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role=role,
+            endpoint_id=endpoint_id,
+            target_kind=target_kind,
+            target_key=target_key,
+            now=reserved_at,
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, target_kind, target_key
+            ),
+        )
+        unit = stable_systemd_unit(role, target_kind, target_key)
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id=invocation_id,
+            systemd_control_group=f"/user.slice/{unit}",
+            now=launching_at,
+        )
+        current = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=process_id,
+            now=running_at,
+        )
+        if terminal_state is not None:
+            current = transition_attempt(
+                self.store.connection,
+                attempt_id=reserved["attempt_id"],
+                token=token,
+                expected_version=current["version"],
+                new_state=terminal_state,
+                exit_code=0 if terminal_state == "COMPLETE" else None,
+                now=terminal_at,
+            )
+        return current, token
+
+    def synthetic_manager_submission(
+        self,
+        endpoint_id: str,
+        target_kind: str,
+        target_key: str,
+        process_id: int,
+    ):
+        ordinal = self.store.connection.execute(
+            "SELECT COUNT(*) FROM executor_attempts "
+            "WHERE target_kind=? AND target_key=?",
+            (target_kind, target_key),
+        ).fetchone()[0]
+        invocation_id = hashlib.sha256(
+            f"{target_kind}:{target_key}:{process_id}:{ordinal}".encode()
+        ).hexdigest()[:32]
+        role = endpoint_id.split(".")[1]
+        self.seed_role_executor_child(
+            role=role,
+            endpoint_id=endpoint_id,
+            target_kind=target_kind,
+            target_key=target_key,
+            invocation_id=invocation_id,
+            process_id=process_id,
+        )
+        return role_executor_transport_module.RoleExecutorManagerSubmission(
+            systemd_unit=stable_systemd_unit(role, target_kind, target_key),
+            systemd_invocation_id=invocation_id,
         )
 
     @staticmethod
@@ -231,12 +394,18 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
         self.store.connection.set_trace_callback(trace)
         try:
+            def launcher(endpoint: str, candidate: int):
+                self.launches.append((endpoint, candidate))
+                return self.synthetic_manager_submission(
+                    endpoint, "message", str(candidate), 1490
+                )
+
             supervisor = CoordinationSupervisor(
                 self.store,
-                launcher=lambda endpoint, candidate: (
-                    self.launches.append((endpoint, candidate)) or 1490
+                launcher=launcher,
+                terminal_watch_launcher=lambda *_args: self.fail(
+                    "terminal watcher must not launch"
                 ),
-                terminal_watch_launcher=lambda _endpoint, _watch: 1,
                 process_checker=lambda *_: False,
                 transport_preflight=attestor,
             )
@@ -338,6 +507,1572 @@ class CoordinationSupervisorTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(kwargs["env"], launch_call["env"])
+
+    def test_manager_submission_is_exact_and_combined_output_is_bounded(self) -> None:
+        role = "development"
+        target_kind = "message"
+        target_key = "155"
+        unit = stable_systemd_unit(role, target_kind, target_key)
+        invocation_id = "a" * 32
+        response = (
+            f"Running as unit: {unit}; invocation ID: {invocation_id}\n"
+        ).encode()
+
+        def completed(
+            stdout: object, stderr: object = b"", returncode: int = 0
+        ) -> subprocess.CompletedProcess[object]:
+            return subprocess.CompletedProcess(
+                ["/usr/bin/systemd-run"],
+                returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        with patch.object(
+            role_executor_transport_module,
+            "_bounded_manager_submission_run",
+            return_value=completed(response),
+        ) as bounded, patch.object(
+            role_executor_transport_module.subprocess,
+            "run",
+            side_effect=AssertionError("subprocess.run must not submit"),
+        ):
+            receipt = role_executor_transport_module.submit_role_executor(
+                role=role,
+                endpoint_id=DEVELOPMENT_SESSION,
+                target_kind=target_kind,
+                target_key=target_key,
+                prompt="Synthetic exact manager receipt",
+            )
+        self.assertEqual(unit, receipt.systemd_unit)
+        self.assertEqual(invocation_id, receipt.systemd_invocation_id)
+        self.assertRegex(receipt.receipt_sha256, r"^[0-9a-f]{64}$")
+        command = bounded.call_args.args[0]
+        kwargs = bounded.call_args.kwargs
+        self.assertNotIn("--quiet", command)
+        self.assertNotIn("TWINFINITY_EXECUTOR_TOKEN", " ".join(command))
+        self.assertEqual(
+            role_executor_transport_module.SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS,
+            kwargs["timeout"],
+        )
+        self.assertEqual(
+            role_executor_transport_module._manager_environment(os.geteuid()),
+            kwargs["env"],
+        )
+
+        with patch.object(
+            role_executor_transport_module,
+            "_bounded_manager_submission_run",
+            return_value=completed(b"", response),
+        ):
+            stderr_receipt = role_executor_transport_module.submit_role_executor(
+                role=role,
+                endpoint_id=DEVELOPMENT_SESSION,
+                target_kind=target_kind,
+                target_key=target_key,
+                prompt="Synthetic exact manager receipt on stderr",
+            )
+        self.assertEqual(receipt, stderr_receipt)
+
+        malformed = (
+            (b"", b"", ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+            (response.decode(), b"", ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+            (response, response.decode(), ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+            (b"\xff\n", b"", ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+            (
+                response.replace(b"\n", b"\0\n"),
+                b"",
+                ROLE_EXECUTOR_TRANSPORT_MALFORMED,
+            ),
+            (response[:-1], b"", ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+            (response + response, b"", ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS),
+            (response, response, ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS),
+            (
+                response.replace(
+                    unit.encode(),
+                    stable_systemd_unit(role, target_kind, "156").encode(),
+                ),
+                b"",
+                ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED,
+            ),
+            (b"x" * 513, b"", ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+            (b"x" * 300, b"y" * 213, ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+        )
+        for stdout, stderr, expected in malformed:
+            with self.subTest(expected=expected), self.assertRaisesRegex(
+                RegistryError, f"^{expected}$"
+            ), patch.object(
+                role_executor_transport_module,
+                "_bounded_manager_submission_run",
+                return_value=completed(stdout, stderr),
+            ):
+                role_executor_transport_module.submit_role_executor(
+                    role=role,
+                    endpoint_id=DEVELOPMENT_SESSION,
+                    target_kind=target_kind,
+                    target_key=target_key,
+                    prompt="Synthetic invalid manager receipt",
+                )
+
+        failures = (
+            (
+                "nonzero",
+                completed(response, returncode=1),
+                None,
+                ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS,
+            ),
+            (
+                "timeout",
+                None,
+                subprocess.TimeoutExpired(["/usr/bin/systemd-run"], 5),
+                ROLE_EXECUTOR_TRANSPORT_TIMED_OUT,
+            ),
+            (
+                "unavailable",
+                None,
+                OSError("synthetic post-start manager read failure"),
+                ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE,
+            ),
+        )
+        for label, returned, raised, expected in failures:
+            patch_kwargs = (
+                {"return_value": returned}
+                if raised is None
+                else {"side_effect": raised}
+            )
+            with self.subTest(label=label), self.assertRaisesRegex(
+                RegistryError, f"^{expected}$"
+            ), patch.object(
+                role_executor_transport_module,
+                "_bounded_manager_submission_run",
+                **patch_kwargs,
+            ):
+                role_executor_transport_module.submit_role_executor(
+                    role=role,
+                    endpoint_id=DEVELOPMENT_SESSION,
+                    target_kind=target_kind,
+                    target_key=target_key,
+                    prompt="Synthetic manager transport failure",
+                )
+
+        def unavailable_popen(*_args, **_kwargs):
+            raise OSError("synthetic process creation failure")
+
+        with self.assertRaises(
+            role_executor_transport_module.RoleExecutorManagerNotSubmitted
+        ) as unavailable:
+            role_executor_transport_module._bounded_manager_submission_run(
+                [sys.executable, "-c", "pass"],
+                timeout=2,
+                env=os.environ.copy(),
+                popen=unavailable_popen,
+            )
+        self.assertEqual(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE, str(unavailable.exception))
+
+        half = (
+            role_executor_transport_module.
+            ROLE_EXECUTOR_MANAGER_SUBMISSION_MAXIMUM_RESPONSE_BYTES
+            // 2
+            + 1
+        )
+        spawned: dict[str, subprocess.Popen[bytes]] = {}
+
+        def capturing_popen(command, **popen_kwargs):
+            process = subprocess.Popen(command, **popen_kwargs)
+            spawned["process"] = process
+            return process
+
+        with self.assertRaises(
+            role_executor_transport_module._ManagerSubmissionOutputOverflow
+        ):
+            role_executor_transport_module._bounded_manager_submission_run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os;"
+                        f"os.write(1,b'x'*{half});"
+                        f"os.write(2,b'y'*{half})"
+                    ),
+                ],
+                timeout=2,
+                env=os.environ.copy(),
+                popen=capturing_popen,
+            )
+        process = spawned["process"]
+        self.assertIsNotNone(process.poll())
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+        for invalid_clock in (float("nan"), float("inf")):
+            blocked_spawn = Mock(
+                side_effect=AssertionError(
+                    "invalid initial clock must prevent spawn"
+                )
+            )
+            with self.subTest(invalid_clock=invalid_clock), self.assertRaisesRegex(
+                subprocess.SubprocessError, "manager submission clock invalid"
+            ):
+                role_executor_transport_module._bounded_manager_submission_run(
+                    [sys.executable, "-c", "pass"],
+                    timeout=2,
+                    env=os.environ.copy(),
+                    popen=blocked_spawn,
+                    monotonic=lambda: invalid_clock,
+                )
+            blocked_spawn.assert_not_called()
+
+        regressing_spawned: dict[str, subprocess.Popen[bytes]] = {}
+
+        def capture_regressing_popen(command, **popen_kwargs):
+            process = subprocess.Popen(command, **popen_kwargs)
+            regressing_spawned["process"] = process
+            return process
+
+        clock_samples = iter((1.0, 0.5))
+        with self.assertRaisesRegex(
+            subprocess.SubprocessError, "manager submission clock invalid"
+        ):
+            role_executor_transport_module._bounded_manager_submission_run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time;time.sleep(30)",
+                ],
+                timeout=2,
+                env=os.environ.copy(),
+                popen=capture_regressing_popen,
+                monotonic=lambda: next(clock_samples),
+            )
+        regressing_process = regressing_spawned["process"]
+        self.assertIsNotNone(regressing_process.poll())
+        self.assertTrue(regressing_process.stdout.closed)
+        self.assertTrue(regressing_process.stderr.closed)
+
+    def test_potentially_post_effect_error_never_resubmits(self) -> None:
+        failures = (
+            (
+                "unavailable",
+                lambda: RegistryError(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE),
+            ),
+            (
+                "timed-out",
+                lambda: RegistryError(ROLE_EXECUTOR_TRANSPORT_TIMED_OUT),
+            ),
+            (
+                "malformed",
+                lambda: RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED),
+            ),
+            (
+                "ambiguous",
+                lambda: RegistryError(ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS),
+            ),
+            (
+                "substituted",
+                lambda: RegistryError(ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED),
+            ),
+            ("oserror", lambda: OSError("synthetic post-effect read failure")),
+            (
+                "called-process-error",
+                lambda: subprocess.CalledProcessError(
+                    1, ["/usr/bin/systemd-run"]
+                ),
+            ),
+        )
+        for offset, (label, failure) in enumerate(failures):
+            with self.subTest(label=label):
+                message_id = self.notice(
+                    idempotency_key=f"post-effect-{label}",
+                    issue_number=1550 + offset,
+                )
+                calls = 0
+
+                def launcher(_session: str, _message: int):
+                    nonlocal calls
+                    calls += 1
+                    raise failure()
+
+                supervisor = CoordinationSupervisor(
+                    self.store,
+                    launcher=launcher,
+                    terminal_watch_launcher=lambda *_args: self.fail(
+                        "terminal watcher must not launch"
+                    ),
+                    process_checker=lambda *_args: False,
+                )
+                minute = offset * 2
+                supervisor.run_once(f"2026-09-02T21:{minute:02d}:00Z")
+                supervisor.run_once(f"2026-09-02T21:{minute + 1:02d}:00Z")
+
+                self.assertEqual(1, calls)
+                wake = self.store.connection.execute(
+                    "SELECT wake_key,state,process_id,last_error "
+                    "FROM coordination_wakes WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+                self.assertEqual(
+                    (
+                        "HOLD",
+                        None,
+                        coordination_supervisor_module.CHILD_ACK_AMBIGUOUS,
+                    ),
+                    tuple(wake)[1:],
+                )
+                intent, envelope = self.manager_intent_event(
+                    target_kind="message", target_key=str(message_id)
+                )
+                self.assertEqual(wake["wake_key"], envelope["target_entity_key"])
+                self.assertEqual(
+                    0,
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM coordination_events WHERE "
+                        "event_type='SESSION_WAKE_MANAGER_SUBMISSION_ABANDONED' "
+                        "AND entity_key=?",
+                        (intent["entity_key"],),
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    [],
+                    self.manager_submission_events_for_intent(
+                        target_kind="message",
+                        intent_event_key=str(intent["entity_key"]),
+                    ),
+                )
+                self.assertEqual(
+                    0,
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM coordination_events WHERE "
+                        "event_type='SESSION_WAKE_STARTED' AND entity_key=?",
+                        (wake["wake_key"],),
+                    ).fetchone()[0],
+                )
+
+    def test_presubmit_intent_revalidates_exact_reserved_progress(self) -> None:
+        message_id = self.notice(
+            idempotency_key="stale-pre-submit-reservation", issue_number=155
+        )
+        message = self.store.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        ).fetchone()
+        wake_key, should_launch = self.supervisor._reserve_wake(
+            message, "2026-09-02T22:00:00Z"
+        )
+        self.assertTrue(should_launch)
+        reservation = dict(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_wakes WHERE wake_key=?", (wake_key,)
+            ).fetchone()
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_messages SET state='HOLD',last_error=? "
+            "WHERE id=?",
+            ("FOREIGN_PROGRESS", message_id),
+        )
+        fence = executor_registry_module.snapshot_role_executor_child_ack_fence(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=str(message_id),
+        )
+        self.assertNotEqual(
+            reservation["target_progress_sha256"], fence.target_progress_sha256
+        )
+        self.store.connection.execute(
+            "UPDATE coordination_wakes SET attempts=attempts+1,updated_at=? "
+            "WHERE wake_key=?",
+            ("2026-09-02T22:00:01Z", wake_key),
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "^ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT$"
+        ):
+            self.supervisor._record_submission_intent(
+                entity_key=wake_key,
+                target_kind="message",
+                fence=fence,
+                reservation=reservation,
+                now="2026-09-02T22:00:02Z",
+            )
+        current = self.store.connection.execute(
+            "SELECT attempts,target_progress_sha256,last_error "
+            "FROM coordination_wakes WHERE wake_key=?",
+            (wake_key,),
+        ).fetchone()
+        self.assertEqual(reservation["attempts"] + 1, current["attempts"])
+        self.assertEqual(
+            reservation["target_progress_sha256"],
+            current["target_progress_sha256"],
+        )
+        self.assertIsNone(current["last_error"])
+        self.assertEqual(
+            ("HOLD", "FOREIGN_PROGRESS"),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT state,last_error FROM coordination_messages WHERE id=?",
+                    (message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events "
+                "WHERE event_type='SESSION_WAKE_MANAGER_SUBMISSION_INTENT'"
+            ).fetchone()[0],
+        )
+
+    def test_atomic_submit_revalidation_rejects_post_intent_message_drift(
+        self,
+    ) -> None:
+        message_id = self.notice(
+            idempotency_key="post-intent-message-drift", issue_number=1551
+        )
+        target_key = str(message_id)
+        message = self.store.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+        ).fetchone()
+        wake_key, should_launch = self.supervisor._reserve_wake(
+            message, "2026-09-02T22:01:00Z"
+        )
+        self.assertTrue(should_launch)
+        reservation = dict(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_wakes WHERE wake_key=?", (wake_key,)
+            ).fetchone()
+        )
+        fence = executor_registry_module.snapshot_role_executor_child_ack_fence(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=target_key,
+        )
+        intent_key = self.supervisor._record_submission_intent(
+            entity_key=wake_key,
+            target_kind="message",
+            fence=fence,
+            reservation=reservation,
+            now="2026-09-02T22:01:01Z",
+        )
+        foreign = sqlite3.connect(self.store.path)
+        try:
+            foreign.execute(
+                "UPDATE coordination_messages SET state='HOLD',last_error=?,"
+                "updated_at=? WHERE id=?",
+                (
+                    "FOREIGN_PROGRESS",
+                    "2026-09-02T22:01:02Z",
+                    message_id,
+                ),
+            )
+            foreign.commit()
+        finally:
+            foreign.close()
+        calls = 0
+
+        def forbidden_submit():
+            nonlocal calls
+            calls += 1
+            return self.synthetic_manager_submission(
+                DEVELOPMENT_SESSION, "message", target_key, 81551
+            )
+
+        result = self.supervisor._submit_manager_after_atomic_revalidation(
+            intent_event_key=intent_key,
+            target_kind="message",
+            entity_key=wake_key,
+            submit=forbidden_submit,
+            now="2026-09-02T22:01:03Z",
+        )
+
+        self.assertEqual({"status": "ABANDONED"}, result)
+        self.assertEqual(0, calls)
+        current_message = self.store.connection.execute(
+            "SELECT state,payload_sha256,updated_at,last_error "
+            "FROM coordination_messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
+        self.assertEqual(
+            (
+                "HOLD",
+                message["payload_sha256"],
+                "2026-09-02T22:01:02Z",
+                "FOREIGN_PROGRESS",
+            ),
+            tuple(current_message),
+        )
+        self.assertEqual(
+            ("INFLIGHT", reservation["attempts"], None, None),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT state,attempts,process_id,last_error "
+                    "FROM coordination_wakes WHERE wake_key=?",
+                    (wake_key,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_MANAGER_SUBMISSION_ABANDONED' "
+                "AND entity_key=?",
+                (intent_key,),
+            ).fetchone()[0],
+        )
+
+    def test_atomic_submit_revalidation_rejects_post_intent_watch_drift(
+        self,
+    ) -> None:
+        _source, _message_id, watch_key, _attempt, _token = (
+            self.bound_development_admission(complete=True)
+        )
+        reserved_watch, should_launch = self.supervisor._reserve_terminal_watch(
+            watch_key, "2026-08-22T10:01:10Z"
+        )
+        self.assertTrue(should_launch)
+        reservation = dict(reserved_watch)
+        fence = executor_registry_module.snapshot_role_executor_child_ack_fence(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="terminal_watch",
+            target_key=watch_key,
+        )
+        intent_key = self.supervisor._record_submission_intent(
+            entity_key=watch_key,
+            target_kind="terminal_watch",
+            fence=fence,
+            reservation=reservation,
+            now="2026-08-22T10:01:11Z",
+        )
+        replacement_source_sha256 = "9" * 64
+        foreign = sqlite3.connect(self.store.path)
+        try:
+            foreign.execute(
+                "UPDATE coordination_items SET source_payload_sha256=?,"
+                "version=version+1,updated_at=? WHERE repository=? "
+                "AND issue_number=92",
+                (
+                    replacement_source_sha256,
+                    "2026-08-22T10:01:12Z",
+                    REPOSITORY,
+                ),
+            )
+            foreign.commit()
+        finally:
+            foreign.close()
+        calls = 0
+
+        def forbidden_submit():
+            nonlocal calls
+            calls += 1
+            return self.synthetic_manager_submission(
+                DEVELOPMENT_SESSION, "terminal_watch", watch_key, 81552
+            )
+
+        result = self.supervisor._submit_manager_after_atomic_revalidation(
+            intent_event_key=intent_key,
+            target_kind="terminal_watch",
+            entity_key=watch_key,
+            submit=forbidden_submit,
+            now="2026-08-22T10:01:13Z",
+        )
+
+        self.assertEqual({"status": "ABANDONED"}, result)
+        self.assertEqual(0, calls)
+        item = self.store.connection.execute(
+            "SELECT source_payload_sha256,updated_at FROM coordination_items "
+            "WHERE repository=? AND issue_number=92",
+            (REPOSITORY,),
+        ).fetchone()
+        self.assertEqual(
+            (replacement_source_sha256, "2026-08-22T10:01:12Z"), tuple(item)
+        )
+        watch = self.store.connection.execute(
+            "SELECT state,attempts,process_id,last_error "
+            "FROM coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        self.assertEqual(
+            ("ACTIVE", reservation["attempts"], None, None), tuple(watch)
+        )
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='TERMINAL_WATCH_MANAGER_SUBMISSION_ABANDONED' "
+                "AND entity_key=?",
+                (intent_key,),
+            ).fetchone()[0],
+        )
+
+    def test_manager_receipt_accepts_only_token_authenticated_exact_child(self) -> None:
+        message_id = self.notice(
+            idempotency_key="exact-manager-child", issue_number=155
+        )
+        target_key = str(message_id)
+        invocation_id = "b" * 32
+
+        def launcher(session_id: str, _message: int):
+            self.seed_role_executor_child(
+                role="development",
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=target_key,
+                invocation_id=invocation_id,
+                process_id=8155,
+            )
+            return role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", target_key
+                ),
+                systemd_invocation_id=invocation_id,
+            )
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=launcher,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+        )
+        result = supervisor.run_once("2026-09-02T22:10:00Z")
+        self.assertEqual(1, len(result["launched"]))
+        self.assertEqual(8155, result["launched"][0]["process_id"])
+        self.assertRegex(
+            result["launched"][0]["child_ack_sha256"], r"^[0-9a-f]{64}$"
+        )
+        intent, _intent_envelope = self.manager_intent_event(
+            target_kind="message", target_key=target_key
+        )
+        submissions = self.manager_submission_events_for_intent(
+            target_kind="message", intent_event_key=str(intent["entity_key"])
+        )
+        self.assertEqual(1, len(submissions))
+        receipt_event, receipt_envelope = submissions[0]
+        expectation = receipt_envelope["expectation"]
+        self.assertIsInstance(expectation, dict)
+        expected_receipt = role_executor_transport_module.RoleExecutorManagerSubmission(
+            systemd_unit=stable_systemd_unit(
+                "development", "message", target_key
+            ),
+            systemd_invocation_id=invocation_id,
+        )
+        self.assertEqual(
+            expected_receipt.receipt_sha256,
+            expectation["manager_receipt_sha256"],
+        )
+        self.assertEqual(intent["created_at"], expectation["intent_recorded_at"])
+        self.assertNotEqual(
+            expectation["manager_receipt_sha256"], digest_json(expectation)
+        )
+        attempt = self.store.connection.execute(
+            "SELECT * FROM executor_attempts WHERE target_kind='message' "
+            "AND target_key=? AND process_id=?",
+            (target_key, 8155),
+        ).fetchone()
+        accepted = self.store.connection.execute(
+            "SELECT * FROM coordination_events WHERE "
+            "event_type='SESSION_WAKE_CHILD_ACK_ACCEPTED' AND entity_key=?",
+            (receipt_event["entity_key"],),
+        ).fetchone()
+        self.assertIsNotNone(accepted)
+        expectation_object = self.supervisor._decode_expectation(expectation)
+        acknowledgement = executor_registry_module.observe_role_executor_child_ack(
+            self.store.connection,
+            expectation=expectation_object,
+            not_after="2026-09-02T22:10:00Z",
+        )
+        self.assertIsNotNone(acknowledgement)
+        accepted_payload = {
+            "child_ack_sha256": acknowledgement.sha256,
+            "expectation_sha256": acknowledgement.expectation_sha256,
+            "manager_receipt_sha256": acknowledgement.manager_receipt_sha256,
+            "attempt_id": acknowledgement.attempt_id,
+            "instance_id": acknowledgement.instance_id,
+            "token_sha256": acknowledgement.token_sha256,
+            "event_chain_sha256": acknowledgement.event_chain_sha256,
+            "execution_class": acknowledgement.execution_class,
+            "execution_ownership_sha256": (
+                acknowledgement.execution_ownership_sha256
+            ),
+            "process_id": acknowledgement.process_id,
+        }
+        self.assertEqual(digest_json(accepted_payload), accepted["payload_sha256"])
+        self.assertEqual(
+            {
+                "attempt_id": attempt["attempt_id"],
+                "instance_id": attempt["instance_id"],
+                "token_sha256": attempt["token_sha256"],
+                "process_id": 8155,
+                "manager_receipt_sha256": expected_receipt.receipt_sha256,
+                "expectation_sha256": digest_json(expectation),
+                "child_ack_sha256": result["launched"][0]["child_ack_sha256"],
+            },
+            {
+                key: accepted_payload[key]
+                for key in (
+                    "attempt_id",
+                    "instance_id",
+                    "token_sha256",
+                    "process_id",
+                    "manager_receipt_sha256",
+                    "expectation_sha256",
+                    "child_ack_sha256",
+                )
+            },
+        )
+
+        competing_id = self.notice(
+            idempotency_key="competing-manager-child", issue_number=156
+        )
+        competing_key = str(competing_id)
+
+        def competing_launcher(session_id: str, _message: int):
+            for ordinal, identity in enumerate(("c" * 32, "d" * 32), start=1):
+                self.seed_role_executor_child(
+                    role="development",
+                    endpoint_id=session_id,
+                    target_kind="message",
+                    target_key=competing_key,
+                    invocation_id=identity,
+                    process_id=8255 + ordinal,
+                )
+            return role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", competing_key
+                ),
+                systemd_invocation_id="c" * 32,
+            )
+
+        rejected = CoordinationSupervisor(
+            self.store,
+            launcher=competing_launcher,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+        ).run_once("2026-09-02T22:20:00Z")
+        self.assertEqual([], rejected["launched"])
+        self.assertEqual(
+            ("HOLD", None),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT state,process_id FROM coordination_wakes "
+                    "WHERE message_id=?",
+                    (competing_id,),
+                ).fetchone()
+            ),
+        )
+
+        wrong_role_id = self.notice(
+            idempotency_key="wrong-role-competing-manager-child",
+            issue_number=157,
+        )
+        wrong_role_key = str(wrong_role_id)
+        shared_invocation_id = "e" * 32
+
+        def wrong_role_launcher(session_id: str, _message: int):
+            self.seed_role_executor_child(
+                role="sre",
+                endpoint_id=SRE_SESSION,
+                target_kind="message",
+                target_key=wrong_role_key,
+                invocation_id=shared_invocation_id,
+                process_id=8355,
+            )
+            self.seed_role_executor_child(
+                role="development",
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=wrong_role_key,
+                invocation_id=shared_invocation_id,
+                process_id=8356,
+            )
+            return role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", wrong_role_key
+                ),
+                systemd_invocation_id=shared_invocation_id,
+            )
+
+        wrong_role_result = CoordinationSupervisor(
+            self.store,
+            launcher=wrong_role_launcher,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+        ).run_once("2026-09-02T22:25:00Z")
+        self.assertEqual([], wrong_role_result["launched"])
+        self.assertEqual(
+            ("HOLD", None),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT state,process_id FROM coordination_wakes "
+                    "WHERE message_id=?",
+                    (wrong_role_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_STARTED' AND "
+                "entity_key LIKE ?",
+                (f"message:{wrong_role_key}:%",),
+            ).fetchone()[0],
+        )
+
+    def test_manager_child_running_before_receipt_uses_wait_start_wall_time(
+        self,
+    ) -> None:
+        observed_at = "2026-09-02T22:29:00Z"
+        wait_started_at = coordination_store_module.timestamp_after(observed_at, 2)
+        message_id = self.notice(
+            idempotency_key="manager-child-running-before-receipt",
+            issue_number=1570,
+        )
+        target_key = str(message_id)
+        invocation_id = "5" * 32
+        calls = 0
+
+        def launcher(session_id: str, _message: int):
+            nonlocal calls
+            calls += 1
+            child_at = coordination_store_module.timestamp_after(observed_at, 1)
+            self.seed_role_executor_child(
+                role="development",
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=target_key,
+                invocation_id=invocation_id,
+                process_id=8450,
+                reserved_at=child_at,
+                launching_at=child_at,
+                running_at=child_at,
+                terminal_state=None,
+            )
+            return role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", target_key
+                ),
+                systemd_invocation_id=invocation_id,
+            )
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=launcher,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+            child_ack_timeout_seconds=0,
+        )
+        with patch.object(
+            coordination_supervisor_module,
+            "utc_now",
+            return_value=wait_started_at,
+        ):
+            result = supervisor.run_once(observed_at)
+
+        self.assertEqual(1, calls)
+        self.assertEqual(1, len(result["launched"]))
+        self.assertEqual(8450, result["launched"][0]["process_id"])
+        wake = self.store.connection.execute(
+            "SELECT state,attempts,process_id,last_error FROM coordination_wakes "
+            "WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        self.assertEqual(("INFLIGHT", 1, 8450, None), tuple(wake))
+        intent, _envelope = self.manager_intent_event(
+            target_kind="message", target_key=target_key
+        )
+        submissions = self.manager_submission_events_for_intent(
+            target_kind="message", intent_event_key=str(intent["entity_key"])
+        )
+        self.assertEqual(1, len(submissions))
+        receipt = submissions[0][0]
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_CHILD_ACK_ACCEPTED' AND entity_key=?",
+                (receipt["entity_key"],),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type IN "
+                "('SESSION_WAKE_CHILD_ACK_REJECTED', "
+                "'SESSION_WAKE_CHILD_ACK_EXPIRED') AND entity_key=?",
+                (receipt["entity_key"],),
+            ).fetchone()[0],
+        )
+
+    def test_reserved_child_stays_pending_then_same_attempt_acknowledges(
+        self,
+    ) -> None:
+        message_id = self.notice(
+            idempotency_key="reserved-child-pending", issue_number=1571
+        )
+        target_key = str(message_id)
+        intent_at = "2026-09-02T22:30:00Z"
+        invocation_id = "6" * 32
+        fence = executor_registry_module.snapshot_role_executor_child_ack_fence(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=target_key,
+        )
+        expectation = (
+            executor_registry_module.bind_role_executor_child_ack_expectation(
+                fence,
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", target_key
+                ),
+                systemd_invocation_id=invocation_id,
+                intent_recorded_at=intent_at,
+                manager_receipt_sha256=(
+                    role_executor_transport_module.RoleExecutorManagerSubmission(
+                        systemd_unit=stable_systemd_unit(
+                            "development", "message", target_key
+                        ),
+                        systemd_invocation_id=invocation_id,
+                    ).receipt_sha256
+                ),
+                observation_deadline_at=(
+                    coordination_store_module.timestamp_after(intent_at, 10)
+                ),
+            )
+        )
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=target_key,
+            now=intent_at,
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "message", target_key
+            ),
+        )
+
+        self.assertIsNone(
+            executor_registry_module.observe_role_executor_child_ack(
+                self.store.connection,
+                expectation=expectation,
+                not_after=intent_at,
+            )
+        )
+        unit = stable_systemd_unit("development", "message", target_key)
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id=invocation_id,
+            systemd_control_group=f"/user.slice/{unit}",
+            now=intent_at,
+        )
+        self.assertIsNone(
+            executor_registry_module.observe_role_executor_child_ack(
+                self.store.connection,
+                expectation=expectation,
+                not_after=intent_at,
+            )
+        )
+        running = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=8571,
+            now=intent_at,
+        )
+        acknowledgement = (
+            executor_registry_module.observe_role_executor_child_ack(
+                self.store.connection,
+                expectation=expectation,
+                not_after=intent_at,
+            )
+        )
+
+        self.assertIsNotNone(acknowledgement)
+        self.assertEqual(running["attempt_id"], acknowledgement.attempt_id)
+        self.assertEqual(running["instance_id"], acknowledgement.instance_id)
+        self.assertEqual(running["token_sha256"], acknowledgement.token_sha256)
+        self.assertEqual(8571, acknowledgement.process_id)
+        self.assertEqual(
+            digest_json(
+                {
+                    "schema": (
+                        "twinfinity-role-executor-execution-ownership/v1"
+                    ),
+                    "attempt_id": running["attempt_id"],
+                    "broker_table_present": False,
+                    "broker_ownership_rows": [],
+                }
+            ),
+            acknowledgement.execution_ownership_sha256,
+        )
+
+    def test_child_ack_enforces_bound_deadline_and_observation_instant(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "post-deadline",
+                "2026-09-02T22:31:00Z",
+                2,
+                (0, 1, 3),
+                3,
+                "EXECUTOR_CHILD_ACK_EXPIRED",
+            ),
+            (
+                "future-at-observation",
+                "2026-09-02T22:32:00Z",
+                10,
+                (1, 1, 1),
+                0,
+                "EXECUTOR_CHILD_ACK_SUBSTITUTED",
+            ),
+        )
+        for ordinal, (
+            label,
+            intent_at,
+            deadline_seconds,
+            child_seconds,
+            observed_seconds,
+            expected_error,
+        ) in enumerate(cases, 1):
+            with self.subTest(label=label):
+                message_id = self.notice(
+                    idempotency_key=f"child-window-{label}",
+                    issue_number=1571 + ordinal,
+                )
+                target_key = str(message_id)
+                invocation_id = str(6 + ordinal) * 32
+                fence = (
+                    executor_registry_module.snapshot_role_executor_child_ack_fence(
+                        self.store.connection,
+                        role="development",
+                        endpoint_id=DEVELOPMENT_SESSION,
+                        target_kind="message",
+                        target_key=target_key,
+                    )
+                )
+                expectation = (
+                    executor_registry_module.bind_role_executor_child_ack_expectation(
+                        fence,
+                        systemd_unit=stable_systemd_unit(
+                            "development", "message", target_key
+                        ),
+                        systemd_invocation_id=invocation_id,
+                        intent_recorded_at=intent_at,
+                        manager_receipt_sha256=(
+                            role_executor_transport_module.RoleExecutorManagerSubmission(
+                                systemd_unit=stable_systemd_unit(
+                                    "development", "message", target_key
+                                ),
+                                systemd_invocation_id=invocation_id,
+                            ).receipt_sha256
+                        ),
+                        observation_deadline_at=(
+                            coordination_store_module.timestamp_after(
+                                intent_at, deadline_seconds
+                            )
+                        ),
+                    )
+                )
+                self.seed_role_executor_child(
+                    role="development",
+                    endpoint_id=DEVELOPMENT_SESSION,
+                    target_kind="message",
+                    target_key=target_key,
+                    invocation_id=invocation_id,
+                    process_id=8580 + ordinal,
+                    reserved_at=coordination_store_module.timestamp_after(
+                        intent_at, child_seconds[0]
+                    ),
+                    launching_at=coordination_store_module.timestamp_after(
+                        intent_at, child_seconds[1]
+                    ),
+                    running_at=coordination_store_module.timestamp_after(
+                        intent_at, child_seconds[2]
+                    ),
+                    terminal_state=None,
+                )
+                with self.assertRaisesRegex(
+                    RegistryError, f"^{expected_error}$"
+                ):
+                    executor_registry_module.observe_role_executor_child_ack(
+                        self.store.connection,
+                        expectation=expectation,
+                        not_after=coordination_store_module.timestamp_after(
+                            intent_at, observed_seconds
+                        ),
+                    )
+
+    def test_direct_child_with_broker_ownership_is_never_launch_evidence(
+        self,
+    ) -> None:
+        message_id = self.notice(
+            idempotency_key="broker-owned-direct-child", issue_number=1574
+        )
+        target_key = str(message_id)
+        invocation_id = "9" * 32
+
+        def broker_owned_launcher(session_id: str, _message: int):
+            child, _token = self.seed_role_executor_child(
+                role="development",
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=target_key,
+                invocation_id=invocation_id,
+                process_id=8590,
+            )
+            self.store.connection.execute(
+                "CREATE TABLE role_executor_broker_runs(attempt_id TEXT PRIMARY KEY)"
+            )
+            self.store.connection.execute(
+                "INSERT INTO role_executor_broker_runs(attempt_id) VALUES (?)",
+                (child["attempt_id"],),
+            )
+            return role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", target_key
+                ),
+                systemd_invocation_id=invocation_id,
+            )
+
+        result = CoordinationSupervisor(
+            self.store,
+            launcher=broker_owned_launcher,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+            child_ack_timeout_seconds=0,
+        ).run_once("2026-09-02T22:34:00Z")
+
+        self.assertEqual([], result["launched"])
+        wake = self.store.connection.execute(
+            "SELECT wake_key,state,process_id,last_error FROM coordination_wakes "
+            "WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        self.assertEqual(
+            ("HOLD", None, coordination_supervisor_module.CHILD_ACK_REJECTED),
+            tuple(wake)[1:],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_STARTED' AND entity_key=?",
+                (wake["wake_key"],),
+            ).fetchone()[0],
+        )
+        intent, _envelope = self.manager_intent_event(
+            target_kind="message", target_key=target_key
+        )
+        receipt = self.manager_submission_events_for_intent(
+            target_kind="message", intent_event_key=str(intent["entity_key"])
+        )[0][0]
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_CHILD_ACK_REJECTED' AND entity_key=?",
+                (receipt["entity_key"],),
+            ).fetchone()[0],
+        )
+
+    def test_child_ack_rejects_preintent_and_regressing_event_timestamps(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "pre-intent",
+                "2026-09-02T22:50:00Z",
+                (
+                    "2026-09-02T22:49:57Z",
+                    "2026-09-02T22:49:58Z",
+                    "2026-09-02T22:49:59Z",
+                ),
+            ),
+            (
+                "regressing",
+                "2026-09-02T22:51:00Z",
+                (
+                    "2026-09-02T22:51:03Z",
+                    "2026-09-02T22:51:02Z",
+                    "2026-09-02T22:51:01Z",
+                ),
+            ),
+        )
+        for ordinal, (label, observed_at, event_times) in enumerate(cases, 1):
+            with self.subTest(label=label):
+                message_id = self.notice(
+                    idempotency_key=f"child-time-{label}",
+                    issue_number=1570 + ordinal,
+                )
+                target_key = str(message_id)
+                invocation_id = (str(ordinal + 4) * 32)[:32]
+
+                calls = 0
+
+                def invalid_time_launcher(session_id: str, _message: int):
+                    nonlocal calls
+                    calls += 1
+                    self.seed_role_executor_child(
+                        role="development",
+                        endpoint_id=session_id,
+                        target_kind="message",
+                        target_key=target_key,
+                        invocation_id=invocation_id,
+                        process_id=8455 + ordinal,
+                        reserved_at=event_times[0],
+                        launching_at=event_times[1],
+                        running_at=event_times[2],
+                        terminal_state=None,
+                    )
+                    return role_executor_transport_module.RoleExecutorManagerSubmission(
+                        systemd_unit=stable_systemd_unit(
+                            "development", "message", target_key
+                        ),
+                        systemd_invocation_id=invocation_id,
+                    )
+
+                supervisor = CoordinationSupervisor(
+                    self.store,
+                    launcher=invalid_time_launcher,
+                    terminal_watch_launcher=lambda *_args: self.fail(
+                        "terminal watcher must not launch"
+                    ),
+                    process_checker=lambda *_args: False,
+                    child_ack_timeout_seconds=0,
+                )
+                result = supervisor.run_once(observed_at)
+                supervisor.run_once(
+                    coordination_store_module.timestamp_after(observed_at, 1)
+                )
+
+                self.assertEqual([], result["launched"])
+                self.assertEqual(1, calls)
+                wake = self.store.connection.execute(
+                    "SELECT wake_key,state,process_id FROM coordination_wakes "
+                    "WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+                self.assertEqual("HOLD", wake["state"])
+                self.assertIsNone(wake["process_id"])
+                intent, envelope = self.manager_intent_event(
+                    target_kind="message", target_key=target_key
+                )
+                self.assertEqual(observed_at, intent["created_at"])
+                self.assertEqual(wake["wake_key"], envelope["target_entity_key"])
+                self.assertEqual(
+                    0,
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM coordination_events WHERE "
+                        "event_type='SESSION_WAKE_STARTED' AND entity_key=?",
+                        (wake["wake_key"],),
+                    ).fetchone()[0],
+                )
+                for receipt, _receipt_envelope in (
+                    self.manager_submission_events_for_intent(
+                        target_kind="message",
+                        intent_event_key=str(intent["entity_key"]),
+                    )
+                ):
+                    self.assertEqual(
+                        0,
+                        self.store.connection.execute(
+                            "SELECT COUNT(*) FROM coordination_events WHERE "
+                            "event_type='SESSION_WAKE_CHILD_ACK_ACCEPTED' "
+                            "AND entity_key=?",
+                            (receipt["entity_key"],),
+                        ).fetchone()[0],
+                    )
+
+    def test_integer_result_and_raw_token_never_become_launch_evidence(self) -> None:
+        message_id = self.notice(
+            idempotency_key="integer-launch-evidence", issue_number=157
+        )
+        calls = 0
+
+        def integer_launcher(_session: str, _message: int) -> int:
+            nonlocal calls
+            calls += 1
+            return 8157
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=integer_launcher,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+        )
+        supervisor.run_once("2026-09-02T22:30:00Z")
+        supervisor.run_once("2026-09-02T22:31:00Z")
+        self.assertEqual(1, calls)
+        self.assertEqual(
+            ("HOLD", None),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT state,process_id FROM coordination_wakes "
+                    "WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+            ),
+        )
+
+        protected_id = self.notice(
+            idempotency_key="raw-token-redaction", issue_number=158
+        )
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role="development",
+            endpoint_id=DEVELOPMENT_SESSION,
+            target_kind="message",
+            target_key=str(protected_id),
+            now="2026-09-02T22:40:00Z",
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, "message", str(protected_id)
+            ),
+        )
+        held = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="HOLD",
+            last_error=f"private:{token}:value",
+            now="2026-09-02T22:40:01Z",
+        )
+        self.assertEqual(
+            executor_registry_module.EXECUTOR_PRIVATE_ERROR_REDACTED,
+            held["last_error"],
+        )
+        self.assertNotIn(token, "\n".join(self.store.connection.iterdump()))
+
+    def test_integer_terminal_watch_result_is_never_launch_evidence(self) -> None:
+        _source, _message_id, watch_key, _attempt, _token = (
+            self.bound_development_admission(complete=True)
+        )
+        calls = 0
+
+        def integer_launcher(_session: str, _watch_key: str) -> int:
+            nonlocal calls
+            calls += 1
+            return 8255
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=lambda *_args: self.fail("message launcher must not run"),
+            terminal_watch_launcher=integer_launcher,
+            process_checker=lambda *_args: False,
+        )
+        first = supervisor.run_once("2026-08-22T10:01:10Z")
+        second = supervisor.run_once("2026-08-22T10:20:10Z")
+
+        self.assertEqual([], first["terminal_watch_launches"])
+        self.assertEqual([], second["terminal_watch_launches"])
+        self.assertEqual(1, calls)
+        watch = self.store.connection.execute(
+            "SELECT state,process_id,last_error FROM "
+            "coordination_terminal_watches WHERE watch_key=?",
+            (watch_key,),
+        ).fetchone()
+        self.assertEqual(
+            ("HOLD", None, coordination_supervisor_module.CHILD_ACK_AMBIGUOUS),
+            tuple(watch),
+        )
+        intent, envelope = self.manager_intent_event(
+            target_kind="terminal_watch", target_key=watch_key
+        )
+        self.assertEqual(watch_key, envelope["target_entity_key"])
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='TERMINAL_WATCH_MANAGER_SUBMISSION_ABANDONED' "
+                "AND entity_key=?",
+                (intent["entity_key"],),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='TERMINAL_WATCH_WAKE_STARTED' AND entity_key=?",
+                (watch_key,),
+            ).fetchone()[0],
+        )
+
+    def test_submission_dispositions_are_exclusive_and_zero_cas_is_nonretiring(
+        self,
+    ) -> None:
+        def prepared_target(issue_number: int, suffix: str):
+            message_id = self.notice(
+                idempotency_key=f"intent-disposition-{suffix}",
+                issue_number=issue_number,
+            )
+            message = self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()
+            wake_key, should_launch = self.supervisor._reserve_wake(
+                message, f"2026-09-02T23:0{suffix}:00Z"
+            )
+            self.assertTrue(should_launch)
+            reservation = dict(
+                self.store.connection.execute(
+                    "SELECT * FROM coordination_wakes WHERE wake_key=?",
+                    (wake_key,),
+                ).fetchone()
+            )
+            fence = executor_registry_module.snapshot_role_executor_child_ack_fence(
+                self.store.connection,
+                role="development",
+                endpoint_id=DEVELOPMENT_SESSION,
+                target_kind="message",
+                target_key=str(message_id),
+            )
+            now = f"2026-09-02T23:0{suffix}:01Z"
+            intent_key = self.supervisor._record_submission_intent(
+                entity_key=wake_key,
+                target_kind="message",
+                fence=fence,
+                reservation=reservation,
+                now=now,
+            )
+            expectation = executor_registry_module.bind_role_executor_child_ack_expectation(
+                fence,
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", str(message_id)
+                ),
+                systemd_invocation_id=(suffix * 32)[:32],
+                intent_recorded_at=now,
+                manager_receipt_sha256=(
+                    role_executor_transport_module.RoleExecutorManagerSubmission(
+                        systemd_unit=stable_systemd_unit(
+                            "development", "message", str(message_id)
+                        ),
+                        systemd_invocation_id=(suffix * 32)[:32],
+                    ).receipt_sha256
+                ),
+            )
+            return message_id, wake_key, intent_key, expectation
+
+        _message, wake_key, intent_key, expectation = prepared_target(159, "1")
+        receipt_key = self.supervisor._record_manager_submission(
+            entity_key=wake_key,
+            target_kind="message",
+            intent_event_key=intent_key,
+            expectation=expectation,
+            now="2026-09-02T23:01:02Z",
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "^ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT$"
+        ):
+            self.supervisor._record_unbound_submission_not_submitted(
+                intent_event_key=intent_key,
+                target_kind="message",
+                entity_key=wake_key,
+                now="2026-09-02T23:01:03Z",
+            )
+        submitted = self.manager_submission_events_for_intent(
+            target_kind="message", intent_event_key=intent_key
+        )
+        self.assertEqual(1, len(submitted))
+        self.assertEqual(receipt_key, submitted[0][0]["entity_key"])
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_MANAGER_SUBMISSION_ABANDONED' "
+                "AND entity_key=?",
+                (intent_key,),
+            ).fetchone()[0],
+        )
+
+        _message, wake_key, intent_key, expectation = prepared_target(160, "2")
+        self.supervisor._record_unbound_submission_not_submitted(
+            intent_event_key=intent_key,
+            target_kind="message",
+            entity_key=wake_key,
+            now="2026-09-02T23:02:02Z",
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "^ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT$"
+        ):
+            self.supervisor._record_manager_submission(
+                entity_key=wake_key,
+                target_kind="message",
+                intent_event_key=intent_key,
+                expectation=expectation,
+                now="2026-09-02T23:02:03Z",
+            )
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_MANAGER_SUBMISSION_ABANDONED' "
+                "AND entity_key=?",
+                (intent_key,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            [],
+            self.manager_submission_events_for_intent(
+                target_kind="message", intent_event_key=intent_key
+            ),
+        )
+
+        _message, wake_key, intent_key, expectation = prepared_target(161, "3")
+        self.store.connection.execute(
+            "UPDATE coordination_wakes SET state='HOLD',last_error='NEWER_STATE' "
+            "WHERE wake_key=?",
+            (wake_key,),
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "^ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT$"
+        ):
+            self.supervisor._record_manager_submission(
+                entity_key=wake_key,
+                target_kind="message",
+                intent_event_key=intent_key,
+                expectation=expectation,
+                now="2026-09-02T23:03:02Z",
+            )
+        self.assertEqual(
+            [],
+            self.manager_submission_events_for_intent(
+                target_kind="message", intent_event_key=intent_key
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE event_type IN "
+                "('SESSION_WAKE_MANAGER_SUBMISSION_ABANDONED',"
+                "'SESSION_WAKE_MANAGER_SUBMISSION_AMBIGUOUS') "
+                "AND entity_key=?",
+                (intent_key,),
+            ).fetchone()[0],
+        )
 
     def test_user_bus_identity_rejects_a_mocked_unsafe_runtime_directory(self) -> None:
         effective_uid = os.geteuid()
@@ -955,12 +2690,14 @@ class CoordinationSupervisorTests(unittest.TestCase):
         message_id = self.notice(idempotency_key="preflight-not-child-success", issue_number=152)
 
         def fail_launch(_endpoint: str, _message_id: int) -> int:
-            raise OSError("later launch race")
+            raise role_executor_transport_module.RoleExecutorManagerNotSubmitted()
 
         supervisor = CoordinationSupervisor(
             self.store,
             launcher=fail_launch,
-            terminal_watch_launcher=lambda *_args: 1,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
             process_checker=lambda *_: False,
             transport_preflight=self.successful_transport,
         )
@@ -1690,12 +3427,14 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
         def failing_launcher(session_id: str, candidate_message_id: int) -> int:
             failures.append((session_id, candidate_message_id))
-            raise OSError("launch failed")
+            raise role_executor_transport_module.RoleExecutorManagerNotSubmitted()
 
         supervisor = CoordinationSupervisor(
             self.store,
             launcher=failing_launcher,
-            terminal_watch_launcher=lambda _session, _key: 1,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
             process_checker=lambda *_: False,
         )
         for timestamp in (
@@ -1752,12 +3491,14 @@ class CoordinationSupervisorTests(unittest.TestCase):
                     delay_seconds=1800,
                     now="2026-08-22T10:03:07Z",
                 )
-            raise OSError("launch failed")
+            raise role_executor_transport_module.RoleExecutorManagerNotSubmitted()
 
         supervisor = CoordinationSupervisor(
             self.store,
             launcher=failing_launcher,
-            terminal_watch_launcher=lambda _session, _key: 1,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
             process_checker=lambda *_: False,
         )
         supervisor.run_once("2026-08-22T10:00:05Z")
@@ -1792,11 +3533,11 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
         def fail_watch(_session_id: str, watch_key: str) -> int:
             failures.append(watch_key)
-            raise OSError("watch launch failed")
+            raise role_executor_transport_module.RoleExecutorManagerNotSubmitted()
 
         supervisor = CoordinationSupervisor(
             self.store,
-            launcher=lambda _session, _message: 1,
+            launcher=lambda *_args: self.fail("message launcher must not run"),
             terminal_watch_launcher=fail_watch,
             process_checker=lambda *_: False,
         )
@@ -1836,11 +3577,11 @@ class CoordinationSupervisorTests(unittest.TestCase):
                     delay_seconds=600,
                     now="2026-08-22T10:03:10Z",
                 )
-            raise OSError("watch launch failed")
+            raise role_executor_transport_module.RoleExecutorManagerNotSubmitted()
 
         supervisor = CoordinationSupervisor(
             self.store,
-            launcher=lambda _session, _message: 1,
+            launcher=lambda *_args: self.fail("message launcher must not run"),
             terminal_watch_launcher=fail_after_progress,
             process_checker=lambda *_: False,
         )
@@ -1859,14 +3600,25 @@ class CoordinationSupervisorTests(unittest.TestCase):
         self.assertEqual("ACTIVE", watch["state"])
         self.assertEqual(0, watch["attempts"])
         self.assertEqual("2026-08-22T10:13:10Z", watch["next_wake_at"])
-        self.assertEqual(
-            "TERMINAL_WATCH_WAKE_FAILED_AFTER_PROGRESS", watch["last_error"]
-        )
+        self.assertIsNone(watch["last_error"])
         self.assertEqual(3, len(failures))
 
         retry = supervisor.run_once("2026-08-22T10:13:11Z")
-        self.assertEqual(1, retry["launch_attempts"]["terminal_watches"])
-        self.assertEqual(4, len(failures))
+        self.assertEqual(0, retry["launch_attempts"]["terminal_watches"])
+        self.assertEqual(3, len(failures))
+        intent, envelope = self.manager_intent_event(
+            target_kind="terminal_watch", target_key=watch_key
+        )
+        self.assertEqual(watch_key, envelope["target_entity_key"])
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='TERMINAL_WATCH_MANAGER_SUBMISSION_ABANDONED' "
+                "AND entity_key=?",
+                (intent["entity_key"],),
+            ).fetchone()[0],
+        )
 
     def test_capacity_release_consumes_dirty_event_without_planner_notice(self) -> None:
         source, message_id, watch_key, running, token = (
@@ -1952,14 +3704,36 @@ class CoordinationSupervisorTests(unittest.TestCase):
             control_group=original_attempt["systemd_control_group"],
             result="exit-code",
         )
+        watch_child: dict[str, object] = {}
+
+        def launch_recovery_watch(session_id: str, candidate_watch_key: str):
+            self.terminal_watch_launches.append(
+                (session_id, candidate_watch_key)
+            )
+            invocation_id = "f" * 32
+            attempt, child_token = self.seed_role_executor_child(
+                role="development",
+                endpoint_id=session_id,
+                target_kind="terminal_watch",
+                target_key=candidate_watch_key,
+                invocation_id=invocation_id,
+                process_id=2999,
+                terminal_state=None,
+            )
+            watch_child.update(attempt=attempt, token=child_token)
+            return role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "terminal_watch", candidate_watch_key
+                ),
+                systemd_invocation_id=invocation_id,
+            )
+
         recovery_supervisor = CoordinationSupervisor(
             self.store,
             launcher=lambda _session, _message: self.fail(
                 "packet-aware recovery must not relaunch the admission"
             ),
-            terminal_watch_launcher=lambda session, key: (
-                self.terminal_watch_launches.append((session, key)) or 2999
-            ),
+            terminal_watch_launcher=launch_recovery_watch,
             process_checker=lambda *_: False,
             stale_attempt_evidence_reader=lambda _unit: inactive,
         )
@@ -1994,38 +3768,8 @@ class CoordinationSupervisorTests(unittest.TestCase):
             publisher_login="twinfinity-bot",
             now="2026-08-22T10:20:02Z",
         )
-        fresh, fresh_token = reserve_attempt(
-            self.store.connection,
-            role="development",
-            endpoint_id=DEVELOPMENT_SESSION,
-            target_kind="terminal_watch",
-            target_key=watch_key,
-            now="2026-08-22T10:20:03Z",
-            precondition=lambda connection: attempt_lineage_for_target(
-                connection, "terminal_watch", watch_key
-            ),
-        )
-        unit = stable_systemd_unit("development", "terminal_watch", watch_key)
-        fresh_launching = transition_attempt(
-            self.store.connection,
-            attempt_id=fresh["attempt_id"],
-            token=fresh_token,
-            expected_version=fresh["version"],
-            new_state="LAUNCHING",
-            systemd_unit=unit,
-            systemd_invocation_id="f" * 32,
-            systemd_control_group=f"/user.slice/{unit}",
-            now="2026-08-22T10:20:03Z",
-        )
-        fresh_running = transition_attempt(
-            self.store.connection,
-            attempt_id=fresh["attempt_id"],
-            token=fresh_token,
-            expected_version=fresh_launching["version"],
-            new_state="RUNNING",
-            process_id=2999,
-            now="2026-08-22T10:20:04Z",
-        )
+        fresh_running = watch_child["attempt"]
+        fresh_token = watch_child["token"]
         with (
             patch.object(
                 coordination_store_module,
@@ -2398,16 +4142,24 @@ class CoordinationSupervisorTests(unittest.TestCase):
 
         after_exit = self.supervisor.run_once("2026-08-22T10:01:10Z")
         watch_key = f"terminal:{REPOSITORY}:issue:92:generation:2"
+        self.assertEqual(1, len(after_exit["terminal_watch_launches"]))
+        terminal_launch = after_exit["terminal_watch_launches"][0]
         self.assertEqual(
-            [
-                {
-                    "watch_key": watch_key,
-                    "recipient_session_id": DEVELOPMENT_SESSION,
-                    "process_id": 2001,
-                }
-            ],
-            after_exit["terminal_watch_launches"],
+            {
+                "watch_key": watch_key,
+                "recipient_session_id": DEVELOPMENT_SESSION,
+                "process_id": 2001,
+            },
+            {
+                key: terminal_launch[key]
+                for key in (
+                    "watch_key",
+                    "recipient_session_id",
+                    "process_id",
+                )
+            },
         )
+        self.assertRegex(terminal_launch["child_ack_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual([(DEVELOPMENT_SESSION, watch_key)], self.terminal_watch_launches)
 
     def test_done_item_without_terminal_commit_holds_watch(self) -> None:
@@ -2727,44 +4479,50 @@ class CoordinationSupervisorTests(unittest.TestCase):
         self.assertEqual(2, len(result["launched"]))
 
     def test_systemd_wake_unit_is_deterministic_per_target(self) -> None:
-        with patch("coordination_supervisor.subprocess.run") as run:
-            run.return_value.returncode = 0
-            launch_canonical_session(DEVELOPMENT_SESSION, 11)
-            launch_canonical_session(DEVELOPMENT_SESSION, 12)
-
-        units = [
-            next(argument for argument in call.args[0] if argument.startswith("--unit="))
-            for call in run.call_args_list
+        receipts = [
+            role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", target_key
+                ),
+                systemd_invocation_id=identity * 32,
+            )
+            for target_key, identity in (("11", "1"), ("12", "2"))
         ]
+        with patch(
+            "coordination_supervisor.submit_role_executor", side_effect=receipts
+        ) as submit, patch(
+            "role_executor_transport.subprocess.run",
+            side_effect=AssertionError("direct manager path must not use run"),
+        ) as run:
+            observed = (
+                launch_canonical_session(DEVELOPMENT_SESSION, 11),
+                launch_canonical_session(DEVELOPMENT_SESSION, 12),
+            )
+
+        self.assertEqual(tuple(receipts), observed)
+        run.assert_not_called()
+        units = [call.kwargs["target_key"] for call in submit.call_args_list]
         self.assertEqual(
-            [
-                f"--unit={stable_systemd_unit('development', 'message', key)}"
-                for key in ("11", "12")
-            ],
+            ["11", "12"],
             units,
         )
         self.assertEqual(2, len(set(units)))
-        self.assertTrue(all(len(unit.removeprefix("--unit=")) < 100 for unit in units))
         self.assertEqual(
-            units[0],
-            f"--unit={stable_systemd_unit('development', 'message', '11')}",
+            [receipt.systemd_unit for receipt in receipts],
+            [
+                stable_systemd_unit("development", "message", key)
+                for key in units
+            ],
         )
-        for key, call in zip(("11", "12"), run.call_args_list, strict=True):
-            command = call.args[0]
-            self.assertNotIn("--collect", command)
-            self.assertIn("run_role_executor.py", " ".join(command))
-            self.assertEqual(
-                "development", command[command.index("--role") + 1]
-            )
+        for key, call in zip(("11", "12"), submit.call_args_list, strict=True):
+            self.assertEqual("development", call.kwargs["role"])
             self.assertEqual(
                 DEVELOPMENT_SESSION,
-                command[command.index("--endpoint-id") + 1],
+                call.kwargs["endpoint_id"],
             )
-            self.assertEqual(
-                stable_systemd_unit("development", "message", key),
-                command[command.index("--systemd-unit") + 1],
-            )
-            self.assertNotIn("resume", command)
+            self.assertEqual("message", call.kwargs["target_kind"])
+            self.assertEqual(key, call.kwargs["target_key"])
+            self.assertIn(f"exact inbox row {key}", call.kwargs["prompt"])
 
     def test_lock_contention_emits_one_bounded_skip_without_opening_store(self) -> None:
         lock_path = Path(self.temp.name) / "coordination-supervisor.lock"
@@ -2804,21 +4562,38 @@ class CoordinationSupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(CoordinationError, "NONCANONICAL_ROLE_ENDPOINT"):
             _canonical_session_command(NONCANONICAL_SESSION, prompt)
 
-        with patch("coordination_supervisor.subprocess.run") as run:
+        with patch("coordination_supervisor.submit_role_executor") as submit:
             with self.assertRaisesRegex(
                 CoordinationError, "NONCANONICAL_ROLE_ENDPOINT"
             ):
                 launch_canonical_session(NONCANONICAL_SESSION, 7)
-        run.assert_not_called()
+        submit.assert_not_called()
 
     def test_terminal_watch_wake_is_outcome_oriented_not_one_gate_bounded(self) -> None:
         watch_key = f"terminal:{REPOSITORY}:issue:92:generation:3"
-        with patch("coordination_supervisor.subprocess.run") as run:
-            run.return_value.returncode = 0
-            launch_terminal_watch_session(DEVELOPMENT_SESSION, watch_key)
+        receipt = role_executor_transport_module.RoleExecutorManagerSubmission(
+            systemd_unit=stable_systemd_unit(
+                "development", "terminal_watch", watch_key
+            ),
+            systemd_invocation_id="3" * 32,
+        )
+        with patch(
+            "coordination_supervisor.submit_role_executor", return_value=receipt
+        ) as submit, patch(
+            "role_executor_transport.subprocess.run",
+            side_effect=AssertionError("direct manager path must not use run"),
+        ) as run:
+            observed = launch_terminal_watch_session(
+                DEVELOPMENT_SESSION, watch_key
+            )
 
-        command = run.call_args.args[0]
-        prompt = command[-1]
+        self.assertEqual(receipt, observed)
+        run.assert_not_called()
+        prompt = submit.call_args.kwargs["prompt"]
+        self.assertEqual("development", submit.call_args.kwargs["role"])
+        self.assertEqual(DEVELOPMENT_SESSION, submit.call_args.kwargs["endpoint_id"])
+        self.assertEqual("terminal_watch", submit.call_args.kwargs["target_kind"])
+        self.assertEqual(watch_key, submit.call_args.kwargs["target_key"])
         self.assertIn(watch_key, prompt)
         self.assertIn("every immediately executable routine step", prompt)
         self.assertIn("merge, cleanup, and capacity release", prompt)
@@ -2827,28 +4602,33 @@ class CoordinationSupervisorTests(unittest.TestCase):
         self.assertNotIn("next material or terminal gate", prompt)
 
     def test_role_executor_profile_is_selected_by_strict_registry_config(self) -> None:
-        with patch("coordination_supervisor.subprocess.run") as run:
-            run.return_value.returncode = 0
+        receipts = [
+            role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(role, "message", target_key),
+                systemd_invocation_id=identity * 32,
+            )
+            for role, target_key, identity in (
+                ("planner", "21", "4"),
+                ("sre", "22", "5"),
+            )
+        ]
+        with patch(
+            "coordination_supervisor.submit_role_executor", side_effect=receipts
+        ) as submit:
             launch_canonical_session(PLANNER_SESSION, 21)
             launch_canonical_session(SRE_SESSION, 22)
 
-        planner_command = run.call_args_list[0].args[0]
-        sre_command = run.call_args_list[1].args[0]
-        self.assertEqual("planner", planner_command[planner_command.index("--role") + 1])
+        planner_call, sre_call = submit.call_args_list
+        self.assertEqual("planner", planner_call.kwargs["role"])
         self.assertEqual(
             PLANNER_SESSION,
-            planner_command[planner_command.index("--endpoint-id") + 1],
+            planner_call.kwargs["endpoint_id"],
         )
-        self.assertEqual(
-            "sre",
-            sre_command[sre_command.index("--role") + 1],
-        )
+        self.assertEqual("sre", sre_call.kwargs["role"])
         self.assertEqual(
             SRE_SESSION,
-            sre_command[sre_command.index("--endpoint-id") + 1],
+            sre_call.kwargs["endpoint_id"],
         )
-        self.assertNotIn("resume", planner_command)
-        self.assertNotIn("resume", sre_command)
 
     def test_wrong_role_prepared_and_claimed_rows_are_held_without_wake(self) -> None:
         now = "2026-08-22T10:00:02Z"

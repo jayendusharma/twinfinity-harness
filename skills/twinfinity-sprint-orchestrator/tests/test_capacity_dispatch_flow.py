@@ -43,6 +43,7 @@ from reconcile_routing_artifacts import (  # noqa: E402
     load_legacy_alias_fixture,
 )
 from role_executor_transport import (  # noqa: E402
+    RoleExecutorManagerSubmission,
     SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS,
     launch_role_executor,
 )
@@ -426,14 +427,18 @@ class _FlowHarness:
 
     def _reserve_running(
         self, role: str, endpoint: str, target_kind: str, target_key: str
-    ) -> int:
+    ) -> RoleExecutorManagerSubmission:
+        recorded_at = self._current_submission_intent_at(target_kind, target_key)
+        reserved_at = recorded_at
+        launching_at = recorded_at
+        running_at = recorded_at
         reserved, token = reserve_attempt(
             self.store.connection,
             role=role,
             endpoint_id=endpoint,
             target_kind=target_kind,
             target_key=target_key,
-            now="2026-08-24T10:01:00Z",
+            now=reserved_at,
             precondition=lambda connection: attempt_lineage_for_target(
                 connection, target_kind, target_key
             ),
@@ -449,7 +454,7 @@ class _FlowHarness:
             systemd_unit=unit,
             systemd_invocation_id=invocation,
             systemd_control_group=f"/user.slice/{unit}",
-            now="2026-08-24T10:01:00Z",
+            now=launching_at,
         )
         self.next_process_id += 1
         running = transition_attempt(
@@ -459,7 +464,7 @@ class _FlowHarness:
             expected_version=int(launching["version"]),
             new_state="RUNNING",
             process_id=self.next_process_id,
-            now="2026-08-24T10:01:00Z",
+            now=running_at,
         )
         if target_kind == "message":
             message_id = int(target_key)
@@ -470,20 +475,63 @@ class _FlowHarness:
             ).fetchone()
             issue_number = int(json.loads(message["payload_json"])["issue_number"])
             self.message_by_issue[issue_number] = message_id
-        return self.next_process_id
+        return RoleExecutorManagerSubmission(
+            systemd_unit=unit,
+            systemd_invocation_id=invocation,
+        )
 
-    def message_launcher(self, endpoint: str, message_id: int) -> int:
+    def _current_submission_intent_at(
+        self, target_kind: str, target_key: str
+    ) -> str:
+        if target_kind == "message":
+            target_entity_keys = {
+                f"message:{target_key}:prepared",
+                f"message:{target_key}:claimed",
+            }
+            event_type = "SESSION_WAKE_MANAGER_SUBMISSION_INTENT"
+        elif target_kind == "terminal_watch":
+            target_entity_keys = {target_key}
+            event_type = "TERMINAL_WATCH_MANAGER_SUBMISSION_INTENT"
+        else:
+            return "2026-08-24T10:01:00Z"
+        events = self.store.connection.execute(
+            "SELECT entity_key,created_at FROM coordination_events "
+            "WHERE event_type=? ORDER BY id DESC",
+            (event_type,),
+        ).fetchall()
+        for event in events:
+            try:
+                envelope = json.loads(str(event["entity_key"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(envelope, dict)
+                and envelope.get("target_kind") == target_kind
+                and envelope.get("target_entity_key") in target_entity_keys
+            ):
+                return str(event["created_at"])
+        return "2026-08-24T10:01:00Z"
+
+    def message_launcher(
+        self, endpoint: str, message_id: int
+    ) -> RoleExecutorManagerSubmission:
         role = "sre" if endpoint == SRE_ENDPOINT else "development"
         return self._reserve_running(role, endpoint, "message", str(message_id))
 
     def hosted_launcher(self, **kwargs: object) -> int:
-        return_code = self._reserve_running(
+        self._reserve_running(
             str(kwargs["role"]),
             str(kwargs["endpoint_id"]),
             str(kwargs["target_kind"]),
             str(kwargs["target_key"]),
         )
-        return 0 if return_code > 0 else 1
+        return 0
+
+    @staticmethod
+    def unexpected_terminal_watch_launcher(
+        _endpoint: str, _watch_key: str
+    ) -> RoleExecutorManagerSubmission:
+        raise AssertionError("terminal watcher must not launch in this flow")
 
     def supervisor(self) -> CoordinationSupervisor:
         return CoordinationSupervisor(
@@ -492,7 +540,7 @@ class _FlowHarness:
                 self.store, canonical_main_reader=lambda _repository: MAIN
             ),
             launcher=self.message_launcher,
-            terminal_watch_launcher=lambda _endpoint, _watch: 9999,
+            terminal_watch_launcher=self.unexpected_terminal_watch_launcher,
             process_checker=lambda _endpoint, _kind, _key: False,
         )
 
