@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import sqlite3
-import subprocess
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
@@ -31,28 +32,37 @@ from coordination_store import (
 from executor_registry import (
     ENDPOINT_ID,
     RegistryError,
+    RoleExecutorChildAckFence,
+    RoleExecutorChildAckExpectation,
+    RoleExecutorChildAcknowledgement,
     SystemdUnitEvidence,
     applied_endpoint_rotation_chain,
     active_attempt_for_lineage,
     active_attempt_for_target,
     active_planner_attempt_for_repository,
     attempt_lineage_for_target,
+    bind_role_executor_child_ack_expectation,
     current_endpoint,
+    observe_role_executor_child_ack,
     planner_repository_for_target,
     recover_reserved_attempts,
+    recover_role_executor_child_ack_expectation,
     recover_stale_active_attempts,
+    snapshot_role_executor_child_ack_fence,
     target_progress_digest,
 )
 from role_executor_transport import (
+    RoleExecutorManagerNotSubmitted,
+    RoleExecutorManagerSubmission,
     RoleExecutorTransportPreflight,
     attest_role_executor_transport,
     build_role_executor_transport_preflight,
     enqueue_role_executor_transport_failure_notice,
     injected_role_executor_transport_attestation,
-    launch_role_executor,
     revalidate_role_executor_transport_preflight,
     role_executor_command,
     role_executor_transport_failure_reason,
+    submit_role_executor,
     validate_role_executor_transport_attestation,
 )
 from role_executor_broker import (
@@ -83,6 +93,20 @@ MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS = 3
 MAX_DUE_MESSAGE_RETRY_LAUNCH_ATTEMPTS_PER_RUN = 1
 ATTEMPT_STALE_SECONDS = 15 * 60
 CONVERGENCE_PHASE_TIMEOUT_SECONDS = 5
+CHILD_ACK_TIMEOUT_SECONDS = 5.0
+CHILD_ACK_POLL_INTERVAL_SECONDS = 0.05
+CHILD_ACK_LATE_RECONCILE_SECONDS = ATTEMPT_STALE_SECONDS
+CHILD_ACK_SUBMITTING = "ROLE_EXECUTOR_MANAGER_SUBMISSION_INFLIGHT"
+CHILD_ACK_PENDING = "ROLE_EXECUTOR_CHILD_ACK_PENDING"
+CHILD_ACK_AMBIGUOUS = "ROLE_EXECUTOR_MANAGER_SUBMISSION_AMBIGUOUS"
+CHILD_ACK_REJECTED = "ROLE_EXECUTOR_CHILD_ACK_REJECTED"
+CHILD_ACK_EXPIRED = "ROLE_EXECUTOR_CHILD_ACK_EXPIRED"
+CHILD_ACK_SUBMISSION_INTENT_EVENT_KEY_SCHEMA = (
+    "twinfinity-role-executor-manager-submission-intent-event-key/v2"
+)
+CHILD_ACK_SUBMISSION_EVENT_KEY_SCHEMA = (
+    "twinfinity-role-executor-manager-submission-event-key/v3"
+)
 LOCK = DEFAULT_DATABASE.parent / "coordination-supervisor.lock"
 
 
@@ -172,24 +196,22 @@ def _canonical_session_command(
 
 def _launch_canonical_session(
     identity: str, prompt: str, *, target_kind: str, target_key: str
-) -> int:
+) -> RoleExecutorManagerSubmission:
     if not isinstance(identity, str) or ENDPOINT_ID.fullmatch(identity) is None:
         raise CoordinationError("NONCANONICAL_ROLE_ENDPOINT")
     role = identity.split(".")[1]
-    return_code = launch_role_executor(
+    return submit_role_executor(
         role=role,
         endpoint_id=identity,
         target_kind=target_kind,
         target_key=target_key,
         prompt=prompt,
-        runner=subprocess.run,
     )
-    if return_code != 0:
-        raise OSError("ROLE_EXECUTOR_TRANSIENT_LAUNCH_FAILED")
-    return 0
 
 
-def launch_canonical_session(session_id: str, message_id: int) -> int:
+def launch_canonical_session(
+    session_id: str, message_id: int
+) -> RoleExecutorManagerSubmission:
     return _launch_canonical_session(
         session_id,
         (
@@ -202,7 +224,9 @@ def launch_canonical_session(session_id: str, message_id: int) -> int:
     )
 
 
-def launch_terminal_watch_session(session_id: str, watch_key: str) -> int:
+def launch_terminal_watch_session(
+    session_id: str, watch_key: str
+) -> RoleExecutorManagerSubmission:
     return _launch_canonical_session(
         session_id,
         (
@@ -224,8 +248,8 @@ class CoordinationSupervisor:
         self,
         store: CoordinationStore,
         *,
-        launcher: Callable[[str, int], int] = launch_canonical_session,
-        terminal_watch_launcher: Callable[[str, str], int] = launch_terminal_watch_session,
+        launcher: Callable[[str, int], object] = launch_canonical_session,
+        terminal_watch_launcher: Callable[[str, str], object] = launch_terminal_watch_session,
         process_checker: Callable[[str, str, str], bool] | None = None,
         convergence: PortfolioConvergence | None = None,
         convergence_limit: int = DEFAULT_CONVERGENCE_LIMIT,
@@ -235,6 +259,10 @@ class CoordinationSupervisor:
         | None = None,
         transport_preflight: Callable[[RoleExecutorTransportPreflight], object]
         | None = None,
+        child_ack_timeout_seconds: float = CHILD_ACK_TIMEOUT_SECONDS,
+        child_ack_poll_interval_seconds: float = CHILD_ACK_POLL_INTERVAL_SECONDS,
+        child_ack_monotonic: Callable[[], float] = time.monotonic,
+        child_ack_sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if convergence_limit <= 0 or convergence_limit > MAX_CONVERGENCE_LIMIT:
             raise CoordinationError("CONVERGENCE_LIMIT_INVALID")
@@ -255,6 +283,21 @@ class CoordinationSupervisor:
         self.launch_policy = launch_policy
         self.monotonic = monotonic
         self.stale_attempt_evidence_reader = stale_attempt_evidence_reader
+        if (
+            isinstance(child_ack_timeout_seconds, bool)
+            or not isinstance(child_ack_timeout_seconds, (int, float))
+            or not math.isfinite(float(child_ack_timeout_seconds))
+            or float(child_ack_timeout_seconds) < 0
+            or isinstance(child_ack_poll_interval_seconds, bool)
+            or not isinstance(child_ack_poll_interval_seconds, (int, float))
+            or not math.isfinite(float(child_ack_poll_interval_seconds))
+            or float(child_ack_poll_interval_seconds) <= 0
+        ):
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_WAIT_INVALID")
+        self.child_ack_timeout_seconds = float(child_ack_timeout_seconds)
+        self.child_ack_poll_interval_seconds = float(child_ack_poll_interval_seconds)
+        self.child_ack_monotonic = child_ack_monotonic
+        self.child_ack_sleeper = child_ack_sleeper
         self.transport_preflight = (
             transport_preflight
             if transport_preflight is not None
@@ -265,6 +308,1694 @@ class CoordinationSupervisor:
                 else injected_role_executor_transport_attestation
             )
         )
+
+    @staticmethod
+    def _submission_event_types(target_kind: str) -> dict[str, str]:
+        if target_kind == "message":
+            prefix = "SESSION_WAKE"
+        elif target_kind == "terminal_watch":
+            prefix = "TERMINAL_WATCH"
+        else:
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_TARGET_INVALID")
+        return {
+            "intent": f"{prefix}_MANAGER_SUBMISSION_INTENT",
+            "submitted": f"{prefix}_MANAGER_SUBMITTED",
+            "abandoned": f"{prefix}_MANAGER_SUBMISSION_ABANDONED",
+            "ambiguous": f"{prefix}_MANAGER_SUBMISSION_AMBIGUOUS",
+            "recovered": f"{prefix}_MANAGER_SUBMISSION_RECOVERED_FROM_EXACT_CHILD",
+            "terminal_resolved": (
+                f"{prefix}_MANAGER_SUBMISSION_RESOLVED_BY_TERMINAL_EVIDENCE"
+            ),
+            "accepted": f"{prefix}_CHILD_ACK_ACCEPTED",
+            "rejected": f"{prefix}_CHILD_ACK_REJECTED",
+            "expired": f"{prefix}_CHILD_ACK_EXPIRED",
+        }
+
+    @staticmethod
+    def _target_entity_matches(
+        target_kind: str, entity_key: str, target_key: str
+    ) -> bool:
+        if target_kind == "terminal_watch":
+            return entity_key == target_key
+        if target_kind == "message":
+            return entity_key in {
+                f"message:{target_key}:prepared",
+                f"message:{target_key}:claimed",
+            }
+        return False
+
+    @staticmethod
+    def _target_table(target_kind: str) -> tuple[str, str]:
+        if target_kind == "message":
+            return "coordination_wakes", "wake_key"
+        if target_kind == "terminal_watch":
+            return "coordination_terminal_watches", "watch_key"
+        raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_TARGET_INVALID")
+
+    @staticmethod
+    def _decode_fence(payload: object) -> RoleExecutorChildAckFence:
+        if type(payload) is not dict:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_INTENT_INVALID"
+            )
+        values = dict(payload)
+        preexisting = values.get("preexisting_attempt_ids")
+        if type(preexisting) is not list or any(
+            type(value) is not str for value in preexisting
+        ):
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_INTENT_INVALID"
+            )
+        values["preexisting_attempt_ids"] = tuple(preexisting)
+        try:
+            return RoleExecutorChildAckFence(**values)
+        except (TypeError, ValueError, RegistryError) as exc:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_INTENT_INVALID"
+            ) from exc
+
+    @staticmethod
+    def _decode_expectation(payload: object) -> RoleExecutorChildAckExpectation:
+        if type(payload) is not dict:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+            )
+        values = dict(payload)
+        preexisting = values.get("preexisting_attempt_ids")
+        if type(preexisting) is not list or any(
+            type(value) is not str for value in preexisting
+        ):
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+            )
+        values["preexisting_attempt_ids"] = tuple(preexisting)
+        try:
+            return RoleExecutorChildAckExpectation(**values)
+        except (TypeError, ValueError, RegistryError) as exc:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+            ) from exc
+
+    def _submission_intent_event_key(
+        self,
+        *,
+        entity_key: str,
+        target_kind: str,
+        fence: RoleExecutorChildAckFence,
+        reservation: dict[str, object],
+        now: str,
+    ) -> str:
+        if (
+            type(fence) is not RoleExecutorChildAckFence
+            or type(reservation) is not dict
+            or not self._target_entity_matches(
+                target_kind, entity_key, fence.target_key
+            )
+        ):
+            raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+        attempts = reservation.get("attempts")
+        if (
+            type(attempts) is not int
+            or attempts <= 0
+            or attempts > MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
+        ):
+            raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+        planner_repository = (
+            planner_repository_for_target(
+                self.store.connection, target_kind, fence.target_key
+            )
+            if fence.role == "planner"
+            else None
+        )
+        return canonical_json(
+            {
+                "schema": CHILD_ACK_SUBMISSION_INTENT_EVENT_KEY_SCHEMA,
+                "target_kind": target_kind,
+                "target_entity_key": entity_key,
+                "submission_attempt": attempts,
+                "observation_deadline_at": timestamp_after(
+                    now, CHILD_ACK_LATE_RECONCILE_SECONDS
+                ),
+                "planner_repository": planner_repository,
+                "reservation": reservation,
+                "fence": fence.payload,
+            }
+        )
+
+    def _intent_from_submission_event(
+        self, event: sqlite3.Row
+    ) -> dict[str, object]:
+        try:
+            envelope = json.loads(str(event["entity_key"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_INTENT_INVALID"
+            ) from exc
+        if (
+            type(envelope) is not dict
+            or canonical_json(envelope) != event["entity_key"]
+            or envelope.get("schema")
+            != CHILD_ACK_SUBMISSION_INTENT_EVENT_KEY_SCHEMA
+            or envelope.get("target_kind") not in {"message", "terminal_watch"}
+            or type(envelope.get("target_entity_key")) is not str
+            or type(envelope.get("submission_attempt")) is not int
+            or envelope.get("submission_attempt", 0) <= 0
+            or envelope.get("submission_attempt", 0)
+            > MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
+            or type(envelope.get("reservation")) is not dict
+            or type(envelope.get("observation_deadline_at")) is not str
+            or (
+                envelope.get("planner_repository") is not None
+                and type(envelope.get("planner_repository")) is not str
+            )
+            or digest_json(envelope) != event["payload_sha256"]
+        ):
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_INTENT_INVALID"
+            )
+        fence = self._decode_fence(envelope.get("fence"))
+        reservation = dict(envelope["reservation"])
+        if (
+            not self._target_entity_matches(
+                str(envelope["target_kind"]),
+                str(envelope["target_entity_key"]),
+                fence.target_key,
+            )
+            or envelope["submission_attempt"] != reservation.get("attempts")
+            or (
+                fence.role != "planner"
+                and envelope.get("planner_repository") is not None
+            )
+            or envelope["observation_deadline_at"]
+            != timestamp_after(
+                str(event["created_at"]), CHILD_ACK_LATE_RECONCILE_SECONDS
+            )
+        ):
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_INTENT_INVALID"
+            )
+        return {
+            "fence": fence,
+            "reservation": reservation,
+            "intent_event_key": str(event["entity_key"]),
+            "intent_recorded_at": str(event["created_at"]),
+            "observation_deadline_at": str(
+                envelope["observation_deadline_at"]
+            ),
+            "planner_repository": envelope.get("planner_repository"),
+            "target_kind": str(envelope["target_kind"]),
+            "target_entity_key": str(envelope["target_entity_key"]),
+        }
+
+    def _intent_event(
+        self, *, target_kind: str, intent_event_key: str
+    ) -> sqlite3.Row:
+        event_type = self._submission_event_types(target_kind)["intent"]
+        rows = self.store.connection.execute(
+            "SELECT * FROM coordination_events WHERE event_type=? "
+            "AND entity_key=? ORDER BY id",
+            (event_type, intent_event_key),
+        ).fetchall()
+        if len(rows) != 1:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_INTENT_INVALID"
+            )
+        return rows[0]
+
+    @staticmethod
+    def _marker_target_snapshot(
+        reservation: dict[str, object], *, marker: str, updated_at: str
+    ) -> dict[str, object]:
+        expected = dict(reservation)
+        expected["process_id"] = None
+        expected["last_error"] = marker
+        expected["updated_at"] = updated_at
+        return expected
+
+    def _require_marker_target(
+        self,
+        *,
+        decoded_intent: dict[str, object],
+        marker: str,
+        updated_at: str,
+    ) -> sqlite3.Row:
+        target_kind = str(decoded_intent["target_kind"])
+        entity_key = str(decoded_intent["target_entity_key"])
+        table, key_column = self._target_table(target_kind)
+        target = self.store.connection.execute(
+            f"SELECT * FROM {table} WHERE {key_column}=?", (entity_key,)
+        ).fetchone()
+        reservation = decoded_intent["reservation"]
+        assert type(reservation) is dict
+        expected = self._marker_target_snapshot(
+            reservation, marker=marker, updated_at=updated_at
+        )
+        if target is None or dict(target) != expected:
+            raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+        return target
+
+    def _submitted_events_for_intent(
+        self, *, target_kind: str, intent_event_key: str
+    ) -> list[sqlite3.Row]:
+        event_type = self._submission_event_types(target_kind)["submitted"]
+        matches: list[sqlite3.Row] = []
+        for row in self.store.connection.execute(
+            "SELECT * FROM coordination_events WHERE event_type=? ORDER BY id",
+            (event_type,),
+        ).fetchall():
+            try:
+                envelope = json.loads(str(row["entity_key"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+                ) from exc
+            if (
+                type(envelope) is not dict
+                or canonical_json(envelope) != row["entity_key"]
+                or digest_json(envelope) != row["payload_sha256"]
+            ):
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+                )
+            if envelope.get("intent_event_key") == intent_event_key:
+                matches.append(row)
+        return matches
+
+    def _intent_first_disposition(
+        self, *, target_kind: str, intent_event_key: str
+    ) -> tuple[str | None, sqlite3.Row | None]:
+        event_types = self._submission_event_types(target_kind)
+        dispositions: list[tuple[str, sqlite3.Row]] = []
+        submitted = self._submitted_events_for_intent(
+            target_kind=target_kind, intent_event_key=intent_event_key
+        )
+        dispositions.extend(("submitted", row) for row in submitted)
+        for kind in ("abandoned", "ambiguous"):
+            rows = self.store.connection.execute(
+                "SELECT * FROM coordination_events WHERE event_type=? "
+                "AND entity_key=? ORDER BY id",
+                (event_types[kind], intent_event_key),
+            ).fetchall()
+            dispositions.extend((kind, row) for row in rows)
+        if not dispositions:
+            return None, None
+        if len(dispositions) != 1:
+            raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT")
+        return dispositions[0]
+
+    def _ambiguous_resolution(
+        self, *, target_kind: str, intent_event_key: str
+    ) -> tuple[str | None, sqlite3.Row | None]:
+        event_types = self._submission_event_types(target_kind)
+        found: list[tuple[str, sqlite3.Row]] = []
+        for kind in ("recovered", "terminal_resolved"):
+            rows = self.store.connection.execute(
+                "SELECT * FROM coordination_events WHERE event_type=? ORDER BY id",
+                (event_types[kind],),
+            ).fetchall()
+            for row in rows:
+                try:
+                    envelope = json.loads(str(row["entity_key"]))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CoordinationError(
+                        "ROLE_EXECUTOR_CHILD_ACK_DISPOSITION_INVALID"
+                    ) from exc
+                if (
+                    type(envelope) is not dict
+                    or canonical_json(envelope) != row["entity_key"]
+                    or digest_json(envelope) != row["payload_sha256"]
+                    or envelope.get("schema")
+                    != "twinfinity-manager-ambiguity-resolution/v1"
+                    or envelope.get("resolution_kind") != kind
+                ):
+                    raise CoordinationError(
+                        "ROLE_EXECUTOR_CHILD_ACK_DISPOSITION_INVALID"
+                    )
+                if envelope.get("intent_event_key") == intent_event_key:
+                    found.append((kind, row))
+        if not found:
+            return None, None
+        if len(found) != 1:
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_DISPOSITION_INVALID")
+        return found[0]
+
+    def _unresolved_submission_intents(self) -> list[dict[str, object]]:
+        unresolved: list[dict[str, object]] = []
+        for target_kind in ("message", "terminal_watch"):
+            event_type = self._submission_event_types(target_kind)["intent"]
+            for event in self.store.connection.execute(
+                "SELECT * FROM coordination_events WHERE event_type=? ORDER BY id",
+                (event_type,),
+            ).fetchall():
+                decoded = self._intent_from_submission_event(event)
+                prior, prior_event = self._intent_first_disposition(
+                    target_kind=target_kind,
+                    intent_event_key=str(decoded["intent_event_key"]),
+                )
+                if prior is None:
+                    unresolved.append(decoded)
+                elif prior == "submitted" and prior_event is not None:
+                    terminal, _terminal_event = self._terminal_disposition(
+                        target_kind=target_kind,
+                        receipt_event_key=str(prior_event["entity_key"]),
+                    )
+                    if terminal is None:
+                        unresolved.append(decoded)
+                elif prior == "ambiguous":
+                    resolution, _resolution_event = self._ambiguous_resolution(
+                        target_kind=target_kind,
+                        intent_event_key=str(decoded["intent_event_key"]),
+                    )
+                    if resolution is None:
+                        unresolved.append(decoded)
+        return unresolved
+
+    def _authoritative_terminal_evidence(
+        self, decoded: dict[str, object]
+    ) -> dict[str, object] | None:
+        target_kind = str(decoded["target_kind"])
+        fence = decoded["fence"]
+        assert type(fence) is RoleExecutorChildAckFence
+        if target_kind == "message":
+            message = self.store.connection.execute(
+                "SELECT id,state,payload_sha256,claimed_by,updated_at,last_error "
+                "FROM coordination_messages WHERE id=?",
+                (int(fence.target_key),),
+            ).fetchone()
+            if message is None or message["state"] not in {"COMPLETE", "HOLD"}:
+                return None
+            terminal_event_type = (
+                "MESSAGE_COMPLETED"
+                if message["state"] == "COMPLETE"
+                else "MESSAGE_HELD"
+            )
+            terminal_events = self.store.connection.execute(
+                "SELECT id,event_type,entity_key,payload_sha256,created_at "
+                "FROM coordination_events WHERE event_type=? AND entity_key=? "
+                "AND created_at=? ORDER BY id",
+                (
+                    terminal_event_type,
+                    f"message:{fence.target_key}",
+                    message["updated_at"],
+                ),
+            ).fetchall()
+            if len(terminal_events) != 1:
+                return None
+            return {
+                "schema": "twinfinity-manager-ambiguity-terminal-evidence/v1",
+                "target_kind": target_kind,
+                "target_key": fence.target_key,
+                "message": dict(message),
+                "terminal_event": dict(terminal_events[0]),
+            }
+        watch = self.store.connection.execute(
+            "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+            (fence.target_key,),
+        ).fetchone()
+        if watch is None:
+            return None
+        item = self.store.connection.execute(
+            "SELECT status,allocation_class,generation,version "
+            "FROM coordination_items WHERE repository=? AND issue_number=?",
+            (watch["repository"], watch["issue_number"]),
+        ).fetchone()
+        closeout = self.store.connection.execute(
+            "SELECT terminal_commit.closeout_key "
+            "FROM coordination_terminal_closeout_packets packet "
+            "JOIN coordination_terminal_closeout_commits terminal_commit "
+            "USING(closeout_key) WHERE packet.terminal_watch_key=?",
+            (fence.target_key,),
+        ).fetchone()
+        if (
+            item is not None
+            and item["allocation_class"] == "ACTIVE"
+            and item["status"] in ACTIVE_EXECUTION_STATUSES
+        ) or closeout is None:
+            return None
+        return {
+            "schema": "twinfinity-manager-ambiguity-terminal-evidence/v1",
+            "target_kind": target_kind,
+            "target_key": fence.target_key,
+            "item": None if item is None else dict(item),
+            "closeout_key": str(closeout["closeout_key"]),
+        }
+
+    def _resolve_ambiguous_submission(
+        self, *, decoded: dict[str, object], now: str
+    ) -> dict[str, object]:
+        target_kind = str(decoded["target_kind"])
+        entity_key = str(decoded["target_entity_key"])
+        intent_event_key = str(decoded["intent_event_key"])
+        event_types = self._submission_event_types(target_kind)
+        with self.store.transaction():
+            intent = self._intent_event(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            current_decoded = self._intent_from_submission_event(intent)
+            if current_decoded != decoded:
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            prior, prior_event = self._intent_first_disposition(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            if prior != "ambiguous" or prior_event is None:
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT"
+                )
+            resolution, _resolution_event = self._ambiguous_resolution(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            if resolution is not None:
+                return {"status": "RESOLVED", "acknowledgement": None}
+            terminal_evidence = self._authoritative_terminal_evidence(decoded)
+            if terminal_evidence is not None:
+                resolution_payload = {
+                    "schema": "twinfinity-manager-ambiguity-resolution/v1",
+                    "resolution_kind": "terminal_resolved",
+                    "intent_event_key": intent_event_key,
+                    "target_kind": target_kind,
+                    "target_entity_key": entity_key,
+                    "evidence": terminal_evidence,
+                }
+                self.store._event(
+                    event_types["terminal_resolved"],
+                    canonical_json(resolution_payload),
+                    resolution_payload,
+                    now,
+                )
+                return {"status": "TERMINAL", "acknowledgement": None}
+            table, key_column = self._target_table(target_kind)
+            target = self.store.connection.execute(
+                f"SELECT * FROM {table} WHERE {key_column}=?", (entity_key,)
+            ).fetchone()
+            reservation = decoded["reservation"]
+            assert type(reservation) is dict
+            expected = dict(reservation)
+            expected["process_id"] = None
+            expected["last_error"] = CHILD_ACK_AMBIGUOUS
+            expected["updated_at"] = str(prior_event["created_at"])
+            held_expected = dict(expected)
+            held_expected["state"] = "HOLD"
+            if target is None or (
+                dict(target) != expected
+                and not all(
+                    target[key] == value
+                    for key, value in held_expected.items()
+                    if key != "updated_at"
+                )
+            ):
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            fence = decoded["fence"]
+            assert type(fence) is RoleExecutorChildAckFence
+            try:
+                recovered = recover_role_executor_child_ack_expectation(
+                    self.store.connection,
+                    fence=fence,
+                    intent_recorded_at=str(decoded["intent_recorded_at"]),
+                    observation_deadline_at=str(
+                        decoded["observation_deadline_at"]
+                    ),
+                    not_after=now,
+                )
+            except RegistryError:
+                recovered = None
+            if recovered is None:
+                if target["state"] != "HOLD":
+                    cursor = self.store.connection.execute(
+                        f"UPDATE {table} SET state='HOLD',process_id=NULL,"
+                        f"updated_at=?,last_error=? WHERE {key_column}=? "
+                        "AND process_id IS NULL AND last_error=?",
+                        (now, CHILD_ACK_AMBIGUOUS, entity_key, CHILD_ACK_AMBIGUOUS),
+                    )
+                    if cursor.rowcount != 1:
+                        raise CoordinationError(
+                            "ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT"
+                        )
+                    self.store._event(
+                        "WAKE_HELD"
+                        if target_kind == "message"
+                        else "TERMINAL_WATCH_HELD",
+                        entity_key,
+                        {"error": CHILD_ACK_AMBIGUOUS},
+                        now,
+                    )
+                return {"status": "UNRESOLVED", "acknowledgement": None}
+            expectation, acknowledgement = recovered
+            event_payload = {
+                "child_ack_sha256": acknowledgement.sha256,
+                "expectation_sha256": acknowledgement.expectation_sha256,
+                "manager_identity_source": expectation.manager_identity_source,
+                "manager_identity_sha256": expectation.manager_identity_sha256,
+                "attempt_id": acknowledgement.attempt_id,
+                "instance_id": acknowledgement.instance_id,
+                "token_sha256": acknowledgement.token_sha256,
+                "event_chain_sha256": acknowledgement.event_chain_sha256,
+                "execution_class": acknowledgement.execution_class,
+                "execution_ownership_sha256": (
+                    acknowledgement.execution_ownership_sha256
+                ),
+                "process_id": acknowledgement.process_id,
+            }
+            cursor = self.store.connection.execute(
+                f"UPDATE {table} SET state=?,process_id=?,updated_at=?,last_error=NULL "
+                f"WHERE {key_column}=? AND process_id IS NULL AND last_error=?",
+                (
+                    reservation["state"],
+                    acknowledgement.process_id,
+                    now,
+                    entity_key,
+                    CHILD_ACK_AMBIGUOUS,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            self.store._event(
+                "SESSION_WAKE_STARTED"
+                if target_kind == "message"
+                else "TERMINAL_WATCH_WAKE_STARTED",
+                entity_key,
+                event_payload,
+                now,
+            )
+            resolution_payload = {
+                "schema": "twinfinity-manager-ambiguity-resolution/v1",
+                "resolution_kind": "recovered",
+                "intent_event_key": intent_event_key,
+                "target_kind": target_kind,
+                "target_entity_key": entity_key,
+                "evidence": event_payload,
+            }
+            self.store._event(
+                event_types["recovered"],
+                canonical_json(resolution_payload),
+                resolution_payload,
+                now,
+            )
+            return {
+                "status": "RECOVERED",
+                "acknowledgement": acknowledgement,
+            }
+
+    def _reconcile_ambiguous_submission_intents(
+        self, now: str
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        messages: list[dict[str, object]] = []
+        watches: list[dict[str, object]] = []
+        for decoded in self._unresolved_submission_intents():
+            target_kind = str(decoded["target_kind"])
+            prior, _prior_event = self._intent_first_disposition(
+                target_kind=target_kind,
+                intent_event_key=str(decoded["intent_event_key"]),
+            )
+            if prior != "ambiguous":
+                continue
+            resolved = self._resolve_ambiguous_submission(
+                decoded=decoded, now=now
+            )
+            acknowledgement = resolved["acknowledgement"]
+            if (
+                type(acknowledgement) is RoleExecutorChildAcknowledgement
+                and resolved["status"] == "RECOVERED"
+            ):
+                result = {
+                    "process_id": acknowledgement.process_id,
+                    "child_ack_sha256": acknowledgement.sha256,
+                    "manager_identity_source": "AUTHENTICATED_CHILD_RECOVERY",
+                }
+                if target_kind == "message":
+                    messages.append(
+                        {
+                            **result,
+                            "wake_key": str(decoded["target_entity_key"]),
+                            "message_id": int(acknowledgement.target_key),
+                        }
+                    )
+                else:
+                    watches.append(
+                        {
+                            **result,
+                            "watch_key": acknowledgement.target_key,
+                            "recipient_session_id": acknowledgement.endpoint_id,
+                        }
+                    )
+        return messages, watches
+
+    def _record_submission_intent(
+        self,
+        *,
+        entity_key: str,
+        target_kind: str,
+        fence: RoleExecutorChildAckFence,
+        reservation: dict[str, object],
+        now: str,
+    ) -> str:
+        """Commit an exact retry reservation and immutable child fence first."""
+
+        intent_event_key = self._submission_intent_event_key(
+            entity_key=entity_key,
+            target_kind=target_kind,
+            fence=fence,
+            reservation=reservation,
+            now=now,
+        )
+        event_type = self._submission_event_types(target_kind)["intent"]
+        table, key_column = self._target_table(target_kind)
+        with self.store.transaction():
+            current_fence = snapshot_role_executor_child_ack_fence(
+                self.store.connection,
+                role=fence.role,
+                endpoint_id=fence.endpoint_id,
+                target_kind=fence.target_kind,
+                target_key=fence.target_key,
+            )
+            target = self.store.connection.execute(
+                f"SELECT * FROM {table} WHERE {key_column}=?", (entity_key,)
+            ).fetchone()
+            current_planner_repository = (
+                planner_repository_for_target(
+                    self.store.connection, target_kind, fence.target_key
+                )
+                if fence.role == "planner"
+                else None
+            )
+            intent_envelope = json.loads(intent_event_key)
+            if (
+                current_fence != fence
+                or current_planner_repository
+                != intent_envelope.get("planner_repository")
+                or target is None
+                or dict(target) != reservation
+                or reservation.get("process_id") is not None
+                or reservation.get("last_error") is not None
+                or reservation.get("target_progress_sha256")
+                != fence.target_progress_sha256
+                or (
+                    target_kind == "message"
+                    and (
+                        reservation.get("state") != "INFLIGHT"
+                        or reservation.get("recipient_session_id")
+                        != fence.endpoint_id
+                        or str(reservation.get("message_id")) != fence.target_key
+                    )
+                )
+                or (
+                    target_kind == "terminal_watch"
+                    and (
+                        reservation.get("state") != "ACTIVE"
+                        or reservation.get("accountable_session_id")
+                        != fence.endpoint_id
+                        or reservation.get("watch_key") != fence.target_key
+                    )
+                )
+            ):
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            cursor = self.store.connection.execute(
+                f"UPDATE {table} SET updated_at=?,last_error=? "
+                f"WHERE {key_column}=? AND process_id IS NULL AND last_error IS NULL",
+                (now, CHILD_ACK_SUBMITTING, entity_key),
+            )
+            if cursor.rowcount != 1:
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            self.store._event(event_type, intent_event_key, json.loads(intent_event_key), now)
+        return intent_event_key
+
+    def _submit_manager_after_atomic_revalidation(
+        self,
+        *,
+        intent_event_key: str,
+        target_kind: str,
+        entity_key: str,
+        submit: Callable[[], object],
+        now: str,
+    ) -> dict[str, object]:
+        """Atomically revalidate, submit, and bind the manager outcome."""
+
+        with self.store.transaction():
+            intent = self._intent_event(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            decoded = self._intent_from_submission_event(intent)
+            if (
+                decoded["target_kind"] != target_kind
+                or decoded["target_entity_key"] != entity_key
+            ):
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            prior, _prior_event = self._intent_first_disposition(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            if prior is not None:
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT"
+                )
+            self._require_marker_target(
+                decoded_intent=decoded,
+                marker=CHILD_ACK_SUBMITTING,
+                updated_at=str(intent["created_at"]),
+            )
+            fence = decoded["fence"]
+            assert type(fence) is RoleExecutorChildAckFence
+            current_fence = snapshot_role_executor_child_ack_fence(
+                self.store.connection,
+                role=fence.role,
+                endpoint_id=fence.endpoint_id,
+                target_kind=fence.target_kind,
+                target_key=fence.target_key,
+            )
+            current_planner_repository = (
+                planner_repository_for_target(
+                    self.store.connection, target_kind, fence.target_key
+                )
+                if fence.role == "planner"
+                else None
+            )
+            message_contract_current = True
+            if target_kind == "message":
+                reservation = decoded["reservation"]
+                assert type(reservation) is dict
+                message = self.store.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=?",
+                    (reservation.get("message_id"),),
+                ).fetchone()
+                message_contract_current = (
+                    message is not None
+                    and message["payload_sha256"]
+                    == reservation.get("message_payload_sha256")
+                    and self._message_contract_error(message) is None
+                    and self._message_needs_worker(message)
+                )
+            if (
+                current_fence != fence
+                or current_planner_repository != decoded["planner_repository"]
+                or not message_contract_current
+            ):
+                self._record_unbound_submission_not_submitted(
+                    intent_event_key=intent_event_key,
+                    target_kind=target_kind,
+                    entity_key=entity_key,
+                    now=now,
+                    mark_launch_failure=False,
+                )
+                return {"status": "ABANDONED"}
+        # The transaction above is the final pre-call fence.  Do not hold a
+        # SQLite writer lock across the external manager invocation; bind its
+        # outcome in a new transaction so target progress can be revalidated.
+        try:
+            result = submit()
+        except RoleExecutorManagerNotSubmitted:
+            self._record_unbound_submission_not_submitted(
+                intent_event_key=intent_event_key,
+                target_kind=target_kind,
+                entity_key=entity_key,
+                now=now,
+            )
+            return {"status": "ABANDONED"}
+        except Exception:
+            self._record_unbound_submission_hold(
+                intent_event_key=intent_event_key,
+                target_kind=target_kind,
+                entity_key=entity_key,
+                now=now,
+            )
+            return {"status": "AMBIGUOUS"}
+        if type(result) is not RoleExecutorManagerSubmission:
+            self._record_unbound_submission_hold(
+                intent_event_key=intent_event_key,
+                target_kind=target_kind,
+                entity_key=entity_key,
+                now=now,
+            )
+            return {"status": "AMBIGUOUS"}
+        try:
+            expectation = bind_role_executor_child_ack_expectation(
+                fence,
+                systemd_unit=result.systemd_unit,
+                systemd_invocation_id=result.systemd_invocation_id,
+                manager_receipt_sha256=result.receipt_sha256,
+                intent_recorded_at=str(intent["created_at"]),
+                observation_deadline_at=str(decoded["observation_deadline_at"]),
+            )
+        except RegistryError:
+            self._record_unbound_submission_hold(
+                intent_event_key=intent_event_key,
+                target_kind=target_kind,
+                entity_key=entity_key,
+                now=now,
+            )
+            return {"status": "AMBIGUOUS"}
+        receipt_event_key = self._record_manager_submission(
+            entity_key=entity_key,
+            target_kind=target_kind,
+            intent_event_key=intent_event_key,
+            expectation=expectation,
+            now=now,
+        )
+        return {
+            "status": "SUBMITTED",
+            "submission": result,
+            "expectation": expectation,
+            "receipt_event_key": receipt_event_key,
+        }
+
+    def _record_unbound_submission_disposition(
+        self,
+        *,
+        intent_event_key: str,
+        target_kind: str,
+        entity_key: str,
+        disposition: str,
+        now: str,
+        mark_launch_failure: bool = True,
+    ) -> bool:
+        if disposition not in {"abandoned", "ambiguous"}:
+            raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT")
+        event_types = self._submission_event_types(target_kind)
+        transaction = (
+            self.store.transaction()
+            if not self.store.connection.in_transaction
+            else nullcontext()
+        )
+        with transaction:
+            intent = self._intent_event(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            decoded = self._intent_from_submission_event(intent)
+            if decoded["target_entity_key"] != entity_key:
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            prior, _prior_event = self._intent_first_disposition(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            if prior is not None:
+                if prior == disposition:
+                    return False
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT"
+                )
+            table, key_column = self._target_table(target_kind)
+            if disposition == "abandoned":
+                reservation = decoded["reservation"]
+                assert type(reservation) is dict
+                current_progress_sha256 = target_progress_digest(
+                    self.store.connection,
+                    target_kind,
+                    str(decoded["fence"].target_key),
+                )
+                if (
+                    mark_launch_failure
+                    and current_progress_sha256
+                    != reservation["target_progress_sha256"]
+                ):
+                    if target_kind == "message":
+                        self._require_marker_target(
+                            decoded_intent=decoded,
+                            marker=CHILD_ACK_SUBMITTING,
+                            updated_at=str(intent["created_at"]),
+                        )
+                        cursor = self.store.connection.execute(
+                            "UPDATE coordination_wakes SET attempts=1,process_id=NULL,"
+                            "target_progress_sha256=?,last_attempt_at=?,updated_at=?,"
+                            "last_error='WAKE_LAUNCH_FAILED_AFTER_PROGRESS' "
+                            "WHERE wake_key=? AND process_id IS NULL AND last_error=?",
+                            (
+                                current_progress_sha256,
+                                now,
+                                now,
+                                entity_key,
+                                CHILD_ACK_SUBMITTING,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise CoordinationError(
+                                "ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT"
+                            )
+                        self.store._event(
+                            "WAKE_RETRY_BUDGET_RESET",
+                            entity_key,
+                            {"reason": "TARGET_PROGRESS_CHANGED"},
+                            now,
+                        )
+                    else:
+                        # The watch itself advanced while the manager call was
+                        # in flight.  Preserve that authoritative heartbeat and
+                        # the unresolved intent; neither an abandonment nor a
+                        # retry is safe until exact evidence resolves it.
+                        return False
+                    self.store._event(
+                        event_types[disposition],
+                        intent_event_key,
+                        {"error": "ROLE_EXECUTOR_MANAGER_NOT_SUBMITTED"},
+                        now,
+                    )
+                    return True
+                self._require_marker_target(
+                    decoded_intent=decoded,
+                    marker=CHILD_ACK_SUBMITTING,
+                    updated_at=str(intent["created_at"]),
+                )
+                if not mark_launch_failure:
+                    cursor = self.store.connection.execute(
+                        f"UPDATE {table} SET state=?,process_id=NULL,updated_at=?,"
+                        f"last_error=NULL WHERE {key_column}=? AND process_id IS NULL "
+                        "AND last_error=?",
+                        (
+                            reservation["state"],
+                            now,
+                            entity_key,
+                            CHILD_ACK_SUBMITTING,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise CoordinationError(
+                            "ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT"
+                        )
+                    self.store._event(
+                        event_types[disposition],
+                        intent_event_key,
+                        {"error": "ROLE_EXECUTOR_PRECALL_VALIDATION_FAILED"},
+                        now,
+                    )
+                    return True
+                exhausted = (
+                    int(reservation["attempts"])
+                    >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS
+                )
+                failure_error = (
+                    "WAKE_RETRY_EXHAUSTED"
+                    if target_kind == "message" and exhausted
+                    else "TERMINAL_WATCH_RETRY_EXHAUSTED"
+                    if exhausted
+                    else "WAKE_LAUNCH_FAILED"
+                    if target_kind == "message"
+                    else "TERMINAL_WATCH_WAKE_FAILED"
+                )
+                if target_kind == "message" and exhausted:
+                    message = self.store.connection.execute(
+                        "SELECT * FROM coordination_messages WHERE id=?",
+                        (int(decoded["fence"].target_key),),
+                    ).fetchone()
+                    if message is None:
+                        raise CoordinationError(
+                            "ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT"
+                        )
+                    self._hold_retry_exhausted_locked(message, reservation, now)
+                    cursor = None
+                else:
+                    next_wake_sql = (
+                        ",next_wake_at=?" if target_kind == "terminal_watch" else ""
+                    )
+                    parameters: tuple[object, ...] = (
+                        (
+                            "HOLD" if exhausted else reservation["state"],
+                            now,
+                            failure_error,
+                            timestamp_after(now, 60),
+                            entity_key,
+                            CHILD_ACK_SUBMITTING,
+                        )
+                        if target_kind == "terminal_watch"
+                        else (
+                            reservation["state"],
+                            now,
+                            failure_error,
+                            entity_key,
+                            CHILD_ACK_SUBMITTING,
+                        )
+                    )
+                    cursor = self.store.connection.execute(
+                        f"UPDATE {table} SET state=?,updated_at=?,last_error=?"
+                        f"{next_wake_sql} WHERE {key_column}=? AND process_id IS NULL "
+                        "AND last_error=?",
+                        parameters,
+                    )
+                error = "ROLE_EXECUTOR_MANAGER_NOT_SUBMITTED"
+            else:
+                self._require_marker_target(
+                    decoded_intent=decoded,
+                    marker=CHILD_ACK_SUBMITTING,
+                    updated_at=str(intent["created_at"]),
+                )
+                cursor = self.store.connection.execute(
+                    f"UPDATE {table} SET process_id=NULL,updated_at=?,last_error=? "
+                    f"WHERE {key_column}=? "
+                    "AND process_id IS NULL AND last_error=?",
+                    (now, CHILD_ACK_AMBIGUOUS, entity_key, CHILD_ACK_SUBMITTING),
+                )
+                error = CHILD_ACK_AMBIGUOUS
+            if cursor is not None and cursor.rowcount != 1:
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            if disposition == "abandoned" and not (
+                target_kind == "message" and exhausted
+            ):
+                self.store._event(
+                    (
+                        "WAKE_HELD"
+                        if target_kind == "message" and exhausted
+                        else "TERMINAL_WATCH_HELD"
+                        if exhausted
+                        else "WAKE_LAUNCH_FAILED"
+                        if target_kind == "message"
+                        else "TERMINAL_WATCH_WAKE_FAILED"
+                    ),
+                    entity_key,
+                    {"error": failure_error},
+                    now,
+                )
+            self.store._event(
+                event_types[disposition],
+                intent_event_key,
+                {"error": error},
+                now,
+            )
+        return True
+
+    def _record_unbound_submission_hold(
+        self,
+        *,
+        intent_event_key: str,
+        target_kind: str,
+        entity_key: str,
+        now: str,
+    ) -> bool:
+        return self._record_unbound_submission_disposition(
+            intent_event_key=intent_event_key,
+            target_kind=target_kind,
+            entity_key=entity_key,
+            disposition="ambiguous",
+            now=now,
+        )
+
+    def _record_unbound_submission_not_submitted(
+        self,
+        *,
+        intent_event_key: str,
+        target_kind: str,
+        entity_key: str,
+        now: str,
+        mark_launch_failure: bool = True,
+    ) -> bool:
+        return self._record_unbound_submission_disposition(
+            intent_event_key=intent_event_key,
+            target_kind=target_kind,
+            entity_key=entity_key,
+            disposition="abandoned",
+            now=now,
+            mark_launch_failure=mark_launch_failure,
+        )
+
+    def _manager_submission_event_key(
+        self,
+        *,
+        entity_key: str,
+        target_kind: str,
+        intent_event_key: str,
+        expectation: RoleExecutorChildAckExpectation,
+        now: str,
+    ) -> str:
+        if (
+            type(expectation) is not RoleExecutorChildAckExpectation
+            or not self._target_entity_matches(
+                target_kind, entity_key, expectation.target_key
+            )
+        ):
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+        return canonical_json(
+            {
+                "schema": CHILD_ACK_SUBMISSION_EVENT_KEY_SCHEMA,
+                "target_kind": target_kind,
+                "target_entity_key": entity_key,
+                "intent_event_key": intent_event_key,
+                "late_reconcile_deadline_at": expectation.observation_deadline_at,
+                "expectation": expectation.payload,
+            }
+        )
+
+    def _expectation_from_submission_event(
+        self, event: sqlite3.Row
+    ) -> dict[str, object]:
+        try:
+            envelope = json.loads(str(event["entity_key"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+            ) from exc
+        if (
+            type(envelope) is not dict
+            or canonical_json(envelope) != event["entity_key"]
+            or digest_json(envelope) != event["payload_sha256"]
+            or envelope.get("schema") != CHILD_ACK_SUBMISSION_EVENT_KEY_SCHEMA
+            or envelope.get("target_kind") not in {"message", "terminal_watch"}
+            or type(envelope.get("target_entity_key")) is not str
+            or type(envelope.get("intent_event_key")) is not str
+            or type(envelope.get("late_reconcile_deadline_at")) is not str
+        ):
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+            )
+        expectation = self._decode_expectation(envelope.get("expectation"))
+        intent = self._intent_event(
+            target_kind=str(envelope["target_kind"]),
+            intent_event_key=str(envelope["intent_event_key"]),
+        )
+        decoded_intent = self._intent_from_submission_event(intent)
+        try:
+            expected = bind_role_executor_child_ack_expectation(
+                decoded_intent["fence"],
+                systemd_unit=expectation.systemd_unit,
+                systemd_invocation_id=expectation.systemd_invocation_id,
+                manager_receipt_sha256=expectation.manager_receipt_sha256,
+                intent_recorded_at=str(intent["created_at"]),
+                observation_deadline_at=expectation.observation_deadline_at,
+            )
+            deadline = str(envelope["late_reconcile_deadline_at"])
+            if (
+                deadline != expectation.observation_deadline_at
+                or deadline
+                != timestamp_after(
+                    str(intent["created_at"]),
+                    CHILD_ACK_LATE_RECONCILE_SECONDS,
+                )
+            ):
+                raise ValueError
+        except (TypeError, ValueError, RegistryError) as exc:
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+            ) from exc
+        if (
+            expected != expectation
+            or expectation.fence_sha256 != decoded_intent["fence"].sha256
+            or decoded_intent["target_kind"] != envelope["target_kind"]
+            or decoded_intent["target_entity_key"]
+            != envelope["target_entity_key"]
+            or not self._target_entity_matches(
+                str(envelope["target_kind"]),
+                str(envelope["target_entity_key"]),
+                expectation.target_key,
+            )
+        ):
+            raise CoordinationError(
+                "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+            )
+        return {
+            "expectation": expectation,
+            "receipt_event_key": str(event["entity_key"]),
+            "intent_event_key": str(envelope["intent_event_key"]),
+            "target_kind": str(envelope["target_kind"]),
+            "target_entity_key": str(envelope["target_entity_key"]),
+            "submission_recorded_at": str(event["created_at"]),
+            "late_reconcile_deadline_at": deadline,
+            "decoded_intent": decoded_intent,
+        }
+
+    def _record_manager_submission(
+        self,
+        *,
+        entity_key: str,
+        target_kind: str,
+        intent_event_key: str,
+        expectation: RoleExecutorChildAckExpectation,
+        now: str,
+    ) -> str:
+        """Bind one manager receipt to its committed intent by exact CAS."""
+
+        if (
+            type(expectation) is not RoleExecutorChildAckExpectation
+            or digest_json(expectation.payload) != expectation.sha256
+            or expectation.observation_deadline_at
+            != timestamp_after(
+                expectation.intent_recorded_at,
+                CHILD_ACK_LATE_RECONCILE_SECONDS,
+            )
+        ):
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+        receipt_event_key = self._manager_submission_event_key(
+            entity_key=entity_key,
+            target_kind=target_kind,
+            intent_event_key=intent_event_key,
+            expectation=expectation,
+            now=now,
+        )
+        event_types = self._submission_event_types(target_kind)
+        transaction = (
+            self.store.transaction()
+            if not self.store.connection.in_transaction
+            else nullcontext()
+        )
+        with transaction:
+            intent = self._intent_event(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            decoded = self._intent_from_submission_event(intent)
+            if (
+                decoded["target_entity_key"] != entity_key
+                or decoded["target_kind"] != target_kind
+                or expectation.fence_sha256 != decoded["fence"].sha256
+                or expectation.intent_recorded_at != intent["created_at"]
+            ):
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+                )
+            expected = bind_role_executor_child_ack_expectation(
+                decoded["fence"],
+                systemd_unit=expectation.systemd_unit,
+                systemd_invocation_id=expectation.systemd_invocation_id,
+                manager_receipt_sha256=expectation.manager_receipt_sha256,
+                intent_recorded_at=str(intent["created_at"]),
+                observation_deadline_at=expectation.observation_deadline_at,
+            )
+            if expected != expectation:
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+                )
+            prior, prior_event = self._intent_first_disposition(
+                target_kind=target_kind, intent_event_key=intent_event_key
+            )
+            if prior is not None:
+                if prior == "submitted" and prior_event is not None:
+                    if prior_event["entity_key"] == receipt_event_key:
+                        return receipt_event_key
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_SUBMISSION_DISPOSITION_CONFLICT"
+                )
+            self._require_marker_target(
+                decoded_intent=decoded,
+                marker=CHILD_ACK_SUBMITTING,
+                updated_at=str(intent["created_at"]),
+            )
+            table, key_column = self._target_table(target_kind)
+            cursor = self.store.connection.execute(
+                f"UPDATE {table} SET updated_at=?,last_error=? "
+                f"WHERE {key_column}=? AND process_id IS NULL AND last_error=?",
+                (now, CHILD_ACK_PENDING, entity_key, CHILD_ACK_SUBMITTING),
+            )
+            if cursor.rowcount != 1:
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            self.store._event(
+                event_types["submitted"],
+                receipt_event_key,
+                json.loads(receipt_event_key),
+                now,
+            )
+        return receipt_event_key
+
+    @staticmethod
+    def _child_ack_observation_ceiling(
+        *,
+        observed_at: str,
+        observation_deadline_at: str,
+        elapsed_seconds: float = 0.0,
+    ) -> str:
+        """Advance a caller-owned logical wall, capped by the fixed deadline."""
+
+        try:
+            if (
+                isinstance(elapsed_seconds, bool)
+                or not isinstance(elapsed_seconds, (int, float))
+                or not math.isfinite(float(elapsed_seconds))
+                or float(elapsed_seconds) < 0
+            ):
+                raise ValueError
+            advanced = timestamp_after(observed_at, float(elapsed_seconds))
+            if _epoch(advanced) <= _epoch(observation_deadline_at):
+                return advanced
+            return observation_deadline_at
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_WAIT_INVALID") from exc
+
+    def _await_role_executor_child_ack(
+        self,
+        expectation: RoleExecutorChildAckExpectation,
+        *,
+        observed_at: str,
+    ) -> tuple[RoleExecutorChildAcknowledgement | None, str]:
+        """Bound the exact-child observation loop independently of its clock."""
+
+        def sample(previous: float | None = None) -> float:
+            raw = self.child_ack_monotonic()
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) < 0
+                or (previous is not None and float(raw) < previous)
+            ):
+                raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_WAIT_INVALID")
+            return float(raw)
+
+        started_at = sample()
+        previous = started_at
+        maximum_polls = (
+            math.ceil(
+                self.child_ack_timeout_seconds
+                / self.child_ack_poll_interval_seconds
+            )
+            + 2
+        )
+        for _poll in range(maximum_polls):
+            observation_not_after = self._child_ack_observation_ceiling(
+                observed_at=observed_at,
+                observation_deadline_at=expectation.observation_deadline_at,
+                elapsed_seconds=previous - started_at,
+            )
+            acknowledgement = observe_role_executor_child_ack(
+                self.store.connection,
+                expectation=expectation,
+                not_after=observation_not_after,
+            )
+            if acknowledgement is not None:
+                return acknowledgement, observation_not_after
+            sampled_at = sample(previous)
+            previous = sampled_at
+            remaining = self.child_ack_timeout_seconds - (
+                sampled_at - started_at
+            )
+            if remaining <= 0:
+                return None, self._child_ack_observation_ceiling(
+                    observed_at=observed_at,
+                    observation_deadline_at=expectation.observation_deadline_at,
+                    elapsed_seconds=sampled_at - started_at,
+                )
+            self.child_ack_sleeper(
+                min(self.child_ack_poll_interval_seconds, remaining)
+            )
+        raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_WAIT_INVALID")
+
+    def _terminal_disposition(
+        self, *, target_kind: str, receipt_event_key: str
+    ) -> tuple[str | None, sqlite3.Row | None]:
+        event_types = self._submission_event_types(target_kind)
+        found: list[tuple[str, sqlite3.Row]] = []
+        for kind in ("accepted", "rejected", "expired"):
+            rows = self.store.connection.execute(
+                "SELECT * FROM coordination_events WHERE event_type=? "
+                "AND entity_key=? ORDER BY id",
+                (event_types[kind], receipt_event_key),
+            ).fetchall()
+            found.extend((kind, row) for row in rows)
+        if not found:
+            return None, None
+        if len(found) != 1:
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_DISPOSITION_INVALID")
+        return found[0]
+
+    def _finalize_manager_submission(
+        self,
+        *,
+        entity_key: str,
+        target_kind: str,
+        receipt_event_key: str,
+        expectation: RoleExecutorChildAckExpectation,
+        now: str,
+        observation_not_after: str,
+        expire_if_pending: bool = False,
+        forced_rejection: bool = False,
+    ) -> dict[str, object]:
+        """Observe and attach one authenticated exact child atomically."""
+
+        event_types = self._submission_event_types(target_kind)
+        with self.store.transaction():
+            rows = self.store.connection.execute(
+                "SELECT * FROM coordination_events WHERE event_type=? "
+                "AND entity_key=? ORDER BY id",
+                (event_types["submitted"], receipt_event_key),
+            ).fetchall()
+            if len(rows) != 1:
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+                )
+            decoded = self._expectation_from_submission_event(rows[0])
+            if (
+                decoded["target_kind"] != target_kind
+                or decoded["target_entity_key"] != entity_key
+                or decoded["expectation"] != expectation
+                or _epoch(observation_not_after)
+                < _epoch(expectation.intent_recorded_at)
+                or _epoch(observation_not_after)
+                > _epoch(expectation.observation_deadline_at)
+            ):
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_MANAGER_SUBMISSION_EVENT_INVALID"
+                )
+            terminal, _terminal_event = self._terminal_disposition(
+                target_kind=target_kind, receipt_event_key=receipt_event_key
+            )
+            if terminal is not None:
+                return {
+                    "resolved": True,
+                    "started": False,
+                    "acknowledgement": None,
+                }
+
+            acknowledgement: RoleExecutorChildAcknowledgement | None = None
+            rejection: str | None = CHILD_ACK_REJECTED if forced_rejection else None
+            if rejection is None:
+                try:
+                    acknowledgement = observe_role_executor_child_ack(
+                        self.store.connection,
+                        expectation=expectation,
+                        not_after=observation_not_after,
+                    )
+                except RegistryError as exc:
+                    rejection = (
+                        CHILD_ACK_EXPIRED
+                        if str(exc) == "EXECUTOR_CHILD_ACK_EXPIRED"
+                        else CHILD_ACK_REJECTED
+                    )
+            if acknowledgement is None and rejection is None:
+                if not expire_if_pending:
+                    return {
+                        "resolved": False,
+                        "started": False,
+                        "acknowledgement": None,
+                    }
+                rejection = CHILD_ACK_EXPIRED
+
+            intent = self._intent_event(
+                target_kind=target_kind,
+                intent_event_key=str(decoded["intent_event_key"]),
+            )
+            decoded_intent = decoded["decoded_intent"]
+            assert type(decoded_intent) is dict
+            self._require_marker_target(
+                decoded_intent=decoded_intent,
+                marker=CHILD_ACK_PENDING,
+                updated_at=str(rows[0]["created_at"]),
+            )
+            table, key_column = self._target_table(target_kind)
+            if acknowledgement is not None:
+                event_payload = {
+                    "child_ack_sha256": acknowledgement.sha256,
+                    "expectation_sha256": acknowledgement.expectation_sha256,
+                    "manager_receipt_sha256": (
+                        acknowledgement.manager_receipt_sha256
+                    ),
+                    "attempt_id": acknowledgement.attempt_id,
+                    "instance_id": acknowledgement.instance_id,
+                    "token_sha256": acknowledgement.token_sha256,
+                    "event_chain_sha256": acknowledgement.event_chain_sha256,
+                    "execution_class": acknowledgement.execution_class,
+                    "execution_ownership_sha256": (
+                        acknowledgement.execution_ownership_sha256
+                    ),
+                    "process_id": acknowledgement.process_id,
+                }
+                cursor = self.store.connection.execute(
+                    f"UPDATE {table} SET process_id=?,updated_at=?,last_error=NULL "
+                    f"WHERE {key_column}=? AND process_id IS NULL AND last_error=?",
+                    (
+                        acknowledgement.process_id,
+                        now,
+                        entity_key,
+                        CHILD_ACK_PENDING,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+                self.store._event(
+                    "SESSION_WAKE_STARTED"
+                    if target_kind == "message"
+                    else "TERMINAL_WATCH_WAKE_STARTED",
+                    entity_key,
+                    event_payload,
+                    now,
+                )
+                self.store._event(
+                    event_types["accepted"], receipt_event_key, event_payload, now
+                )
+                return {
+                    "resolved": True,
+                    "started": True,
+                    "acknowledgement": acknowledgement,
+                }
+
+            assert rejection is not None
+            kind = "expired" if rejection == CHILD_ACK_EXPIRED else "rejected"
+            cursor = self.store.connection.execute(
+                f"UPDATE {table} SET state='HOLD',process_id=NULL,"
+                f"updated_at=?,last_error=? WHERE {key_column}=? "
+                "AND process_id IS NULL AND last_error=?",
+                (now, rejection, entity_key, CHILD_ACK_PENDING),
+            )
+            if cursor.rowcount != 1:
+                raise CoordinationError("ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT")
+            self.store._event(
+                event_types[kind],
+                receipt_event_key,
+                {
+                    "error": rejection,
+                    "expectation_sha256": expectation.sha256,
+                    "manager_receipt_sha256": expectation.manager_receipt_sha256,
+                },
+                now,
+            )
+            return {
+                "resolved": True,
+                "started": False,
+                "acknowledgement": None,
+            }
+
+    def _pending_manager_submission_rows(
+        self, *, target_kind: str
+    ) -> list[dict[str, object]]:
+        event_types = self._submission_event_types(target_kind)
+        pending: list[dict[str, object]] = []
+        seen_intents: set[str] = set()
+        seen_targets: set[str] = set()
+        for event in self.store.connection.execute(
+            "SELECT * FROM coordination_events WHERE event_type=? ORDER BY id",
+            (event_types["submitted"],),
+        ).fetchall():
+            decoded = self._expectation_from_submission_event(event)
+            intent_key = str(decoded["intent_event_key"])
+            entity_key = str(decoded["target_entity_key"])
+            terminal, _terminal_event = self._terminal_disposition(
+                target_kind=target_kind,
+                receipt_event_key=str(decoded["receipt_event_key"]),
+            )
+            if terminal is not None:
+                continue
+            if intent_key in seen_intents or entity_key in seen_targets:
+                raise CoordinationError(
+                    "ROLE_EXECUTOR_MANAGER_SUBMISSION_AMBIGUOUS"
+                )
+            seen_intents.add(intent_key)
+            seen_targets.add(entity_key)
+            pending.append(decoded)
+        return pending
+
+    def _reconcile_unbound_submission_intents(
+        self, now: str
+    ) -> set[tuple[str, str, str]]:
+        """Fail closed on an intent whose manager outcome was never bound."""
+
+        handled: set[tuple[str, str, str]] = set()
+        for target_kind in ("message", "terminal_watch"):
+            event_types = self._submission_event_types(target_kind)
+            for event in self.store.connection.execute(
+                "SELECT * FROM coordination_events WHERE event_type=? ORDER BY id",
+                (event_types["intent"],),
+            ).fetchall():
+                decoded = self._intent_from_submission_event(event)
+                fence = decoded["fence"]
+                assert type(fence) is RoleExecutorChildAckFence
+                prior, _prior_event = self._intent_first_disposition(
+                    target_kind=target_kind,
+                    intent_event_key=str(decoded["intent_event_key"]),
+                )
+                if prior == "abandoned":
+                    continue
+                if prior == "submitted" and _prior_event is not None:
+                    terminal, _terminal_event = self._terminal_disposition(
+                        target_kind=target_kind,
+                        receipt_event_key=str(_prior_event["entity_key"]),
+                    )
+                    if terminal is not None:
+                        continue
+                if prior == "ambiguous":
+                    resolution, _resolution_event = self._ambiguous_resolution(
+                        target_kind=target_kind,
+                        intent_event_key=str(decoded["intent_event_key"]),
+                    )
+                    if resolution is not None:
+                        continue
+                handled.add((fence.role, target_kind, fence.target_key))
+                if prior is not None:
+                    continue
+                try:
+                    self._record_unbound_submission_hold(
+                        intent_event_key=str(decoded["intent_event_key"]),
+                        target_kind=target_kind,
+                        entity_key=str(decoded["target_entity_key"]),
+                        now=now,
+                    )
+                except CoordinationError as exc:
+                    if str(exc) != "ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT":
+                        raise
+        return handled
+
+    def _reconcile_pending_manager_submissions(
+        self, now: str
+    ) -> tuple[
+        list[dict[str, object]],
+        list[dict[str, object]],
+        set[tuple[str, str, str]],
+    ]:
+        messages: list[dict[str, object]] = []
+        watches: list[dict[str, object]] = []
+        handled: set[tuple[str, str, str]] = set()
+        for target_kind in ("message", "terminal_watch"):
+            for pending in self._pending_manager_submission_rows(
+                target_kind=target_kind
+            ):
+                expectation = pending["expectation"]
+                assert type(expectation) is RoleExecutorChildAckExpectation
+                handled.add((expectation.role, target_kind, expectation.target_key))
+                try:
+                    observation_not_after = self._child_ack_observation_ceiling(
+                        observed_at=now,
+                        observation_deadline_at=str(
+                            pending["late_reconcile_deadline_at"]
+                        ),
+                    )
+                    finalized = self._finalize_manager_submission(
+                        entity_key=str(pending["target_entity_key"]),
+                        target_kind=target_kind,
+                        receipt_event_key=str(pending["receipt_event_key"]),
+                        expectation=expectation,
+                        now=now,
+                        observation_not_after=observation_not_after,
+                        expire_if_pending=(
+                            _epoch(now)
+                            >= _epoch(str(pending["late_reconcile_deadline_at"]))
+                        ),
+                    )
+                except CoordinationError as exc:
+                    if str(exc) == "ROLE_EXECUTOR_SUBMISSION_TARGET_DRIFT":
+                        continue
+                    raise
+                acknowledgement = finalized["acknowledgement"]
+                if (
+                    type(acknowledgement) is RoleExecutorChildAcknowledgement
+                    and finalized["started"] is True
+                ):
+                    result = {
+                        "process_id": acknowledgement.process_id,
+                        "child_ack_sha256": acknowledgement.sha256,
+                    }
+                    if target_kind == "message":
+                        messages.append(
+                            {
+                                **result,
+                                "wake_key": str(pending["target_entity_key"]),
+                                "message_id": int(expectation.target_key),
+                            }
+                        )
+                    else:
+                        watches.append(
+                            {
+                                **result,
+                                "watch_key": expectation.target_key,
+                                "recipient_session_id": expectation.endpoint_id,
+                            }
+                        )
+        return messages, watches, handled
 
     def _transport_preflight_hold(self, now: str) -> dict[str, object] | None:
         request: RoleExecutorTransportPreflight | None = None
@@ -834,7 +2565,7 @@ class CoordinationSupervisor:
                 )
                 return None, False
             attempts = 1 if progress_changed else int(watch["attempts"]) + 1
-            self.store.connection.execute(
+            cursor = self.store.connection.execute(
                 """
                 UPDATE coordination_terminal_watches
                 SET attempts=?, process_id=NULL, target_progress_sha256=?,
@@ -849,7 +2580,13 @@ class CoordinationSupervisor:
                     watch_key,
                 ),
             )
-            return watch, True
+            if cursor.rowcount != 1:
+                return None, False
+            reserved = self.store.connection.execute(
+                "SELECT * FROM coordination_terminal_watches WHERE watch_key=?",
+                (watch_key,),
+            ).fetchone()
+            return reserved, reserved is not None
 
     def _eligible_due_terminal_watch_lineages(self, now: str) -> set[str]:
         """Read due watch eligibility without consuming a wake or retry counter."""
@@ -913,25 +2650,6 @@ class CoordinationSupervisor:
             except (CoordinationError, RegistryError, TypeError, ValueError):
                 continue
         return eligible
-
-    def _record_terminal_watch_launch(
-        self, watch_key: str, process_id: int, now: str
-    ) -> None:
-        with self.store.transaction():
-            self.store.connection.execute(
-                """
-                UPDATE coordination_terminal_watches
-                SET process_id=?, updated_at=?
-                WHERE watch_key=? AND state='ACTIVE'
-                """,
-                (process_id, now, watch_key),
-            )
-            self.store._event(
-                "TERMINAL_WATCH_WAKE_STARTED",
-                watch_key,
-                {"process_id": process_id},
-                now,
-            )
 
     def _record_terminal_watch_launch_failure(self, watch_key: str, now: str) -> None:
         with self.store.transaction():
@@ -1440,13 +3158,15 @@ class CoordinationSupervisor:
             if current["state"] != "INFLIGHT":
                 return wake_key, False
             if current["target_progress_sha256"] != progress_sha256:
-                self.store.connection.execute(
+                cursor = self.store.connection.execute(
                     """UPDATE coordination_wakes
                     SET attempts=1, process_id=NULL, target_progress_sha256=?,
                         last_attempt_at=?, updated_at=?, last_error=NULL
                     WHERE wake_key=? AND state='INFLIGHT'""",
                     (progress_sha256, now, now, wake_key),
                 )
+                if cursor.rowcount != 1:
+                    return wake_key, False
                 self.store._event(
                     "WAKE_RETRY_BUDGET_RESET",
                     wake_key,
@@ -1461,21 +3181,13 @@ class CoordinationSupervisor:
             if int(current["attempts"]) >= MAX_IDENTICAL_TARGET_LAUNCH_ATTEMPTS:
                 self._hold_retry_exhausted_locked(current_row, current, now)
                 return wake_key, False
-            self.store.connection.execute(
+            cursor = self.store.connection.execute(
                 "UPDATE coordination_wakes SET attempts=attempts+1, process_id=NULL, last_attempt_at=?, updated_at=?, last_error=NULL WHERE wake_key=?",
                 (now, now, wake_key),
             )
+            if cursor.rowcount != 1:
+                return wake_key, False
             return wake_key, True
-
-    def _record_launch(self, wake_key: str, process_id: int, now: str) -> None:
-        with self.store.transaction():
-            self.store.connection.execute(
-                "UPDATE coordination_wakes SET process_id=?, updated_at=? WHERE wake_key=? AND state='INFLIGHT'",
-                (process_id, now, wake_key),
-            )
-            self.store._event(
-                "SESSION_WAKE_STARTED", wake_key, {"process_id": process_id}, now
-            )
 
     def _record_launch_failure(self, wake_key: str, now: str) -> None:
         preview_wake = self.store.connection.execute(
@@ -1627,11 +3339,18 @@ class CoordinationSupervisor:
                 )
 
     def _complete_stale_wakes(self, now: str) -> None:
+        pending_manager_wakes = {
+            str(row["target_entity_key"])
+            for row in self._unresolved_submission_intents()
+            if row["target_kind"] == "message"
+        }
         with self.store.transaction():
             rows = self.store.connection.execute(
                 "SELECT * FROM coordination_wakes WHERE state='INFLIGHT'"
             ).fetchall()
             for wake in rows:
+                if str(wake["wake_key"]) in pending_manager_wakes:
+                    continue
                 message = self.store.connection.execute(
                     "SELECT * FROM coordination_messages WHERE id=?", (wake["message_id"],)
                 ).fetchone()
@@ -1764,6 +3483,35 @@ class CoordinationSupervisor:
                 "error": str(exc) if isinstance(exc, CoordinationError) else "ARTIFACT_GC_FAILED",
             }
         opened_watches, held_watch_backfills = self._ensure_terminal_watches(observed_at)
+        self._reconcile_unbound_submission_intents(observed_at)
+        (
+            ambiguity_recovered_message_launches,
+            ambiguity_recovered_terminal_watch_launches,
+        ) = self._reconcile_ambiguous_submission_intents(observed_at)
+        (
+            reconciled_message_launches,
+            reconciled_terminal_watch_launches,
+            _pending_submission_targets,
+        ) = self._reconcile_pending_manager_submissions(observed_at)
+        unresolved_submission_intents = self._unresolved_submission_intents()
+        manager_submission_targets = {
+            (
+                str(decoded["fence"].role),
+                str(decoded["target_kind"]),
+                str(decoded["fence"].target_key),
+            )
+            for decoded in unresolved_submission_intents
+        }
+        manager_submission_lineages = {
+            str(decoded["fence"].lineage_sha256)
+            for decoded in unresolved_submission_intents
+            if decoded["fence"].lineage_sha256 is not None
+        }
+        manager_submission_planner_repositories = {
+            str(decoded["planner_repository"])
+            for decoded in unresolved_submission_intents
+            if decoded["planner_repository"] is not None
+        }
         self._complete_stale_wakes(observed_at)
         due_terminal_lineages = self._eligible_due_terminal_watch_lineages(observed_at)
         terminal_watch_slot_reserved = bool(due_terminal_lineages)
@@ -1773,7 +3521,10 @@ class CoordinationSupervisor:
                 self.launch_policy.total,
                 self.launch_policy.messages + self.launch_policy.terminal_watches,
             )
-        launched: list[dict[str, object]] = []
+        launched: list[dict[str, object]] = [
+            *ambiguity_recovered_message_launches,
+            *reconciled_message_launches,
+        ]
         scanned_rows = self.store.connection.execute(
             """
             SELECT * FROM coordination_messages AS message
@@ -1785,8 +3536,10 @@ class CoordinationSupervisor:
             list(scanned_rows), observed_at
         )
         scheduled_targets: set[tuple[str, str, str]] = set()
-        scheduled_lineages: set[str] = set()
-        scheduled_planner_repositories: set[str] = set()
+        scheduled_lineages: set[str] = set(manager_submission_lineages)
+        scheduled_planner_repositories: set[str] = set(
+            manager_submission_planner_repositories
+        )
         launch_attempts = 0
         message_launch_attempts = 0
         due_message_retry_launch_attempts = 0
@@ -1868,7 +3621,7 @@ class CoordinationSupervisor:
             if planner_repository_busy or lineage_busy:
                 continue
             target = (recipient_role, "message", str(row["id"]))
-            if target in scheduled_targets:
+            if target in scheduled_targets or target in manager_submission_targets:
                 continue
             scheduled_targets.add(target)
             if self.process_checker(current_identity, "message", str(row["id"])):
@@ -1876,6 +3629,12 @@ class CoordinationSupervisor:
             wake_key, should_launch = self._reserve_wake(row, observed_at)
             if not should_launch or wake_key is None:
                 continue
+            reservation_row = self.store.connection.execute(
+                "SELECT * FROM coordination_wakes WHERE wake_key=?", (wake_key,)
+            ).fetchone()
+            if reservation_row is None:
+                continue
+            reservation = dict(reservation_row)
             launch_attempts += 1
             message_launch_attempts += 1
             if message_id in retry_message_ids:
@@ -1885,15 +3644,106 @@ class CoordinationSupervisor:
             if planner_repository is not None:
                 scheduled_planner_repositories.add(planner_repository)
             try:
-                process_id = self.launcher(current_identity, int(row["id"]))
-            except (OSError, subprocess.CalledProcessError):
-                self._record_launch_failure(wake_key, observed_at)
+                child_ack_fence = snapshot_role_executor_child_ack_fence(
+                    self.store.connection,
+                    role=recipient_role,
+                    endpoint_id=current_identity,
+                    target_kind="message",
+                    target_key=str(row["id"]),
+                )
+                intent_event_key = self._record_submission_intent(
+                    entity_key=wake_key,
+                    target_kind="message",
+                    fence=child_ack_fence,
+                    reservation=reservation,
+                    now=observed_at,
+                )
+            except (CoordinationError, RegistryError):
                 continue
-            self._record_launch(wake_key, process_id, observed_at)
-            launched.append(
-                {"wake_key": wake_key, "message_id": int(row["id"]), "process_id": process_id}
-            )
-        terminal_watch_launches: list[dict[str, object]] = []
+            try:
+                launch_result = self._submit_manager_after_atomic_revalidation(
+                    intent_event_key=intent_event_key,
+                    target_kind="message",
+                    entity_key=wake_key,
+                    submit=lambda: self.launcher(
+                        current_identity, int(row["id"])
+                    ),
+                    now=observed_at,
+                )
+            except Exception:
+                try:
+                    self._record_unbound_submission_hold(
+                        intent_event_key=intent_event_key,
+                        target_kind="message",
+                        entity_key=wake_key,
+                        now=observed_at,
+                    )
+                except CoordinationError:
+                    pass
+                continue
+            if launch_result["status"] == "ABANDONED":
+                continue
+            if launch_result["status"] != "SUBMITTED":
+                continue
+            expectation = launch_result["expectation"]
+            receipt_event_key = str(launch_result["receipt_event_key"])
+            assert type(expectation) is RoleExecutorChildAckExpectation
+            try:
+                (
+                    observed_ack,
+                    observation_not_after,
+                ) = self._await_role_executor_child_ack(
+                    expectation, observed_at=observed_at
+                )
+            except (CoordinationError, RegistryError):
+                try:
+                    self._finalize_manager_submission(
+                        entity_key=wake_key,
+                        target_kind="message",
+                        receipt_event_key=receipt_event_key,
+                        expectation=expectation,
+                        now=observed_at,
+                        observation_not_after=self._child_ack_observation_ceiling(
+                            observed_at=observed_at,
+                            observation_deadline_at=(
+                                expectation.observation_deadline_at
+                            ),
+                        ),
+                        forced_rejection=True,
+                    )
+                except (CoordinationError, RegistryError):
+                    pass
+                continue
+            if observed_ack is None:
+                continue
+            try:
+                finalized = self._finalize_manager_submission(
+                    entity_key=wake_key,
+                    target_kind="message",
+                    receipt_event_key=receipt_event_key,
+                    expectation=expectation,
+                    now=observed_at,
+                    observation_not_after=observation_not_after,
+                )
+            except (CoordinationError, RegistryError):
+                continue
+            acknowledgement = finalized["acknowledgement"]
+            if (
+                type(acknowledgement) is RoleExecutorChildAcknowledgement
+                and finalized["started"] is True
+            ):
+                launched.append(
+                    {
+                        "wake_key": wake_key,
+                        "message_id": int(row["id"]),
+                        "process_id": acknowledgement.process_id,
+                        "child_ack_sha256": acknowledgement.sha256,
+                    }
+                )
+        terminal_watch_launches: list[dict[str, object]] = [
+            *ambiguity_recovered_terminal_watch_launches,
+            *reconciled_terminal_watch_launches,
+        ]
         watches = self.store.connection.execute(
             """
             SELECT * FROM coordination_terminal_watches
@@ -1942,7 +3792,7 @@ class CoordinationSupervisor:
             if lineage_busy:
                 continue
             target = (recipient_role, "terminal_watch", str(watch["watch_key"]))
-            if target in scheduled_targets:
+            if target in scheduled_targets or target in manager_submission_targets:
                 continue
             scheduled_targets.add(target)
             if self.process_checker(
@@ -1957,22 +3807,111 @@ class CoordinationSupervisor:
             launch_attempts += 1
             terminal_watch_launch_attempts += 1
             try:
-                process_id = self.terminal_watch_launcher(
-                    current_identity, watch["watch_key"]
+                child_ack_fence = snapshot_role_executor_child_ack_fence(
+                    self.store.connection,
+                    role=recipient_role,
+                    endpoint_id=current_identity,
+                    target_kind="terminal_watch",
+                    target_key=str(watch["watch_key"]),
                 )
-            except (OSError, subprocess.CalledProcessError):
-                self._record_terminal_watch_launch_failure(watch["watch_key"], observed_at)
+                intent_event_key = self._record_submission_intent(
+                    entity_key=str(watch["watch_key"]),
+                    target_kind="terminal_watch",
+                    fence=child_ack_fence,
+                    reservation=dict(current),
+                    now=observed_at,
+                )
+            except (CoordinationError, RegistryError):
                 continue
-            self._record_terminal_watch_launch(watch["watch_key"], process_id, observed_at)
-            scheduled_lineages.add(lineage.sha256)
-            terminal_watch_launches.append(
-                {
-                    "watch_key": watch["watch_key"],
-                    "recipient_session_id": recipient,
-                    "process_id": process_id,
-                }
-            )
+            try:
+                launch_result = self._submit_manager_after_atomic_revalidation(
+                    intent_event_key=intent_event_key,
+                    target_kind="terminal_watch",
+                    entity_key=str(watch["watch_key"]),
+                    submit=lambda: self.terminal_watch_launcher(
+                        current_identity, watch["watch_key"]
+                    ),
+                    now=observed_at,
+                )
+            except Exception:
+                try:
+                    self._record_unbound_submission_hold(
+                        intent_event_key=intent_event_key,
+                        target_kind="terminal_watch",
+                        entity_key=str(watch["watch_key"]),
+                        now=observed_at,
+                    )
+                except CoordinationError:
+                    pass
+                continue
+            if launch_result["status"] == "ABANDONED":
+                continue
+            if launch_result["status"] != "SUBMITTED":
+                continue
+            expectation = launch_result["expectation"]
+            receipt_event_key = str(launch_result["receipt_event_key"])
+            assert type(expectation) is RoleExecutorChildAckExpectation
+            try:
+                (
+                    observed_ack,
+                    observation_not_after,
+                ) = self._await_role_executor_child_ack(
+                    expectation, observed_at=observed_at
+                )
+            except (CoordinationError, RegistryError):
+                try:
+                    self._finalize_manager_submission(
+                        entity_key=str(watch["watch_key"]),
+                        target_kind="terminal_watch",
+                        receipt_event_key=receipt_event_key,
+                        expectation=expectation,
+                        now=observed_at,
+                        observation_not_after=self._child_ack_observation_ceiling(
+                            observed_at=observed_at,
+                            observation_deadline_at=(
+                                expectation.observation_deadline_at
+                            ),
+                        ),
+                        forced_rejection=True,
+                    )
+                except (CoordinationError, RegistryError):
+                    pass
+                continue
+            if observed_ack is None:
+                continue
+            try:
+                finalized = self._finalize_manager_submission(
+                    entity_key=str(watch["watch_key"]),
+                    target_kind="terminal_watch",
+                    receipt_event_key=receipt_event_key,
+                    expectation=expectation,
+                    now=observed_at,
+                    observation_not_after=observation_not_after,
+                )
+            except (CoordinationError, RegistryError):
+                continue
+            acknowledgement = finalized["acknowledgement"]
+            if (
+                type(acknowledgement) is RoleExecutorChildAcknowledgement
+                and finalized["started"] is True
+            ):
+                scheduled_lineages.add(lineage.sha256)
+                terminal_watch_launches.append(
+                    {
+                        "watch_key": watch["watch_key"],
+                        "recipient_session_id": recipient,
+                        "process_id": acknowledgement.process_id,
+                        "child_ack_sha256": acknowledgement.sha256,
+                    }
+                )
         successful_launches = len(launched) + len(terminal_watch_launches)
+        reconciled_launches = (
+            len(ambiguity_recovered_message_launches)
+            + len(ambiguity_recovered_terminal_watch_launches)
+            + len(reconciled_message_launches)
+            + len(reconciled_terminal_watch_launches)
+        )
+        newly_successful_launches = successful_launches - reconciled_launches
         return {
             "telemetry": {
                 "duration_seconds": round(
@@ -1980,8 +3919,8 @@ class CoordinationSupervisor:
                 ),
                 "selected": len(rows) + len(watches),
                 "attempted": launch_attempts,
-                "succeeded": successful_launches,
-                "failed": launch_attempts - successful_launches,
+                "succeeded": newly_successful_launches,
+                "failed": launch_attempts - newly_successful_launches,
             },
             "launch_policy": self.launch_policy.as_dict(),
             "launch_policy_decision": {

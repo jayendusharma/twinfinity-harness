@@ -55,6 +55,10 @@ from reconcile_routing_artifacts import (  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
+from role_executor_transport import (  # noqa: E402
+    RoleExecutorManagerNotSubmitted,
+    RoleExecutorManagerSubmission,
+)
 from tests.canonical_ready_fixture import (  # noqa: E402
     finalize_canonical_ready_item,
 )
@@ -279,11 +283,121 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
             )
         return running, token
 
+    def _launch_exact_child(
+        self,
+        *,
+        endpoint_id: str,
+        target_kind: str,
+        target_key: str,
+        process_id: int,
+        terminal: bool,
+    ) -> tuple[RoleExecutorManagerSubmission, dict, str]:
+        event_type = (
+            "SESSION_WAKE_MANAGER_SUBMISSION_INTENT"
+            if target_kind == "message"
+            else "TERMINAL_WATCH_MANAGER_SUBMISSION_INTENT"
+        )
+        intent = self.store.connection.execute(
+            "SELECT created_at FROM coordination_events WHERE event_type=? "
+            "ORDER BY id DESC LIMIT 1",
+            (event_type,),
+        ).fetchone()
+        self.assertIsNotNone(intent)
+        intent_recorded_at = str(intent["created_at"])
+        role = endpoint_id.split(".")[1]
+        ordinal = int(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM executor_attempts "
+                "WHERE target_kind=? AND target_key=?",
+                (target_kind, target_key),
+            ).fetchone()[0]
+        )
+        invocation_id = hashlib.sha256(
+            (
+                f"{endpoint_id}:{target_kind}:{target_key}:"
+                f"{intent_recorded_at}:{ordinal}"
+            ).encode()
+        ).hexdigest()[:32]
+        unit = stable_systemd_unit(role, target_kind, target_key)
+        reserved, token = reserve_attempt(
+            self.store.connection,
+            role=role,
+            endpoint_id=endpoint_id,
+            target_kind=target_kind,
+            target_key=target_key,
+            now=intent_recorded_at,
+            precondition=lambda connection: attempt_lineage_for_target(
+                connection, target_kind, target_key
+            ),
+        )
+        launching = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=reserved["version"],
+            new_state="LAUNCHING",
+            systemd_unit=unit,
+            systemd_invocation_id=invocation_id,
+            systemd_control_group=f"/user.slice/{unit}",
+            now=intent_recorded_at,
+        )
+        child = transition_attempt(
+            self.store.connection,
+            attempt_id=reserved["attempt_id"],
+            token=token,
+            expected_version=launching["version"],
+            new_state="RUNNING",
+            process_id=process_id,
+            now=intent_recorded_at,
+        )
+        if terminal:
+            child = transition_attempt(
+                self.store.connection,
+                attempt_id=reserved["attempt_id"],
+                token=token,
+                expected_version=child["version"],
+                new_state="COMPLETE",
+                exit_code=0,
+                now=intent_recorded_at,
+            )
+        return (
+            RoleExecutorManagerSubmission(
+                systemd_unit=unit,
+                systemd_invocation_id=invocation_id,
+            ),
+            child,
+            token,
+        )
+
     def _run_to_third_attempt(self, lineage: dict) -> CoordinationSupervisor:
+        launches = 0
+
+        def launcher(session_id: str, message_id: int):
+            nonlocal launches
+            launches += 1
+            receipt, _child, _token = self._launch_exact_child(
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=str(message_id),
+                process_id=9272 + launches,
+                terminal=True,
+            )
+            return receipt
+
+        def terminal_watch_launcher(session_id: str, watch_key: str):
+            receipt, _child, _token = self._launch_exact_child(
+                endpoint_id=session_id,
+                target_kind="terminal_watch",
+                target_key=watch_key,
+                process_id=9274,
+                terminal=True,
+            )
+            return receipt
+
         supervisor = CoordinationSupervisor(
             self.store,
-            launcher=lambda _session, _message: 9273,
-            terminal_watch_launcher=lambda _session, _watch: 9274,
+            launcher=launcher,
+            terminal_watch_launcher=terminal_watch_launcher,
             process_checker=lambda *_args: False,
         )
         for timestamp in (
@@ -445,7 +559,37 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         )
         lineage = self._admitted(issue=812)
         self.assertEqual(historical_endpoint, lineage["endpoint"])
-        self._run_to_third_attempt(lineage)
+
+        def manager_not_submitted(*_args: object) -> RoleExecutorManagerSubmission:
+            raise RoleExecutorManagerNotSubmitted()
+
+        legacy_supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=manager_not_submitted,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+        )
+        for timestamp in (
+            "2026-08-26T10:00:06Z",
+            "2026-08-26T10:01:07Z",
+        ):
+            legacy_supervisor.run_once(timestamp)
+        legacy_message = self.store.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        legacy_wake_key, should_launch = legacy_supervisor._reserve_wake(
+            legacy_message, "2026-08-26T10:03:08Z"
+        )
+        self.assertTrue(should_launch)
+        self.assertIsNotNone(legacy_wake_key)
+        legacy_wake = self.store.connection.execute(
+            "SELECT state,attempts FROM coordination_wakes WHERE message_id=?",
+            (lineage["message_id"],),
+        ).fetchone()
+        self.assertEqual(("INFLIGHT", 3), tuple(legacy_wake))
 
         message = self.store.connection.execute(
             "SELECT * FROM coordination_messages WHERE id=?",
@@ -639,10 +783,33 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
         )
         lineage = self._admitted(role=role, issue=issue)
         self.assertEqual(historical_endpoint, lineage["endpoint"])
+        launched_child: dict[str, object] = {}
+
+        def launcher(session_id: str, message_id: int):
+            receipt, child, token = self._launch_exact_child(
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=str(message_id),
+                process_id=9273,
+                terminal=False,
+            )
+            launched_child.update({"attempt": child, "token": token})
+            return receipt
+
+        def terminal_watch_launcher(session_id: str, watch_key: str):
+            receipt, _child, _token = self._launch_exact_child(
+                endpoint_id=session_id,
+                target_kind="terminal_watch",
+                target_key=watch_key,
+                process_id=9274,
+                terminal=True,
+            )
+            return receipt
+
         supervisor = CoordinationSupervisor(
             self.store,
-            launcher=lambda _session, _message: 9273,
-            terminal_watch_launcher=lambda _session, _watch: 9274,
+            launcher=launcher,
+            terminal_watch_launcher=terminal_watch_launcher,
             process_checker=lambda *_args: False,
         )
         supervisor.run_once("2026-08-26T10:00:06Z")
@@ -651,7 +818,9 @@ class UnclaimedAdmissionRecoveryTests(unittest.TestCase):
             (lineage["message_id"],),
         ).fetchone()
         self.assertEqual(("INFLIGHT", 1), (wake["state"], int(wake["attempts"])))
-        historical_attempt, historical_token = self._reserve_running_attempt(lineage)
+        self.assertEqual({"attempt", "token"}, set(launched_child))
+        historical_attempt = dict(launched_child["attempt"])
+        historical_token = str(launched_child["token"])
         historical_attempt = transition_attempt(
             self.store.connection,
             attempt_id=historical_attempt["attempt_id"],

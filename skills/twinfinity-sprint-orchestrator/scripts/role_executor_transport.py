@@ -6,12 +6,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import pwd
 import re
+import selectors
 import stat
 import subprocess
+import time
 from typing import Any, Callable
 
 from executor_registry import (
@@ -21,6 +24,8 @@ from executor_registry import (
     ENDPOINT_ID,
     ROLES,
     RegistryError,
+    SYSTEMD_INVOCATION_ID,
+    SYSTEMD_UNIT,
     canonical_json,
     digest_json,
     load_registry_config,
@@ -34,6 +39,8 @@ BROKER_SYSTEMD_TASKS_MAX = 64
 BROKER_SYSTEMD_RUNTIME_MAX_SECONDS = 660
 BROKER_SYSTEMD_CPU_QUOTA_PERCENT = 100
 SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS = 5
+ROLE_EXECUTOR_MANAGER_SUBMISSION_MAXIMUM_RESPONSE_BYTES = 512
+ROLE_EXECUTOR_MANAGER_REAP_TIMEOUT_SECONDS = 1
 ROLE_EXECUTOR_TRANSPORT_PREFLIGHT_TIMEOUT_SECONDS = 5
 TRANSPORT_PREFLIGHT_SOURCE_REPOSITORY = "jayendusharma/twinfinity-harness"
 TRANSPORT_PREFLIGHT_SOURCE_ISSUE_NUMBER = 149
@@ -55,6 +62,11 @@ ROLE_EXECUTOR_TRANSPORT_FAILURES = frozenset(
     }
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MANAGER_SUBMISSION_RESPONSE = re.compile(
+    r"\ARunning as unit: "
+    r"(?P<systemd_unit>[A-Za-z0-9_.@:-]{1,255}\.service); "
+    r"invocation ID: (?P<systemd_invocation_id>[0-9a-f]{32})\n\Z"
+)
 _SYSTEMCTL_MANAGER_PROPERTIES = (
     "Architecture",
     "ControlGroup",
@@ -70,6 +82,7 @@ _SYSTEMCTL_MANAGER_COMMAND = (
     *tuple(f"--property={name}" for name in _SYSTEMCTL_MANAGER_PROPERTIES),
 )
 _SYSTEMD_RUN_PREFIX = ("/usr/bin/systemd-run", "--user", "--quiet")
+_SYSTEMD_RUN_DIRECT_SUBMISSION_PREFIX = ("/usr/bin/systemd-run", "--user")
 _ROLE_EXECUTOR_RUNNER_PREFIX = (
     "/usr/bin/python3",
     str(RUNNER),
@@ -95,9 +108,30 @@ _TRANSPORT_PROBE_CONTRACT = {
 ROLE_EXECUTOR_TRANSPORT_PROBE_CONTRACT_SHA256 = digest_json(
     _TRANSPORT_PROBE_CONTRACT
 )
+_MANAGER_SUBMISSION_CONTRACT = {
+    "schema": "twinfinity-role-executor-manager-submission-contract/v1",
+    "manager_command_prefix": list(_SYSTEMD_RUN_DIRECT_SUBMISSION_PREFIX),
+    "timeout_seconds": SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS,
+    "reap_timeout_seconds": ROLE_EXECUTOR_MANAGER_REAP_TIMEOUT_SECONDS,
+    "response_encoding": "utf-8",
+    "response_channels": "exactly_one_of_stdout_or_stderr",
+    "response_format": (
+        "Running as unit: <systemd_unit>; invocation ID: "
+        "<systemd_invocation_id>\\n"
+    ),
+    "maximum_combined_response_bytes": (
+        ROLE_EXECUTOR_MANAGER_SUBMISSION_MAXIMUM_RESPONSE_BYTES
+    ),
+}
+ROLE_EXECUTOR_MANAGER_SUBMISSION_CONTRACT_SHA256 = digest_json(
+    _MANAGER_SUBMISSION_CONTRACT
+)
 _TRANSPORT_CONFIGURATION = {
     "schema": "twinfinity-role-executor-transport-configuration/v1",
     "manager_probe_sha256": ROLE_EXECUTOR_TRANSPORT_PROBE_CONTRACT_SHA256,
+    "manager_submission_sha256": (
+        ROLE_EXECUTOR_MANAGER_SUBMISSION_CONTRACT_SHA256
+    ),
     "systemd_run_prefix": list(_SYSTEMD_RUN_PREFIX),
     "runner_prefix": list(_ROLE_EXECUTOR_RUNNER_PREFIX),
     "client_environment": _TRANSPORT_CLIENT_ENVIRONMENT_POLICY,
@@ -106,6 +140,46 @@ _TRANSPORT_CONFIGURATION = {
 ROLE_EXECUTOR_TRANSPORT_CONFIGURATION_SHA256 = digest_json(
     _TRANSPORT_CONFIGURATION
 )
+
+
+@dataclass(frozen=True)
+class RoleExecutorManagerSubmission:
+    """Closed manager receipt for one exact transient-unit submission."""
+
+    systemd_unit: str
+    systemd_invocation_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.systemd_unit) is not str
+            or SYSTEMD_UNIT.fullmatch(self.systemd_unit) is None
+            or type(self.systemd_invocation_id) is not str
+            or SYSTEMD_INVOCATION_ID.fullmatch(self.systemd_invocation_id) is None
+        ):
+            raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED)
+
+    @property
+    def payload(self) -> dict[str, str]:
+        return {
+            "schema": "twinfinity-role-executor-manager-submission/v1",
+            "systemd_invocation_id": self.systemd_invocation_id,
+            "systemd_unit": self.systemd_unit,
+        }
+
+    @property
+    def receipt_sha256(self) -> str:
+        return digest_json(self.payload)
+
+
+class RoleExecutorManagerNotSubmitted(RegistryError):
+    """Positive proof that process creation failed before manager submission."""
+
+    def __init__(self) -> None:
+        super().__init__(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE)
+
+
+class _ManagerSubmissionOutputOverflow(Exception):
+    """Value-free internal signal for aggregate manager output overflow."""
 
 
 @dataclass(frozen=True)
@@ -959,6 +1033,230 @@ def role_executor_command(
         "--prompt",
         prompt,
     ]
+
+
+def _parse_manager_submission_response(
+    stdout: object,
+    stderr: object,
+    *,
+    expected_systemd_unit: str,
+) -> RoleExecutorManagerSubmission:
+    """Parse exactly one bounded manager channel into a closed receipt."""
+
+    if type(stdout) is not bytes or type(stderr) is not bytes:
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED)
+    if (
+        len(stdout) + len(stderr)
+        > ROLE_EXECUTOR_MANAGER_SUBMISSION_MAXIMUM_RESPONSE_BYTES
+    ):
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED)
+    if bool(stdout) == bool(stderr):
+        if stdout and stderr:
+            raise RegistryError(ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS)
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED)
+    raw = stdout or stderr
+    if b"\0" in raw:
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED)
+    try:
+        response = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED) from None
+    match = _MANAGER_SUBMISSION_RESPONSE.fullmatch(response)
+    if match is None:
+        if response.count("Running as unit:") > 1:
+            raise RegistryError(ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS)
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED)
+    unit = match.group("systemd_unit")
+    if unit != expected_systemd_unit:
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED)
+    return RoleExecutorManagerSubmission(
+        systemd_unit=unit,
+        systemd_invocation_id=match.group("systemd_invocation_id"),
+    )
+
+
+def _bounded_manager_submission_run(
+    command: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str],
+    popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> subprocess.CompletedProcess[bytes]:
+    """Read both manager pipes under one pre-buffer byte and time ceiling."""
+
+    if (
+        type(command) is not list
+        or not command
+        or any(type(value) is not str or not value for value in command)
+        or isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or float(timeout) <= 0
+        or type(env) is not dict
+    ):
+        raise subprocess.SubprocessError("manager submission input invalid")
+
+    def sample(previous: float | None = None) -> float:
+        value = monotonic()
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+            or (previous is not None and float(value) < previous)
+        ):
+            raise subprocess.SubprocessError("manager submission clock invalid")
+        return float(value)
+
+    started_at = sample()
+    deadline = started_at + float(timeout)
+    if not math.isfinite(deadline):
+        raise subprocess.SubprocessError("manager submission clock invalid")
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    buffers: dict[object, bytearray] = {}
+    total = 0
+
+    def stop_and_reap() -> None:
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.kill()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            process.wait(timeout=ROLE_EXECUTOR_MANAGER_REAP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            pass
+
+    try:
+        try:
+            process = popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+        except OSError:
+            raise RoleExecutorManagerNotSubmitted() from None
+        if process.stdout is None or process.stderr is None:
+            raise subprocess.SubprocessError("manager submission pipe missing")
+        for stream in (process.stdout, process.stderr):
+            buffers[stream] = bytearray()
+            selector.register(stream, selectors.EVENT_READ)
+
+        previous = started_at
+        while selector.get_map():
+            observed_at = sample(previous)
+            previous = observed_at
+            remaining = deadline - observed_at
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            ready = selector.select(remaining)
+            if not ready:
+                raise subprocess.TimeoutExpired(command, timeout)
+            for key, _mask in ready:
+                stream = key.fileobj
+                read_limit = (
+                    ROLE_EXECUTOR_MANAGER_SUBMISSION_MAXIMUM_RESPONSE_BYTES
+                    + 1
+                    - total
+                )
+                chunk = os.read(stream.fileno(), max(1, read_limit))
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                total += len(chunk)
+                if (
+                    total
+                    > ROLE_EXECUTOR_MANAGER_SUBMISSION_MAXIMUM_RESPONSE_BYTES
+                ):
+                    raise _ManagerSubmissionOutputOverflow
+                buffers[stream].extend(chunk)
+
+        observed_at = sample(previous)
+        remaining = deadline - observed_at
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return_code = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(
+            command,
+            return_code,
+            stdout=bytes(buffers[process.stdout]),
+            stderr=bytes(buffers[process.stderr]),
+        )
+    except Exception:
+        stop_and_reap()
+        raise
+    finally:
+        try:
+            selector.close()
+        except (OSError, ValueError, AttributeError):
+            pass
+        if process is not None:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError, AttributeError):
+                        pass
+
+
+def submit_role_executor(
+    *,
+    role: str,
+    endpoint_id: str,
+    target_kind: str,
+    target_key: str,
+    prompt: str,
+    working_directory: Path | None = None,
+) -> RoleExecutorManagerSubmission:
+    """Submit once and require the manager's exact unit/invocation receipt."""
+
+    resolved_working_directory = (working_directory or Path.cwd()).resolve()
+    if not resolved_working_directory.is_dir():
+        raise RegistryError("ROLE_EXECUTOR_WORKING_DIRECTORY_INVALID")
+    systemd_unit = stable_systemd_unit(role, target_kind, target_key)
+    command = [
+        *_SYSTEMD_RUN_DIRECT_SUBMISSION_PREFIX,
+        f"--unit={systemd_unit}",
+        f"--working-directory={resolved_working_directory}",
+        *broker_systemd_properties(endpoint_id),
+        *role_executor_command(
+            role=role,
+            endpoint_id=endpoint_id,
+            target_kind=target_kind,
+            target_key=target_key,
+            prompt=prompt,
+        ),
+    ]
+    try:
+        completed = _bounded_manager_submission_run(
+            command,
+            timeout=SYSTEMD_RUN_SUBMISSION_TIMEOUT_SECONDS,
+            env=_manager_environment(os.geteuid()),
+        )
+    except RoleExecutorManagerNotSubmitted:
+        raise
+    except _ManagerSubmissionOutputOverflow:
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED) from None
+    except (subprocess.TimeoutExpired, TimeoutError):
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_TIMED_OUT) from None
+    except (OSError, subprocess.SubprocessError):
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE) from None
+    return_code = getattr(completed, "returncode", None)
+    if type(return_code) is not int:
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_MALFORMED)
+    if return_code != 0:
+        raise RegistryError(ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS)
+    return _parse_manager_submission_response(
+        getattr(completed, "stdout", None),
+        getattr(completed, "stderr", None),
+        expected_systemd_unit=systemd_unit,
+    )
 
 
 def launch_role_executor(

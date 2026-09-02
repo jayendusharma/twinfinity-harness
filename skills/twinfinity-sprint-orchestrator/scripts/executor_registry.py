@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -54,6 +55,29 @@ SYSTEMD_UNIT = re.compile(
     r"^twinfinity-role-executor-(planner|development|sre)-"
     r"(message|terminal-watch|hosted-operation)-[0-9a-f]{16}\.service$"
 )
+RFC3339_UTC = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?Z$"
+)
+SQLITE_INTEGER_TARGET = re.compile(
+    r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+)
+CANONICAL_INTEGER_TARGET = re.compile(r"^[1-9][0-9]*$")
+ROLE_EXECUTOR_CHILD_ACK_FENCE_SCHEMA = (
+    "twinfinity-role-executor-child-ack-fence/v1"
+)
+ROLE_EXECUTOR_CHILD_ACK_EXPECTATION_SCHEMA = (
+    "twinfinity-role-executor-child-ack-expectation/v1"
+)
+ROLE_EXECUTOR_CHILD_ACK_SCHEMA = "twinfinity-role-executor-child-ack/v1"
+ROLE_EXECUTOR_MANAGER_SUBMISSION_SCHEMA = (
+    "twinfinity-role-executor-manager-submission/v1"
+)
+ROLE_EXECUTOR_DIRECT_EXECUTION_CLASS = "DIRECT_MANAGER_CHILD"
+ROLE_EXECUTOR_DEFAULT_ACK_WINDOW_SECONDS = 900
+ROLE_EXECUTOR_MANAGER_RECEIPT_IDENTITY_SOURCE = "MANAGER_SUBMISSION_RECEIPT"
+ROLE_EXECUTOR_CHILD_RECOVERY_IDENTITY_SOURCE = "AUTHENTICATED_CHILD_RECOVERY"
+EXECUTOR_PRIVATE_ERROR_REDACTED = "EXECUTOR_PRIVATE_ERROR_REDACTED"
 ATTEMPT_STATES = {
     "RESERVED",
     "LAUNCHING",
@@ -268,6 +292,122 @@ class SystemdUnitEvidence:
     @property
     def payload(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class RoleExecutorChildAckFence:
+    """Exact endpoint, target, and attempt inventory before submission."""
+
+    schema: str
+    execution_class: str
+    role: str
+    endpoint_id: str
+    endpoint_pointer_version: int
+    endpoint_config_sha256: str
+    profile_sha256: str
+    execution_protocol: str | None
+    target_kind: str
+    target_key: str
+    target_progress_sha256: str
+    preexisting_attempt_ids: tuple[str, ...]
+    lineage_repository: str | None
+    lineage_issue_number: int | None
+    lineage_generation: int | None
+    lineage_lease_sha256: str | None
+    lineage_sha256: str | None
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def sha256(self) -> str:
+        return digest_json(self.payload)
+
+
+@dataclass(frozen=True)
+class RoleExecutorChildAckExpectation:
+    """One exact manager receipt bound to its immutable pre-submit fence."""
+
+    schema: str
+    execution_class: str
+    role: str
+    endpoint_id: str
+    endpoint_pointer_version: int
+    endpoint_config_sha256: str
+    profile_sha256: str
+    execution_protocol: str | None
+    target_kind: str
+    target_key: str
+    target_progress_sha256: str
+    preexisting_attempt_ids: tuple[str, ...]
+    lineage_repository: str | None
+    lineage_issue_number: int | None
+    lineage_generation: int | None
+    lineage_lease_sha256: str | None
+    lineage_sha256: str | None
+    fence_sha256: str
+    systemd_unit: str
+    systemd_invocation_id: str
+    manager_identity_source: str
+    manager_identity_sha256: str
+    manager_receipt_sha256: str | None
+    intent_recorded_at: str
+    observation_deadline_at: str
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def sha256(self) -> str:
+        return digest_json(self.payload)
+
+
+@dataclass(frozen=True)
+class RoleExecutorChildAcknowledgement:
+    """Closed privacy-safe evidence for one exact token-authenticated child."""
+
+    schema: str
+    expectation_sha256: str
+    fence_sha256: str
+    manager_identity_source: str
+    manager_identity_sha256: str
+    manager_receipt_sha256: str | None
+    intent_recorded_at: str
+    observation_deadline_at: str
+    attempt_id: str
+    instance_id: str
+    token_sha256: str
+    event_chain_sha256: str
+    execution_class: str
+    execution_ownership_sha256: str
+    role: str
+    endpoint_id: str
+    endpoint_pointer_version: int
+    endpoint_config_sha256: str
+    profile_sha256: str
+    execution_protocol: str | None
+    target_kind: str
+    target_key: str
+    target_progress_sha256: str
+    lineage_sha256: str | None
+    state: str
+    version: int
+    process_id: int
+    systemd_unit: str
+    systemd_invocation_id: str
+    systemd_control_group: str
+    token_authenticated: bool
+    token_persisted: bool
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def sha256(self) -> str:
+        return digest_json(self.payload)
 
 
 def stable_systemd_unit(role: str, target_kind: str, target_key: str) -> str:
@@ -1902,6 +2042,17 @@ def endpoint_is_current(connection: sqlite3.Connection, endpoint_id: str) -> boo
 
 @contextmanager
 def immediate_transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    if connection.in_transaction:
+        savepoint = f"executor_registry_{uuid.uuid4().hex}"
+        connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        return
     connection.execute("BEGIN IMMEDIATE")
     try:
         yield
@@ -2188,6 +2339,1180 @@ def planner_repository_for_target(
     return repository_scope_for_target(connection, target_kind, target_key)
 
 
+def _role_executor_child_ack_timestamp(
+    value: str, *, error: str = "EXECUTOR_CHILD_ACK_OBSERVATION_INVALID"
+) -> datetime:
+    """Parse only canonical UTC RFC3339 timestamps used by ACK evidence."""
+
+    if type(value) is not str or RFC3339_UTC.fullmatch(value) is None:
+        raise RegistryError(error)
+    try:
+        instant = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        raise RegistryError(error) from None
+    if instant.tzinfo is None or instant.utcoffset() != timedelta(0):
+        raise RegistryError(error)
+    return instant.astimezone(timezone.utc)
+
+
+def _role_executor_integer_target_value(value: Any) -> Decimal | None:
+    """Recognize integral SQLite numeric aliases without integer truncation."""
+
+    if type(value) is not str:
+        return None
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > 128
+        or SQLITE_INTEGER_TARGET.fullmatch(candidate) is None
+    ):
+        return None
+    try:
+        number = Decimal(candidate)
+    except InvalidOperation:
+        return None
+    if not number.is_finite() or number != number.to_integral_value():
+        return None
+    return number
+
+
+def _role_executor_manager_receipt_sha256(
+    systemd_unit: str, systemd_invocation_id: str
+) -> str:
+    return digest_json(
+        {
+            "schema": ROLE_EXECUTOR_MANAGER_SUBMISSION_SCHEMA,
+            "systemd_invocation_id": systemd_invocation_id,
+            "systemd_unit": systemd_unit,
+        }
+    )
+
+
+def _validate_role_executor_child_ack_fence(
+    fence: RoleExecutorChildAckFence,
+) -> None:
+    if (
+        type(fence) is not RoleExecutorChildAckFence
+        or fence.schema != ROLE_EXECUTOR_CHILD_ACK_FENCE_SCHEMA
+        or fence.execution_class != ROLE_EXECUTOR_DIRECT_EXECUTION_CLASS
+        or type(fence.role) is not str
+        or fence.role not in ROLES
+        or type(fence.endpoint_id) is not str
+        or ENDPOINT_ID.fullmatch(fence.endpoint_id) is None
+        or fence.endpoint_id.split(".")[1] != fence.role
+        or type(fence.endpoint_pointer_version) is not int
+        or fence.endpoint_pointer_version <= 0
+        or type(fence.endpoint_config_sha256) is not str
+        or SHA256.fullmatch(fence.endpoint_config_sha256) is None
+        or type(fence.profile_sha256) is not str
+        or SHA256.fullmatch(fence.profile_sha256) is None
+        or (
+            fence.execution_protocol is not None
+            and (
+                type(fence.execution_protocol) is not str
+                or not fence.execution_protocol
+            )
+        )
+        or type(fence.target_kind) is not str
+        or fence.target_kind not in TARGET_KINDS
+        or type(fence.target_key) is not str
+        or not fence.target_key
+        or type(fence.target_progress_sha256) is not str
+        or SHA256.fullmatch(fence.target_progress_sha256) is None
+        or type(fence.preexisting_attempt_ids) is not tuple
+        or any(
+            type(attempt_id) is not str or UUID.fullmatch(attempt_id) is None
+            for attempt_id in fence.preexisting_attempt_ids
+        )
+        or tuple(sorted(fence.preexisting_attempt_ids))
+        != fence.preexisting_attempt_ids
+        or len(set(fence.preexisting_attempt_ids))
+        != len(fence.preexisting_attempt_ids)
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_FENCE_INVALID")
+    if fence.execution_protocol == BROKERED_READINESS_PROTOCOL:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXECUTION_CLASS_MISMATCH")
+    if fence.target_kind in {"message", "hosted_operation"}:
+        try:
+            target_number = int(fence.target_key)
+        except (TypeError, ValueError):
+            raise RegistryError("EXECUTOR_CHILD_ACK_FENCE_INVALID") from None
+        if target_number <= 0 or str(target_number) != fence.target_key:
+            raise RegistryError("EXECUTOR_CHILD_ACK_FENCE_INVALID")
+    lineage_values = (
+        fence.lineage_repository,
+        fence.lineage_issue_number,
+        fence.lineage_generation,
+        fence.lineage_lease_sha256,
+        fence.lineage_sha256,
+    )
+    if all(value is None for value in lineage_values):
+        return
+    if any(value is None for value in lineage_values):
+        raise RegistryError("EXECUTOR_CHILD_ACK_FENCE_INVALID")
+    try:
+        lineage = AttemptLineage(
+            repository=fence.lineage_repository,
+            issue_number=fence.lineage_issue_number,
+            generation=fence.lineage_generation,
+            lease_manifest_sha256=fence.lineage_lease_sha256,
+        )
+    except RegistryError:
+        raise RegistryError("EXECUTOR_CHILD_ACK_FENCE_INVALID") from None
+    if not secrets.compare_digest(lineage.sha256, str(fence.lineage_sha256)):
+        raise RegistryError("EXECUTOR_CHILD_ACK_FENCE_INVALID")
+
+
+def _role_executor_child_ack_endpoint_binding(
+    connection: sqlite3.Connection,
+    *,
+    role: str,
+    endpoint_id: str,
+) -> dict[str, Any]:
+    if (
+        type(role) is not str
+        or role not in ROLES
+        or type(endpoint_id) is not str
+        or ENDPOINT_ID.fullmatch(endpoint_id) is None
+        or endpoint_id.split(".")[1] != role
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ENDPOINT_INVALID")
+    endpoint = current_endpoint(connection, role)
+    if endpoint is None or str(endpoint["endpoint_id"]) != endpoint_id:
+        raise RegistryError("EXECUTOR_CHILD_ACK_ENDPOINT_NOT_CURRENT")
+    try:
+        payload = json.loads(endpoint["config_json"])
+    except (TypeError, json.JSONDecodeError):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ENDPOINT_INVALID") from None
+    profile_sha256 = payload.get("profile_sha256") if type(payload) is dict else None
+    execution_protocol = (
+        payload.get("execution_protocol") if type(payload) is dict else None
+    )
+    pointer_version = endpoint["pointer_version"]
+    config_sha256 = endpoint["config_sha256"]
+    if (
+        type(payload) is not dict
+        or payload.get("role") != role
+        or payload.get("endpoint_id") != endpoint_id
+        or canonical_json(payload) != endpoint["config_json"]
+        or type(config_sha256) is not str
+        or SHA256.fullmatch(config_sha256) is None
+        or not secrets.compare_digest(digest_json(payload), config_sha256)
+        or type(profile_sha256) is not str
+        or SHA256.fullmatch(profile_sha256) is None
+        or (
+            execution_protocol is not None
+            and (type(execution_protocol) is not str or not execution_protocol)
+        )
+        or type(pointer_version) is not int
+        or pointer_version <= 0
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ENDPOINT_INVALID")
+    return {
+        "endpoint_pointer_version": pointer_version,
+        "endpoint_config_sha256": config_sha256,
+        "profile_sha256": profile_sha256,
+        "execution_protocol": execution_protocol,
+    }
+
+
+def _validate_role_executor_child_ack_target_route(
+    connection: sqlite3.Connection,
+    *,
+    role: str,
+    endpoint_id: str,
+    target_kind: str,
+    target_key: str,
+) -> None:
+    """Require the target's durable receiver to resolve to this endpoint."""
+
+    try:
+        if target_kind == "message":
+            target_id = int(target_key)
+            row = connection.execute(
+                "SELECT recipient_session_id FROM coordination_messages WHERE id=?",
+                (target_id,),
+            ).fetchone()
+            identity = None if row is None else row["recipient_session_id"]
+        elif target_kind == "terminal_watch":
+            row = connection.execute(
+                "SELECT accountable_session_id FROM coordination_terminal_watches "
+                "WHERE watch_key=?",
+                (target_key,),
+            ).fetchone()
+            identity = None if row is None else row["accountable_session_id"]
+        elif target_kind == "hosted_operation":
+            target_id = int(target_key)
+            row = connection.execute(
+                "SELECT recipient_session_id FROM hosted_operations WHERE id=?",
+                (target_id,),
+            ).fetchone()
+            identity = None if row is None else row["recipient_session_id"]
+        else:
+            raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_INVALID")
+    except (TypeError, ValueError, sqlite3.Error):
+        raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_INVALID") from None
+    if type(identity) is not str or identity_role(connection, identity) != role:
+        raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_INVALID")
+    if target_kind in {"terminal_watch", "hosted_operation"}:
+        if identity != endpoint_id:
+            raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_INVALID")
+        return
+    if identity == endpoint_id:
+        return
+    alias = connection.execute(
+        "SELECT role FROM executor_role_endpoint_aliases "
+        "WHERE alias=? AND endpoint_id=?",
+        (identity, endpoint_id),
+    ).fetchone()
+    if alias is None or alias["role"] != role:
+        raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_INVALID")
+
+
+def _role_executor_child_ack_fence_from_attempt(
+    row: sqlite3.Row,
+    *,
+    endpoint_binding: dict[str, Any],
+    preexisting_attempt_ids: tuple[str, ...],
+) -> RoleExecutorChildAckFence:
+    try:
+        fence = RoleExecutorChildAckFence(
+            schema=ROLE_EXECUTOR_CHILD_ACK_FENCE_SCHEMA,
+            execution_class=ROLE_EXECUTOR_DIRECT_EXECUTION_CLASS,
+            role=row["role"],
+            endpoint_id=row["endpoint_id"],
+            endpoint_pointer_version=endpoint_binding["endpoint_pointer_version"],
+            endpoint_config_sha256=endpoint_binding["endpoint_config_sha256"],
+            profile_sha256=endpoint_binding["profile_sha256"],
+            execution_protocol=endpoint_binding["execution_protocol"],
+            target_kind=row["target_kind"],
+            target_key=row["target_key"],
+            target_progress_sha256=row["target_progress_sha256"],
+            preexisting_attempt_ids=preexisting_attempt_ids,
+            lineage_repository=row["lineage_repository"],
+            lineage_issue_number=row["lineage_issue_number"],
+            lineage_generation=row["lineage_generation"],
+            lineage_lease_sha256=row["lineage_lease_sha256"],
+            lineage_sha256=row["lineage_sha256"],
+        )
+        _validate_role_executor_child_ack_fence(fence)
+    except (KeyError, IndexError, TypeError, RegistryError):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID") from None
+    return fence
+
+
+@contextmanager
+def _role_executor_child_ack_read_snapshot(
+    connection: sqlite3.Connection,
+) -> Iterator[None]:
+    """Hold one coherent SQLite view while deriving an ACK fence or receipt."""
+
+    owns_snapshot = not connection.in_transaction
+    if owns_snapshot:
+        connection.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if owns_snapshot and connection.in_transaction:
+            connection.execute("ROLLBACK")
+
+
+def _role_executor_logical_target_attempts(
+    connection: sqlite3.Connection, *, target_kind: str, target_key: str
+) -> list[sqlite3.Row]:
+    """Return attempts for one durable target, including numeric aliases."""
+
+    if target_kind == "terminal_watch":
+        return connection.execute(
+            "SELECT * FROM executor_attempts "
+            "WHERE target_kind=? AND target_key=? ORDER BY created_at,attempt_id",
+            (target_kind, target_key),
+        ).fetchall()
+    if target_kind not in {"message", "hosted_operation"}:
+        raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_INVALID")
+    expected_number = _role_executor_integer_target_value(target_key)
+    if expected_number is None:
+        raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_INVALID") from None
+    rows = connection.execute(
+        "SELECT * FROM executor_attempts WHERE target_kind=? "
+        "ORDER BY created_at,attempt_id",
+        (target_kind,),
+    ).fetchall()
+    matches: list[sqlite3.Row] = []
+    for row in rows:
+        candidate_number = _role_executor_integer_target_value(row["target_key"])
+        if candidate_number is None:
+            continue
+        if candidate_number == expected_number:
+            matches.append(row)
+    return matches
+
+
+def _snapshot_role_executor_child_ack_fence(
+    connection: sqlite3.Connection,
+    *,
+    role: str,
+    endpoint_id: str,
+    target_kind: str,
+    target_key: str,
+) -> RoleExecutorChildAckFence:
+    if (
+        type(target_kind) is not str
+        or target_kind not in TARGET_KINDS
+        or type(target_key) is not str
+        or not target_key
+        or not attempt_schema_is_current(connection)
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_FENCE_INVALID")
+    endpoint_binding = _role_executor_child_ack_endpoint_binding(
+        connection, role=role, endpoint_id=endpoint_id
+    )
+    _validate_role_executor_child_ack_target_route(
+        connection,
+        role=role,
+        endpoint_id=endpoint_id,
+        target_kind=target_kind,
+        target_key=target_key,
+    )
+    logical_attempts = _role_executor_logical_target_attempts(
+        connection, target_kind=target_kind, target_key=target_key
+    )
+    if any(row["state"] in ACTIVE_ATTEMPT_STATES for row in logical_attempts):
+        raise RegistryError("EXECUTOR_CHILD_ACK_PREEXISTING_ACTIVE")
+    preexisting_attempt_ids = tuple(
+        sorted(str(row["attempt_id"]) for row in logical_attempts)
+    )
+    target_progress_sha256 = target_progress_digest(
+        connection, target_kind, target_key
+    )
+    lineage = attempt_lineage_for_target(connection, target_kind, target_key)
+    fence = RoleExecutorChildAckFence(
+        schema=ROLE_EXECUTOR_CHILD_ACK_FENCE_SCHEMA,
+        execution_class=ROLE_EXECUTOR_DIRECT_EXECUTION_CLASS,
+        role=role,
+        endpoint_id=endpoint_id,
+        endpoint_pointer_version=endpoint_binding["endpoint_pointer_version"],
+        endpoint_config_sha256=endpoint_binding["endpoint_config_sha256"],
+        profile_sha256=endpoint_binding["profile_sha256"],
+        execution_protocol=endpoint_binding["execution_protocol"],
+        target_kind=target_kind,
+        target_key=target_key,
+        target_progress_sha256=target_progress_sha256,
+        preexisting_attempt_ids=preexisting_attempt_ids,
+        lineage_repository=None if lineage is None else lineage.repository,
+        lineage_issue_number=None if lineage is None else lineage.issue_number,
+        lineage_generation=None if lineage is None else lineage.generation,
+        lineage_lease_sha256=(
+            None if lineage is None else lineage.lease_manifest_sha256
+        ),
+        lineage_sha256=None if lineage is None else lineage.sha256,
+    )
+    _validate_role_executor_child_ack_fence(fence)
+    return fence
+
+
+def snapshot_role_executor_child_ack_fence(
+    connection: sqlite3.Connection,
+    *,
+    role: str,
+    endpoint_id: str,
+    target_kind: str,
+    target_key: str,
+) -> RoleExecutorChildAckFence:
+    """Capture one coherent all-role attempt inventory before submission."""
+
+    with _role_executor_child_ack_read_snapshot(connection):
+        return _snapshot_role_executor_child_ack_fence(
+            connection,
+            role=role,
+            endpoint_id=endpoint_id,
+            target_kind=target_kind,
+            target_key=target_key,
+        )
+
+
+def _role_executor_child_ack_fence_from_expectation(
+    expectation: RoleExecutorChildAckExpectation,
+) -> RoleExecutorChildAckFence:
+    return RoleExecutorChildAckFence(
+        schema=ROLE_EXECUTOR_CHILD_ACK_FENCE_SCHEMA,
+        execution_class=expectation.execution_class,
+        role=expectation.role,
+        endpoint_id=expectation.endpoint_id,
+        endpoint_pointer_version=expectation.endpoint_pointer_version,
+        endpoint_config_sha256=expectation.endpoint_config_sha256,
+        profile_sha256=expectation.profile_sha256,
+        execution_protocol=expectation.execution_protocol,
+        target_kind=expectation.target_kind,
+        target_key=expectation.target_key,
+        target_progress_sha256=expectation.target_progress_sha256,
+        preexisting_attempt_ids=expectation.preexisting_attempt_ids,
+        lineage_repository=expectation.lineage_repository,
+        lineage_issue_number=expectation.lineage_issue_number,
+        lineage_generation=expectation.lineage_generation,
+        lineage_lease_sha256=expectation.lineage_lease_sha256,
+        lineage_sha256=expectation.lineage_sha256,
+    )
+
+
+def _validate_role_executor_child_ack_expectation(
+    expectation: RoleExecutorChildAckExpectation,
+) -> None:
+    if (
+        type(expectation) is not RoleExecutorChildAckExpectation
+        or expectation.schema != ROLE_EXECUTOR_CHILD_ACK_EXPECTATION_SCHEMA
+        or expectation.execution_class != ROLE_EXECUTOR_DIRECT_EXECUTION_CLASS
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+    try:
+        fence = _role_executor_child_ack_fence_from_expectation(expectation)
+        _validate_role_executor_child_ack_fence(fence)
+        _role_executor_child_ack_timestamp(
+            expectation.intent_recorded_at,
+            error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+        )
+        deadline_instant = _role_executor_child_ack_timestamp(
+            expectation.observation_deadline_at,
+            error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+        )
+        intent_instant = _role_executor_child_ack_timestamp(
+            expectation.intent_recorded_at,
+            error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+        )
+        expected_unit = stable_systemd_unit(
+            expectation.role, expectation.target_kind, expectation.target_key
+        )
+    except RegistryError as exc:
+        if str(exc) == "EXECUTOR_CHILD_ACK_EXECUTION_CLASS_MISMATCH":
+            raise RegistryError(
+                "EXECUTOR_CHILD_ACK_EXECUTION_CLASS_MISMATCH"
+            ) from None
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID") from None
+    expected_identity_sha256 = _role_executor_manager_receipt_sha256(
+        expectation.systemd_unit, expectation.systemd_invocation_id
+    )
+    if (
+        type(expectation.fence_sha256) is not str
+        or SHA256.fullmatch(expectation.fence_sha256) is None
+        or not secrets.compare_digest(expectation.fence_sha256, fence.sha256)
+        or type(expectation.systemd_unit) is not str
+        or expectation.systemd_unit != expected_unit
+        or type(expectation.systemd_invocation_id) is not str
+        or SYSTEMD_INVOCATION_ID.fullmatch(expectation.systemd_invocation_id) is None
+        or expectation.manager_identity_source
+        not in {
+            ROLE_EXECUTOR_MANAGER_RECEIPT_IDENTITY_SOURCE,
+            ROLE_EXECUTOR_CHILD_RECOVERY_IDENTITY_SOURCE,
+        }
+        or type(expectation.manager_identity_sha256) is not str
+        or SHA256.fullmatch(expectation.manager_identity_sha256) is None
+        or not secrets.compare_digest(
+            expectation.manager_identity_sha256, expected_identity_sha256
+        )
+        or (
+            expectation.manager_identity_source
+            == ROLE_EXECUTOR_MANAGER_RECEIPT_IDENTITY_SOURCE
+            and (
+                type(expectation.manager_receipt_sha256) is not str
+                or SHA256.fullmatch(expectation.manager_receipt_sha256) is None
+                or not secrets.compare_digest(
+                    expectation.manager_receipt_sha256, expected_identity_sha256
+                )
+            )
+        )
+        or (
+            expectation.manager_identity_source
+            == ROLE_EXECUTOR_CHILD_RECOVERY_IDENTITY_SOURCE
+            and expectation.manager_receipt_sha256 is not None
+        )
+        or deadline_instant < intent_instant
+        or deadline_instant - intent_instant
+        > timedelta(seconds=ROLE_EXECUTOR_DEFAULT_ACK_WINDOW_SECONDS)
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+
+
+def bind_role_executor_child_ack_expectation(
+    fence: RoleExecutorChildAckFence,
+    *,
+    systemd_unit: str,
+    systemd_invocation_id: str,
+    intent_recorded_at: str,
+    manager_receipt_sha256: str | None = None,
+    observation_deadline_at: str | None = None,
+    manager_identity_source: str = ROLE_EXECUTOR_MANAGER_RECEIPT_IDENTITY_SOURCE,
+) -> RoleExecutorChildAckExpectation:
+    """Bind a committed intent and exact manager receipt to one ACK fence."""
+
+    _validate_role_executor_child_ack_fence(fence)
+    identity_sha256 = _role_executor_manager_receipt_sha256(
+        systemd_unit, systemd_invocation_id
+    )
+    if manager_identity_source not in {
+        ROLE_EXECUTOR_MANAGER_RECEIPT_IDENTITY_SOURCE,
+        ROLE_EXECUTOR_CHILD_RECOVERY_IDENTITY_SOURCE,
+    }:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+    if manager_identity_source == ROLE_EXECUTOR_MANAGER_RECEIPT_IDENTITY_SOURCE:
+        if (
+            type(manager_receipt_sha256) is not str
+            or SHA256.fullmatch(manager_receipt_sha256) is None
+            or not secrets.compare_digest(
+                manager_receipt_sha256, identity_sha256
+            )
+        ):
+            raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+        bound_receipt_sha256: str | None = identity_sha256
+    else:
+        if manager_receipt_sha256 is not None:
+            raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+        bound_receipt_sha256 = None
+    try:
+        intent_instant = _role_executor_child_ack_timestamp(
+            intent_recorded_at,
+            error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+        )
+        if observation_deadline_at is None:
+            observation_deadline_at = (
+                intent_instant
+                + timedelta(seconds=ROLE_EXECUTOR_DEFAULT_ACK_WINDOW_SECONDS)
+            ).isoformat().replace("+00:00", "Z")
+        deadline_instant = _role_executor_child_ack_timestamp(
+            observation_deadline_at,
+            error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+        )
+    except RegistryError:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID") from None
+    if (
+        deadline_instant < intent_instant
+        or deadline_instant - intent_instant
+        > timedelta(seconds=ROLE_EXECUTOR_DEFAULT_ACK_WINDOW_SECONDS)
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+    expectation = RoleExecutorChildAckExpectation(
+        schema=ROLE_EXECUTOR_CHILD_ACK_EXPECTATION_SCHEMA,
+        execution_class=fence.execution_class,
+        role=fence.role,
+        endpoint_id=fence.endpoint_id,
+        endpoint_pointer_version=fence.endpoint_pointer_version,
+        endpoint_config_sha256=fence.endpoint_config_sha256,
+        profile_sha256=fence.profile_sha256,
+        execution_protocol=fence.execution_protocol,
+        target_kind=fence.target_kind,
+        target_key=fence.target_key,
+        target_progress_sha256=fence.target_progress_sha256,
+        preexisting_attempt_ids=fence.preexisting_attempt_ids,
+        lineage_repository=fence.lineage_repository,
+        lineage_issue_number=fence.lineage_issue_number,
+        lineage_generation=fence.lineage_generation,
+        lineage_lease_sha256=fence.lineage_lease_sha256,
+        lineage_sha256=fence.lineage_sha256,
+        fence_sha256=fence.sha256,
+        systemd_unit=systemd_unit,
+        systemd_invocation_id=systemd_invocation_id,
+        manager_identity_source=manager_identity_source,
+        manager_identity_sha256=identity_sha256,
+        manager_receipt_sha256=bound_receipt_sha256,
+        intent_recorded_at=intent_recorded_at,
+        observation_deadline_at=observation_deadline_at,
+    )
+    _validate_role_executor_child_ack_expectation(expectation)
+    return expectation
+
+
+def _validate_role_executor_child_ack_event_chain(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> tuple[str, datetime, datetime | None, datetime]:
+    """Validate the immutable lifecycle and return its digest and time bounds."""
+
+    try:
+        if type(row["version"]) is not int:
+            raise TypeError
+        version = row["version"]
+        attempt_id = str(row["attempt_id"])
+        instance_id = str(row["instance_id"])
+        state = str(row["state"])
+        token_sha256 = str(row["token_sha256"])
+        process_id = row["process_id"]
+        unit = str(row["systemd_unit"] or "")
+        invocation_id = str(row["systemd_invocation_id"] or "")
+        control_group = str(row["systemd_control_group"] or "")
+        created_at = _role_executor_child_ack_timestamp(str(row["created_at"]))
+        updated_at = _role_executor_child_ack_timestamp(str(row["updated_at"]))
+        heartbeat_at = _role_executor_child_ack_timestamp(str(row["heartbeat_at"]))
+    except (KeyError, IndexError, TypeError, ValueError, RegistryError):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID") from None
+    if (
+        UUID.fullmatch(attempt_id) is None
+        or UUID.fullmatch(instance_id) is None
+        or SHA256.fullmatch(token_sha256) is None
+        or state not in ATTEMPT_STATES
+        or version <= 0
+        or type(row["last_error"]) not in {str, type(None)}
+        or (
+            type(row["last_error"]) is str
+            and secrets.compare_digest(
+                hashlib.sha256(row["last_error"].encode("utf-8")).hexdigest(),
+                token_sha256,
+            )
+        )
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID")
+    launch_identity_present = bool(unit or invocation_id or control_group)
+    if launch_identity_present and (
+        unit
+        != stable_systemd_unit(
+            str(row["role"]), str(row["target_kind"]), str(row["target_key"])
+        )
+        or SYSTEMD_INVOCATION_ID.fullmatch(invocation_id) is None
+        or not control_group.startswith("/")
+        or not control_group.endswith(f"/{unit}")
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID")
+    if state == "RESERVED" and (
+        version != 1 or process_id is not None or launch_identity_present
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID")
+    if state == "LAUNCHING" and (
+        version != 2 or process_id is not None or not launch_identity_present
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID")
+    if state == "RUNNING" and (
+        version < 3
+        or type(process_id) is not int
+        or process_id <= 0
+        or not launch_identity_present
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID")
+
+    events = connection.execute(
+        "SELECT * FROM executor_attempt_events WHERE attempt_id=? ORDER BY rowid",
+        (attempt_id,),
+    ).fetchall()
+    if len(events) != version:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_CHAIN_INVALID")
+    allowed = {
+        "RESERVED": {"LAUNCHING", "LAUNCH_FAILED", "HOLD"},
+        "LAUNCHING": {"RUNNING", "LAUNCH_FAILED", "HOLD"},
+        "RUNNING": {"RUNNING", "COMPLETE", "HOLD"},
+        "COMPLETE": set(),
+        "HOLD": set(),
+        "LAUNCH_FAILED": set(),
+    }
+    projection: list[dict[str, Any]] = []
+    event_instants: list[datetime] = []
+    previous_state: str | None = None
+    previous_version: int | None = None
+    previous_instant: datetime | None = None
+    running_instant: datetime | None = None
+    for ordinal, event in enumerate(events, 1):
+        try:
+            if type(event["to_version"]) is not int or (
+                event["from_version"] is not None
+                and type(event["from_version"]) is not int
+            ):
+                raise TypeError
+            to_version = event["to_version"]
+            from_version = (
+                None
+                if event["from_version"] is None
+                else event["from_version"]
+            )
+            recorded_instant = _role_executor_child_ack_timestamp(
+                str(event["recorded_at"])
+            )
+        except (TypeError, ValueError, RegistryError):
+            raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_CHAIN_INVALID") from None
+        if (
+            UUID.fullmatch(str(event["event_id"])) is None
+            or type(event["reason"]) not in {str, type(None)}
+            or (
+                type(event["reason"]) is str
+                and secrets.compare_digest(
+                    hashlib.sha256(event["reason"].encode("utf-8")).hexdigest(),
+                    token_sha256,
+                )
+            )
+            or (previous_instant is not None and recorded_instant < previous_instant)
+        ):
+            raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_CHAIN_INVALID")
+        if ordinal == 1:
+            if (
+                event["from_state"] is not None
+                or event["from_version"] is not None
+                or to_version != 1
+                or event["to_state"] != "RESERVED"
+                or event["reason"] != "ATTEMPT_RESERVED"
+                or recorded_instant != created_at
+            ):
+                raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_CHAIN_INVALID")
+        elif (
+            event["from_state"] != previous_state
+            or from_version != previous_version
+            or to_version != int(previous_version) + 1
+            or event["to_state"] not in allowed.get(str(previous_state), set())
+        ):
+            raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_CHAIN_INVALID")
+
+        evidence_json = event["evidence_json"]
+        evidence_sha256 = event["evidence_sha256"]
+        if (evidence_json is None) != (evidence_sha256 is None):
+            raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_EVIDENCE_INVALID")
+        evidence = None
+        if evidence_json is not None:
+            try:
+                evidence = json.loads(evidence_json)
+            except (TypeError, json.JSONDecodeError):
+                raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_EVIDENCE_INVALID") from None
+            if (
+                canonical_json(evidence) != evidence_json
+                or type(evidence_sha256) is not str
+                or SHA256.fullmatch(evidence_sha256) is None
+                or not secrets.compare_digest(
+                    hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+                    evidence_sha256,
+                )
+            ):
+                raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_EVIDENCE_INVALID")
+        expected_evidence = None
+        if event["to_state"] == "LAUNCHING":
+            expected_evidence = {
+                "systemd_control_group": control_group,
+                "systemd_invocation_id": invocation_id,
+                "systemd_unit": unit,
+            }
+            if event["reason"] is not None:
+                raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_EVIDENCE_INVALID")
+        elif (
+            event["to_state"] in {"COMPLETE", "HOLD", "LAUNCH_FAILED"}
+            and row["terminal_progress_sha256"] is not None
+        ):
+            expected_evidence = {
+                "target_progress_sha256": row["target_progress_sha256"],
+                "terminal_progress_sha256": row["terminal_progress_sha256"],
+            }
+        elif (
+            event["from_state"] == "RUNNING"
+            and event["to_state"] == "HOLD"
+            and event["reason"] == "RECOVERED_STALE_ACTIVE_SYSTEMD_INACTIVE"
+        ):
+            recovery_keys = {
+                "unit",
+                "load_state",
+                "active_state",
+                "sub_state",
+                "invocation_id",
+                "control_group",
+                "result",
+                "memory_max",
+                "tasks_max",
+                "runtime_max_usec",
+                "cpu_quota_per_sec_usec",
+            }
+            if (
+                type(evidence) is not dict
+                or set(evidence) != recovery_keys
+                or any(type(value) is not str for value in evidence.values())
+                or evidence["unit"] != unit
+                or evidence["invocation_id"] != invocation_id
+                or evidence["control_group"] != control_group
+                or evidence["load_state"] != "loaded"
+                or evidence["active_state"] != "inactive"
+                or evidence["sub_state"] != "dead"
+                or evidence["result"]
+                not in {
+                    "success",
+                    "exit-code",
+                    "signal",
+                    "core-dump",
+                    "watchdog",
+                    "timeout",
+                    "resources",
+                    "protocol",
+                }
+            ):
+                raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_EVIDENCE_INVALID")
+            expected_evidence = evidence
+        if evidence != expected_evidence:
+            raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_EVIDENCE_INVALID")
+        if event["to_state"] == "RUNNING" and running_instant is None:
+            if event["from_state"] != "LAUNCHING" or to_version != 3:
+                raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_CHAIN_INVALID")
+            running_instant = recorded_instant
+        projection.append(
+            {
+                "event_id": event["event_id"],
+                "attempt_id": event["attempt_id"],
+                "from_state": event["from_state"],
+                "to_state": event["to_state"],
+                "from_version": event["from_version"],
+                "to_version": event["to_version"],
+                "reason": event["reason"],
+                "evidence_sha256": evidence_sha256,
+                "evidence_json": evidence_json,
+                "recorded_at": event["recorded_at"],
+            }
+        )
+        previous_state = str(event["to_state"])
+        previous_version = to_version
+        previous_instant = recorded_instant
+        event_instants.append(recorded_instant)
+    if (
+        previous_state != state
+        or previous_version != version
+        or previous_instant != updated_at
+        or heartbeat_at not in event_instants
+        or heartbeat_at > updated_at
+        or (state == "RESERVED" and row["last_error"] is not None)
+        or (state != "RESERVED" and events[-1]["reason"] != row["last_error"])
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_EVENT_CHAIN_INVALID")
+    if state in {"COMPLETE", "HOLD"} and running_instant is not None:
+        if type(process_id) is not int or process_id <= 0 or not launch_identity_present:
+            raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID")
+    assert previous_instant is not None
+    return digest_json(projection), created_at, running_instant, previous_instant
+
+
+def _observe_role_executor_child_ack(
+    connection: sqlite3.Connection,
+    *,
+    expectation: RoleExecutorChildAckExpectation,
+    not_after: str,
+) -> RoleExecutorChildAcknowledgement | None:
+    if not attempt_schema_is_current(connection):
+        raise RegistryError("EXECUTOR_ATTEMPT_SCHEMA_MIGRATION_REQUIRED")
+    _validate_role_executor_child_ack_expectation(expectation)
+    intent_instant = _role_executor_child_ack_timestamp(
+        expectation.intent_recorded_at,
+        error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+    )
+    bound_deadline_instant = _role_executor_child_ack_timestamp(
+        expectation.observation_deadline_at,
+        error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+    )
+    observation_instant = _role_executor_child_ack_timestamp(not_after)
+    if observation_instant < intent_instant:
+        raise RegistryError("EXECUTOR_CHILD_ACK_OBSERVATION_INVALID")
+    if observation_instant > bound_deadline_instant:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPIRED")
+
+    endpoint_binding = _role_executor_child_ack_endpoint_binding(
+        connection, role=expectation.role, endpoint_id=expectation.endpoint_id
+    )
+    if endpoint_binding != {
+        "endpoint_pointer_version": expectation.endpoint_pointer_version,
+        "endpoint_config_sha256": expectation.endpoint_config_sha256,
+        "profile_sha256": expectation.profile_sha256,
+        "execution_protocol": expectation.execution_protocol,
+    }:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_DRIFT")
+    _validate_role_executor_child_ack_target_route(
+        connection,
+        role=expectation.role,
+        endpoint_id=expectation.endpoint_id,
+        target_kind=expectation.target_kind,
+        target_key=expectation.target_key,
+    )
+    candidates = _role_executor_logical_target_attempts(
+        connection,
+        target_kind=expectation.target_kind,
+        target_key=expectation.target_key,
+    )
+    candidate_ids = tuple(sorted(str(row["attempt_id"]) for row in candidates))
+    if not set(expectation.preexisting_attempt_ids).issubset(candidate_ids):
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_DRIFT")
+    reused_receipt = connection.execute(
+        "SELECT attempt_id,target_kind,target_key FROM executor_attempts "
+        "WHERE (systemd_invocation_id=? OR systemd_unit=?) "
+        "AND NOT (target_kind=? AND target_key=?) LIMIT 1",
+        (
+            expectation.systemd_invocation_id,
+            expectation.systemd_unit,
+            expectation.target_kind,
+            expectation.target_key,
+        ),
+    ).fetchone()
+    if reused_receipt is not None:
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    invocation_users = connection.execute(
+        "SELECT attempt_id FROM executor_attempts "
+        "WHERE systemd_invocation_id=? ORDER BY attempt_id",
+        (expectation.systemd_invocation_id,),
+    ).fetchall()
+    fresh = [
+        row
+        for row in candidates
+        if str(row["attempt_id"]) not in expectation.preexisting_attempt_ids
+    ]
+    if len(fresh) > 1:
+        raise RegistryError("EXECUTOR_CHILD_ACK_AMBIGUOUS")
+    if not fresh:
+        if invocation_users:
+            raise RegistryError("EXECUTOR_CHILD_ACK_REPLAY")
+        return None
+    row = fresh[0]
+    if (
+        row["role"] != expectation.role
+        or row["endpoint_id"] != expectation.endpoint_id
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    invocation_attempt_ids = [str(item["attempt_id"]) for item in invocation_users]
+    if row["state"] == "RESERVED" and invocation_attempt_ids:
+        raise RegistryError("EXECUTOR_CHILD_ACK_REPLAY")
+    if row["state"] != "RESERVED" and invocation_attempt_ids != [
+        str(row["attempt_id"])
+    ]:
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    temp_broker_shadow = connection.execute(
+        "SELECT 1 FROM temp.sqlite_master "
+        "WHERE type='table' AND name='role_executor_broker_runs'"
+    ).fetchone() is not None
+    if temp_broker_shadow:
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    broker_table_present = connection.execute(
+        "SELECT 1 FROM main.sqlite_master "
+        "WHERE type='table' AND name='role_executor_broker_runs'"
+    ).fetchone() is not None
+    broker_rows: list[sqlite3.Row] = []
+    if broker_table_present:
+        try:
+            broker_rows = connection.execute(
+                "SELECT attempt_id FROM main.role_executor_broker_runs "
+                "WHERE attempt_id=?",
+                (row["attempt_id"],),
+            ).fetchall()
+        except sqlite3.Error:
+            raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED") from None
+    if broker_rows:
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    execution_ownership_sha256 = digest_json(
+        {
+            "schema": "twinfinity-role-executor-execution-ownership/v1",
+            "attempt_id": row["attempt_id"],
+            "broker_table_present": broker_table_present,
+            "broker_ownership_rows": [],
+        }
+    )
+    event_chain_sha256, created_instant, running_instant, latest_instant = (
+        _validate_role_executor_child_ack_event_chain(connection, row)
+    )
+    if created_instant < intent_instant:
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    if latest_instant > bound_deadline_instant:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPIRED")
+    if latest_instant > observation_instant:
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    candidate_fence = _role_executor_child_ack_fence_from_attempt(
+        row,
+        endpoint_binding=endpoint_binding,
+        preexisting_attempt_ids=expectation.preexisting_attempt_ids,
+    )
+    if candidate_fence != _role_executor_child_ack_fence_from_expectation(
+        expectation
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    if row["state"] != "RESERVED" and (
+        row["systemd_unit"] != expectation.systemd_unit
+        or row["systemd_invocation_id"] != expectation.systemd_invocation_id
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    if row["state"] == "LAUNCH_FAILED":
+        if not row["systemd_unit"] or not row["systemd_invocation_id"]:
+            raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+        raise RegistryError("EXECUTOR_CHILD_ACK_LAUNCH_FAILED")
+    if row["state"] in {"RESERVED", "LAUNCHING"}:
+        if created_instant > bound_deadline_instant:
+            raise RegistryError("EXECUTOR_CHILD_ACK_EXPIRED")
+        return None
+    if running_instant is None:
+        raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+    if running_instant > bound_deadline_instant:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPIRED")
+    derived_expectation = bind_role_executor_child_ack_expectation(
+        candidate_fence,
+        systemd_unit=str(row["systemd_unit"] or ""),
+        systemd_invocation_id=str(row["systemd_invocation_id"] or ""),
+        manager_receipt_sha256=expectation.manager_receipt_sha256,
+        intent_recorded_at=expectation.intent_recorded_at,
+        observation_deadline_at=expectation.observation_deadline_at,
+        manager_identity_source=expectation.manager_identity_source,
+    )
+    if derived_expectation != expectation:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_DRIFT")
+
+    current_progress_sha256 = target_progress_digest(
+        connection, expectation.target_kind, expectation.target_key
+    )
+    accepted_progress_sha256 = expectation.target_progress_sha256
+    if row["state"] in {"COMPLETE", "HOLD"} and row["terminal_progress_sha256"]:
+        accepted_progress_sha256 = str(row["terminal_progress_sha256"])
+    current_lineage = attempt_lineage_for_target(
+        connection, expectation.target_kind, expectation.target_key
+    )
+    current_lineage_sha256 = (
+        None if current_lineage is None else current_lineage.sha256
+    )
+    if (
+        not secrets.compare_digest(current_progress_sha256, accepted_progress_sha256)
+        or current_lineage_sha256 != expectation.lineage_sha256
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_TARGET_DRIFT")
+    token_sha256 = str(row["token_sha256"])
+    if SHA256.fullmatch(token_sha256) is None:
+        raise RegistryError("EXECUTOR_CHILD_ACK_ATTEMPT_INVALID")
+    return RoleExecutorChildAcknowledgement(
+        schema=ROLE_EXECUTOR_CHILD_ACK_SCHEMA,
+        expectation_sha256=expectation.sha256,
+        fence_sha256=expectation.fence_sha256,
+        manager_identity_source=expectation.manager_identity_source,
+        manager_identity_sha256=expectation.manager_identity_sha256,
+        manager_receipt_sha256=expectation.manager_receipt_sha256,
+        intent_recorded_at=expectation.intent_recorded_at,
+        observation_deadline_at=expectation.observation_deadline_at,
+        attempt_id=str(row["attempt_id"]),
+        instance_id=str(row["instance_id"]),
+        token_sha256=token_sha256,
+        event_chain_sha256=event_chain_sha256,
+        execution_class=expectation.execution_class,
+        execution_ownership_sha256=execution_ownership_sha256,
+        role=expectation.role,
+        endpoint_id=expectation.endpoint_id,
+        endpoint_pointer_version=expectation.endpoint_pointer_version,
+        endpoint_config_sha256=expectation.endpoint_config_sha256,
+        profile_sha256=expectation.profile_sha256,
+        execution_protocol=expectation.execution_protocol,
+        target_kind=expectation.target_kind,
+        target_key=expectation.target_key,
+        target_progress_sha256=expectation.target_progress_sha256,
+        lineage_sha256=expectation.lineage_sha256,
+        state=str(row["state"]),
+        version=int(row["version"]),
+        process_id=int(row["process_id"]),
+        systemd_unit=expectation.systemd_unit,
+        systemd_invocation_id=expectation.systemd_invocation_id,
+        systemd_control_group=str(row["systemd_control_group"]),
+        token_authenticated=True,
+        token_persisted=False,
+    )
+
+
+def observe_role_executor_child_ack(
+    connection: sqlite3.Connection,
+    *,
+    expectation: RoleExecutorChildAckExpectation,
+    not_after: str,
+) -> RoleExecutorChildAcknowledgement | None:
+    """Read and validate one exact child ACK in one coherent SQLite view."""
+
+    with _role_executor_child_ack_read_snapshot(connection):
+        return _observe_role_executor_child_ack(
+            connection, expectation=expectation, not_after=not_after
+        )
+
+
+def recover_role_executor_child_ack_expectation(
+    connection: sqlite3.Connection,
+    *,
+    fence: RoleExecutorChildAckFence,
+    intent_recorded_at: str,
+    observation_deadline_at: str,
+    not_after: str,
+) -> tuple[
+    RoleExecutorChildAckExpectation, RoleExecutorChildAcknowledgement
+] | None:
+    """Recover an ambiguous submission only from its unique exact child ACK.
+
+    The receipt identity is derived from the authenticated child's immutable
+    launch event, never from a return code or reconstructed manager stdout.
+    """
+
+    _validate_role_executor_child_ack_fence(fence)
+    try:
+        intent_instant = _role_executor_child_ack_timestamp(
+            intent_recorded_at,
+            error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+        )
+        deadline_instant = _role_executor_child_ack_timestamp(
+            observation_deadline_at,
+            error="EXECUTOR_CHILD_ACK_EXPECTATION_INVALID",
+        )
+        observation_instant = _role_executor_child_ack_timestamp(not_after)
+    except RegistryError:
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID") from None
+    if (
+        deadline_instant < intent_instant
+        or deadline_instant - intent_instant
+        > timedelta(seconds=ROLE_EXECUTOR_DEFAULT_ACK_WINDOW_SECONDS)
+        or observation_instant < intent_instant
+        or observation_instant > deadline_instant
+    ):
+        raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_INVALID")
+
+    with _role_executor_child_ack_read_snapshot(connection):
+        endpoint_binding = _role_executor_child_ack_endpoint_binding(
+            connection, role=fence.role, endpoint_id=fence.endpoint_id
+        )
+        if endpoint_binding != {
+            "endpoint_pointer_version": fence.endpoint_pointer_version,
+            "endpoint_config_sha256": fence.endpoint_config_sha256,
+            "profile_sha256": fence.profile_sha256,
+            "execution_protocol": fence.execution_protocol,
+        }:
+            raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_DRIFT")
+        _validate_role_executor_child_ack_target_route(
+            connection,
+            role=fence.role,
+            endpoint_id=fence.endpoint_id,
+            target_kind=fence.target_kind,
+            target_key=fence.target_key,
+        )
+        candidates = _role_executor_logical_target_attempts(
+            connection,
+            target_kind=fence.target_kind,
+            target_key=fence.target_key,
+        )
+        candidate_ids = {str(row["attempt_id"]) for row in candidates}
+        if not set(fence.preexisting_attempt_ids).issubset(candidate_ids):
+            raise RegistryError("EXECUTOR_CHILD_ACK_EXPECTATION_DRIFT")
+        fresh = [
+            row
+            for row in candidates
+            if str(row["attempt_id"]) not in fence.preexisting_attempt_ids
+        ]
+        if len(fresh) > 1:
+            raise RegistryError("EXECUTOR_CHILD_ACK_AMBIGUOUS")
+        if not fresh:
+            return None
+        row = fresh[0]
+        if row["role"] != fence.role or row["endpoint_id"] != fence.endpoint_id:
+            raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED")
+        if row["state"] in {"RESERVED", "LAUNCHING"}:
+            return None
+        try:
+            expectation = bind_role_executor_child_ack_expectation(
+                fence,
+                systemd_unit=row["systemd_unit"],
+                systemd_invocation_id=row["systemd_invocation_id"],
+                intent_recorded_at=intent_recorded_at,
+                observation_deadline_at=observation_deadline_at,
+                manager_identity_source=(
+                    ROLE_EXECUTOR_CHILD_RECOVERY_IDENTITY_SOURCE
+                ),
+            )
+        except RegistryError:
+            raise RegistryError("EXECUTOR_CHILD_ACK_SUBSTITUTED") from None
+        acknowledgement = _observe_role_executor_child_ack(
+            connection,
+            expectation=expectation,
+            not_after=not_after,
+        )
+        if acknowledgement is None:
+            return None
+        return expectation, acknowledgement
+
+
 def reserve_attempt(
     connection: sqlite3.Connection,
     *,
@@ -2209,6 +3534,19 @@ def reserve_attempt(
         or not target_key
     ):
         raise RegistryError("EXECUTOR_ATTEMPT_INVALID")
+    if target_kind in {"message", "hosted_operation"}:
+        target_number = _role_executor_integer_target_value(target_key)
+        # Low-level registry tests may use non-Planner synthetic keys. Numeric
+        # durable identifiers, however, have one canonical positive form.
+        if target_number is not None and (
+            target_number <= 0
+            or CANONICAL_INTEGER_TARGET.fullmatch(target_key) is None
+        ):
+            raise RegistryError("EXECUTOR_ATTEMPT_INVALID")
+    try:
+        _role_executor_child_ack_timestamp(now, error="EXECUTOR_ATTEMPT_INVALID")
+    except RegistryError:
+        raise RegistryError("EXECUTOR_ATTEMPT_INVALID") from None
     ensure_executor_registry_schema(connection)
     if not attempt_schema_is_current(connection):
         raise RegistryError("EXECUTOR_ATTEMPT_SCHEMA_MIGRATION_REQUIRED")
@@ -2368,8 +3706,47 @@ def transition_attempt(
 ) -> dict[str, Any]:
     """Apply a token-bound optimistic transition or heartbeat."""
 
-    if new_state not in ATTEMPT_STATES or expected_version <= 0:
+    if (
+        type(attempt_id) is not str
+        or UUID.fullmatch(attempt_id) is None
+        or type(token) is not str
+        or not token
+        or type(expected_version) is not int
+        or expected_version <= 0
+        or type(new_state) is not str
+        or new_state not in ATTEMPT_STATES
+        or type(now) is not str
+        or type(last_error) not in {str, type(None)}
+        or type(exit_code) not in {int, type(None)}
+        or isinstance(exit_code, bool)
+        or type(process_id) not in {int, type(None)}
+        or isinstance(process_id, bool)
+        or type(systemd_unit) not in {str, type(None)}
+        or type(systemd_invocation_id) not in {str, type(None)}
+        or type(systemd_control_group) not in {str, type(None)}
+        or type(terminal_progress_sha256) not in {str, type(None)}
+    ):
         raise RegistryError("EXECUTOR_ATTEMPT_INVALID")
+    effective_last_error = last_error
+    if last_error is not None and token in last_error:
+        effective_last_error = EXECUTOR_PRIVATE_ERROR_REDACTED
+    durable_inputs = (
+        now,
+        systemd_unit,
+        systemd_invocation_id,
+        systemd_control_group,
+        terminal_progress_sha256,
+        None if exit_code is None else str(exit_code),
+        None if process_id is None else str(process_id),
+    )
+    if any(type(value) is str and token in value for value in durable_inputs):
+        raise RegistryError("EXECUTOR_PRIVATE_VALUE_REJECTED")
+    try:
+        _role_executor_child_ack_timestamp(
+            now, error="EXECUTOR_ATTEMPT_INVALID"
+        )
+    except RegistryError:
+        raise RegistryError("EXECUTOR_ATTEMPT_INVALID") from None
     token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
     ensure_executor_registry_schema(connection)
     if not attempt_schema_is_current(connection):
@@ -2382,8 +3759,24 @@ def transition_attempt(
             raise RegistryError("EXECUTOR_ATTEMPT_NOT_FOUND")
         if not secrets.compare_digest(str(row["token_sha256"]), token_sha256):
             raise RegistryError("EXECUTOR_TOKEN_MISMATCH")
-        if int(row["version"]) != expected_version:
+        if any(
+            type(value) is str and token in value
+            for value in dict(row).values()
+        ):
+            raise RegistryError("EXECUTOR_PRIVATE_VALUE_REJECTED")
+        if type(row["version"]) is not int or row["version"] != expected_version:
             raise RegistryError("EXECUTOR_ATTEMPT_VERSION_CONFLICT")
+        try:
+            prior_instant = _role_executor_child_ack_timestamp(
+                str(row["updated_at"]), error="EXECUTOR_ATTEMPT_INVALID"
+            )
+            current_instant = _role_executor_child_ack_timestamp(
+                now, error="EXECUTOR_ATTEMPT_INVALID"
+            )
+        except RegistryError:
+            raise RegistryError("EXECUTOR_ATTEMPT_INVALID") from None
+        if current_instant < prior_instant:
+            raise RegistryError("EXECUTOR_ATTEMPT_TIMESTAMP_REGRESSION")
         old_state = str(row["state"])
         allowed = {
             "RESERVED": {"LAUNCHING", "LAUNCH_FAILED", "HOLD"},
@@ -2443,6 +3836,20 @@ def transition_attempt(
             or control_group != row["systemd_control_group"]
         ):
             raise RegistryError("EXECUTOR_LAUNCH_IDENTITY_CONFLICT")
+        if old_state in {"COMPLETE", "HOLD", "LAUNCH_FAILED"}:
+            replay_values_match = (
+                now == row["updated_at"]
+                and process_id == row["process_id"]
+                and systemd_unit == row["systemd_unit"]
+                and systemd_invocation_id == row["systemd_invocation_id"]
+                and systemd_control_group == row["systemd_control_group"]
+                and exit_code == row["exit_code"]
+                and effective_last_error == row["last_error"]
+                and terminal_progress_sha256 == row["terminal_progress_sha256"]
+            )
+            if not replay_values_match:
+                raise RegistryError("EXECUTOR_ATTEMPT_STATE_CONFLICT")
+            return dict(row)
         old_process_id = row["process_id"]
         if new_state == "RUNNING":
             effective_process_id = (
@@ -2460,11 +3867,7 @@ def transition_attempt(
             effective_process_id = old_process_id
             if process_id is not None:
                 raise RegistryError("EXECUTOR_PROCESS_ID_INVALID")
-        version = (
-            expected_version
-            if new_state == old_state and old_state not in ACTIVE_ATTEMPT_STATES
-            else expected_version + 1
-        )
+        version = expected_version + 1
         cursor = connection.execute(
             """
             UPDATE executor_attempts
@@ -2484,7 +3887,7 @@ def transition_attempt(
                 effective_terminal_progress,
                 version,
                 now,
-                last_error,
+                effective_last_error,
                 attempt_id,
                 expected_version,
             ),
@@ -2510,7 +3913,7 @@ def transition_attempt(
             to_state=new_state,
             from_version=expected_version,
             to_version=version,
-            reason=last_error,
+            reason=effective_last_error,
             evidence=evidence,
             recorded_at=now,
         )
@@ -2535,12 +3938,12 @@ def recover_reserved_attempts(
     with immediate_transaction(connection):
         broker_table = connection.execute(
             """
-            SELECT 1 FROM sqlite_master
+            SELECT 1 FROM main.sqlite_master
             WHERE type='table' AND name='role_executor_broker_runs'
             """
         ).fetchone() is not None
         broker_fence = (
-            " AND NOT EXISTS (SELECT 1 FROM role_executor_broker_runs broker "
+            " AND NOT EXISTS (SELECT 1 FROM main.role_executor_broker_runs broker "
             "WHERE broker.attempt_id=executor_attempts.attempt_id "
             "AND broker.state IN ('PREPARING','LAUNCHING','RUNNING'))"
             if broker_table
@@ -2593,12 +3996,12 @@ def recover_stale_active_attempts(
         raise RegistryError("EXECUTOR_ATTEMPT_SCHEMA_MIGRATION_REQUIRED")
     broker_table = connection.execute(
         """
-        SELECT 1 FROM sqlite_master
+        SELECT 1 FROM main.sqlite_master
         WHERE type='table' AND name='role_executor_broker_runs'
         """
     ).fetchone() is not None
     broker_fence = (
-        " AND NOT EXISTS (SELECT 1 FROM role_executor_broker_runs broker "
+        " AND NOT EXISTS (SELECT 1 FROM main.role_executor_broker_runs broker "
         "WHERE broker.attempt_id=executor_attempts.attempt_id "
         "AND broker.state IN ('PREPARING','LAUNCHING','RUNNING'))"
         if broker_table
@@ -2637,6 +4040,24 @@ def recover_stale_active_attempts(
         try:
             evidence = evidence_reader(unit)
         except (OSError, subprocess.SubprocessError, RegistryError):
+            results.append({
+                "attempt_id": attempt_id,
+                "phase": "HOLD",
+                "error": "STALE_RECOVERY_SYSTEMD_EVIDENCE_FAILED",
+            })
+            continue
+        if type(evidence) is not SystemdUnitEvidence:
+            results.append({
+                "attempt_id": attempt_id,
+                "phase": "HOLD",
+                "error": "STALE_RECOVERY_SYSTEMD_EVIDENCE_FAILED",
+            })
+            continue
+        evidence_payload = evidence.payload
+        if (
+            type(evidence_payload) is not dict
+            or any(type(value) is not str for value in evidence_payload.values())
+        ):
             results.append({
                 "attempt_id": attempt_id,
                 "phase": "HOLD",
@@ -2682,7 +4103,7 @@ def recover_stale_active_attempts(
             broker_active = (
                 connection.execute(
                     """
-                    SELECT 1 FROM role_executor_broker_runs
+                    SELECT 1 FROM main.role_executor_broker_runs
                     WHERE attempt_id=? AND state IN ('PREPARING','LAUNCHING','RUNNING')
                     """,
                     (attempt_id,),
@@ -2764,7 +4185,7 @@ def recover_stale_active_attempts(
                 from_version=int(candidate["version"]),
                 to_version=int(candidate["version"]) + 1,
                 reason="RECOVERED_STALE_ACTIVE_SYSTEMD_INACTIVE",
-                evidence=evidence.payload,
+                evidence=evidence_payload,
                 recorded_at=now,
             )
         results.append({

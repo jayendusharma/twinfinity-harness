@@ -33,7 +33,14 @@ from portfolio_convergence import (  # noqa: E402
     PortfolioConvergenceError,
 )
 from portfolio_graph import replace_graph  # noqa: E402
-from executor_registry import load_registry_config  # noqa: E402
+from executor_registry import (  # noqa: E402
+    attempt_lineage_for_target,
+    load_registry_config,
+    reserve_attempt,
+    stable_systemd_unit,
+    transition_attempt,
+)
+from role_executor_transport import RoleExecutorManagerSubmission  # noqa: E402
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
@@ -1199,7 +1206,9 @@ class PortfolioConvergenceTests(unittest.TestCase):
         self._release()
         launch_observations: list[tuple[str, str, str]] = []
 
-        def launcher(_session: str, message_id: int) -> int:
+        def launcher(
+            session_id: str, message_id: int
+        ) -> RoleExecutorManagerSubmission:
             event = self.store.connection.execute(
                 "SELECT state FROM portfolio_dirty_events"
             ).fetchone()
@@ -1208,13 +1217,62 @@ class PortfolioConvergenceTests(unittest.TestCase):
                 (REPOSITORY,),
             ).fetchone()
             launch_observations.append((event["state"], item["status"], item["allocation_class"]))
-            return 9000 + message_id
+            intent = self.store.connection.execute(
+                "SELECT created_at FROM coordination_events "
+                "WHERE event_type='SESSION_WAKE_MANAGER_SUBMISSION_INTENT' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(intent)
+            intent_at = str(intent["created_at"])
+
+            target_key = str(message_id)
+            invocation_id = hashlib.sha256(
+                f"{session_id}:message:{target_key}".encode("utf-8")
+            ).hexdigest()[:32]
+            reserved, token = reserve_attempt(
+                self.store.connection,
+                role="development",
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=target_key,
+                now=intent_at,
+                precondition=lambda connection: attempt_lineage_for_target(
+                    connection, "message", target_key
+                ),
+            )
+            unit = stable_systemd_unit("development", "message", target_key)
+            launching = transition_attempt(
+                self.store.connection,
+                attempt_id=reserved["attempt_id"],
+                token=token,
+                expected_version=reserved["version"],
+                new_state="LAUNCHING",
+                systemd_unit=unit,
+                systemd_invocation_id=invocation_id,
+                systemd_control_group=f"/user.slice/{unit}",
+                now=intent_at,
+            )
+            transition_attempt(
+                self.store.connection,
+                attempt_id=reserved["attempt_id"],
+                token=token,
+                expected_version=launching["version"],
+                new_state="RUNNING",
+                process_id=9000 + message_id,
+                now=intent_at,
+            )
+            return RoleExecutorManagerSubmission(
+                systemd_unit=unit,
+                systemd_invocation_id=invocation_id,
+            )
 
         supervisor = CoordinationSupervisor(
             self.store,
             convergence=self._convergence(),
             launcher=launcher,
-            terminal_watch_launcher=lambda _session, _watch: 1,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
             process_checker=lambda _session, _target_kind, _target_key: False,
         )
         result = supervisor.run_once("2026-08-24T10:00:04Z")
