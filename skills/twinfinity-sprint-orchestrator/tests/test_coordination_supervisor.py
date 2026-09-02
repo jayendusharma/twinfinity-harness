@@ -1327,6 +1327,94 @@ class CoordinationSupervisorTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_manager_child_running_before_receipt_uses_wait_start_wall_time(
+        self,
+    ) -> None:
+        observed_at = "2026-09-02T22:29:00Z"
+        wait_started_at = coordination_store_module.timestamp_after(observed_at, 2)
+        message_id = self.notice(
+            idempotency_key="manager-child-running-before-receipt",
+            issue_number=1570,
+        )
+        target_key = str(message_id)
+        invocation_id = "5" * 32
+        calls = 0
+
+        def launcher(session_id: str, _message: int):
+            nonlocal calls
+            calls += 1
+            child_at = coordination_store_module.timestamp_after(observed_at, 1)
+            self.seed_role_executor_child(
+                role="development",
+                endpoint_id=session_id,
+                target_kind="message",
+                target_key=target_key,
+                invocation_id=invocation_id,
+                process_id=8450,
+                reserved_at=child_at,
+                launching_at=child_at,
+                running_at=child_at,
+                terminal_state=None,
+            )
+            return role_executor_transport_module.RoleExecutorManagerSubmission(
+                systemd_unit=stable_systemd_unit(
+                    "development", "message", target_key
+                ),
+                systemd_invocation_id=invocation_id,
+            )
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=launcher,
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal watcher must not launch"
+            ),
+            process_checker=lambda *_args: False,
+            child_ack_timeout_seconds=0,
+        )
+        with patch.object(
+            coordination_supervisor_module,
+            "utc_now",
+            return_value=wait_started_at,
+        ):
+            result = supervisor.run_once(observed_at)
+
+        self.assertEqual(1, calls)
+        self.assertEqual(1, len(result["launched"]))
+        self.assertEqual(8450, result["launched"][0]["process_id"])
+        wake = self.store.connection.execute(
+            "SELECT state,attempts,process_id,last_error FROM coordination_wakes "
+            "WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        self.assertEqual(("INFLIGHT", 1, 8450, None), tuple(wake))
+        intent, _envelope = self.manager_intent_event(
+            target_kind="message", target_key=target_key
+        )
+        submissions = self.manager_submission_events_for_intent(
+            target_kind="message", intent_event_key=str(intent["entity_key"])
+        )
+        self.assertEqual(1, len(submissions))
+        receipt = submissions[0][0]
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type='SESSION_WAKE_CHILD_ACK_ACCEPTED' AND entity_key=?",
+                (receipt["entity_key"],),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events WHERE "
+                "event_type IN "
+                "('SESSION_WAKE_CHILD_ACK_REJECTED', "
+                "'SESSION_WAKE_CHILD_ACK_EXPIRED') AND entity_key=?",
+                (receipt["entity_key"],),
+            ).fetchone()[0],
+        )
+
     def test_reserved_child_stays_pending_then_same_attempt_acknowledges(
         self,
     ) -> None:

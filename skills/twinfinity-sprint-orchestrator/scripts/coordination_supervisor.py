@@ -1639,6 +1639,15 @@ class CoordinationSupervisor:
                 raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_WAIT_INVALID")
             return float(raw)
 
+        try:
+            wait_started_wall = utc_now()
+            observation_started_at = (
+                wait_started_wall
+                if _epoch(wait_started_wall) >= _epoch(observed_at)
+                else observed_at
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CoordinationError("ROLE_EXECUTOR_CHILD_ACK_WAIT_INVALID") from exc
         started_at = sample()
         previous = started_at
         maximum_polls = (
@@ -1650,7 +1659,7 @@ class CoordinationSupervisor:
         )
         for _poll in range(maximum_polls):
             observation_not_after = self._child_ack_observation_ceiling(
-                observed_at=observed_at,
+                observed_at=observation_started_at,
                 observation_deadline_at=expectation.observation_deadline_at,
                 elapsed_seconds=previous - started_at,
             )
@@ -1668,7 +1677,7 @@ class CoordinationSupervisor:
             )
             if remaining <= 0:
                 return None, self._child_ack_observation_ceiling(
-                    observed_at=observed_at,
+                    observed_at=observation_started_at,
                     observation_deadline_at=expectation.observation_deadline_at,
                     elapsed_seconds=sampled_at - started_at,
                 )
