@@ -698,7 +698,7 @@ def load_install_manifest(path: Path) -> InstallManifest:
     ):
         raise BaselineError("BASELINE_INSTALL_MANIFEST_INVALID")
     normalized: list[dict[str, Any]] = []
-    seen_sources: set[str] = set()
+    source_bindings: dict[str, tuple[str, int]] = {}
     seen_destinations: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != INSTALL_ENTRY_KEYS:
@@ -711,8 +711,7 @@ def load_install_manifest(path: Path) -> InstallManifest:
         )
         prior = entry.get("destination_prior")
         if (
-            source_path in seen_sources
-            or destination_path in seen_destinations
+            destination_path in seen_destinations
             or type(entry.get("source_sha256")) is not str
             or not SHA256.fullmatch(entry["source_sha256"])
             or type(entry.get("source_mode")) is not int
@@ -742,7 +741,13 @@ def load_install_manifest(path: Path) -> InstallManifest:
             or prior["gid"] != os.getgid()
         ):
             raise BaselineError("BASELINE_INSTALL_MANIFEST_ENTRY_INVALID")
-        seen_sources.add(source_path)
+        source_binding = (entry["source_sha256"], entry["source_mode"])
+        if (
+            source_path in source_bindings
+            and source_bindings[source_path] != source_binding
+        ):
+            raise BaselineError("BASELINE_INSTALL_MANIFEST_ENTRY_INVALID")
+        source_bindings[source_path] = source_binding
         seen_destinations.add(destination_path)
         normalized.append(
             {
@@ -1340,22 +1345,41 @@ def _install_manifest_target_paths(
     catalog: BaselineCatalog,
     manifest: InstallManifest,
 ) -> dict[str, str]:
-    source_entries: dict[str, dict[str, Any]] = {}
+    source_entries: dict[str, list[dict[str, Any]]] = {}
+    source_bindings: dict[str, tuple[str, int]] = {}
     destination_paths: set[str] = set()
     for entry in manifest.entries:
         source_path = entry["source_path"]
         destination_path = entry["destination_path"]
-        if source_path in source_entries or destination_path in destination_paths:
+        source_binding = (entry["source_sha256"], entry["source_mode"])
+        if (
+            destination_path in destination_paths
+            or source_path in source_bindings
+            and source_bindings[source_path] != source_binding
+        ):
             raise BaselineError("BASELINE_INSTALL_MANIFEST_COVERAGE_INCOMPLETE")
-        source_entries[source_path] = entry
+        source_entries.setdefault(source_path, []).append(entry)
+        source_bindings[source_path] = source_binding
         destination_paths.add(destination_path)
     required = _required_target_files(tool_root, catalog)
     if not required.issubset(source_entries):
         raise BaselineError("BASELINE_INSTALL_MANIFEST_COVERAGE_INCOMPLETE")
-    target_paths = {
-        relative: source_entries[relative]["destination_path"]
-        for relative in required
-    }
+    target_paths: dict[str, str] = {}
+    for relative in required:
+        entries = source_entries[relative]
+        if len(entries) == 1:
+            target_paths[relative] = entries[0]["destination_path"]
+            continue
+        source_parts = PurePosixPath(relative).parts
+        catalog_destinations = [
+            entry["destination_path"]
+            for entry in entries
+            if PurePosixPath(entry["destination_path"]).parts[-len(source_parts) :]
+            == source_parts
+        ]
+        if len(catalog_destinations) != 1:
+            raise BaselineError("BASELINE_INSTALL_MANIFEST_COVERAGE_INCOMPLETE")
+        target_paths[relative] = catalog_destinations[0]
     for relative in sorted(_required_target_paths(catalog)):
         if relative in target_paths:
             continue

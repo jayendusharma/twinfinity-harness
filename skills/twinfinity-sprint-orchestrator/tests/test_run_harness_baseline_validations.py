@@ -1510,7 +1510,10 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
 
                 for name, mutated in (
                     ("missing", replace(manifest, entries=entries[:-1])),
-                    ("duplicate-source", replace(manifest, entries=entries + (entries[0],))),
+                    (
+                        "exact-duplicate",
+                        replace(manifest, entries=entries + (entries[0],)),
+                    ),
                     (
                         "duplicate-destination",
                         replace(
@@ -1520,6 +1523,34 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                                 {
                                     **entries[0],
                                     "source_path": "skills/extra.py",
+                                },
+                            ),
+                        ),
+                    ),
+                    (
+                        "conflicting-source-sha256",
+                        replace(
+                            manifest,
+                            entries=entries
+                            + (
+                                {
+                                    **entries[0],
+                                    "destination_path": "extra/conflicting-sha256",
+                                    "source_sha256": "0" * 64,
+                                },
+                            ),
+                        ),
+                    ),
+                    (
+                        "conflicting-source-mode",
+                        replace(
+                            manifest,
+                            entries=entries
+                            + (
+                                {
+                                    **entries[0],
+                                    "destination_path": "extra/conflicting-mode",
+                                    "source_mode": 0o755,
                                 },
                             ),
                         ),
@@ -1554,6 +1585,274 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                 ):
                     baseline_runner._install_manifest_byte_manifest(
                         tool_root, target_root, self.catalog, manifest
+                    )
+
+    def test_exact_planner_v3_catalog_mapping_accepts_attested_profile_fanout(
+        self,
+    ) -> None:
+        planner_profile = (
+            "skills/twinfinity-sprint-orchestrator/references/"
+            "twinfinity-planner-v3.config.toml"
+        )
+        root_profile_destination = ".codex/twinfinity-planner-v3.config.toml"
+        with (
+            tempfile.TemporaryDirectory() as tool_name,
+            tempfile.TemporaryDirectory() as target_name,
+        ):
+            tool_root = Path(tool_name)
+            target_root = Path(target_name)
+            required = baseline_runner._required_target_files(
+                self.repository_root, self.catalog
+            )
+            self.assertEqual(215, len(required))
+            self.assertEqual(
+                "efcf4db0af3443a30748b98882093e24926e83230829bd52cb36046e4730b5a8",
+                baseline_runner.digest_json(sorted(required)),
+            )
+            self.assertIn(planner_profile, required)
+
+            entries: list[dict] = []
+            catalog_destinations: dict[str, str] = {}
+            for relative in sorted(required):
+                source_bytes = (self.repository_root / relative).read_bytes()
+                source_mode = stat.S_IMODE(
+                    (self.repository_root / relative).stat().st_mode
+                )
+                synthetic_source = tool_root / relative
+                synthetic_source.parent.mkdir(parents=True, exist_ok=True)
+                synthetic_source.write_bytes(source_bytes)
+                synthetic_source.chmod(source_mode)
+
+                catalog_destination = f".codex/{relative}"
+                catalog_destinations[relative] = catalog_destination
+                installed = target_root / catalog_destination
+                installed.parent.mkdir(parents=True, exist_ok=True)
+                installed.write_bytes(source_bytes)
+                installed.chmod(source_mode)
+                entries.append(
+                    {
+                        "source_path": relative,
+                        "destination_path": catalog_destination,
+                        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                        "source_mode": source_mode,
+                        "destination_mode": source_mode,
+                        "destination_uid": os.getuid(),
+                        "destination_gid": os.getgid(),
+                        "destination_prior": {"state": "ABSENT"},
+                    }
+                )
+
+            profile_entry = next(
+                entry
+                for entry in entries
+                if entry["source_path"] == planner_profile
+            )
+            extra_profile = {
+                **profile_entry,
+                "destination_path": root_profile_destination,
+                "destination_mode": 0o600,
+            }
+            installed_profile = target_root / root_profile_destination
+            installed_profile.parent.mkdir(parents=True, exist_ok=True)
+            installed_profile.write_bytes(
+                (tool_root / planner_profile).read_bytes()
+            )
+            installed_profile.chmod(extra_profile["destination_mode"])
+
+            manifests = (
+                baseline_runner.InstallManifest(
+                    atom_id="planner-v3-fanout",
+                    source_commit="1" * 40,
+                    manifest_sha256="2" * 64,
+                    raw_sha256="3" * 64,
+                    entries=tuple(entries + [extra_profile]),
+                ),
+                baseline_runner.InstallManifest(
+                    atom_id="planner-v3-fanout",
+                    source_commit="1" * 40,
+                    manifest_sha256="2" * 64,
+                    raw_sha256="3" * 64,
+                    entries=(extra_profile, *reversed(entries)),
+                ),
+            )
+            byte_manifests: set[str] = set()
+            for manifest in manifests:
+                with self.subTest(
+                    extra_first=(manifest.entries[0] == extra_profile)
+                ):
+                    self.assertEqual(
+                        215,
+                        len({entry["source_path"] for entry in manifest.entries}),
+                    )
+                    self.assertEqual(216, len(manifest.entries))
+                    self.assertEqual(
+                        216,
+                        len(
+                            {
+                                entry["destination_path"]
+                                for entry in manifest.entries
+                            }
+                        ),
+                    )
+                    self.assertEqual(
+                        {
+                            catalog_destinations[planner_profile],
+                            root_profile_destination,
+                        },
+                        {
+                            entry["destination_path"]
+                            for entry in manifest.entries
+                            if entry["source_path"] == planner_profile
+                        },
+                    )
+                    mapping = baseline_runner._install_manifest_target_paths(
+                        tool_root, self.catalog, manifest
+                    )
+                    self.assertEqual(
+                        catalog_destinations[planner_profile],
+                        mapping[planner_profile],
+                    )
+                    self.assertNotEqual(
+                        root_profile_destination,
+                        mapping[planner_profile],
+                    )
+                    self.assertEqual(
+                        ".codex/skills/twinfinity-sprint-orchestrator/references",
+                        mapping[
+                            "skills/twinfinity-sprint-orchestrator/references"
+                        ],
+                    )
+                    for entry in self.catalog.entries:
+                        baseline_runner._require_entry_inputs(
+                            tool_root,
+                            target_root,
+                            entry,
+                            target_paths=mapping,
+                        )
+                    installed_catalog = baseline_runner.load_catalog(
+                        target_root,
+                        relative_path=mapping[
+                            baseline_runner.CATALOG_RELATIVE_PATH
+                        ],
+                    )
+                    self.assertEqual(
+                        self.catalog.canonical_sha256,
+                        installed_catalog.canonical_sha256,
+                    )
+                    self.assertEqual(
+                        hashlib.sha256(self.runner_path.read_bytes()).hexdigest(),
+                        baseline_runner._root_runner_sha256(
+                            target_root,
+                            relative_path=mapping[
+                                baseline_runner.RUNNER_RELATIVE_PATH
+                            ],
+                        ),
+                    )
+                    byte_manifests.add(
+                        baseline_runner._install_manifest_byte_manifest(
+                            tool_root, target_root, self.catalog, manifest
+                        )
+                    )
+            self.assertEqual(1, len(byte_manifests))
+
+            with tempfile.TemporaryDirectory() as execution_name:
+                results = [
+                    baseline_runner._run_entry(
+                        target_root,
+                        entry,
+                        self.catalog,
+                        baseline_runner._environment(Path(execution_name)),
+                        tool_root=tool_root,
+                        target_paths=baseline_runner._install_manifest_target_paths(
+                            tool_root, self.catalog, manifests[0]
+                        ),
+                    )
+                    for entry in self.catalog.entries
+                ]
+            self.assertEqual(
+                [entry.entry_id for entry in self.catalog.entries],
+                [result["id"] for result in results],
+            )
+
+            for destination in (
+                catalog_destinations[planner_profile],
+                root_profile_destination,
+            ):
+                installed = target_root / destination
+                original = installed.read_bytes()
+                with self.subTest(drifted_destination=destination):
+                    installed.write_bytes(b"drifted\n")
+                    with self.assertRaisesRegex(
+                        baseline_runner.BaselineError,
+                        "BASELINE_INSTALL_MANIFEST_BYTE_MISMATCH",
+                    ):
+                        baseline_runner._install_manifest_byte_manifest(
+                            tool_root, target_root, self.catalog, manifests[0]
+                        )
+                    installed.write_bytes(original)
+                    installed.chmod(
+                        extra_profile["destination_mode"]
+                        if destination == root_profile_destination
+                        else profile_entry["destination_mode"]
+                    )
+
+            installed_profile.chmod(profile_entry["destination_mode"])
+            with self.assertRaisesRegex(
+                baseline_runner.BaselineError,
+                "BASELINE_INSTALL_MANIFEST_BYTE_MISMATCH",
+            ):
+                baseline_runner._install_manifest_byte_manifest(
+                    tool_root, target_root, self.catalog, manifests[0]
+                )
+            installed_profile.chmod(extra_profile["destination_mode"])
+
+            for field, value in (
+                ("destination_uid", os.getuid() + 1),
+                ("destination_gid", os.getgid() + 1),
+            ):
+                with self.subTest(drifted_attestation=field):
+                    drifted_entry = {**extra_profile, field: value}
+                    drifted_manifest = replace(
+                        manifests[0],
+                        entries=manifests[0].entries[:-1]
+                        + (drifted_entry,),
+                    )
+                    with self.assertRaisesRegex(
+                        baseline_runner.BaselineError,
+                        "BASELINE_INSTALL_MANIFEST_BYTE_MISMATCH",
+                    ):
+                        baseline_runner._install_manifest_byte_manifest(
+                            tool_root,
+                            target_root,
+                            self.catalog,
+                            drifted_manifest,
+                        )
+
+            conflicting = replace(
+                manifests[0],
+                entries=manifests[0].entries[:-1]
+                + ({**extra_profile, "source_sha256": "0" * 64},),
+            )
+            duplicate_destination = replace(
+                manifests[0],
+                entries=manifests[0].entries[:-1]
+                + (
+                    {
+                        **extra_profile,
+                        "destination_path": catalog_destinations[planner_profile],
+                    },
+                ),
+            )
+            for name, manifest in (
+                ("conflicting-source", conflicting),
+                ("duplicate-destination", duplicate_destination),
+            ):
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    baseline_runner.BaselineError,
+                    "BASELINE_INSTALL_MANIFEST_COVERAGE_INCOMPLETE",
+                ):
+                    baseline_runner._install_manifest_target_paths(
+                        tool_root, self.catalog, manifest
                     )
 
     def test_documented_installed_runtime_uses_common_destination_root(self) -> None:
@@ -1621,6 +1920,80 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                 "BASELINE_INSTALL_MANIFEST_ENTRY_INVALID",
             ):
                 baseline_runner.load_install_manifest(path)
+
+    def test_install_manifest_parser_accepts_only_identical_source_fanout(
+        self,
+    ) -> None:
+        first = {
+            "source_path": "skills/example/profile.config.toml",
+            "destination_path": ".codex/skills/example/profile.config.toml",
+            "source_sha256": "2" * 64,
+            "source_mode": 0o644,
+            "destination_mode": 0o644,
+            "destination_uid": os.getuid(),
+            "destination_gid": os.getgid(),
+            "destination_prior": {"state": "ABSENT"},
+        }
+        second = {
+            **first,
+            "destination_path": ".codex/profile.config.toml",
+        }
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            root.chmod(0o700)
+            path = root / "manifest.json"
+            payload = {
+                "schema": baseline_runner.INSTALL_MANIFEST_SCHEMA,
+                "manifest_sha256": "0" * 64,
+                "atom_id": "source-fanout",
+                "source_commit": "1" * 40,
+                "destination_root_identity": (
+                    baseline_runner._destination_root_identity(root)
+                ),
+                "entries": [first, second],
+            }
+            for entries in (
+                [first, second],
+                [second, first],
+            ):
+                payload["entries"] = entries
+                payload["manifest_sha256"] = (
+                    baseline_runner._install_manifest_digest(payload)
+                )
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                manifest = baseline_runner.load_install_manifest(path)
+                self.assertEqual(2, len(manifest.entries))
+                self.assertEqual(
+                    {
+                        ".codex/skills/example/profile.config.toml",
+                        ".codex/profile.config.toml",
+                    },
+                    {
+                        entry["destination_path"]
+                        for entry in manifest.entries
+                    },
+                )
+
+            for field, value in (
+                ("source_sha256", "4" * 64),
+                ("source_mode", 0o755),
+                (
+                    "destination_path",
+                    ".codex/skills/example/profile.config.toml",
+                ),
+            ):
+                with self.subTest(field=field):
+                    conflicting = {**second, field: value}
+                    payload["entries"] = [first, conflicting]
+                    payload["manifest_sha256"] = (
+                        baseline_runner._install_manifest_digest(payload)
+                    )
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        baseline_runner.BaselineError,
+                        "BASELINE_INSTALL_MANIFEST_ENTRY_INVALID",
+                    ):
+                        baseline_runner.load_install_manifest(path)
 
             payload["entries"][0]["destination_uid"] = os.getuid()
             payload["entries"][0]["destination_prior"] = {
