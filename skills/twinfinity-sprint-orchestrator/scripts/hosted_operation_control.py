@@ -31,7 +31,17 @@ from executor_registry import (
     require_current_endpoint_identity,
     select_role_equivalent_identity,
 )
-from role_executor_transport import launch_role_executor
+from role_executor_transport import (
+    RoleExecutorTransportPreflight,
+    attest_role_executor_transport,
+    build_role_executor_transport_preflight,
+    enqueue_role_executor_transport_failure_notice,
+    injected_role_executor_transport_attestation,
+    launch_role_executor,
+    revalidate_role_executor_transport_preflight,
+    role_executor_transport_failure_reason,
+    validate_role_executor_transport_attestation,
+)
 from approval_guard import (
     ApprovalGuardError,
     hosted_execution_scope_sha256,
@@ -1623,7 +1633,54 @@ def run_supervisor(
     now: str,
     *,
     launcher: Callable[..., int] = launch_role_executor,
+    transport_preflight: Callable[[RoleExecutorTransportPreflight], object]
+    | None = None,
 ) -> dict[str, Any]:
+    request: RoleExecutorTransportPreflight | None = None
+    attestor = (
+        transport_preflight
+        if transport_preflight is not None
+        else (
+            attest_role_executor_transport
+            if launcher is launch_role_executor
+            else injected_role_executor_transport_attestation
+        )
+    )
+    try:
+        request = build_role_executor_transport_preflight(control.connection)
+        attestation = attestor(request)
+        validate_role_executor_transport_attestation(request, attestation)
+        revalidate_role_executor_transport_preflight(
+            control.connection, request
+        )
+    except Exception as exc:
+        reason = role_executor_transport_failure_reason(exc)
+        notice_message_id = (
+            None
+            if request is None
+            else enqueue_role_executor_transport_failure_notice(
+                control.store, request, reason=reason, now=now
+            )
+        )
+        return {
+            "phase": "HOLD",
+            "promoted": [],
+            "launched": [],
+            "rejected": [],
+            "skipped": [],
+            "capacity": {
+                "limit": 0,
+                "active": 0,
+                "pending": 0,
+                "reserved": 0,
+            },
+            "reason": reason,
+            "notice_message_id": notice_message_id,
+            "transport_preflight": {
+                "status": "HOLD",
+                "reason": reason,
+            },
+        }
     promoted = control.refresh_waiting(now)
     endpoint = current_endpoint(control.connection, "sre")
     if endpoint is None:
@@ -1892,7 +1949,11 @@ def main() -> int:
         elif args.command == "show":
             result = control.show()
         else:
-            result = run_supervisor(control, utc_now())
+            result = run_supervisor(
+                control,
+                utc_now(),
+                transport_preflight=attest_role_executor_transport,
+            )
         print(canonical_json(result))
         return 0
     except (CoordinationError, json.JSONDecodeError, OSError) as exc:

@@ -43,7 +43,18 @@ from executor_registry import (
     recover_stale_active_attempts,
     target_progress_digest,
 )
-from role_executor_transport import launch_role_executor, role_executor_command
+from role_executor_transport import (
+    RoleExecutorTransportPreflight,
+    attest_role_executor_transport,
+    build_role_executor_transport_preflight,
+    enqueue_role_executor_transport_failure_notice,
+    injected_role_executor_transport_attestation,
+    launch_role_executor,
+    revalidate_role_executor_transport_preflight,
+    role_executor_command,
+    role_executor_transport_failure_reason,
+    validate_role_executor_transport_attestation,
+)
 from role_executor_broker import (
     consume_staged_broker_pickups,
     recover_stale_broker_runs,
@@ -222,6 +233,8 @@ class CoordinationSupervisor:
         monotonic: Callable[[], float] = time.monotonic,
         stale_attempt_evidence_reader: Callable[[str], SystemdUnitEvidence]
         | None = None,
+        transport_preflight: Callable[[RoleExecutorTransportPreflight], object]
+        | None = None,
     ) -> None:
         if convergence_limit <= 0 or convergence_limit > MAX_CONVERGENCE_LIMIT:
             raise CoordinationError("CONVERGENCE_LIMIT_INVALID")
@@ -235,13 +248,56 @@ class CoordinationSupervisor:
                 self.store.connection, identity, target_kind, target_key
             )
         )
-        self.convergence = convergence or PortfolioConvergence(store)
+        self.convergence = convergence
         self.convergence_limit = convergence_limit
         if not isinstance(launch_policy, SchedulerLaunchPolicy):
             raise CoordinationError("SCHEDULER_LAUNCH_POLICY_INVALID")
         self.launch_policy = launch_policy
         self.monotonic = monotonic
         self.stale_attempt_evidence_reader = stale_attempt_evidence_reader
+        self.transport_preflight = (
+            transport_preflight
+            if transport_preflight is not None
+            else (
+                attest_role_executor_transport
+                if launcher is launch_canonical_session
+                and terminal_watch_launcher is launch_terminal_watch_session
+                else injected_role_executor_transport_attestation
+            )
+        )
+
+    def _transport_preflight_hold(self, now: str) -> dict[str, object] | None:
+        request: RoleExecutorTransportPreflight | None = None
+        try:
+            request = build_role_executor_transport_preflight(
+                self.store.connection
+            )
+            attestation = self.transport_preflight(request)
+            validate_role_executor_transport_attestation(request, attestation)
+            revalidate_role_executor_transport_preflight(
+                self.store.connection, request
+            )
+            return None
+        except Exception as exc:
+            reason = role_executor_transport_failure_reason(exc)
+            notice_message_id = (
+                None
+                if request is None
+                else enqueue_role_executor_transport_failure_notice(
+                    self.store, request, reason=reason, now=now
+                )
+            )
+            return {
+                "phase": "HOLD",
+                "reason": reason,
+                "notice_message_id": notice_message_id,
+                "launched": [],
+                "terminal_watch_launches": [],
+                "transport_preflight": {
+                    "status": "HOLD",
+                    "reason": reason,
+                },
+            }
 
     def _terminal_watch_backfill_plan(self, item: object) -> dict[str, object]:
         item_snapshot = dict(item)
@@ -1595,6 +1651,12 @@ class CoordinationSupervisor:
     def run_once(self, now: str | None = None) -> dict[str, object]:
         pass_started_at = self.monotonic()
         observed_at = now or utc_now()
+        transport_hold = self._transport_preflight_hold(observed_at)
+        if transport_hold is not None:
+            return transport_hold
+        if self.convergence is None:
+            self.convergence = PortfolioConvergence(self.store)
+        assert self.convergence is not None
         try:
             readiness_receipt_pickup: dict[str, object] = pickup_due_receipts(
                 self.store, now=observed_at
@@ -1963,7 +2025,9 @@ def main() -> int:
         return 0
     store = CoordinationStore(DEFAULT_DATABASE)
     try:
-        result = CoordinationSupervisor(store).run_once()
+        result = CoordinationSupervisor(
+            store, transport_preflight=attest_role_executor_transport
+        ).run_once()
         print(canonical_json(result))
     except (CoordinationError, RegistryError) as exc:
         print(canonical_json({"phase": "HOLD", "error": str(exc)}))

@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
+from dataclasses import replace
 import fcntl
+import hashlib
 import io
 from pathlib import Path
 import json
 import os
+import pwd
 import sqlite3
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -37,12 +43,32 @@ from coordination_supervisor import (  # noqa: E402
 )
 from executor_registry import (  # noqa: E402
     AttemptLineage,
+    RegistryError,
     SystemdUnitEvidence,
     attempt_lineage_for_target,
+    current_endpoint,
     load_registry_config,
     reserve_attempt,
     stable_systemd_unit,
     transition_attempt,
+)
+from hosted_operation_control import (  # noqa: E402
+    HostedOperationControl,
+    run_supervisor as run_hosted_supervisor,
+)
+from role_executor_transport import (  # noqa: E402
+    ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS,
+    ROLE_EXECUTOR_TRANSPORT_MALFORMED,
+    ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED,
+    ROLE_EXECUTOR_TRANSPORT_TIMED_OUT,
+    ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE,
+    RoleExecutorTransportAttestation,
+    RoleExecutorUserBusContext,
+    attest_role_executor_transport,
+    build_role_executor_transport_preflight,
+    launch_role_executor,
+    role_executor_user_bus_context,
+    validate_role_executor_transport_attestation,
 )
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
@@ -109,6 +135,851 @@ class CoordinationSupervisorTests(unittest.TestCase):
             launcher=launcher,
             terminal_watch_launcher=terminal_watch_launcher,
             process_checker=lambda *_: False,
+        )
+
+    @staticmethod
+    def successful_transport(preflight):
+        return RoleExecutorTransportAttestation.pass_for(
+            preflight, user_manager_identity_sha256="a" * 64
+        )
+
+    @staticmethod
+    def user_bus_context(effective_uid: int, generation: int = 1):
+        return RoleExecutorUserBusContext(
+            effective_uid=effective_uid,
+            home=pwd.getpwuid(effective_uid).pw_dir,
+            runtime_directory=f"/run/user/{effective_uid}",
+            runtime_identity=(1, 2 + generation, 0o40700, effective_uid, 1),
+            bus_identity=(1, 3 + generation, 0o140600, effective_uid, 1),
+        )
+
+    @staticmethod
+    def non_notice_database_state(connection: sqlite3.Connection) -> dict[str, object]:
+        excluded = {"coordination_events", "coordination_messages", "sqlite_sequence"}
+        tables = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            if str(row[0]) not in excluded
+        ]
+        return {
+            table: sorted(
+                (tuple(row) for row in connection.execute(f'SELECT * FROM "{table}"')),
+                key=repr,
+            )
+            for table in tables
+        }
+
+    def seed_transport_notice_source(self, body: str) -> object:
+        return self.store.ingest_snapshot(
+            repository="jayendusharma/twinfinity-harness",
+            object_kind="issue",
+            object_number=149,
+            payload={
+                "number": 149,
+                "state": "open",
+                "title": "Transport preflight",
+                "body": body,
+                "updated_at": "2026-09-02T04:23:51Z",
+                "html_url": "https://github.com/jayendusharma/twinfinity-harness/issues/149",
+            },
+            source_updated_at="2026-09-02T04:23:51Z",
+            fetched_at="2026-09-02T04:24:00Z",
+        )
+
+    def transport_config_loader(self, preflight):
+        rows = {
+            role: dict(current_endpoint(self.store.connection, role))
+            for role in ("planner", "development", "sre")
+        }
+
+        def load(_path, *, selected_current_endpoint_id):
+            row = next(
+                item
+                for item in rows.values()
+                if item["endpoint_id"] == selected_current_endpoint_id
+            )
+            payload = json.loads(row["config_json"])
+            configured = SimpleNamespace(
+                endpoint_id=row["endpoint_id"],
+                role=row["role"],
+                config_sha256=row["config_sha256"],
+                payload=payload,
+                profile_sha256=payload["profile_sha256"],
+                command_prefix=tuple(json.loads(row["command_json"])),
+            )
+            return SimpleNamespace(
+                source_sha256=preflight.registry_source_sha256,
+                roles={row["role"]: configured},
+            )
+
+        return load
+
+    def test_transport_preflight_runs_once_before_first_dispatch_write(self) -> None:
+        message_id = self.notice(idempotency_key="preflight-before-write", issue_number=149)
+        order: list[str] = []
+
+        def attestor(preflight):
+            order.append("preflight")
+            return self.successful_transport(preflight)
+
+        def trace(statement: str) -> None:
+            verb = statement.lstrip().split(None, 1)[0].upper() if statement.strip() else ""
+            if verb in {"CREATE", "DELETE", "INSERT", "REPLACE", "UPDATE"}:
+                order.append("write")
+
+        self.store.connection.set_trace_callback(trace)
+        try:
+            supervisor = CoordinationSupervisor(
+                self.store,
+                launcher=lambda endpoint, candidate: (
+                    self.launches.append((endpoint, candidate)) or 1490
+                ),
+                terminal_watch_launcher=lambda _endpoint, _watch: 1,
+                process_checker=lambda *_: False,
+                transport_preflight=attestor,
+            )
+            result = supervisor.run_once("2026-09-02T05:00:00Z")
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        self.assertEqual("preflight", order[0])
+        self.assertEqual(1, order.count("preflight"))
+        self.assertIn("write", order)
+        self.assertEqual([message_id], [row["message_id"] for row in result["launched"]])
+
+    def test_transport_attestor_is_strict_read_only_identity_bound_and_uncached(self) -> None:
+        effective_uid = os.geteuid()
+        preflight = build_role_executor_transport_preflight(
+            self.store.connection, effective_uid=effective_uid
+        )
+        load = self.transport_config_loader(preflight)
+        observed: list[tuple[list[str], dict[str, object]]] = []
+        response = (
+            "Architecture=x86-64\n"
+            f"ControlGroup=/user.slice/user-{effective_uid}.slice/"
+            f"user@{effective_uid}.service\n"
+            "SystemState=running\n"
+            "UserspaceTimestampMonotonic=123456\n"
+            "Version=257.7\n"
+        ).encode()
+        user_bus = self.user_bus_context(effective_uid)
+
+        def runner(command, **kwargs):
+            observed.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout=response, stderr=b"")
+
+        first = attest_role_executor_transport(
+            preflight,
+            runner=runner,
+            config_loader=load,
+            euid_reader=lambda: effective_uid,
+            user_bus_reader=lambda _uid: user_bus,
+        )
+        second = attest_role_executor_transport(
+            preflight,
+            runner=runner,
+            config_loader=load,
+            euid_reader=lambda: effective_uid,
+            user_bus_reader=lambda _uid: user_bus,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(2, len(observed))
+        command, kwargs = observed[0]
+        self.assertEqual(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "show",
+                "--no-pager",
+                "--property=Architecture",
+                "--property=ControlGroup",
+                "--property=SystemState",
+                "--property=UserspaceTimestampMonotonic",
+                "--property=Version",
+            ],
+            command,
+        )
+        self.assertEqual(observed[0], observed[1])
+        self.assertIs(kwargs["check"], False)
+        self.assertIs(kwargs["capture_output"], True)
+        self.assertEqual(subprocess.DEVNULL, kwargs["stdin"])
+        self.assertEqual(5, kwargs["timeout"])
+        self.assertEqual(
+            {"DBUS_SESSION_BUS_ADDRESS", "HOME", "LC_ALL", "PATH", "XDG_RUNTIME_DIR"},
+            set(kwargs["env"]),
+        )
+        self.assertTrue(first.user_manager_identity_sha256)
+
+        launch_call: dict[str, object] = {}
+
+        def launch_runner(_command, **launch_kwargs):
+            launch_call.update(launch_kwargs)
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict(
+            os.environ,
+            {
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/hostile/bus",
+                "XDG_RUNTIME_DIR": "/hostile/runtime",
+            },
+        ):
+            self.assertEqual(
+                0,
+                launch_role_executor(
+                    role="development",
+                    endpoint_id=DEVELOPMENT_SESSION,
+                    target_kind="message",
+                    target_key="149",
+                    prompt="Synthetic transport environment check",
+                    runner=launch_runner,
+                ),
+            )
+        self.assertEqual(kwargs["env"], launch_call["env"])
+
+    def test_user_bus_identity_rejects_a_mocked_unsafe_runtime_directory(self) -> None:
+        effective_uid = os.geteuid()
+        runtime_root = Path("/synthetic/run/user")
+
+        def metadata(path: Path, *, unsafe: bool = False):
+            is_bus = path.name == "bus"
+            mode = (
+                stat.S_IFSOCK | 0o600
+                if is_bus
+                else stat.S_IFDIR
+                | (0o770 if unsafe and path.name == str(effective_uid) else 0o700)
+            )
+            return SimpleNamespace(
+                st_dev=1,
+                st_ino=3 if is_bus else 2,
+                st_mode=mode,
+                st_uid=effective_uid,
+                st_nlink=1,
+            )
+
+        with patch.object(Path, "lstat", new=lambda path: metadata(path)):
+            context = role_executor_user_bus_context(
+                effective_uid, runtime_root=runtime_root
+            )
+        self.assertEqual(effective_uid, context.effective_uid)
+        self.assertEqual(5, len(context.bus_identity))
+        with patch.object(
+            Path,
+            "lstat",
+            new=lambda path: metadata(path, unsafe=True),
+        ):
+            with self.assertRaisesRegex(
+                RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED}$"
+            ):
+                context = role_executor_user_bus_context(
+                    effective_uid, runtime_root=runtime_root
+                )
+
+    def test_source_current_registry_identity_attests_with_mocked_manager(self) -> None:
+        directory = Path(self.temp.name) / "source-current-coordinator"
+        directory.mkdir(mode=0o700)
+        store = CoordinationStore(directory / "state.sqlite3")
+        self.addCleanup(store.close)
+        config = load_registry_config(
+            ROOT / "references" / "twinfinity-executor-registry.toml"
+        )
+        aliases, alias_sha = load_legacy_alias_fixture(
+            ROOT / "tests" / "fixtures" / "legacy-role-aliases.json"
+        )
+        plan = build_plan(
+            store.connection,
+            config,
+            aliases,
+            alias_fixture_sha256=alias_sha,
+        )
+        apply_plan(
+            store.connection,
+            plan=plan,
+            operation_key="transport-source-current-test",
+            expected_plan_sha256=plan["plan_sha256"],
+            now="2026-09-02T04:59:59Z",
+        )
+        effective_uid = os.geteuid()
+        preflight = build_role_executor_transport_preflight(
+            store.connection, effective_uid=effective_uid
+        )
+        response = (
+            "Architecture=x86-64\n"
+            f"ControlGroup=/user.slice/user-{effective_uid}.slice/"
+            f"user@{effective_uid}.service\n"
+            "SystemState=running\n"
+            "UserspaceTimestampMonotonic=123456\n"
+            "Version=257.7\n"
+        ).encode()
+        attestation = attest_role_executor_transport(
+            preflight,
+            runner=lambda command, **_kwargs: subprocess.CompletedProcess(
+                command, 0, stdout=response, stderr=b""
+            ),
+            euid_reader=lambda: effective_uid,
+            user_bus_reader=lambda _uid: self.user_bus_context(effective_uid),
+        )
+
+        self.assertEqual("PASS", attestation.status)
+        self.assertEqual(
+            ("role.development.v6", "role.planner.v3", "role.sre.v6"),
+            tuple(identity.endpoint_id for identity in preflight.endpoint_identities),
+        )
+
+    def test_transport_attestor_rejects_outage_timeout_ambiguity_malformed_and_substitution(
+        self,
+    ) -> None:
+        effective_uid = os.geteuid()
+        preflight = build_role_executor_transport_preflight(
+            self.store.connection, effective_uid=effective_uid
+        )
+        load = self.transport_config_loader(preflight)
+        valid = (
+            "Architecture=x86-64\n"
+            f"ControlGroup=/user.slice/user-{effective_uid}.slice/"
+            f"user@{effective_uid}.service\n"
+            "SystemState=running\n"
+            "UserspaceTimestampMonotonic=123456\n"
+            "Version=257.7\n"
+        ).encode()
+        user_bus = self.user_bus_context(effective_uid)
+
+        def completed(stdout: object, *, returncode: int = 0, stderr: object = b""):
+            return lambda command, **_kwargs: subprocess.CompletedProcess(
+                command, returncode, stdout=stdout, stderr=stderr
+            )
+
+        def timeout(command, **_kwargs):
+            raise subprocess.TimeoutExpired(command, 5)
+
+        def unavailable(_command, **_kwargs):
+            raise OSError("private host detail")
+
+        cases = (
+            (ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE, unavailable, load),
+            (ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE, completed(valid, returncode=1), load),
+            (ROLE_EXECUTOR_TRANSPORT_TIMED_OUT, timeout, load),
+            (
+                ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS,
+                completed(valid + b"Version=257.7\n"),
+                load,
+            ),
+            (
+                ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS,
+                completed(valid + b"Unexpected=value\n"),
+                load,
+            ),
+            (
+                ROLE_EXECUTOR_TRANSPORT_MALFORMED,
+                completed(valid.replace(b"Version=257.7\n", b"")),
+                load,
+            ),
+            (ROLE_EXECUTOR_TRANSPORT_MALFORMED, completed("not-bytes"), load),
+            (
+                ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED,
+                completed(
+                    valid.replace(
+                        f"user-{effective_uid}.slice/user@{effective_uid}.service".encode(),
+                        f"user-{effective_uid + 1}.slice/user@{effective_uid + 1}.service".encode(),
+                    )
+                ),
+                load,
+            ),
+        )
+        for expected, runner, loader in cases:
+            with self.subTest(expected=expected), self.assertRaisesRegex(
+                RegistryError, f"^{expected}$"
+            ):
+                attest_role_executor_transport(
+                    preflight,
+                    runner=runner,
+                    config_loader=loader,
+                    euid_reader=lambda: effective_uid,
+                    user_bus_reader=lambda _uid: user_bus,
+                )
+
+        transport_calls: list[str] = []
+
+        def must_not_probe(_command, **_kwargs):
+            transport_calls.append("called")
+            return subprocess.CompletedProcess(_command, 0, stdout=valid, stderr=b"")
+
+        with self.assertRaisesRegex(
+            RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED}$"
+        ):
+            attest_role_executor_transport(
+                preflight,
+                runner=must_not_probe,
+                config_loader=load,
+                euid_reader=lambda: effective_uid + 1,
+                user_bus_reader=lambda _uid: user_bus,
+            )
+        with self.assertRaisesRegex(
+            RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE}$"
+        ):
+            attest_role_executor_transport(
+                preflight,
+                runner=must_not_probe,
+                config_loader=load,
+                euid_reader=lambda: effective_uid,
+                user_bus_reader=lambda _uid: (_ for _ in ()).throw(
+                    RegistryError(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE)
+                ),
+            )
+        self.assertEqual([], transport_calls)
+
+        original = load(None, selected_current_endpoint_id=PLANNER_SESSION)
+        configured = original.roles["planner"]
+        substituted = SimpleNamespace(
+            source_sha256=original.source_sha256,
+            roles={
+                "planner": SimpleNamespace(
+                    **{
+                        **configured.__dict__,
+                        "profile_sha256": "f" * 64,
+                    }
+                )
+            },
+        )
+
+        def substituted_loader(path, *, selected_current_endpoint_id):
+            if selected_current_endpoint_id == PLANNER_SESSION:
+                return substituted
+            return load(path, selected_current_endpoint_id=selected_current_endpoint_id)
+
+        with self.assertRaisesRegex(
+            RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED}$"
+        ):
+            attest_role_executor_transport(
+                preflight,
+                runner=completed(valid),
+                config_loader=substituted_loader,
+                euid_reader=lambda: effective_uid,
+                user_bus_reader=lambda _uid: user_bus,
+            )
+
+        user_buses = iter(
+            (user_bus, self.user_bus_context(effective_uid, generation=2))
+        )
+        with self.assertRaisesRegex(
+            RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED}$"
+        ):
+            attest_role_executor_transport(
+                preflight,
+                runner=completed(valid),
+                config_loader=load,
+                euid_reader=lambda: effective_uid,
+                user_bus_reader=lambda _uid: next(user_buses),
+            )
+
+        identity = preflight.endpoint_identities[0]
+        substituted_requests = (
+            replace(preflight, source_body_sha256="f" * 64),
+            replace(
+                preflight,
+                endpoint_identities=(
+                    replace(identity, endpoint_config_sha256="f" * 64),
+                    *preflight.endpoint_identities[1:],
+                ),
+            ),
+            replace(
+                preflight,
+                endpoint_identities=(
+                    replace(identity, registered_launch_sha256="f" * 64),
+                    *preflight.endpoint_identities[1:],
+                ),
+            ),
+        )
+        for substituted_request in substituted_requests:
+            with self.subTest(
+                request=substituted_request.request_sha256
+            ), self.assertRaisesRegex(
+                RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED}$"
+            ):
+                attest_role_executor_transport(
+                    substituted_request,
+                    runner=completed(valid),
+                    config_loader=load,
+                    euid_reader=lambda: effective_uid,
+                    user_bus_reader=lambda _uid: user_bus,
+                )
+
+        stale_request = replace(preflight, source_body_sha256="e" * 64)
+        stale_attestation = RoleExecutorTransportAttestation.pass_for(
+            stale_request, user_manager_identity_sha256="b" * 64
+        )
+        with self.assertRaisesRegex(
+            RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED}$"
+        ):
+            validate_role_executor_transport_attestation(
+                preflight, stale_attestation
+            )
+        malformed_attestation = replace(
+            self.successful_transport(preflight),
+            user_manager_identity_sha256=None,
+        )
+        with self.assertRaisesRegex(
+            RegistryError, f"^{ROLE_EXECUTOR_TRANSPORT_MALFORMED}$"
+        ):
+            validate_role_executor_transport_attestation(
+                preflight, malformed_attestation
+            )
+
+    def test_transport_failures_preserve_targets_and_notice_is_private_stable_replay(
+        self,
+    ) -> None:
+        source_body = "synthetic exact harness issue 149 body"
+        source_body_sha256 = hashlib.sha256(source_body.encode()).hexdigest()
+        source = self.seed_transport_notice_source(source_body)
+        message_id = self.notice(idempotency_key="preflight-failure-target", issue_number=150)
+        original_message = dict(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()
+        )
+        failure_codes = (
+            ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE,
+            ROLE_EXECUTOR_TRANSPORT_TIMED_OUT,
+            ROLE_EXECUTOR_TRANSPORT_AMBIGUOUS,
+            ROLE_EXECUTOR_TRANSPORT_MALFORMED,
+            ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED,
+        )
+
+        with patch(
+            "role_executor_transport.TRANSPORT_PREFLIGHT_SOURCE_BODY_SHA256",
+            source_body_sha256,
+        ):
+            for index, code in enumerate(failure_codes):
+                with self.subTest(code=code):
+                    before = self.non_notice_database_state(self.store.connection)
+                    message_count = self.store.connection.execute(
+                        "SELECT COUNT(*) FROM coordination_messages"
+                    ).fetchone()[0]
+                    event_count = self.store.connection.execute(
+                        "SELECT COUNT(*) FROM coordination_events"
+                    ).fetchone()[0]
+
+                    def fail(_preflight, reason=code):
+                        raise RegistryError(reason)
+
+                    supervisor = CoordinationSupervisor(
+                        self.store,
+                        launcher=lambda *_args: self.fail("launcher must not run"),
+                        terminal_watch_launcher=lambda *_args: self.fail(
+                            "terminal-watch launcher must not run"
+                        ),
+                        process_checker=lambda *_: False,
+                        transport_preflight=fail,
+                    )
+                    result = supervisor.run_once(f"2026-09-02T05:0{index}:00Z")
+                    after = self.non_notice_database_state(self.store.connection)
+
+                    self.assertEqual(code, result["reason"])
+                    self.assertEqual(before, after)
+                    self.assertEqual(
+                        original_message,
+                        dict(
+                            self.store.connection.execute(
+                                "SELECT * FROM coordination_messages WHERE id=?",
+                                (message_id,),
+                            ).fetchone()
+                        ),
+                    )
+                    notice = self.store.connection.execute(
+                        "SELECT * FROM coordination_messages WHERE id=?",
+                        (result["notice_message_id"],),
+                    ).fetchone()
+                    payload = json.loads(notice["payload_json"])
+                    self.assertEqual(
+                        {
+                            "source",
+                            "notice_kind",
+                            "mutation_authority",
+                            "subject",
+                            "summary",
+                            "evidence",
+                            "next_observation",
+                        },
+                        set(payload),
+                    )
+                    self.assertEqual(
+                        {"repository", "object_kind", "object_number", "payload_sha256"},
+                        set(payload["source"]),
+                    )
+                    self.assertEqual(
+                        {
+                            "schema",
+                            "reason",
+                            "source_body_sha256",
+                            "endpoint_identity_sha256",
+                            "profile_identity_sha256",
+                            "registry_config_sha256",
+                            "transport_runner_sha256",
+                            "registered_launch_sha256",
+                            "transport_configuration_sha256",
+                            "transport_probe_sha256",
+                        },
+                        set(payload["evidence"]),
+                    )
+                    self.assertEqual(PLANNER_SESSION, notice["recipient_session_id"])
+                    self.assertEqual("coordination.notice", notice["topic"])
+                    self.assertIs(payload["mutation_authority"], False)
+                    self.assertEqual(source.payload_sha256, payload["source"]["payload_sha256"])
+                    self.assertEqual(code, payload["evidence"]["reason"])
+                    self.assertEqual(
+                        message_count + 1,
+                        self.store.connection.execute(
+                            "SELECT COUNT(*) FROM coordination_messages"
+                        ).fetchone()[0],
+                    )
+                    self.assertEqual(
+                        event_count + 1,
+                        self.store.connection.execute(
+                            "SELECT COUNT(*) FROM coordination_events"
+                        ).fetchone()[0],
+                    )
+                    rendered = notice["payload_json"]
+                    for forbidden in (
+                        "private host detail",
+                        "2026-09-02T05:",
+                        '"message_id"',
+                        '"object_number":150',
+                        str(self.store.path),
+                        "DBUS_SESSION_BUS_ADDRESS",
+                        "credential",
+                    ):
+                        self.assertNotIn(forbidden, rendered)
+
+                    replay_before = list(self.store.connection.iterdump())
+                    replay = supervisor.run_once(f"2026-09-02T06:0{index}:00Z")
+                    self.assertEqual(result["notice_message_id"], replay["notice_message_id"])
+                    self.assertEqual(replay_before, list(self.store.connection.iterdump()))
+
+    def test_endpoint_rotation_after_pass_is_substitution_before_target_write(self) -> None:
+        message_id = self.notice(
+            idempotency_key="preflight-endpoint-rebound", issue_number=153
+        )
+        original_message = dict(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()
+        )
+        calls = 0
+
+        def rotate_after_pass(preflight):
+            nonlocal calls
+            calls += 1
+            with self.store.transaction():
+                self.store.connection.execute(
+                    """
+                    UPDATE executor_role_endpoint_current
+                    SET pointer_version=pointer_version+1, updated_at=?
+                    WHERE role='development'
+                    """,
+                    ("2026-09-02T05:20:01Z",),
+                )
+            return self.successful_transport(preflight)
+
+        result = CoordinationSupervisor(
+            self.store,
+            launcher=lambda *_args: self.fail("launcher must not run"),
+            terminal_watch_launcher=lambda *_args: self.fail(
+                "terminal-watch launcher must not run"
+            ),
+            process_checker=lambda *_: False,
+            transport_preflight=rotate_after_pass,
+        ).run_once("2026-09-02T05:20:00Z")
+
+        self.assertEqual(1, calls)
+        self.assertEqual(ROLE_EXECUTOR_TRANSPORT_SUBSTITUTED, result["reason"])
+        self.assertIsNone(result["notice_message_id"])
+        self.assertEqual(
+            original_message,
+            dict(
+                self.store.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+                ).fetchone()
+            ),
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_wakes WHERE message_id=?", (message_id,)
+            ).fetchone()
+        )
+
+    def test_concurrent_supervisors_share_one_notice_and_preserve_both_targets(self) -> None:
+        source_body = "synthetic concurrent harness issue 149 body"
+        source_body_sha256 = hashlib.sha256(source_body.encode()).hexdigest()
+        source = self.seed_transport_notice_source(source_body)
+        message_id = self.notice(idempotency_key="preflight-concurrent-target", issue_number=151)
+        hosted = HostedOperationControl(self.store.path)
+        hosted.close()
+        with self.store.transaction():
+            hosted_id = self.store.connection.execute(
+                """
+                INSERT INTO hosted_operations(
+                    idempotency_key,repository,object_kind,issue_number,
+                    source_payload_sha256,provider,target_kind,target_key,
+                    operation_kind,authority_comment_id,authority_body_sha256,
+                    scope_sha256,scope_json,recipient_session_id,sre_units,
+                    state,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "preflight-concurrent-hosted-target",
+                    "jayendusharma/twinfinity-harness",
+                    "issue",
+                    149,
+                    source.payload_sha256,
+                    "github",
+                    "github_ruleset",
+                    "synthetic-ruleset",
+                    "UPDATE_SETTINGS",
+                    1490,
+                    "a" * 64,
+                    "b" * 64,
+                    "{}",
+                    SRE_SESSION,
+                    1,
+                    "PREPARED",
+                    "2026-09-02T05:00:00Z",
+                    "2026-09-02T05:00:00Z",
+                ),
+            ).lastrowid
+        original_message = dict(
+            self.store.connection.execute(
+                "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+            ).fetchone()
+        )
+        message_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_messages"
+        ).fetchone()[0]
+        event_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_events"
+        ).fetchone()[0]
+        original_hosted = dict(
+            self.store.connection.execute(
+                "SELECT * FROM hosted_operations WHERE id=?", (hosted_id,)
+            ).fetchone()
+        )
+        barrier = threading.Barrier(2)
+        initialized = threading.Barrier(3)
+        start = threading.Event()
+
+        def fail(_preflight):
+            barrier.wait(timeout=5)
+            raise RegistryError(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE)
+
+        def run_failure(ordinal: int) -> dict[str, object]:
+            if ordinal == 0:
+                store = CoordinationStore(self.store.path)
+                supervisor = CoordinationSupervisor(
+                    store,
+                    launcher=lambda *_args: 1,
+                    terminal_watch_launcher=lambda *_args: 1,
+                    process_checker=lambda *_: False,
+                    transport_preflight=fail,
+                )
+                initialized.wait(timeout=5)
+                start.wait(timeout=5)
+                try:
+                    return supervisor.run_once("2026-09-02T05:30:00Z")
+                finally:
+                    store.close()
+            control = HostedOperationControl(self.store.path)
+            initialized.wait(timeout=5)
+            start.wait(timeout=5)
+            try:
+                return run_hosted_supervisor(
+                    control,
+                    "2026-09-02T05:30:00Z",
+                    launcher=lambda **_kwargs: 1,
+                    transport_preflight=fail,
+                )
+            finally:
+                control.close()
+
+        with patch(
+            "role_executor_transport.TRANSPORT_PREFLIGHT_SOURCE_BODY_SHA256",
+            source_body_sha256,
+        ), ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(run_failure, ordinal) for ordinal in range(2)]
+            initialized.wait(timeout=5)
+            before = self.non_notice_database_state(self.store.connection)
+            start.set()
+            results = [future.result(timeout=10) for future in futures]
+
+        self.assertEqual(before, self.non_notice_database_state(self.store.connection))
+        self.assertEqual(
+            original_message,
+            dict(
+                self.store.connection.execute(
+                    "SELECT * FROM coordination_messages WHERE id=?", (message_id,)
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            original_hosted,
+            dict(
+                self.store.connection.execute(
+                    "SELECT * FROM hosted_operations WHERE id=?", (hosted_id,)
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages "
+                "WHERE id<>? AND topic='coordination.notice' AND "
+                "json_extract(payload_json,'$.subject')='Role transport preflight unavailable'",
+                (message_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, len({result["notice_message_id"] for result in results}))
+        self.assertEqual(
+            message_count + 1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            event_count + 1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events"
+            ).fetchone()[0],
+        )
+
+    def test_successful_preflight_is_not_child_launch_success(self) -> None:
+        message_id = self.notice(idempotency_key="preflight-not-child-success", issue_number=152)
+
+        def fail_launch(_endpoint: str, _message_id: int) -> int:
+            raise OSError("later launch race")
+
+        supervisor = CoordinationSupervisor(
+            self.store,
+            launcher=fail_launch,
+            terminal_watch_launcher=lambda *_args: 1,
+            process_checker=lambda *_: False,
+            transport_preflight=self.successful_transport,
+        )
+        result = supervisor.run_once("2026-09-02T05:45:00Z")
+
+        self.assertEqual([], result["launched"])
+        self.assertEqual(
+            ("INFLIGHT", 1, "WAKE_LAUNCH_FAILED"),
+            tuple(
+                self.store.connection.execute(
+                    "SELECT state,attempts,last_error FROM coordination_wakes "
+                    "WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute("SELECT COUNT(*) FROM executor_attempts").fetchone()[0],
         )
 
     def seed_current_graph(self, source_sha256: str) -> None:

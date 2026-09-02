@@ -36,6 +36,11 @@ from actions_rerun_scope import build_scope  # noqa: E402
 from hosted_operation_clearance import clear_actions_rerun  # noqa: E402
 from coordination_store import CoordinationStore  # noqa: E402
 from executor_registry import load_registry_config  # noqa: E402
+from executor_registry import RegistryError  # noqa: E402
+from role_executor_transport import (  # noqa: E402
+    ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE,
+    RoleExecutorTransportAttestation,
+)
 from reconcile_routing_artifacts import (  # noqa: E402
     apply_plan,
     build_plan,
@@ -82,6 +87,47 @@ class HostedOperationControlTests(unittest.TestCase):
         self.approval_guard.stop()
         self.control.close()
         self.temp.cleanup()
+
+    @staticmethod
+    def successful_transport(preflight):
+        return RoleExecutorTransportAttestation.pass_for(
+            preflight, user_manager_identity_sha256="a" * 64
+        )
+
+    @staticmethod
+    def non_notice_database_state(connection) -> dict[str, object]:
+        excluded = {"coordination_events", "coordination_messages", "sqlite_sequence"}
+        tables = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            if str(row[0]) not in excluded
+        ]
+        return {
+            table: sorted(
+                (tuple(row) for row in connection.execute(f'SELECT * FROM "{table}"')),
+                key=repr,
+            )
+            for table in tables
+        }
+
+    def seed_transport_notice_source(self, body: str) -> object:
+        return self.control.store.ingest_snapshot(
+            repository="jayendusharma/twinfinity-harness",
+            object_kind="issue",
+            object_number=149,
+            payload={
+                "number": 149,
+                "state": "open",
+                "title": "Transport preflight",
+                "body": body,
+                "updated_at": "2026-09-02T04:23:51Z",
+                "html_url": "https://github.com/jayendusharma/twinfinity-harness/issues/149",
+            },
+            source_updated_at="2026-09-02T04:23:51Z",
+            fetched_at="2026-09-02T04:24:00Z",
+        )
 
     def migrate_registry(self, operation_key: str) -> list[dict[str, str]]:
         root = Path(__file__).resolve().parents[1]
@@ -2056,6 +2102,122 @@ class HostedOperationControlTests(unittest.TestCase):
         self.assertEqual("hosted_operation", launched["target_kind"])
         self.assertEqual(str(row["id"]), launched["target_key"])
         self.assertNotIn("resume", str(launched))
+
+    def test_supervisor_preflight_failure_precedes_refresh_and_preserves_hosted_target(
+        self,
+    ) -> None:
+        source_body = "synthetic hosted harness issue 149 body"
+        source_body_sha256 = hashlib.sha256(source_body.encode()).hexdigest()
+        self.seed_transport_notice_source(source_body)
+        with patch.object(
+            HostedOperationControl,
+            "_fetch_authority_comment",
+            side_effect=self.authority_comment,
+        ):
+            row = self.control.prepare(self.transaction(), "2026-08-23T10:00:02Z")
+        before = self.non_notice_database_state(self.control.connection)
+        calls = 0
+
+        def unavailable(_preflight):
+            nonlocal calls
+            calls += 1
+            raise RegistryError(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE)
+
+        with patch(
+            "role_executor_transport.TRANSPORT_PREFLIGHT_SOURCE_BODY_SHA256",
+            source_body_sha256,
+        ), patch.object(
+            self.control,
+            "refresh_waiting",
+            side_effect=AssertionError("refresh must follow successful preflight"),
+        ):
+            result = run_supervisor(
+                self.control,
+                "2026-09-02T05:00:00Z",
+                launcher=lambda **_kwargs: self.fail("launcher must not run"),
+                transport_preflight=unavailable,
+            )
+
+        self.assertEqual(1, calls)
+        self.assertEqual(ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE, result["reason"])
+        self.assertEqual([], result["promoted"])
+        self.assertEqual([], result["launched"])
+        self.assertEqual(before, self.non_notice_database_state(self.control.connection))
+        self.assertEqual(
+            ("PREPARED", None),
+            tuple(
+                self.control.connection.execute(
+                    "SELECT state,last_wake_at FROM hosted_operations WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+            ),
+        )
+        notice = self.control.connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (result["notice_message_id"],),
+        ).fetchone()
+        self.assertEqual("coordination.notice", notice["topic"])
+        self.assertEqual(
+            ROLE_EXECUTOR_TRANSPORT_UNAVAILABLE,
+            json.loads(notice["payload_json"])["evidence"]["reason"],
+        )
+
+        replay_before = list(self.control.connection.iterdump())
+        with patch(
+            "role_executor_transport.TRANSPORT_PREFLIGHT_SOURCE_BODY_SHA256",
+            source_body_sha256,
+        ):
+            replay = run_supervisor(
+                self.control,
+                "2026-09-02T06:00:00Z",
+                launcher=lambda **_kwargs: self.fail("launcher must not run"),
+                transport_preflight=unavailable,
+            )
+        self.assertEqual(result["notice_message_id"], replay["notice_message_id"])
+        self.assertEqual(replay_before, list(self.control.connection.iterdump()))
+
+    def test_supervisor_successful_preflight_preserves_dispatch_but_not_launch_success(
+        self,
+    ) -> None:
+        with patch.object(
+            HostedOperationControl,
+            "_fetch_authority_comment",
+            side_effect=self.authority_comment,
+        ):
+            row = self.control.prepare(self.transaction(), "2026-08-23T10:00:02Z")
+        order: list[str] = []
+        original_refresh = self.control.refresh_waiting
+
+        def preflight(request):
+            order.append("preflight")
+            return self.successful_transport(request)
+
+        def refresh(now):
+            order.append("refresh")
+            return original_refresh(now)
+
+        def rejected(**_kwargs):
+            order.append("launch")
+            return 1
+
+        with patch.object(self.control, "refresh_waiting", side_effect=refresh):
+            result = run_supervisor(
+                self.control,
+                "2026-09-02T05:15:00Z",
+                launcher=rejected,
+                transport_preflight=preflight,
+            )
+
+        self.assertEqual(["preflight", "refresh", "launch"], order)
+        self.assertEqual([], result["launched"])
+        self.assertEqual([row["id"]], result["rejected"])
+        self.assertEqual("LAUNCH_REJECTED", result["reason"])
+        self.assertEqual(
+            0,
+            self.control.connection.execute(
+                "SELECT COUNT(*) FROM executor_attempts WHERE target_kind='hosted_operation'"
+            ).fetchone()[0],
+        )
 
     def test_supervisor_ignores_a_different_active_sre_target(self) -> None:
         with patch.object(
