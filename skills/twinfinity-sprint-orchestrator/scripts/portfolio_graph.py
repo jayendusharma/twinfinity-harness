@@ -1311,7 +1311,6 @@ def graph_allows_admission_source_pair(
     ).fetchone()
     if (row is None or current is None
             or row["observed_main_sha"] != row["accepted_main_sha"]
-            or row["source_payload_sha256"] != bound_source_sha256
             or current["payload_sha256"] != current_source_sha256):
         return False
     result = evaluate_graph(
@@ -1319,7 +1318,9 @@ def graph_allows_admission_source_pair(
         _ensure_schema=False,
     )
     if result["health"] == "CURRENT":
-        return current_source_sha256 == bound_source_sha256
+        return row["source_payload_sha256"] == current_source_sha256
+    if row["source_payload_sha256"] != bound_source_sha256:
+        return False
     allowed = {
         "GRAPH_SOURCE_DRIFT",
         f"GRAPH_SOURCE_DRIFT:{row['node_key']}",

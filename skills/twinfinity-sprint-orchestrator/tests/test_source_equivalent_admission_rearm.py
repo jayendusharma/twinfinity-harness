@@ -16,7 +16,7 @@ sys.path.insert(0, str(SCRIPTS))
 from admission_source_equivalence import admission_lineage_source_is_current  # noqa: E402
 from coordination_store import CoordinationError, CoordinationStore, canonical_json, digest_json  # noqa: E402
 from executor_registry import attempt_lineage_for_target, load_registry_config, reserve_attempt, stable_systemd_unit, transition_attempt  # noqa: E402
-from portfolio_graph import replace_graph  # noqa: E402
+from portfolio_graph import graph_allows_admission_source_pair, replace_graph  # noqa: E402
 from reconcile_routing_artifacts import apply_plan, build_plan, load_legacy_alias_fixture  # noqa: E402
 from coordination_supervisor import CoordinationSupervisor  # noqa: E402
 from tests.canonical_ready_fixture import finalize_canonical_ready_item  # noqa: E402
@@ -146,6 +146,30 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
             "timeline": self.timeline, "expected_owner_login": OWNER,
         }
 
+    def _reconcile_graph_to_current_source(self) -> None:
+        replace_graph(
+            self.store.connection,
+            {
+                "repository": REPOSITORY,
+                "accepted_main_sha": "b" * 40,
+                "expected_current_version": 1,
+                "scope_milestones": [{"title": "Fixture", "rank": 1}],
+                "excluded_issues": [],
+                "nodes": [{
+                    "node_key": f"issue:{ISSUE}", "issue_number": ISSUE,
+                    "role": "DELIVERY", "root_kind": "STANDALONE",
+                    "root_reason": "Bounded source-equivalence fixture",
+                    "lane_key": "development", "lane_order": 0,
+                    "dispatchable": True, "priority_rank": 1, "estimate_units": 1,
+                    "development_units": 1, "shared_units": 1, "sre_units": 0,
+                    "source_payload_sha256": self.current_sha,
+                    "ready_at": "2026-08-26T20:00:03Z",
+                }],
+                "relations": [],
+            },
+            now="2026-08-26T20:00:15Z",
+        )
+
     def tearDown(self) -> None:
         self.store.close(); self.temp.cleanup()
 
@@ -165,6 +189,84 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
         self.assertEqual(1, self.store.connection.execute("SELECT COUNT(*) FROM coordination_admission_source_equivalence").fetchone()[0])
         supervisor = CoordinationSupervisor(self.store, process_checker=lambda *_: False)
         self.assertEqual(1, len(supervisor._eligible_due_terminal_watch_lineages("2026-08-26T20:00:16Z")))
+
+    def test_current_graph_reconciled_to_current_source_rearms_exact_pair(self) -> None:
+        self._reconcile_graph_to_current_source()
+        item_before = dict(self.store.connection.execute("SELECT * FROM coordination_items").fetchone())
+
+        self.assertTrue(graph_allows_admission_source_pair(
+            self.store.connection,
+            repository=REPOSITORY,
+            issue_number=ISSUE,
+            bound_source_sha256=self.bound_sha,
+            current_source_sha256=self.current_sha,
+        ))
+
+        preview = self.store.preview_source_equivalent_admission_rearm(**self.request)
+        receipt = self.store.apply_source_equivalent_admission_rearm(
+            **self.request,
+            expected_preview_sha256=preview["preview_sha256"],
+            now="2026-08-26T20:00:16Z",
+        )
+        replay = self.store.apply_source_equivalent_admission_rearm(
+            **self.request,
+            expected_preview_sha256=preview["preview_sha256"],
+            now="2026-08-26T20:00:17Z",
+        )
+
+        self.assertEqual(receipt, replay)
+        self.assertEqual(
+            ("CLAIMED", None),
+            tuple(self.store.connection.execute(
+                "SELECT state,last_error FROM coordination_messages WHERE id=?",
+                (self.message_id,),
+            ).fetchone()),
+        )
+        self.assertEqual(
+            ("ACTIVE", None),
+            tuple(self.store.connection.execute(
+                "SELECT state,last_error FROM coordination_terminal_watches WHERE watch_key=?",
+                (self.watch_key,),
+            ).fetchone()),
+        )
+        self.assertEqual(
+            item_before,
+            dict(self.store.connection.execute("SELECT * FROM coordination_items").fetchone()),
+        )
+
+    def test_current_graph_rejects_a_mixed_node_and_later_live_source(self) -> None:
+        self._reconcile_graph_to_current_source()
+        self._change_current(_projection_version=3, _projection_dashboard="later")
+        before = list(self.store.connection.iterdump())
+
+        with self.assertRaisesRegex(CoordinationError, "SOURCE_EQUIVALENCE_GRAPH_DRIFT"):
+            self.store.preview_source_equivalent_admission_rearm(**self.request)
+
+        self.assertEqual(before, list(self.store.connection.iterdump()))
+
+    def test_current_graph_requires_the_exact_accepted_main(self) -> None:
+        self._reconcile_graph_to_current_source()
+        self.store.connection.execute(
+            "UPDATE portfolio_graph_current SET observed_main_sha=? WHERE repository=?",
+            ("a" * 40, REPOSITORY),
+        )
+        self.store.connection.commit()
+        before = list(self.store.connection.iterdump())
+
+        with self.assertRaisesRegex(CoordinationError, "SOURCE_EQUIVALENCE_GRAPH_DRIFT"):
+            self.store.preview_source_equivalent_admission_rearm(**self.request)
+
+        self.assertEqual(before, list(self.store.connection.iterdump()))
+
+    def test_current_graph_cannot_manufacture_equivalence_provenance(self) -> None:
+        self._reconcile_graph_to_current_source()
+        self.request["expected_owner_login"] = "other"
+        before = list(self.store.connection.iterdump())
+
+        with self.assertRaisesRegex(CoordinationError, "SOURCE_EQUIVALENCE_PROVENANCE_INVALID"):
+            self.store.preview_source_equivalent_admission_rearm(**self.request)
+
+        self.assertEqual(before, list(self.store.connection.iterdump()))
 
     def test_later_projection_drift_invalidates_receipt_currentness(self) -> None:
         preview = self.store.preview_source_equivalent_admission_rearm(**self.request)
