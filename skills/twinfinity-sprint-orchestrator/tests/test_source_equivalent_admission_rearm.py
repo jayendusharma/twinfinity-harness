@@ -146,29 +146,133 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
             "timeline": self.timeline, "expected_owner_login": OWNER,
         }
 
-    def _reconcile_graph_to_current_source(self) -> None:
+    def _add_graph_issue(self, issue_number: int, *, retained: bool = False) -> str:
+        payload = {
+            "number": issue_number,
+            "title": f"Graph fixture {issue_number}",
+            "body": "Exact auxiliary graph fixture",
+            "state": "OPEN",
+            "labels": ["bug"],
+            "milestone": None,
+            "assignees": [],
+            "updated_at": "2026-08-26T20:00:14Z",
+            "_projection_version": 1,
+        }
+        snapshot = self.store.ingest_snapshot(
+            repository=REPOSITORY,
+            object_kind="issue",
+            object_number=issue_number,
+            payload=payload,
+            source_updated_at=payload["updated_at"],
+            fetched_at="2026-08-26T20:00:14Z",
+        )
+        if retained:
+            self.store._set_issue_status_for_test_fixture(
+                repository=REPOSITORY,
+                issue_number=issue_number,
+                status="HOLD",
+                allocation_class="RETAINED",
+                generation=0,
+                accountable_session_id=ENDPOINT,
+                lease_manifest_sha256="7" * 64,
+                development_units=0,
+                shared_units=1,
+                sre_units=0,
+                expected_source_sha256=snapshot.payload_sha256,
+                expected_version=0,
+                now="2026-08-26T20:00:14Z",
+            )
+        return snapshot.payload_sha256
+
+    def _reconcile_graph_to_current_source(
+        self,
+        *,
+        accepted_main_sha: str = "b" * 40,
+        dispatchable: bool = True,
+        relation_kind: str | None = None,
+    ) -> None:
+        nodes = [{
+            "node_key": f"issue:{ISSUE}", "issue_number": ISSUE,
+            "role": "DELIVERY", "root_kind": (
+                "NORMAL" if relation_kind == "HARD_BLOCK" else "STANDALONE"
+            ),
+            "root_reason": (
+                None
+                if relation_kind == "HARD_BLOCK"
+                else "Bounded source-equivalence fixture"
+            ),
+            "lane_key": "development", "lane_order": 0,
+            "dispatchable": dispatchable, "priority_rank": 1,
+            "estimate_units": 1, "development_units": 1,
+            "shared_units": 1, "sre_units": 0,
+            "source_payload_sha256": self.current_sha,
+            "ready_at": "2026-08-26T20:00:03Z",
+        }]
+        relations = []
+        if relation_kind is not None:
+            other_issue = ISSUE - 1 if relation_kind == "HARD_BLOCK" else ISSUE + 1
+            other_source = self._add_graph_issue(
+                other_issue, retained=relation_kind == "COLLISION"
+            )
+            nodes.append({
+                "node_key": f"issue:{other_issue}",
+                "issue_number": other_issue,
+                "role": "DELIVERY",
+                "root_kind": (
+                    "INTENTIONAL" if relation_kind == "HARD_BLOCK" else "STANDALONE"
+                ),
+                "root_reason": (
+                    "Required predecessor fixture"
+                    if relation_kind == "HARD_BLOCK"
+                    else "Active collision fixture"
+                ),
+                "lane_key": "other",
+                "lane_order": 0,
+                "dispatchable": True,
+                "priority_rank": 2,
+                "estimate_units": 1,
+                "development_units": 0,
+                "shared_units": 1,
+                "sre_units": 0,
+                "source_payload_sha256": other_source,
+                "ready_at": "2026-08-26T20:00:03Z",
+            })
+            relations.append({
+                "left_node_key": (
+                    f"issue:{other_issue}"
+                    if relation_kind == "HARD_BLOCK"
+                    else f"issue:{ISSUE}"
+                ),
+                "right_node_key": (
+                    f"issue:{ISSUE}"
+                    if relation_kind == "HARD_BLOCK"
+                    else f"issue:{other_issue}"
+                ),
+                "relation_kind": relation_kind,
+                "reason": f"Material {relation_kind.lower()} replacement",
+                "source_payload_sha256": other_source,
+            })
         replace_graph(
             self.store.connection,
             {
                 "repository": REPOSITORY,
-                "accepted_main_sha": "b" * 40,
+                "accepted_main_sha": accepted_main_sha,
                 "expected_current_version": 1,
                 "scope_milestones": [{"title": "Fixture", "rank": 1}],
                 "excluded_issues": [],
-                "nodes": [{
-                    "node_key": f"issue:{ISSUE}", "issue_number": ISSUE,
-                    "role": "DELIVERY", "root_kind": "STANDALONE",
-                    "root_reason": "Bounded source-equivalence fixture",
-                    "lane_key": "development", "lane_order": 0,
-                    "dispatchable": True, "priority_rank": 1, "estimate_units": 1,
-                    "development_units": 1, "shared_units": 1, "sre_units": 0,
-                    "source_payload_sha256": self.current_sha,
-                    "ready_at": "2026-08-26T20:00:03Z",
-                }],
-                "relations": [],
+                "nodes": nodes,
+                "relations": relations,
             },
             now="2026-08-26T20:00:15Z",
         )
+
+    def _assert_graph_drift_is_zero_write(self) -> None:
+        before = list(self.store.connection.iterdump())
+        with self.assertRaisesRegex(
+            CoordinationError, "SOURCE_EQUIVALENCE_GRAPH_DRIFT"
+        ):
+            self.store.preview_source_equivalent_admission_rearm(**self.request)
+        self.assertEqual(before, list(self.store.connection.iterdump()))
 
     def tearDown(self) -> None:
         self.store.close(); self.temp.cleanup()
@@ -267,6 +371,22 @@ class SourceEquivalentAdmissionRearmTests(unittest.TestCase):
             self.store.preview_source_equivalent_admission_rearm(**self.request)
 
         self.assertEqual(before, list(self.store.connection.iterdump()))
+
+    def test_current_graph_cannot_advance_the_admission_base(self) -> None:
+        self._reconcile_graph_to_current_source(accepted_main_sha="c" * 40)
+        self._assert_graph_drift_is_zero_write()
+
+    def test_current_graph_cannot_add_an_unfinished_hard_predecessor(self) -> None:
+        self._reconcile_graph_to_current_source(relation_kind="HARD_BLOCK")
+        self._assert_graph_drift_is_zero_write()
+
+    def test_current_graph_cannot_add_an_active_collision(self) -> None:
+        self._reconcile_graph_to_current_source(relation_kind="COLLISION")
+        self._assert_graph_drift_is_zero_write()
+
+    def test_current_graph_cannot_disable_dispatchability(self) -> None:
+        self._reconcile_graph_to_current_source(dispatchable=False)
+        self._assert_graph_drift_is_zero_write()
 
     def test_later_projection_drift_invalidates_receipt_currentness(self) -> None:
         preview = self.store.preview_source_equivalent_admission_rearm(**self.request)

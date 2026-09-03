@@ -1318,7 +1318,96 @@ def graph_allows_admission_source_pair(
         _ensure_schema=False,
     )
     if result["health"] == "CURRENT":
-        return row["source_payload_sha256"] == current_source_sha256
+        try:
+            item = connection.execute(
+                "SELECT * FROM coordination_items "
+                "WHERE repository=? AND issue_number=?",
+                (repository, issue_number),
+            ).fetchone()
+            bindings = connection.execute(
+                """
+                SELECT candidate.accepted_main_sha, candidate.graph_version,
+                       candidate.source_payload_sha256, candidate.lane_key,
+                       candidate.development_units, candidate.shared_units,
+                       candidate.sre_units, candidate.state
+                FROM portfolio_ready_finalizations finalization
+                JOIN portfolio_pull_buffer_candidates candidate
+                  ON candidate.id=finalization.ready_candidate_id
+                WHERE finalization.repository=?
+                  AND finalization.issue_number=?
+                  AND finalization.generation=?
+                """,
+                (
+                    repository,
+                    issue_number,
+                    -1 if item is None else int(item["generation"]),
+                ),
+            ).fetchall()
+            current_node = connection.execute(
+                """
+                SELECT * FROM portfolio_graph_nodes
+                WHERE repository=? AND graph_version=? AND issue_number=?
+                """,
+                (repository, result["version"], issue_number),
+            ).fetchall()
+        except sqlite3.Error:
+            return False
+        projections = [
+            node for node in result["nodes"]
+            if int(node["issue_number"]) == issue_number
+        ]
+        if (
+            item is None
+            or item["status"] not in EXECUTION_STATUSES - {"READY"}
+            or item["allocation_class"] != "ACTIVE"
+            or item["source_payload_sha256"] != bound_source_sha256
+            or len(bindings) != 1
+            or len(current_node) != 1
+            or len(projections) != 1
+        ):
+            return False
+        binding = bindings[0]
+        node = current_node[0]
+        capacity = (
+            int(item["development_units"]),
+            int(item["shared_units"]),
+            int(item["sre_units"]),
+        )
+        if (
+            binding["state"] != "READY"
+            or binding["source_payload_sha256"] != bound_source_sha256
+            or binding["accepted_main_sha"] != row["accepted_main_sha"]
+            or binding["accepted_main_sha"] != row["observed_main_sha"]
+            or row["source_payload_sha256"] != current_source_sha256
+            or not bool(node["dispatchable"])
+            or not projections[0]["structurally_ready"]
+            or node["lane_key"] != binding["lane_key"]
+            or capacity
+            != (
+                int(binding["development_units"]),
+                int(binding["shared_units"]),
+                int(binding["sre_units"]),
+            )
+            or capacity
+            != (
+                int(node["development_units"]),
+                int(node["shared_units"]),
+                int(node["sre_units"]),
+            )
+        ):
+            return False
+        try:
+            validate_portfolio_transition(
+                connection,
+                repository=repository,
+                issue_number=issue_number,
+                status=str(item["status"]),
+                allocation_class=str(item["allocation_class"]),
+                current_main=str(binding["accepted_main_sha"]),
+            )
+        except PortfolioGraphError:
+            return False
+        return True
     if row["source_payload_sha256"] != bound_source_sha256:
         return False
     allowed = {
