@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -27,7 +28,12 @@ import sqlite3
 import stat
 from typing import Any, Callable, Iterator
 
-from owner_safe_sqlite import UnsafeSQLitePathError, prepare_owner_database
+from owner_safe_sqlite import (
+    UnsafeSQLitePathError,
+    open_owner_database_readonly,
+    prepare_owner_database,
+    validate_owner_database,
+)
 from approval_guard import (
     ApprovalGuardError,
     admission_execution_scope_sha256,
@@ -526,6 +532,13 @@ def _coordination_envelope_constant(_value: str) -> None:
     raise CoordinationError("COORDINATION_ENVELOPE_NONFINITE")
 
 
+def _coordination_envelope_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise CoordinationError("COORDINATION_ENVELOPE_NONFINITE")
+    return parsed
+
+
 def _coordination_envelope_budget(value: Any) -> None:
     """Bound traversal work after the C decoder has produced one value."""
 
@@ -570,6 +583,60 @@ def _coordination_reserved_handler(payload: dict[str, Any]) -> str | None:
     return "claimed_no_delivery_park" if park_schema else None
 
 
+def _read_claimed_no_delivery_park_payload(path: Path) -> bytes:
+    """Read one bounded owner-controlled regular payload without blocking."""
+
+    flags = os.O_RDONLY
+    for flag_name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flag = getattr(os, flag_name, None)
+        if type(flag) is not int or flag == 0:
+            raise CoordinationError("PARK_PAYLOAD_READ_FAILED")
+        flags |= flag
+    no_tty = getattr(os, "O_NOCTTY", 0)
+    if type(no_tty) is int:
+        flags |= no_tty
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise CoordinationError("PARK_PAYLOAD_READ_FAILED")
+        raw_payload = os.read(descriptor, COORDINATION_ENVELOPE_MAX_BYTES + 1)
+        after = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            raise CoordinationError("PARK_PAYLOAD_READ_FAILED")
+        if (
+            before.st_size > COORDINATION_ENVELOPE_MAX_BYTES
+            or len(raw_payload) > COORDINATION_ENVELOPE_MAX_BYTES
+        ):
+            raise CoordinationError("COORDINATION_ENVELOPE_RESOURCE_LIMIT")
+        if len(raw_payload) != before.st_size:
+            raise CoordinationError("PARK_PAYLOAD_READ_FAILED")
+        return raw_payload
+    except CoordinationError:
+        raise
+    except OSError as exc:
+        raise CoordinationError("PARK_PAYLOAD_READ_FAILED") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def parse_coordination_envelope(raw: str | bytes) -> ParsedCoordinationEnvelope:
     """Parse one coordination payload exactly once with closed JSON semantics."""
 
@@ -583,6 +650,7 @@ def parse_coordination_envelope(raw: str | bytes) -> ParsedCoordinationEnvelope:
             raw_bytes,
             object_pairs_hook=_coordination_envelope_object,
             parse_constant=_coordination_envelope_constant,
+            parse_float=_coordination_envelope_float,
         )
     except CoordinationError:
         raise
@@ -1322,6 +1390,84 @@ def canonicalize_coordination_identity(
         return require_current_endpoint_identity(connection, identity)
     except RegistryError as exc:
         raise CoordinationError(str(exc)) from exc
+
+
+def _require_current_planner_identity_readonly(
+    path: Path,
+    identity: str,
+    *,
+    idempotency_key: str,
+    payload_sha256: str,
+) -> str:
+    """Fence PARK preparation through the current Planner without creating state."""
+
+    _validate_coordination_identity(identity)
+    try:
+        database = validate_owner_database(path)
+    except UnsafeSQLitePathError as exc:
+        raise CoordinationError(str(exc)) from exc
+    wal = Path(f"{database}-wal")
+    shm = Path(f"{database}-shm")
+    sidecars = (wal, shm)
+    sidecars_present = tuple(sidecar.exists() for sidecar in sidecars)
+    if any(sidecars_present) and not all(sidecars_present):
+        raise CoordinationError("DATABASE_UNSAFE")
+    database_before = database.stat()
+    if all(sidecars_present):
+        try:
+            connection = open_owner_database_readonly(database)
+        except UnsafeSQLitePathError as exc:
+            raise CoordinationError(str(exc)) from exc
+    else:
+        connection = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            isolation_level=None,
+            timeout=5,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+    try:
+        current = connection.execute(
+            "SELECT recipient_session_id,topic,payload_sha256 "
+            "FROM coordination_messages WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if current is not None and (
+            current["recipient_session_id"] != identity
+            or current["topic"] != "coordination.notice"
+            or current["payload_sha256"] != payload_sha256
+        ):
+            raise CoordinationError("IDEMPOTENCY_CONFLICT")
+        try:
+            current_identity = require_current_endpoint_identity(connection, identity)
+            role = coordination_identity_role(connection, current_identity)
+        except RegistryError as exc:
+            raise CoordinationError(str(exc)) from exc
+        if role != "planner":
+            raise CoordinationError("PARK_PREPARER_INVALID")
+        return current_identity
+    finally:
+        connection.close()
+        if not any(sidecars_present):
+            database_after = database.stat()
+            stable = lambda value: (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_uid,
+                value.st_nlink,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+            if (
+                stable(database_before) != stable(database_after)
+                or any(sidecar.exists() for sidecar in sidecars)
+            ):
+                raise CoordinationError("DATABASE_UNSAFE")
 
 
 def recipient_matches_topic(
@@ -6017,26 +6163,47 @@ class CoordinationStore:
         recipient_session_id: str,
         payload: dict[str, Any],
         now: str,
+        _parsed_envelope: ParsedCoordinationEnvelope | None = None,
         _transaction: bool = True,
     ) -> int:
         """Prepare reserved PARK only from the exact equivalence-bound gateway."""
 
-        recipient_session_id = canonicalize_coordination_identity(
-            self.connection, recipient_session_id
-        )
-        if (
-            not idempotency_key
-            or coordination_identity_role(self.connection, recipient_session_id)
-            != "planner"
-        ):
+        if not idempotency_key:
             raise CoordinationError("PARK_PREPARER_INVALID")
-        payload = copy.deepcopy(payload)
-        envelope = parse_coordination_envelope(canonical_json(payload))
+        if _parsed_envelope is None:
+            payload = copy.deepcopy(payload)
+            envelope = parse_coordination_envelope(canonical_json(payload))
+        else:
+            envelope = _parsed_envelope
+            if (
+                payload is not envelope.payload
+                or envelope.payload_sha256 != digest_json(envelope.payload)
+            ):
+                raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
         if envelope.reserved_handler != "claimed_no_delivery_park":
             raise CoordinationError("PARK_ENVELOPE_INVALID")
         evidence = claimed_no_delivery_park_evidence(envelope.payload)
         payload_json = canonical_json(envelope.payload)
         with (self.transaction() if _transaction else nullcontext()):
+            current = self.connection.execute(
+                "SELECT id,recipient_session_id,topic,payload_sha256 "
+                "FROM coordination_messages WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if current is not None and (
+                current["recipient_session_id"] != recipient_session_id
+                or current["topic"] != "coordination.notice"
+                or current["payload_sha256"] != envelope.payload_sha256
+            ):
+                raise CoordinationError("IDEMPOTENCY_CONFLICT")
+            recipient_session_id = canonicalize_coordination_identity(
+                self.connection, recipient_session_id
+            )
+            if (
+                coordination_identity_role(self.connection, recipient_session_id)
+                != "planner"
+            ):
+                raise CoordinationError("PARK_PREPARER_INVALID")
             self._validate_message_contract(
                 topic="coordination.notice",
                 recipient_session_id=recipient_session_id,
@@ -6052,18 +6219,7 @@ class CoordinationStore:
                 )
                 if replay is None:
                     raise
-            current = self.connection.execute(
-                "SELECT id,recipient_session_id,topic,payload_sha256 "
-                "FROM coordination_messages WHERE idempotency_key=?",
-                (idempotency_key,),
-            ).fetchone()
             if current is not None:
-                if (
-                    current["recipient_session_id"] != recipient_session_id
-                    or current["topic"] != "coordination.notice"
-                    or current["payload_sha256"] != envelope.payload_sha256
-                ):
-                    raise CoordinationError("IDEMPOTENCY_CONFLICT")
                 return int(current["id"])
             cursor = self.connection.execute(
                 "INSERT INTO coordination_messages(idempotency_key,"
@@ -6251,6 +6407,8 @@ class CoordinationStore:
         if not idempotency_key or not topic or not isinstance(payload, dict):
             raise CoordinationError("INVALID_MESSAGE")
         payload = copy.deepcopy(payload)
+        if _coordination_reserved_handler(payload) == "claimed_no_delivery_park":
+            raise CoordinationError("CLAIMED_NO_DELIVERY_PARK_HANDLER_REQUIRED")
         if payload.get("accountable_session_id") == original_recipient:
             payload["accountable_session_id"] = recipient_session_id
         payload_json = canonical_json(payload)
@@ -11622,6 +11780,11 @@ def main() -> int:
     enqueue.add_argument("--recipient-session-id", required=True)
     enqueue.add_argument("--topic", required=True)
     enqueue.add_argument("--payload-file", type=Path, required=True)
+    prepare_park = subparsers.add_parser("prepare-claimed-no-delivery-park")
+    prepare_park.add_argument("--idempotency-key", required=True)
+    prepare_park.add_argument("--planner-session-id", required=True)
+    prepare_park.add_argument("--payload-file", type=Path, required=True)
+    prepare_park.add_argument("--expected-payload-sha256", required=True)
     claim = subparsers.add_parser("claim-message")
     claim.add_argument("--message-id", type=int, required=True)
     claim.add_argument("--session-id", required=True)
@@ -11709,6 +11872,22 @@ def main() -> int:
     collect_artifacts.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     try:
+        park_envelope = None
+        planner_identity = None
+        if args.command == "prepare-claimed-no-delivery-park":
+            raw_payload = _read_claimed_no_delivery_park_payload(args.payload_file)
+            park_envelope = parse_coordination_envelope(raw_payload)
+            if park_envelope.reserved_handler != "claimed_no_delivery_park":
+                raise CoordinationError("CLAIMED_NO_DELIVERY_PARK_HANDLER_REQUIRED")
+            _validate_sha256(args.expected_payload_sha256)
+            if park_envelope.payload_sha256 != args.expected_payload_sha256:
+                raise CoordinationError("MESSAGE_PAYLOAD_MISMATCH")
+            planner_identity = _require_current_planner_identity_readonly(
+                DEFAULT_DATABASE,
+                args.planner_session_id,
+                idempotency_key=args.idempotency_key,
+                payload_sha256=park_envelope.payload_sha256,
+            )
         store = CoordinationStore(DEFAULT_DATABASE)
         if args.command == "show":
             if args.repository is not None:
@@ -11726,6 +11905,27 @@ def main() -> int:
                 now=utc_now(),
             )
             print(canonical_json({"phase": "PREPARED", "message_id": message_id}))
+        elif args.command == "prepare-claimed-no-delivery-park":
+            assert park_envelope is not None
+            assert planner_identity is not None
+            message_id = store.enqueue_claimed_no_delivery_park_message(
+                idempotency_key=args.idempotency_key,
+                recipient_session_id=planner_identity,
+                payload=park_envelope.payload,
+                now=utc_now(),
+                _parsed_envelope=park_envelope,
+            )
+            print(
+                canonical_json(
+                    {
+                        "phase": "PREPARED",
+                        "message_id": message_id,
+                        "payload_sha256": park_envelope.payload_sha256,
+                        "recipient_session_id": args.planner_session_id,
+                        "idempotency_key": args.idempotency_key,
+                    }
+                )
+            )
         elif args.command == "hold-prepared-message":
             message = store.hold_prepared_message(
                 message_id=args.message_id,
