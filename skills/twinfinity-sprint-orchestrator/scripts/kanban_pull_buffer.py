@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -26,6 +27,7 @@ from delivery_identity import (
 )
 from coordination_store import (
     CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA,
+    COORDINATION_ENVELOPE_MAX_BYTES,
     DEFAULT_DATABASE,
     UNCLAIMED_ADMISSION_RECOVERY_NOTICE_SCHEMA,
     UNCLAIMED_ADMISSION_RETRY_REASON,
@@ -54,7 +56,11 @@ from executor_registry import (
     identity_role,
     require_current_endpoint_identity,
 )
-from owner_safe_sqlite import open_owner_database_readonly, prepare_owner_database
+from owner_safe_sqlite import (
+    open_owner_database_readonly,
+    prepare_owner_database,
+    validate_owner_database,
+)
 from portfolio_graph import (
     PortfolioGraphError,
     _schedule_decision,
@@ -85,6 +91,18 @@ from run_role_executor import (
 SCHEMA = "twinfinity-kanban-pull-buffer/v2"
 READY_SCHEMA = "twinfinity-kanban-pull-buffer/v4"
 FINALIZATION_SCHEMA = "twinfinity-kanban-ready-finalization/v2"
+READY_QUARANTINE_REQUEST_SCHEMA = "twinfinity-ready-quarantine-request/v1"
+READY_QUARANTINE_INVENTORY_SCHEMA = "twinfinity-ready-quarantine-inventory/v1"
+READY_QUARANTINE_RECEIPT_SCHEMA = "twinfinity-ready-quarantine-receipt/v1"
+READY_QUARANTINE_REQUEST_MAX_BYTES = COORDINATION_ENVELOPE_MAX_BYTES
+READY_QUARANTINE_REASON = "UNATTESTED_READY_QUARANTINED"
+READY_QUARANTINE_EXECUTION_TOPICS = {
+    "development.admission",
+    "development.recovery_prepare",
+    "development.recovery_commit",
+    "development.terminal_closeout",
+    "sre.admission",
+}
 DRIFT_RECOVERY_SCHEMA = "twinfinity-kanban-ready-drift-recovery/v1"
 UNCLAIMED_ADMISSION_RECOVERY_SCHEMA = "twinfinity-unclaimed-admission-recovery/v1"
 UNCLAIMED_ADMISSION_REFILL_TRIGGER = "UNCLAIMED_ADMISSION_RECOVERY_REFILL"
@@ -836,7 +854,9 @@ def _database_path(connection: sqlite3.Connection) -> Path:
     return Path(row[2])
 
 
-def _open_relative_file(root: Path, relative_path: str) -> int:
+def _open_relative_file(
+    root: Path, relative_path: str, *, nonblocking: bool = False
+) -> int:
     parts = Path(relative_path).parts
     if (
         not parts
@@ -851,9 +871,11 @@ def _open_relative_file(root: Path, relative_path: str) -> int:
     try:
         for component in parts[:-1]:
             descriptors.append(os.open(component, directory_flags, dir_fd=descriptors[-1]))
-        file_flags = os.O_RDONLY
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             file_flags |= os.O_NOFOLLOW
+        if nonblocking:
+            file_flags |= getattr(os, "O_NONBLOCK", 0)
         descriptor = os.open(parts[-1], file_flags, dir_fd=descriptors[-1])
     except OSError as exc:
         raise PullBufferError("PULL_BUFFER_ARTIFACT_UNSAFE") from exc
@@ -881,6 +903,92 @@ def _open_packet(database: Path, packet_path: Path) -> tuple[int, str]:
         os.close(descriptor)
         raise PullBufferError("PULL_BUFFER_ARTIFACT_UNSAFE")
     return descriptor, relative
+
+
+def _read_ready_quarantine_request(
+    database: Path, request_path: Path
+) -> dict[str, Any]:
+    """Acquire one bounded owner-only request before any database access."""
+
+    root = database.parent.resolve()
+    supplied = request_path if request_path.is_absolute() else Path.cwd() / request_path
+    absolute = Path(os.path.abspath(supplied))
+    try:
+        relative = absolute.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise PullBufferError("READY_QUARANTINE_REQUEST_UNSAFE") from exc
+    try:
+        descriptor = _open_relative_file(root, relative, nonblocking=True)
+    except PullBufferError as exc:
+        raise PullBufferError("READY_QUARANTINE_REQUEST_UNSAFE") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise PullBufferError("READY_QUARANTINE_REQUEST_UNSAFE")
+        if before.st_size > READY_QUARANTINE_REQUEST_MAX_BYTES:
+            raise PullBufferError("READY_QUARANTINE_REQUEST_TOO_LARGE")
+        chunks: list[bytes] = []
+        remaining = READY_QUARANTINE_REQUEST_MAX_BYTES + 1
+        while remaining > 0:
+            block = os.read(descriptor, min(64 * 1024, remaining))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        raw_request = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if len(raw_request) > READY_QUARANTINE_REQUEST_MAX_BYTES:
+            raise PullBufferError("READY_QUARANTINE_REQUEST_TOO_LARGE")
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or len(raw_request) != after.st_size
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+        ):
+            raise PullBufferError("READY_QUARANTINE_REQUEST_UNSAFE")
+    except OSError as exc:
+        raise PullBufferError("READY_QUARANTINE_REQUEST_UNSAFE") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        request = json.loads(
+            raw_request.decode("utf-8"), object_pairs_hook=_strict_object
+        )
+    except (UnicodeError, json.JSONDecodeError, PullBufferError) as exc:
+        raise PullBufferError("READY_QUARANTINE_REQUEST_INVALID") from exc
+    if (
+        not isinstance(request, dict)
+        or raw_request != canonical_json(request).encode("utf-8")
+    ):
+        raise PullBufferError("READY_QUARANTINE_REQUEST_NONCANONICAL")
+    _validate_ready_quarantine_request(request)
+    return request
 
 
 def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
@@ -969,6 +1077,24 @@ def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(receipt_id) REFERENCES portfolio_readiness_receipts(id),
             FOREIGN KEY(dirty_event_id) REFERENCES portfolio_dirty_events(id)
         );
+        CREATE TABLE IF NOT EXISTS portfolio_ready_quarantines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_key TEXT NOT NULL UNIQUE,
+            repository TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL UNIQUE,
+            source_harness_repository TEXT NOT NULL,
+            source_harness_main_sha TEXT NOT NULL,
+            cutover_authority_sha256 TEXT NOT NULL,
+            before_ready_inventory_sha256 TEXT NOT NULL,
+            after_ready_inventory_sha256 TEXT NOT NULL,
+            inspected_count INTEGER NOT NULL CHECK(inspected_count >= 0),
+            preserved_count INTEGER NOT NULL CHECK(preserved_count >= 0),
+            quarantined_count INTEGER NOT NULL CHECK(quarantined_count >= 0),
+            receipt_sha256 TEXT NOT NULL UNIQUE,
+            receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(repository, source_harness_main_sha)
+        );
         CREATE TRIGGER IF NOT EXISTS portfolio_pull_buffer_candidates_immutable_update
         BEFORE UPDATE ON portfolio_pull_buffer_candidates
         BEGIN SELECT RAISE(ABORT, 'PULL_BUFFER_CANDIDATE_IMMUTABLE'); END;
@@ -993,6 +1119,12 @@ def ensure_pull_buffer_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS portfolio_ready_finalizations_immutable_delete
         BEFORE DELETE ON portfolio_ready_finalizations
         BEGIN SELECT RAISE(ABORT, 'READY_FINALIZATION_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS portfolio_ready_quarantines_immutable_update
+        BEFORE UPDATE ON portfolio_ready_quarantines
+        BEGIN SELECT RAISE(ABORT, 'READY_QUARANTINE_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS portfolio_ready_quarantines_immutable_delete
+        BEFORE DELETE ON portfolio_ready_quarantines
+        BEGIN SELECT RAISE(ABORT, 'READY_QUARANTINE_IMMUTABLE'); END;
             """
         )
         candidate_columns = {
@@ -1024,18 +1156,54 @@ def require_pull_buffer_schema(connection: sqlite3.Connection) -> None:
     required = {
         "portfolio_pull_buffer_candidates", "portfolio_pull_buffer_current",
         "portfolio_pull_buffer_audits", "portfolio_pull_buffer_retirements",
-        "portfolio_ready_finalizations",
+        "portfolio_ready_finalizations", "portfolio_ready_quarantines",
     }
     present = {
         str(row[0])
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND (name LIKE 'portfolio_pull_buffer_%' "
-            "OR name='portfolio_ready_finalizations')"
+            "OR name IN ('portfolio_ready_finalizations',"
+            "'portfolio_ready_quarantines'))"
         )
     }
     if not required.issubset(present):
         raise PullBufferError("PULL_BUFFER_SCHEMA_MISSING")
+
+
+def _require_ready_quarantine_schema(connection: sqlite3.Connection) -> None:
+    require_pull_buffer_schema(connection)
+    required = {
+        "github_snapshots",
+        "github_current",
+        "coordination_items",
+        "coordination_messages",
+        "coordination_events",
+        "coordination_wakes",
+        "coordination_terminal_watches",
+        "coordination_terminal_closeout_packets",
+        "coordination_pre_push_gates",
+        "coordination_pre_push_publications",
+        "coordination_supervisor_items",
+        "executor_role_endpoints",
+        "executor_attempts",
+        "portfolio_dirty_events",
+        "portfolio_readiness_campaigns",
+        "portfolio_readiness_gates",
+        "portfolio_readiness_receipts",
+        "portfolio_readiness_receipt_pickups",
+        "portfolio_readiness_approval_requests",
+        "portfolio_readiness_source_equivalence",
+        "portfolio_readiness_current",
+    }
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if not required.issubset(present):
+        raise PullBufferError("READY_QUARANTINE_SCHEMA_MISSING")
 
 
 def _require_nonempty_strings(value: Any, code: str) -> None:
@@ -1735,6 +1903,2237 @@ def ready_attestation_error(
         and _ready_dirty_event_error(row, candidate, finalization_payload) is None
     )
     return None if expected else "READINESS_ATTESTATION_DRIFT"
+
+
+def _exact_ready_attestation_error(
+    connection: sqlite3.Connection,
+    item: sqlite3.Row,
+    candidate: sqlite3.Row | None,
+) -> str | None:
+    """Validate the complete immutable READY lineage used at cutover."""
+
+    if candidate is None:
+        return "READINESS_ATTESTATION_MISSING"
+    try:
+        basic_error = ready_attestation_error(connection, dict(candidate))
+    except (
+        AttributeError,
+        CoordinationError,
+        IndexError,
+        KeyError,
+        RegistryError,
+        TypeError,
+        ValueError,
+        sqlite3.Error,
+    ):
+        return "READINESS_ATTESTATION_INVALID"
+    if basic_error is not None:
+        return basic_error
+    pointer = connection.execute(
+        "SELECT candidate_id FROM portfolio_pull_buffer_current "
+        "WHERE repository=? AND issue_number=?",
+        (item["repository"], int(item["issue_number"])),
+    ).fetchone()
+    source = connection.execute(
+        "SELECT current.payload_sha256,current.source_updated_at,"
+        "current.fetched_at,snapshot.payload_json FROM github_current current "
+        "JOIN github_snapshots snapshot USING(repository,object_kind,"
+        "object_number,payload_sha256) WHERE current.repository=? "
+        "AND current.object_kind='issue' AND current.object_number=?",
+        (item["repository"], int(item["issue_number"])),
+    ).fetchone()
+    if (
+        pointer is None
+        or int(pointer["candidate_id"]) != int(candidate["id"])
+        or candidate["repository"] != item["repository"]
+        or int(candidate["issue_number"]) != int(item["issue_number"])
+        or int(candidate["generation"]) != int(item["generation"])
+        or int(candidate["item_version"]) != int(item["version"])
+        or candidate["source_payload_sha256"] != item["source_payload_sha256"]
+        or candidate["state"] != "READY"
+        or item["allocation_class"] != "NONE"
+        or item["accountable_session_id"] is not None
+        or item["lease_manifest_sha256"] is not None
+        or any(
+            int(item[field]) != int(candidate[field])
+            for field in ("development_units", "shared_units", "sre_units")
+        )
+        or source is None
+    ):
+        return "READINESS_ATTESTATION_DRIFT"
+    finalizations = connection.execute(
+        "SELECT * FROM portfolio_ready_finalizations WHERE ready_candidate_id=?",
+        (int(candidate["id"]),),
+    ).fetchall()
+    if len(finalizations) != 1:
+        return "READINESS_ATTESTATION_DRIFT"
+    finalization = finalizations[0]
+    candidate_retirement = connection.execute(
+        "SELECT 1 FROM portfolio_pull_buffer_retirements WHERE candidate_id=?",
+        (int(candidate["id"]),),
+    ).fetchone()
+    prepared = connection.execute(
+        "SELECT * FROM portfolio_pull_buffer_candidates WHERE id=?",
+        (int(finalization["prepared_candidate_id"]),),
+    ).fetchone()
+    current = connection.execute(
+        "SELECT * FROM portfolio_readiness_current WHERE repository=? "
+        "AND issue_number=?",
+        (item["repository"], int(item["issue_number"])),
+    ).fetchone()
+    campaign = connection.execute(
+        "SELECT * FROM portfolio_readiness_campaigns WHERE id=?",
+        (int(finalization["campaign_id"]),),
+    ).fetchone()
+    receipt = connection.execute(
+        "SELECT * FROM portfolio_readiness_receipts WHERE id=?",
+        (int(finalization["receipt_id"]),),
+    ).fetchone()
+    pickup = connection.execute(
+        "SELECT * FROM portfolio_readiness_receipt_pickups WHERE campaign_id=?",
+        (int(finalization["campaign_id"]),),
+    ).fetchone()
+    dirty = connection.execute(
+        "SELECT * FROM portfolio_dirty_events WHERE id=?",
+        (int(finalization["dirty_event_id"]),),
+    ).fetchone()
+    if any(
+        value is None
+        for value in (prepared, current, campaign, receipt, pickup, dirty)
+    ):
+        return "READINESS_ATTESTATION_DRIFT"
+    if any(
+        campaign[field] is not None
+        for field in (
+            "approval_proposal_sha256",
+            "approval_decision_sha256",
+            "approval_recipient_session_id",
+            "approval_execution_scope_sha256",
+        )
+    ):
+        approval_tables = {
+            "executor_role_endpoint_current",
+            "github_outbox",
+            "approval_current",
+            "approval_proposals",
+            "approval_submissions",
+            "approval_interests",
+            "approval_review_batches",
+            "approval_user_events",
+            "approval_decisions",
+            "approval_deliveries",
+            "approval_effectivity",
+            "approval_revocations",
+        }
+        present = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if not approval_tables.issubset(present):
+            raise PullBufferError("READY_QUARANTINE_SCHEMA_MISSING")
+    from kanban_readiness import (
+        ReadinessError,
+        approval_source_equivalent,
+        transition_evidence_sha256,
+        _validate_plan,
+        _validate_receipt,
+    )
+
+    try:
+        source_payload = json.loads(
+            source["payload_json"], object_pairs_hook=_strict_object
+        )
+        plan_payload = json.loads(
+            campaign["plan_json"], object_pairs_hook=_strict_object
+        )
+        receipt_payload = json.loads(
+            receipt["receipt_json"], object_pairs_hook=_strict_object
+        )
+        finalization_payload = json.loads(
+            finalization["payload_json"], object_pairs_hook=_strict_object
+        )
+        _validate_plan(plan_payload)
+        _validate_receipt(receipt_payload)
+        if (
+            canonical_json(source_payload) != source["payload_json"]
+            or digest_json(source_payload) != source["payload_sha256"]
+            or not approval_source_equivalent(
+                connection,
+                campaign,
+                str(item["source_payload_sha256"]),
+                str(source["payload_sha256"]),
+            )
+        ):
+            return "READINESS_ATTESTATION_DRIFT"
+
+        transition = plan_payload.get("transition")
+        campaign_transition_error = False
+        if transition is None:
+            campaign_transition_error = any(
+                (
+                    campaign["parent_campaign_id"] is not None,
+                    campaign["transition_kind"] != "INITIAL",
+                    int(campaign["resolution_ordinal"]) != 0,
+                    campaign["changed_evidence_sha256"] is not None,
+                    campaign["resolution_action_set_sha256"] is not None,
+                )
+            )
+        else:
+            parent = connection.execute(
+                "SELECT * FROM portfolio_readiness_campaigns WHERE id=?",
+                (transition["parent_campaign_id"],),
+            ).fetchone()
+            if parent is None:
+                campaign_transition_error = True
+            else:
+                parent_plan = json.loads(
+                    parent["plan_json"], object_pairs_hook=_strict_object
+                )
+                _validate_plan(parent_plan)
+                expected_ordinal = int(parent["resolution_ordinal"])
+                if transition["kind"] == "RESOLUTION":
+                    expected_ordinal += 1
+                elif int(campaign["generation"]) > int(parent["generation"]):
+                    expected_ordinal = 0
+                campaign_transition_error = (
+                    int(campaign["parent_campaign_id"] or -1)
+                    != int(transition["parent_campaign_id"])
+                    or campaign["transition_kind"] != transition["kind"]
+                    or campaign["changed_evidence_sha256"]
+                    != transition["changed_evidence_sha256"]
+                    or campaign["resolution_action_set_sha256"]
+                    != transition["resolution_action_set_sha256"]
+                    or int(campaign["resolution_ordinal"]) != expected_ordinal
+                    or transition_evidence_sha256(parent_plan, plan_payload)
+                    != transition["changed_evidence_sha256"]
+                    or {
+                        "proposal_sha256": campaign[
+                            "approval_proposal_sha256"
+                        ],
+                        "decision_sha256": campaign[
+                            "approval_decision_sha256"
+                        ],
+                        "recipient_session_id": campaign[
+                            "approval_recipient_session_id"
+                        ],
+                        "execution_scope_sha256": campaign[
+                            "approval_execution_scope_sha256"
+                        ],
+                    }
+                    != (
+                        transition["approval"]
+                        if transition["approval"] is not None
+                        else {
+                            "proposal_sha256": None,
+                            "decision_sha256": None,
+                            "recipient_session_id": None,
+                            "execution_scope_sha256": None,
+                        }
+                    )
+                )
+
+        gate_rows = connection.execute(
+            "SELECT * FROM portfolio_readiness_gates WHERE campaign_id=? "
+            "ORDER BY id",
+            (int(campaign["id"]),),
+        ).fetchall()
+        receipt_gate_keys = {
+            result["gate_key"] for result in receipt_payload["gate_results"]
+        }
+        gate_error = (
+            len(gate_rows) != len(plan_payload["gates"])
+            or receipt_gate_keys
+            != {gate["gate_key"] for gate in plan_payload["gates"]}
+        )
+        if not gate_error:
+            for row, gate in zip(gate_rows, plan_payload["gates"]):
+                if (
+                    row["gate_key"] != gate["gate_key"]
+                    or row["description"] != gate["description"]
+                    or row["requested_evidence_json"]
+                    != canonical_json(gate["requested_evidence"])
+                    or row["gate_sha256"] != digest_json(gate)
+                ):
+                    gate_error = True
+                    break
+
+        message = connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (int(receipt["message_id"]),),
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT * FROM executor_attempts WHERE attempt_id=?",
+            (receipt["attempt_id"],),
+        ).fetchone()
+        endpoint = None
+        message_payload = None
+        if message is not None:
+            endpoint = connection.execute(
+                "SELECT role FROM executor_role_endpoints WHERE endpoint_id=?",
+                (message["recipient_session_id"],),
+            ).fetchone()
+            message_payload = json.loads(
+                message["payload_json"], object_pairs_hook=_strict_object
+            )
+        message_source = (
+            message_payload.get("source")
+            if isinstance(message_payload, dict)
+            else None
+        )
+        message_evidence = (
+            message_payload.get("evidence")
+            if isinstance(message_payload, dict)
+            else None
+        )
+        receipt_locator = {
+            "schema": "twinfinity-kanban-readiness-receipt-locator/v1",
+            "campaign_id": int(campaign["id"]),
+            "repository": str(campaign["repository"]),
+            "issue_number": int(campaign["issue_number"]),
+            "readiness_plan_sha256": str(campaign["plan_sha256"]),
+            "candidate_sha256": str(campaign["candidate_sha256"]),
+            "source_payload_sha256": str(campaign["source_payload_sha256"]),
+            "relative_path": (
+                f"readiness-receipts/{campaign['plan_sha256']}.json"
+            ),
+        }
+        receipt_execution_error = (
+            message is None
+            or attempt is None
+            or endpoint is None
+            or canonical_json(message_payload) != message["payload_json"]
+            or digest_json(message_payload) != message["payload_sha256"]
+            or message["topic"] != "coordination.notice"
+            or message["state"] != "COMPLETE"
+            or message["claimed_by"] != message["recipient_session_id"]
+            or message["last_error"] is not None
+            or endpoint["role"] != campaign["worker_role"]
+            or attempt["state"] != "COMPLETE"
+            or attempt["exit_code"] != 0
+            or attempt["role"] != campaign["worker_role"]
+            or attempt["endpoint_id"] != message["recipient_session_id"]
+            or attempt["target_kind"] != "message"
+            or attempt["target_key"] != str(message["id"])
+            or message_source
+            != {
+                "repository": campaign["repository"],
+                "object_kind": "issue",
+                "object_number": int(campaign["issue_number"]),
+                "payload_sha256": campaign["source_payload_sha256"],
+            }
+            or not isinstance(message_evidence, dict)
+            or message_evidence.get("readiness_plan_sha256")
+            != campaign["plan_sha256"]
+            or message_evidence.get("candidate_sha256")
+            != campaign["candidate_sha256"]
+            or message_evidence.get("accepted_main_sha")
+            != campaign["accepted_main_sha"]
+            or message_evidence.get("graph_version")
+            != int(campaign["graph_version"])
+            or message_evidence.get("capacity_policy_version")
+            != int(campaign["capacity_policy_version"])
+            or message_evidence.get("delivery_identity")
+            != plan_payload["delivery_identity"]
+            or message_evidence.get("delivery_identity_sha256")
+            != plan_payload["delivery_identity_sha256"]
+            or message_evidence.get("receipt_artifact")
+            != {
+                **receipt_locator,
+                "locator_sha256": digest_json(receipt_locator),
+            }
+        )
+        receipt_locator_binding = {
+            "schema": "twinfinity-kanban-readiness-receipt-locator/v1",
+            "campaign_id": int(campaign["id"]),
+            "repository": str(campaign["repository"]),
+            "issue_number": int(campaign["issue_number"]),
+            "readiness_plan_sha256": str(campaign["plan_sha256"]),
+            "candidate_sha256": str(campaign["candidate_sha256"]),
+            "source_payload_sha256": str(campaign["source_payload_sha256"]),
+            "relative_path": f"readiness-receipts/{campaign['plan_sha256']}.json",
+        }
+        pickup_error = (
+            int(pickup["campaign_id"]) != int(campaign["id"])
+            or int(pickup["message_id"]) != int(receipt["message_id"])
+            or pickup["attempt_id"] != receipt["attempt_id"]
+            or pickup["locator_sha256"] != digest_json(receipt_locator_binding)
+            or pickup["relative_path"]
+            != receipt_locator_binding["relative_path"]
+            or pickup["state"] != "RECORDED"
+            or int(pickup["receipt_id"] or -1) != int(receipt["id"])
+            or not isinstance(pickup["attempt_token_sha256"], str)
+            or not isinstance(attempt["token_sha256"], str)
+            or not hmac.compare_digest(
+                pickup["attempt_token_sha256"], attempt["token_sha256"]
+            )
+            or pickup["artifact_sha256"] != receipt["receipt_sha256"]
+            or int(pickup["artifact_size_bytes"] or -1)
+            != len(canonical_json(receipt_payload).encode("utf-8"))
+            or pickup["artifact_mode"] is None
+            or not stat.S_ISREG(int(pickup["artifact_mode"]))
+            or stat.S_IMODE(int(pickup["artifact_mode"])) != 0o600
+            or int(pickup["artifact_uid"] or -1) != os.getuid()
+            or int(pickup["artifact_nlink"] or -1) != 1
+            or any(
+                pickup[field] is None or int(pickup[field]) < 0
+                for field in (
+                    "artifact_device_id",
+                    "artifact_inode",
+                    "artifact_mtime_ns",
+                    "artifact_ctime_ns",
+                )
+            )
+            or int(pickup["version"]) < 4
+            or pickup["next_attempt_at"] is not None
+            or pickup["last_error"] is not None
+        )
+
+        admission = finalization_payload.get("admission_transaction")
+        admission_item = admission.get("item") if isinstance(admission, dict) else None
+        admission_message = (
+            admission.get("message") if isinstance(admission, dict) else None
+        )
+        admission_payload = (
+            admission_message.get("payload")
+            if isinstance(admission_message, dict)
+            else None
+        )
+        admission_source = (
+            admission_payload.get("source")
+            if isinstance(admission_payload, dict)
+            else None
+        )
+        admission_capacity = (
+            admission_payload.get("capacity")
+            if isinstance(admission_payload, dict)
+            else None
+        )
+        expected_admission_role = {
+            "development.admission": "development",
+            "sre.admission": "sre",
+        }.get(
+            admission_message.get("topic")
+            if isinstance(admission_message, dict)
+            else None
+        )
+        admission_error = (
+            not isinstance(admission_item, dict)
+            or not isinstance(admission_message, dict)
+            or not isinstance(admission_payload, dict)
+            or not isinstance(admission_source, dict)
+            or not isinstance(admission_capacity, dict)
+            or expected_admission_role != campaign["worker_role"]
+            or admission_item.get("repository") != item["repository"]
+            or admission_item.get("issue_number") != int(item["issue_number"])
+            or admission_item.get("generation") != int(item["generation"])
+            or admission_item.get("expected_version") != int(item["version"])
+            or admission_item.get("expected_source_sha256")
+            != item["source_payload_sha256"]
+            or admission_item.get("status") not in {"ACTIVE", "ACTIVE_FENCED"}
+            or admission_item.get("allocation_class") != "ACTIVE"
+            or admission_item.get("accountable_session_id")
+            != admission_message.get("recipient_session_id")
+            or admission_payload.get("accountable_session_id")
+            != admission_message.get("recipient_session_id")
+            or admission_payload.get("issue_number") != int(item["issue_number"])
+            or admission_payload.get("generation") != int(item["generation"])
+            or admission_payload.get("item_version") != int(item["version"]) + 1
+            or admission_payload.get("base_sha") != candidate["accepted_main_sha"]
+            or admission_source
+            != {
+                "repository": item["repository"],
+                "object_kind": "issue",
+                "object_number": int(item["issue_number"]),
+                "payload_sha256": item["source_payload_sha256"],
+            }
+            or any(
+                admission_item.get(field) != int(candidate[field])
+                or admission_capacity.get(field) != int(candidate[field])
+                for field in (
+                    "development_units", "shared_units", "sre_units"
+                )
+            )
+            or admission_item.get("lease_manifest_sha256")
+            != finalization_payload.get("lease_manifest_sha256")
+            or admission_payload.get("lease_manifest_sha256")
+            != finalization_payload.get("lease_manifest_sha256")
+        )
+
+        binding_reasons: list[str] = []
+        approval_fields = {
+            "proposal_sha256": campaign["approval_proposal_sha256"],
+            "decision_sha256": campaign["approval_decision_sha256"],
+            "recipient_session_id": campaign["approval_recipient_session_id"],
+            "execution_scope_sha256": campaign[
+                "approval_execution_scope_sha256"
+            ],
+        }
+        has_approval = any(value is not None for value in approval_fields.values())
+        if has_approval:
+            if (
+                not all(value is not None for value in approval_fields.values())
+                or not isinstance(transition, dict)
+                or transition.get("kind")
+                not in {"APPROVAL_RESUME", "RESOLUTION"}
+                or transition.get("approval") != approval_fields
+            ):
+                binding_reasons.append("APPROVAL_AUTHORITY_DRIFT")
+            else:
+                from approval_guard import (
+                    ApprovalGuardError,
+                    require_effective_approval,
+                )
+
+                boundary = connection.execute(
+                    "SELECT boundary FROM approval_proposals "
+                    "WHERE proposal_sha256=?",
+                    (approval_fields["proposal_sha256"],),
+                ).fetchone()
+                planner = current_endpoint(connection, "planner")
+                try:
+                    if boundary is None or planner is None:
+                        raise ApprovalGuardError("APPROVAL_PROPOSAL_MISSING")
+                    require_effective_approval(
+                        connection,
+                        repository=str(item["repository"]),
+                        issue_number=int(item["issue_number"]),
+                        recipient_session_id=str(
+                            approval_fields["recipient_session_id"]
+                        ),
+                        actor_session_id=str(planner["endpoint_id"]),
+                        execution_scope_sha256=str(
+                            approval_fields["execution_scope_sha256"]
+                        ),
+                        authority_sha256=str(
+                            approval_fields["decision_sha256"]
+                        ),
+                        required_proposal_sha256=str(
+                            approval_fields["proposal_sha256"]
+                        ),
+                        required_workstream="READINESS",
+                        required_boundary=str(boundary["boundary"]),
+                        required_current_recipient_role="planner",
+                        required=True,
+                    )
+                except (ApprovalGuardError, sqlite3.Error):
+                    binding_reasons.append("APPROVAL_AUTHORITY_DRIFT")
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        PullBufferError,
+        ReadinessError,
+        RegistryError,
+        sqlite3.Error,
+    ):
+        return "READINESS_ATTESTATION_INVALID"
+    finalization_keys = {
+        "schema", "repository", "issue_number", "generation",
+        "prepared_item_version", "ready_item_version",
+        "source_payload_sha256", "accepted_main_sha", "graph_version",
+        "capacity_policy_version", "prepared_candidate_id",
+        "prepared_candidate_sha256", "readiness_campaign_id",
+        "readiness_current_version", "readiness_plan_sha256",
+        "readiness_receipt_id", "readiness_receipt_sha256",
+        "ready_packet_content_sha256", "ready_candidate_sha256",
+        "delivery_identity", "delivery_identity_sha256",
+        "admission_transaction", "admission_transaction_sha256",
+        "lease_manifest_sha256",
+    }
+    if (
+        binding_reasons
+        or candidate_retirement is not None
+        or campaign_transition_error
+        or gate_error
+        or receipt_execution_error
+        or pickup_error
+        or admission_error
+        or set(finalization_payload) != finalization_keys
+        or canonical_json(plan_payload) != campaign["plan_json"]
+        or digest_json(plan_payload) != campaign["plan_sha256"]
+        or canonical_json(receipt_payload) != receipt["receipt_json"]
+        or digest_json(receipt_payload) != receipt["receipt_sha256"]
+        or canonical_json(finalization_payload) != finalization["payload_json"]
+        or digest_json(finalization_payload) != finalization["finalization_sha256"]
+        or finalization["repository"] != item["repository"]
+        or int(finalization["issue_number"]) != int(item["issue_number"])
+        or int(finalization["generation"]) != int(item["generation"])
+        or int(current["campaign_id"]) != int(campaign["id"])
+        or current["state"] != "FINALIZED"
+        or int(current["receipt_id"] or -1) != int(receipt["id"])
+        or int(current["finalized_candidate_id"] or -1) != int(candidate["id"])
+        or int(current["finalized_event_id"] or -1) != int(dirty["id"])
+        or int(current["version"]) != int(candidate["readiness_current_version"]) + 1
+        or int(campaign["issue_number"]) != int(item["issue_number"])
+        or campaign["repository"] != item["repository"]
+        or int(campaign["generation"]) != int(item["generation"])
+        or int(campaign["item_version"]) + 1 != int(item["version"])
+        or campaign["source_payload_sha256"] != item["source_payload_sha256"]
+        or plan_payload.get("repository") != campaign["repository"]
+        or plan_payload.get("issue_number") != int(campaign["issue_number"])
+        or plan_payload.get("generation") != int(campaign["generation"])
+        or plan_payload.get("item_version") != int(campaign["item_version"])
+        or plan_payload.get("source_payload_sha256")
+        != campaign["source_payload_sha256"]
+        or plan_payload.get("accepted_main_sha") != campaign["accepted_main_sha"]
+        or plan_payload.get("graph_version") != int(campaign["graph_version"])
+        or plan_payload.get("capacity_policy_version")
+        != int(campaign["capacity_policy_version"])
+        or plan_payload.get("candidate_sha256") != campaign["candidate_sha256"]
+        or plan_payload.get("worker_role") != campaign["worker_role"]
+        or plan_payload.get("phase_summary") != campaign["phase_summary"]
+        or campaign["accepted_main_sha"] != candidate["accepted_main_sha"]
+        or int(campaign["graph_version"]) != int(candidate["graph_version"])
+        or int(campaign["capacity_policy_version"])
+        != int(candidate["capacity_policy_version"])
+        or campaign["candidate_sha256"] != prepared["candidate_sha256"]
+        or prepared["repository"] != item["repository"]
+        or int(prepared["issue_number"]) != int(item["issue_number"])
+        or int(prepared["generation"]) != int(item["generation"])
+        or int(prepared["item_version"]) != int(campaign["item_version"])
+        or prepared["source_payload_sha256"] != item["source_payload_sha256"]
+        or prepared["accepted_main_sha"] != candidate["accepted_main_sha"]
+        or int(prepared["graph_version"]) != int(candidate["graph_version"])
+        or int(prepared["capacity_policy_version"])
+        != int(candidate["capacity_policy_version"])
+        or prepared["lane_key"] != candidate["lane_key"]
+        or prepared["state"] != "PREPARED_NOT_READY"
+        or prepared["verticality"] != candidate["verticality"]
+        or any(
+            int(prepared[field]) != int(candidate[field])
+            for field in ("development_units", "shared_units", "sre_units")
+        )
+        or prepared["promotion_trigger"] != candidate["promotion_trigger"]
+        or int(candidate["readiness_campaign_id"] or -1) != int(campaign["id"])
+        or int(candidate["readiness_receipt_id"] or -1) != int(receipt["id"])
+        or candidate["readiness_plan_sha256"] != campaign["plan_sha256"]
+        or candidate["readiness_receipt_sha256"] != receipt["receipt_sha256"]
+        or receipt["verdict"] != "PASS"
+        or int(receipt["campaign_id"]) != int(campaign["id"])
+        or receipt["worker_role"] != campaign["worker_role"]
+        or int(receipt["message_id"]) != int(receipt_payload["message_id"])
+        or receipt["attempt_id"] != receipt_payload["attempt_id"]
+        or receipt["resolution_role"] is not None
+        or receipt["resolution_action_set_sha256"] != digest_json([])
+        or receipt["approval_proposal_sha256"] is not None
+        or receipt["observed_at"] != receipt_payload["observed_at"]
+        or int(current["message_id"] or -1) != int(receipt["message_id"])
+        or current["attempt_id"] != receipt["attempt_id"]
+        or current["endpoint_id"] != message["recipient_session_id"]
+        or int(current["resolution_cycles"])
+        != int(campaign["resolution_ordinal"])
+        or current["last_error"] is not None
+        or current["finalized_at"] is None
+        or receipt_payload.get("repository") != item["repository"]
+        or receipt_payload.get("issue_number") != int(item["issue_number"])
+        or receipt_payload.get("readiness_plan_sha256") != campaign["plan_sha256"]
+        or receipt_payload.get("verdict") != "PASS"
+        or receipt_payload.get("worker_role") != campaign["worker_role"]
+        or receipt_payload.get("delivery_identity_sha256")
+        != plan_payload.get("delivery_identity_sha256")
+        or receipt_payload.get("resolution")
+        != {"role": None, "actions": [], "approval": None}
+        or finalization_payload.get("delivery_identity")
+        != plan_payload.get("delivery_identity")
+        or finalization_payload.get("delivery_identity_sha256")
+        != plan_payload.get("delivery_identity_sha256")
+        or finalization_payload.get("admission_transaction_sha256")
+        != admission_transaction_sha256(admission)
+        or finalization_payload.get("lease_manifest_sha256")
+        != plan_payload.get("delivery_identity", {}).get(
+            "lease_manifest_sha256"
+        )
+        or finalization_payload.get("repository") != item["repository"]
+        or finalization_payload.get("issue_number") != int(item["issue_number"])
+        or finalization_payload.get("generation") != int(item["generation"])
+        or finalization_payload.get("prepared_item_version")
+        != int(campaign["item_version"])
+        or finalization_payload.get("ready_item_version") != int(item["version"])
+        or finalization_payload.get("source_payload_sha256")
+        != item["source_payload_sha256"]
+        or finalization_payload.get("accepted_main_sha")
+        != candidate["accepted_main_sha"]
+        or finalization_payload.get("graph_version")
+        != int(candidate["graph_version"])
+        or finalization_payload.get("capacity_policy_version")
+        != int(candidate["capacity_policy_version"])
+        or finalization_payload.get("prepared_candidate_id") != int(prepared["id"])
+        or finalization_payload.get("prepared_candidate_sha256")
+        != prepared["candidate_sha256"]
+        or finalization_payload.get("readiness_campaign_id") != int(campaign["id"])
+        or finalization_payload.get("readiness_current_version")
+        != int(candidate["readiness_current_version"])
+        or finalization_payload.get("readiness_plan_sha256")
+        != campaign["plan_sha256"]
+        or finalization_payload.get("readiness_receipt_id") != int(receipt["id"])
+        or finalization_payload.get("readiness_receipt_sha256")
+        != receipt["receipt_sha256"]
+        or finalization_payload.get("ready_packet_content_sha256")
+        != candidate["artifact_content_sha256"]
+        or finalization_payload.get("ready_candidate_sha256")
+        != candidate["candidate_sha256"]
+        or int(dirty["release_item_version"]) != int(item["version"])
+        or dirty["release_source_sha256"] != item["source_payload_sha256"]
+        or dirty["repository"] != item["repository"]
+        or int(dirty["issue_number"]) != int(item["issue_number"])
+    ):
+        return "READINESS_ATTESTATION_DRIFT"
+    return None
+
+
+def _message_lineage(payload: Any) -> tuple[str, int, int | None] | None:
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get("source")
+    if isinstance(source, dict) and source.get("object_kind") not in {
+        None,
+        "issue",
+    }:
+        return None
+    source_repository = (
+        source.get("repository") if isinstance(source, dict) else None
+    )
+    top_repository = payload.get("repository")
+    if (
+        isinstance(source_repository, str)
+        and isinstance(top_repository, str)
+        and source_repository != top_repository
+    ):
+        return None
+    repository = (
+        source_repository
+        if isinstance(source_repository, str)
+        else top_repository
+    )
+    source_issue_number = (
+        source.get("object_number") if isinstance(source, dict) else None
+    )
+    top_issue_number = payload.get("issue_number")
+    if (
+        type(source_issue_number) is int
+        and type(top_issue_number) is int
+        and source_issue_number != top_issue_number
+    ):
+        return None
+    issue_number = (
+        top_issue_number
+        if type(top_issue_number) is int
+        else source_issue_number
+    )
+    generation = payload.get("generation")
+    if (
+        not isinstance(repository, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+        is None
+        or type(issue_number) is not int
+        or issue_number <= 0
+        or (generation is not None and type(generation) is not int)
+    ):
+        return None
+    return repository, issue_number, generation
+
+
+def _claimed_execution_lineage_rows(
+    connection: sqlite3.Connection,
+) -> list[tuple[sqlite3.Row, sqlite3.Row, tuple[str, int, int | None]]]:
+    claimed: list[
+        tuple[sqlite3.Row, sqlite3.Row, tuple[str, int, int | None]]
+    ] = []
+    for event in connection.execute(
+        "SELECT * FROM coordination_events "
+        "WHERE event_type='MESSAGE_CLAIMED' ORDER BY id"
+    ):
+        match = re.fullmatch(r"message:([1-9][0-9]*)", str(event["entity_key"]))
+        if match is None:
+            raise PullBufferError(
+                "READY_QUARANTINE_CLAIMED_MESSAGE_INVALID"
+            )
+        message = connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (int(match.group(1)),),
+        ).fetchone()
+        if message is None:
+            raise PullBufferError(
+                "READY_QUARANTINE_CLAIMED_MESSAGE_INVALID"
+            )
+        if message["topic"] not in READY_QUARANTINE_EXECUTION_TOPICS:
+            continue
+        try:
+            envelope = parse_coordination_envelope(message["payload_json"])
+        except CoordinationError as exc:
+            raise PullBufferError(
+                "READY_QUARANTINE_CLAIMED_MESSAGE_INVALID"
+            ) from exc
+        lineage = _message_lineage(envelope.payload)
+        if (
+            lineage is None
+            or envelope.payload_sha256 != message["payload_sha256"]
+        ):
+            raise PullBufferError(
+                "READY_QUARANTINE_CLAIMED_MESSAGE_INVALID"
+            )
+        claimed.append((event, message, lineage))
+    return claimed
+
+
+def _validate_active_ready_message_lineage(
+    connection: sqlite3.Connection,
+) -> None:
+    active_message_ids = {
+        int(row[0])
+        for row in connection.execute(
+            "SELECT id FROM coordination_messages "
+            "WHERE state IN ('PREPARED','CLAIMED')"
+        )
+    }
+    active_message_ids.update(
+        int(row[0])
+        for row in connection.execute(
+            "SELECT message_id FROM coordination_wakes WHERE state='INFLIGHT'"
+        )
+    )
+    for row in connection.execute(
+        "SELECT target_key FROM executor_attempts WHERE target_kind='message' "
+        "AND state IN ('RESERVED','LAUNCHING','RUNNING')"
+    ):
+        target_key = str(row[0])
+        if re.fullmatch(r"[1-9][0-9]*", target_key) is not None:
+            active_message_ids.add(int(target_key))
+    if not active_message_ids:
+        return
+    placeholders = ",".join("?" for _value in active_message_ids)
+    rows = connection.execute(
+        f"SELECT id,payload_json FROM coordination_messages "
+        f"WHERE id IN ({placeholders}) ORDER BY id",
+        tuple(sorted(active_message_ids)),
+    ).fetchall()
+    if len(rows) != len(active_message_ids):
+        raise PullBufferError("READY_QUARANTINE_ACTIVE_MESSAGE_INVALID")
+    for row in rows:
+        try:
+            payload = json.loads(
+                row["payload_json"], object_pairs_hook=_strict_object
+            )
+        except (TypeError, json.JSONDecodeError, PullBufferError) as exc:
+            raise PullBufferError(
+                "READY_QUARANTINE_ACTIVE_MESSAGE_INVALID"
+            ) from exc
+        if _message_lineage(payload) is None:
+            raise PullBufferError("READY_QUARANTINE_ACTIVE_MESSAGE_INVALID")
+
+
+def _ready_message_rows(
+    connection: sqlite3.Connection, repository: str, issue_number: int
+) -> list[sqlite3.Row]:
+    rows: list[sqlite3.Row] = []
+    for row in connection.execute(
+        "SELECT * FROM coordination_messages ORDER BY id"
+    ):
+        try:
+            payload = json.loads(
+                row["payload_json"], object_pairs_hook=_strict_object
+            )
+        except (TypeError, json.JSONDecodeError, PullBufferError):
+            continue
+        lineage = _message_lineage(payload)
+        if (
+            lineage is not None
+            and lineage[0] == repository
+            and lineage[1] == issue_number
+        ):
+            rows.append(row)
+    return rows
+
+
+def _ready_execution_lineage_rows(
+    connection: sqlite3.Connection,
+    repository: str,
+    issue_number: int,
+) -> dict[str, list[sqlite3.Row]]:
+    claim_events = [
+        event
+        for event, _message, lineage in _claimed_execution_lineage_rows(
+            connection
+        )
+        if lineage[0] == repository and lineage[1] == issue_number
+    ]
+    return {
+        "claim_events": claim_events,
+        "terminal_closeout_packets": connection.execute(
+            "SELECT * FROM coordination_terminal_closeout_packets "
+            "WHERE repository=? AND issue_number=? ORDER BY closeout_key",
+            (repository, issue_number),
+        ).fetchall(),
+        "pre_push_gates": connection.execute(
+            "SELECT * FROM coordination_pre_push_gates "
+            "WHERE repository=? AND issue_number=? ORDER BY id",
+            (repository, issue_number),
+        ).fetchall(),
+        "pre_push_publications": connection.execute(
+            "SELECT * FROM coordination_pre_push_publications "
+            "WHERE repository=? AND issue_number=? ORDER BY id",
+            (repository, issue_number),
+        ).fetchall(),
+    }
+
+
+def _active_ready_resources(
+    connection: sqlite3.Connection,
+    item: sqlite3.Row,
+    readiness: sqlite3.Row | None,
+) -> dict[str, list[Any]]:
+    repository = str(item["repository"])
+    issue_number = int(item["issue_number"])
+    all_messages = _ready_message_rows(connection, repository, issue_number)
+    all_message_ids = {int(row["id"]) for row in all_messages}
+    active_messages = {
+        int(row["id"]): {
+            "id": int(row["id"]),
+            "state": row["state"],
+            "topic": row["topic"],
+            "payload_sha256": row["payload_sha256"],
+        }
+        for row in all_messages
+        if row["state"] in {"PREPARED", "CLAIMED"}
+    }
+    if (
+        readiness is not None
+        and readiness["message_id"] is not None
+    ):
+        readiness_message = connection.execute(
+            "SELECT * FROM coordination_messages WHERE id=?",
+            (int(readiness["message_id"]),),
+        ).fetchone()
+        if readiness_message is not None:
+            all_message_ids.add(int(readiness_message["id"]))
+            if readiness_message["state"] in {"PREPARED", "CLAIMED"}:
+                active_messages[int(readiness_message["id"])] = {
+                    "id": int(readiness_message["id"]),
+                    "state": readiness_message["state"],
+                    "topic": readiness_message["topic"],
+                    "payload_sha256": readiness_message["payload_sha256"],
+                }
+    watches = connection.execute(
+        "SELECT watch_key,generation,state FROM coordination_terminal_watches "
+        "WHERE repository=? AND issue_number=? "
+        "AND state IN ('PENDING_CLAIM','ACTIVE') ORDER BY watch_key",
+        (repository, issue_number),
+    ).fetchall()
+    watch_keys = {str(row["watch_key"]) for row in watches}
+    readiness_attempt_id = (
+        None
+        if readiness is None or readiness["attempt_id"] is None
+        else str(readiness["attempt_id"])
+    )
+    attempts: list[dict[str, Any]] = []
+    for row in connection.execute(
+        "SELECT attempt_id,target_kind,target_key,state,lineage_repository,"
+        "lineage_issue_number,lineage_generation FROM executor_attempts "
+        "WHERE state IN ('RESERVED','LAUNCHING','RUNNING') ORDER BY attempt_id"
+    ):
+        direct = (
+            row["lineage_repository"] == repository
+            and row["lineage_issue_number"] is not None
+            and int(row["lineage_issue_number"]) == issue_number
+        )
+        targeted = (
+            readiness_attempt_id is not None
+            and str(row["attempt_id"]) == readiness_attempt_id
+        ) or (
+            row["target_kind"] == "message"
+            and str(row["target_key"])
+            in {str(value) for value in all_message_ids}
+        ) or (
+            row["target_kind"] == "terminal_watch"
+            and str(row["target_key"]) in watch_keys
+        )
+        if direct or targeted:
+            attempts.append(
+                {
+                    "attempt_id": str(row["attempt_id"]),
+                    "state": row["state"],
+                    "target_kind": row["target_kind"],
+                    "target_key": row["target_key"],
+                    "lineage_generation": row["lineage_generation"],
+                }
+            )
+    wakes = [
+        {
+            "wake_key": str(row["wake_key"]),
+            "message_id": int(row["message_id"]),
+            "state": row["state"],
+        }
+        for row in connection.execute(
+            "SELECT wake_key,message_id,state FROM coordination_wakes "
+            "WHERE state='INFLIGHT' ORDER BY wake_key"
+        )
+        if int(row["message_id"]) in all_message_ids
+    ]
+    allocations = [
+        {
+            "version": int(row["version"]),
+            "status": row["status"],
+            "allocation_class": row["allocation_class"],
+        }
+        for row in connection.execute(
+            "SELECT status,allocation_class,version "
+            "FROM coordination_supervisor_items WHERE repository=? "
+            "AND issue_number=? AND allocation_class IN ('ACTIVE','RETAINED')",
+            (repository, issue_number),
+        )
+    ]
+    execution_lineage = _ready_execution_lineage_rows(
+        connection, repository, issue_number
+    )
+    return {
+        "messages": [active_messages[key] for key in sorted(active_messages)],
+        "watches": [
+            {
+                "watch_key": str(row["watch_key"]),
+                "generation": int(row["generation"]),
+                "state": row["state"],
+            }
+            for row in watches
+        ],
+        "attempts": attempts,
+        "wakes": wakes,
+        "allocations": allocations,
+        "claim_events": [
+            {
+                "id": int(row["id"]),
+                "entity_key": row["entity_key"],
+                "payload_sha256": row["payload_sha256"],
+            }
+            for row in execution_lineage["claim_events"]
+        ],
+        "terminal_closeout_packets": [
+            {
+                "closeout_key": row["closeout_key"],
+                "generation": int(row["generation"]),
+                "packet_sha256": row["packet_sha256"],
+            }
+            for row in execution_lineage["terminal_closeout_packets"]
+        ],
+        "pre_push_gates": [
+            {
+                "id": int(row["id"]),
+                "generation": int(row["generation"]),
+                "state": row["state"],
+                "head_sha": row["head_sha"],
+            }
+            for row in execution_lineage["pre_push_gates"]
+        ],
+        "pre_push_publications": [
+            {
+                "id": int(row["id"]),
+                "generation": int(row["generation"]),
+                "state": row["state"],
+                "gate_id": int(row["gate_id"]),
+            }
+            for row in execution_lineage["pre_push_publications"]
+        ],
+    }
+
+
+def _ready_lineage_evidence_sha256(
+    connection: sqlite3.Connection,
+    item: sqlite3.Row,
+    pointer: sqlite3.Row | None,
+    candidate: sqlite3.Row | None,
+    readiness: sqlite3.Row | None,
+) -> str:
+    repository = str(item["repository"])
+    issue_number = int(item["issue_number"])
+    messages = _ready_message_rows(connection, repository, issue_number)
+    message_ids = {int(row["id"]) for row in messages}
+    if readiness is not None and readiness["message_id"] is not None:
+        message_ids.add(int(readiness["message_id"]))
+    watches = connection.execute(
+        "SELECT * FROM coordination_terminal_watches WHERE repository=? "
+        "AND issue_number=? ORDER BY watch_key",
+        (repository, issue_number),
+    ).fetchall()
+    watch_keys = {str(row["watch_key"]) for row in watches}
+    readiness_attempt_id = (
+        None
+        if readiness is None or readiness["attempt_id"] is None
+        else str(readiness["attempt_id"])
+    )
+    attempts = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT * FROM executor_attempts ORDER BY attempt_id"
+        )
+        if (
+            readiness_attempt_id is not None
+            and str(row["attempt_id"]) == readiness_attempt_id
+        )
+        or (
+            row["lineage_repository"] == repository
+            and row["lineage_issue_number"] is not None
+            and int(row["lineage_issue_number"]) == issue_number
+        )
+        or (
+            row["target_kind"] == "message"
+            and str(row["target_key"])
+            in {str(value) for value in message_ids}
+        )
+        or (
+            row["target_kind"] == "terminal_watch"
+            and str(row["target_key"]) in watch_keys
+        )
+    ]
+    execution_lineage = _ready_execution_lineage_rows(
+        connection, repository, issue_number
+    )
+    pointer_finalizations: list[sqlite3.Row] = []
+    if pointer is not None:
+        pointer_finalizations = connection.execute(
+            "SELECT * FROM portfolio_ready_finalizations "
+            "WHERE ready_candidate_id=? ORDER BY id",
+            (int(pointer["candidate_id"]),),
+        ).fetchall()
+    target_finalizations = connection.execute(
+        "SELECT * FROM portfolio_ready_finalizations WHERE repository=? "
+        "AND issue_number=? ORDER BY id",
+        (repository, issue_number),
+    ).fetchall()
+    finalizations = {
+        int(row["id"]): dict(row)
+        for row in [*target_finalizations, *pointer_finalizations]
+    }
+    evidence = {
+        "item": dict(item),
+        "source": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT current.*,snapshot.payload_json "
+                "FROM github_current current JOIN github_snapshots snapshot "
+                "USING(repository,object_kind,object_number,payload_sha256) "
+                "WHERE current.repository=? AND current.object_kind='issue' "
+                "AND current.object_number=?",
+                (repository, issue_number),
+            )
+        ],
+        "pointer": None if pointer is None else dict(pointer),
+        "pointer_candidate": None if candidate is None else dict(candidate),
+        "candidates": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM portfolio_pull_buffer_candidates "
+                "WHERE repository=? AND issue_number=? ORDER BY id",
+                (repository, issue_number),
+            )
+        ],
+        "retirements": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT retirement.* FROM portfolio_pull_buffer_retirements "
+                "retirement LEFT JOIN portfolio_pull_buffer_candidates candidate "
+                "ON candidate.id=retirement.candidate_id "
+                "WHERE (retirement.repository=? AND retirement.issue_number=?) "
+                "OR retirement.candidate_id=? ORDER BY retirement.id",
+                (
+                    repository,
+                    issue_number,
+                    -1 if pointer is None else int(pointer["candidate_id"]),
+                ),
+            )
+        ],
+        "readiness_current": None if readiness is None else dict(readiness),
+        "campaigns": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM portfolio_readiness_campaigns WHERE repository=? "
+                "AND issue_number=? ORDER BY id",
+                (repository, issue_number),
+            )
+        ],
+        "gates": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT gate.* FROM portfolio_readiness_gates gate "
+                "JOIN portfolio_readiness_campaigns campaign "
+                "ON campaign.id=gate.campaign_id WHERE campaign.repository=? "
+                "AND campaign.issue_number=? ORDER BY gate.id",
+                (repository, issue_number),
+            )
+        ],
+        "receipts": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT receipt.* FROM portfolio_readiness_receipts receipt "
+                "JOIN portfolio_readiness_campaigns campaign "
+                "ON campaign.id=receipt.campaign_id "
+                "WHERE campaign.repository=? AND campaign.issue_number=? "
+                "ORDER BY receipt.id",
+                (repository, issue_number),
+            )
+        ],
+        "receipt_pickups": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT pickup.* FROM portfolio_readiness_receipt_pickups pickup "
+                "JOIN portfolio_readiness_campaigns campaign "
+                "ON campaign.id=pickup.campaign_id "
+                "WHERE campaign.repository=? AND campaign.issue_number=? "
+                "ORDER BY pickup.campaign_id",
+                (repository, issue_number),
+            )
+        ],
+        "finalizations": [finalizations[key] for key in sorted(finalizations)],
+        "dirty_events": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM portfolio_dirty_events WHERE repository=? "
+                "AND issue_number=? ORDER BY id",
+                (repository, issue_number),
+            )
+        ],
+        "messages": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM coordination_messages ORDER BY id"
+            )
+            if int(row["id"]) in message_ids
+        ],
+        "wakes": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM coordination_wakes ORDER BY wake_key"
+            )
+            if int(row["message_id"]) in message_ids
+        ],
+        "watches": [dict(row) for row in watches],
+        "attempts": attempts,
+        "claim_events": [
+            dict(row) for row in execution_lineage["claim_events"]
+        ],
+        "terminal_closeout_packets": [
+            dict(row)
+            for row in execution_lineage["terminal_closeout_packets"]
+        ],
+        "pre_push_gates": [
+            dict(row) for row in execution_lineage["pre_push_gates"]
+        ],
+        "pre_push_publications": [
+            dict(row)
+            for row in execution_lineage["pre_push_publications"]
+        ],
+        "supervisor_item": [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM coordination_supervisor_items WHERE repository=? "
+                "AND issue_number=?",
+                (repository, issue_number),
+            )
+        ],
+    }
+    return digest_json(evidence)
+
+
+def ready_quarantine_inventory(
+    connection: sqlite3.Connection, repository: str
+) -> dict[str, Any]:
+    """Return one deterministic repository-scoped READY cutover inventory."""
+
+    if (
+        not isinstance(repository, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+    ):
+        raise PullBufferError("READY_QUARANTINE_REPOSITORY_INVALID")
+    _require_ready_quarantine_schema(connection)
+    _claimed_execution_lineage_rows(connection)
+    _validate_active_ready_message_lineage(connection)
+    items: list[dict[str, Any]] = []
+    for item in connection.execute(
+        "SELECT * FROM coordination_items WHERE repository=? AND status='READY' "
+        "ORDER BY issue_number",
+        (repository,),
+    ):
+        pointer = connection.execute(
+            "SELECT * FROM portfolio_pull_buffer_current WHERE repository=? "
+            "AND issue_number=?",
+            (repository, int(item["issue_number"])),
+        ).fetchone()
+        candidate = None
+        candidate_retired = False
+        if pointer is not None:
+            candidate = connection.execute(
+                "SELECT * FROM portfolio_pull_buffer_candidates WHERE id=?",
+                (int(pointer["candidate_id"]),),
+            ).fetchone()
+            candidate_retired = connection.execute(
+                "SELECT 1 FROM portfolio_pull_buffer_retirements "
+                "WHERE candidate_id=?",
+                (int(pointer["candidate_id"]),),
+            ).fetchone() is not None
+        readiness = connection.execute(
+            "SELECT * FROM portfolio_readiness_current WHERE repository=? "
+            "AND issue_number=?",
+            (repository, int(item["issue_number"])),
+        ).fetchone()
+        attestation_error = _exact_ready_attestation_error(
+            connection, item, candidate
+        )
+        resources = _active_ready_resources(connection, item, readiness)
+        lineage_sha256 = _ready_lineage_evidence_sha256(
+            connection, item, pointer, candidate, readiness
+        )
+        items.append(
+            {
+                "repository": repository,
+                "issue_number": int(item["issue_number"]),
+                "generation": int(item["generation"]),
+                "item_version": int(item["version"]),
+                "source_payload_sha256": item["source_payload_sha256"],
+                "allocation_class": item["allocation_class"],
+                "accountable_session_id": item["accountable_session_id"],
+                "lease_manifest_sha256": item["lease_manifest_sha256"],
+                "capacity": {
+                    "development_units": int(item["development_units"]),
+                    "shared_units": int(item["shared_units"]),
+                    "sre_units": int(item["sre_units"]),
+                },
+                "pointer": None
+                if pointer is None
+                else {
+                    "candidate_id": int(pointer["candidate_id"]),
+                    "updated_at": pointer["updated_at"],
+                },
+                "candidate": None
+                if candidate is None
+                else {
+                    "id": int(candidate["id"]),
+                    "repository": candidate["repository"],
+                    "issue_number": int(candidate["issue_number"]),
+                    "generation": int(candidate["generation"]),
+                    "item_version": int(candidate["item_version"]),
+                    "source_payload_sha256": candidate["source_payload_sha256"],
+                    "state": candidate["state"],
+                    "candidate_sha256": candidate["candidate_sha256"],
+                    "readiness_campaign_id": candidate["readiness_campaign_id"],
+                    "readiness_current_version": candidate[
+                        "readiness_current_version"
+                    ],
+                    "readiness_receipt_id": candidate["readiness_receipt_id"],
+                },
+                "candidate_retired": candidate_retired,
+                "readiness": None
+                if readiness is None
+                else {
+                    "campaign_id": int(readiness["campaign_id"]),
+                    "state": readiness["state"],
+                    "version": int(readiness["version"]),
+                    "receipt_id": readiness["receipt_id"],
+                    "finalized_candidate_id": readiness[
+                        "finalized_candidate_id"
+                    ],
+                    "finalized_event_id": readiness["finalized_event_id"],
+                },
+                "attestation": (
+                    "ATTESTED" if attestation_error is None else attestation_error
+                ),
+                "active_resources": resources,
+                "lineage_evidence_sha256": lineage_sha256,
+            }
+        )
+    payload = {
+        "schema": READY_QUARANTINE_INVENTORY_SCHEMA,
+        "repository": repository,
+        "items": items,
+    }
+    return {**payload, "inventory_sha256": digest_json(payload)}
+
+
+def _validate_ready_quarantine_request(request: Any) -> None:
+    required = {
+        "schema",
+        "repository",
+        "operation_key",
+        "source_harness_repository",
+        "source_harness_main_sha",
+        "expected_ready_inventory_sha256",
+        "cutover_authority_sha256",
+    }
+    if not isinstance(request, dict) or set(request) != required:
+        raise PullBufferError("READY_QUARANTINE_REQUEST_INVALID")
+    if (
+        request.get("schema") != READY_QUARANTINE_REQUEST_SCHEMA
+        or not isinstance(request.get("repository"), str)
+        or re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", request["repository"]
+        )
+        is None
+        or request.get("source_harness_repository") != HARNESS_REPOSITORY
+        or not isinstance(request.get("operation_key"), str)
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", request["operation_key"]
+        )
+        is None
+        or not isinstance(request.get("source_harness_main_sha"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", request["source_harness_main_sha"])
+        is None
+        or any(
+            not isinstance(request.get(field), str)
+            or re.fullmatch(r"[0-9a-f]{64}", request[field]) is None
+            for field in (
+                "expected_ready_inventory_sha256",
+                "cutover_authority_sha256",
+            )
+        )
+    ):
+        raise PullBufferError("READY_QUARANTINE_REQUEST_INVALID")
+
+
+def _validate_ready_quarantine_receipt_row(
+    row: sqlite3.Row, request: dict[str, Any], request_sha256: str
+) -> dict[str, Any]:
+    try:
+        receipt = json.loads(
+            row["receipt_json"], object_pairs_hook=_strict_object
+        )
+    except (TypeError, json.JSONDecodeError, PullBufferError) as exc:
+        raise PullBufferError("READY_QUARANTINE_RECEIPT_INVALID") from exc
+    receipt_keys = {
+        "schema",
+        "operation_key",
+        "request_sha256",
+        "repository",
+        "source_harness_repository",
+        "source_harness_main_sha",
+        "cutover_authority_sha256",
+        "before_ready_inventory_sha256",
+        "after_ready_inventory_sha256",
+        "inspected_items",
+        "preserved",
+        "quarantined",
+        "counts",
+        "empty_ready_inventory",
+        "terminal_result",
+        "created_at",
+    }
+    inspected = receipt.get("inspected_items")
+    preserved = receipt.get("preserved")
+    quarantined = receipt.get("quarantined")
+    counts = receipt.get("counts")
+    inspected_keys = {
+        "issue_number", "generation", "item_version",
+        "source_payload_sha256", "candidate_id", "candidate_sha256",
+        "attestation", "lineage_evidence_sha256",
+    }
+    preserved_keys = {
+        "issue_number", "generation", "item_version",
+        "source_payload_sha256", "candidate_id", "candidate_sha256",
+        "lineage_evidence_sha256",
+    }
+    quarantined_keys = {
+        "issue_number", "generation", "source_payload_sha256", "capacity",
+        "prior_item_version", "hold_item_version",
+        "prior_lineage_evidence_sha256", "hold_lineage_evidence_sha256",
+        "candidate_id", "candidate_sha256", "retirement_id",
+        "readiness_campaign_id", "prior_readiness_version",
+        "hold_readiness_version", "attestation_error",
+    }
+    sha_fields = {
+        "request_sha256", "cutover_authority_sha256",
+        "before_ready_inventory_sha256", "after_ready_inventory_sha256",
+    }
+
+    def valid_sha256(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    def valid_candidate_pair(item: dict[str, Any]) -> bool:
+        candidate_id = item["candidate_id"]
+        candidate_sha256 = item["candidate_sha256"]
+        return (candidate_id is None and candidate_sha256 is None) or (
+            type(candidate_id) is int
+            and candidate_id > 0
+            and valid_sha256(candidate_sha256)
+        )
+
+    try:
+        if not isinstance(receipt, dict) or set(receipt) != receipt_keys:
+            raise ValueError
+        if (
+            row["request_sha256"] != request_sha256
+            or row["operation_key"] != request["operation_key"]
+            or row["repository"] != request["repository"]
+            or row["source_harness_repository"]
+            != request["source_harness_repository"]
+            or row["source_harness_main_sha"]
+            != request["source_harness_main_sha"]
+            or row["cutover_authority_sha256"]
+            != request["cutover_authority_sha256"]
+            or canonical_json(receipt) != row["receipt_json"]
+            or digest_json(receipt) != row["receipt_sha256"]
+            or receipt["schema"] != READY_QUARANTINE_RECEIPT_SCHEMA
+            or receipt["request_sha256"] != request_sha256
+            or receipt["operation_key"] != request["operation_key"]
+            or receipt["repository"] != request["repository"]
+            or receipt["source_harness_repository"]
+            != request["source_harness_repository"]
+            or receipt["source_harness_main_sha"]
+            != request["source_harness_main_sha"]
+            or receipt["cutover_authority_sha256"]
+            != request["cutover_authority_sha256"]
+            or receipt["before_ready_inventory_sha256"]
+            != row["before_ready_inventory_sha256"]
+            or receipt["before_ready_inventory_sha256"]
+            != request["expected_ready_inventory_sha256"]
+            or receipt["after_ready_inventory_sha256"]
+            != row["after_ready_inventory_sha256"]
+            or any(not valid_sha256(receipt[field]) for field in sha_fields)
+            or not isinstance(receipt["created_at"], str)
+            or not receipt["created_at"].endswith("Z")
+            or receipt["created_at"] != row["created_at"]
+            or receipt["terminal_result"] != "COMPLETE"
+            or type(receipt["empty_ready_inventory"]) is not bool
+        ):
+            raise ValueError
+        if (
+            not isinstance(inspected, list)
+            or not isinstance(preserved, list)
+            or not isinstance(quarantined, list)
+            or not isinstance(counts, dict)
+            or set(counts) != {"inspected", "preserved", "quarantined"}
+            or any(
+                type(value) is not int or value < 0
+                for value in counts.values()
+            )
+            or counts
+            != {
+                "inspected": int(row["inspected_count"]),
+                "preserved": int(row["preserved_count"]),
+                "quarantined": int(row["quarantined_count"]),
+            }
+            or counts["inspected"] != len(inspected)
+            or counts["preserved"] != len(preserved)
+            or counts["quarantined"] != len(quarantined)
+            or counts["preserved"] + counts["quarantined"]
+            != counts["inspected"]
+            or receipt["empty_ready_inventory"] != (not inspected)
+        ):
+            raise ValueError
+        if any(
+            not isinstance(item, dict) or set(item) != inspected_keys
+            for item in inspected
+        ) or any(
+            not isinstance(item, dict) or set(item) != preserved_keys
+            for item in preserved
+        ) or any(
+            not isinstance(item, dict) or set(item) != quarantined_keys
+            for item in quarantined
+        ):
+            raise ValueError
+
+        inspected_numbers = [item["issue_number"] for item in inspected]
+        preserved_numbers = [item["issue_number"] for item in preserved]
+        quarantined_numbers = [item["issue_number"] for item in quarantined]
+        if any(
+            type(number) is not int or number <= 0
+            for number in [
+                *inspected_numbers, *preserved_numbers, *quarantined_numbers,
+            ]
+        ):
+            raise ValueError
+        if (
+            inspected_numbers != sorted(inspected_numbers)
+            or preserved_numbers != sorted(preserved_numbers)
+            or quarantined_numbers != sorted(quarantined_numbers)
+            or len(set(inspected_numbers)) != len(inspected_numbers)
+            or len(set(preserved_numbers)) != len(preserved_numbers)
+            or len(set(quarantined_numbers)) != len(quarantined_numbers)
+            or set(preserved_numbers) & set(quarantined_numbers)
+            or set(inspected_numbers)
+            != set(preserved_numbers) | set(quarantined_numbers)
+        ):
+            raise ValueError
+        inspected_by_issue = {
+            item["issue_number"]: item for item in inspected
+        }
+        for item in inspected:
+            if (
+                type(item["generation"]) is not int
+                or item["generation"] < 0
+                or type(item["item_version"]) is not int
+                or item["item_version"] < 0
+                or not valid_sha256(item["source_payload_sha256"])
+                or not valid_sha256(item["lineage_evidence_sha256"])
+                or not valid_candidate_pair(item)
+                or item["attestation"] not in {
+                    "ATTESTED",
+                    "READINESS_ATTESTATION_DRIFT",
+                    "READINESS_ATTESTATION_INVALID",
+                    "READINESS_ATTESTATION_MISSING",
+                }
+                or (
+                    item["attestation"] == "ATTESTED"
+                    and item["candidate_id"] is None
+                )
+            ):
+                raise ValueError
+        for item in preserved:
+            inspected_item = inspected_by_issue[item["issue_number"]]
+            if (
+                inspected_item["attestation"] != "ATTESTED"
+                or type(item["generation"]) is not int
+                or item["generation"] < 0
+                or type(item["item_version"]) is not int
+                or item["item_version"] < 0
+                or not valid_sha256(item["source_payload_sha256"])
+                or not valid_sha256(item["lineage_evidence_sha256"])
+                or not valid_candidate_pair(item)
+                or item["candidate_id"] is None
+                or any(
+                    item[field] != inspected_item[field]
+                    for field in preserved_keys
+                )
+            ):
+                raise ValueError
+        for item in quarantined:
+            inspected_item = inspected_by_issue[item["issue_number"]]
+            capacity = item["capacity"]
+            campaign_id = item["readiness_campaign_id"]
+            if (
+                inspected_item["attestation"] == "ATTESTED"
+                or type(item["generation"]) is not int
+                or item["generation"] < 0
+                or not valid_sha256(item["source_payload_sha256"])
+                or type(item["prior_item_version"]) is not int
+                or item["prior_item_version"] < 0
+                or item["hold_item_version"]
+                != item["prior_item_version"] + 1
+                or not valid_sha256(item["prior_lineage_evidence_sha256"])
+                or not valid_sha256(item["hold_lineage_evidence_sha256"])
+                or not valid_candidate_pair(item)
+                or (
+                    item["candidate_id"] is None
+                    and item["retirement_id"] is not None
+                )
+                or (
+                    item["candidate_id"] is not None
+                    and (
+                        type(item["retirement_id"]) is not int
+                        or item["retirement_id"] <= 0
+                    )
+                )
+                or not isinstance(capacity, dict)
+                or set(capacity)
+                != {"development_units", "shared_units", "sre_units"}
+                or any(
+                    type(value) is not int or value < 0
+                    for value in capacity.values()
+                )
+                or (
+                    campaign_id is None
+                    and (
+                        item["prior_readiness_version"] is not None
+                        or item["hold_readiness_version"] is not None
+                    )
+                )
+                or (
+                    campaign_id is not None
+                    and (
+                        type(campaign_id) is not int
+                        or campaign_id <= 0
+                        or type(item["prior_readiness_version"]) is not int
+                        or item["prior_readiness_version"] < 0
+                        or item["hold_readiness_version"]
+                        != item["prior_readiness_version"] + 1
+                    )
+                )
+                or item["generation"] != inspected_item["generation"]
+                or item["source_payload_sha256"]
+                != inspected_item["source_payload_sha256"]
+                or item["prior_item_version"]
+                != inspected_item["item_version"]
+                or item["prior_lineage_evidence_sha256"]
+                != inspected_item["lineage_evidence_sha256"]
+                or item["candidate_id"] != inspected_item["candidate_id"]
+                or item["candidate_sha256"]
+                != inspected_item["candidate_sha256"]
+                or item["attestation_error"]
+                != inspected_item["attestation"]
+            ):
+                raise ValueError
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise PullBufferError("READY_QUARANTINE_RECEIPT_INVALID") from exc
+    return receipt
+
+
+def _validate_ready_quarantine_postconditions(
+    connection: sqlite3.Connection,
+    receipt: dict[str, Any],
+    current_inventory: dict[str, Any],
+) -> None:
+    if (
+        current_inventory["inventory_sha256"]
+        != receipt["after_ready_inventory_sha256"]
+    ):
+        raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+    current = {
+        int(item["issue_number"]): item
+        for item in current_inventory["items"]
+    }
+    preserved = {
+        int(item["issue_number"]): item for item in receipt["preserved"]
+    }
+    if set(current) != set(preserved):
+        raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+    for issue_number, expected in preserved.items():
+        observed = current[issue_number]
+        if (
+            observed["attestation"] != "ATTESTED"
+            or observed["generation"] != expected["generation"]
+            or observed["item_version"] != expected["item_version"]
+            or observed["source_payload_sha256"]
+            != expected["source_payload_sha256"]
+            or observed["candidate"] is None
+            or observed["candidate"]["id"] != expected["candidate_id"]
+            or observed["candidate"]["candidate_sha256"]
+            != expected["candidate_sha256"]
+            or observed["lineage_evidence_sha256"]
+            != expected["lineage_evidence_sha256"]
+        ):
+            raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+
+    repository = str(receipt["repository"])
+    for expected in receipt["quarantined"]:
+        issue_number = int(expected["issue_number"])
+        item = connection.execute(
+            "SELECT * FROM coordination_items WHERE repository=? "
+            "AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        pointer = connection.execute(
+            "SELECT * FROM portfolio_pull_buffer_current WHERE repository=? "
+            "AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        readiness = connection.execute(
+            "SELECT * FROM portfolio_readiness_current WHERE repository=? "
+            "AND issue_number=?",
+            (repository, issue_number),
+        ).fetchone()
+        if (
+            item is None
+            or pointer is not None
+            or item["status"] != "HOLD"
+            or item["allocation_class"] != "NONE"
+            or item["accountable_session_id"] is not None
+            or item["lease_manifest_sha256"] is not None
+            or int(item["generation"]) != int(expected["generation"])
+            or int(item["version"]) != int(expected["hold_item_version"])
+            or item["source_payload_sha256"]
+            != expected["source_payload_sha256"]
+            or any(
+                int(item[field]) != int(expected["capacity"][field])
+                for field in (
+                    "development_units", "shared_units", "sre_units"
+                )
+            )
+        ):
+            raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+        candidate_id = expected["candidate_id"]
+        if candidate_id is None:
+            if expected["retirement_id"] is not None:
+                raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+        else:
+            candidate = connection.execute(
+                "SELECT * FROM portfolio_pull_buffer_candidates WHERE id=?",
+                (int(candidate_id),),
+            ).fetchone()
+            retirement = connection.execute(
+                "SELECT * FROM portfolio_pull_buffer_retirements WHERE id=?",
+                (int(expected["retirement_id"]),),
+            ).fetchone()
+            reasons = [READY_QUARANTINE_REASON]
+            if (
+                candidate is None
+                or retirement is None
+                or candidate["repository"] != repository
+                or int(candidate["issue_number"]) != issue_number
+                or candidate["candidate_sha256"]
+                != expected["candidate_sha256"]
+                or int(retirement["candidate_id"]) != int(candidate_id)
+                or retirement["repository"] != repository
+                or int(retirement["issue_number"]) != issue_number
+                or retirement["reasons_json"] != canonical_json(reasons)
+                or retirement["reason_sha256"] != digest_json(reasons)
+                or retirement["retired_at"] != receipt["created_at"]
+            ):
+                raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+        campaign_id = expected["readiness_campaign_id"]
+        if campaign_id is None:
+            if readiness is not None:
+                raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+        elif (
+            readiness is None
+            or int(readiness["campaign_id"]) != int(campaign_id)
+            or readiness["state"] != "HOLD"
+            or int(readiness["version"])
+            != int(expected["hold_readiness_version"])
+            or readiness["last_error"] != READY_QUARANTINE_REASON
+        ):
+            raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+        if (
+            _ready_lineage_evidence_sha256(
+                connection, item, None, None, readiness
+            )
+            != expected["hold_lineage_evidence_sha256"]
+        ):
+            raise PullBufferError("READY_QUARANTINE_REPLAY_STATE_DRIFT")
+
+
+def _ready_quarantine_unsafe_reasons(item: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if item["allocation_class"] != "NONE":
+        reasons.append("ALLOCATION")
+    if item["accountable_session_id"] is not None:
+        reasons.append("ACCOUNTABLE_ENDPOINT")
+    if item["lease_manifest_sha256"] is not None:
+        reasons.append("LEASE")
+    pointer = item["pointer"]
+    candidate = item["candidate"]
+    if pointer is not None and (
+        candidate is None
+        or candidate["id"] != pointer["candidate_id"]
+        or candidate["repository"] != item.get("repository")
+        or candidate["issue_number"] != item["issue_number"]
+        or item["candidate_retired"]
+    ):
+        reasons.append("POINTER_SCOPE")
+    resources = item["active_resources"]
+    if resources["messages"]:
+        reasons.append("MESSAGE")
+    if resources["watches"]:
+        reasons.append("WATCH")
+    if resources["attempts"]:
+        reasons.append("ATTEMPT")
+    if resources["wakes"]:
+        reasons.append("WAKE")
+    if resources["allocations"]:
+        reasons.append("ALLOCATION")
+    if resources["claim_events"]:
+        reasons.append("MESSAGE_CLAIM")
+    if resources["terminal_closeout_packets"]:
+        reasons.append("TERMINAL_CLOSEOUT")
+    if resources["pre_push_gates"]:
+        reasons.append("PRE_PUSH_GATE")
+    if resources["pre_push_publications"]:
+        reasons.append("PRE_PUSH_PUBLICATION")
+    return reasons
+
+
+def _require_ready_quarantine_writer_configuration(
+    connection: sqlite3.Connection,
+) -> None:
+    try:
+        journal_mode = str(
+            connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        foreign_keys = int(
+            connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        synchronous = int(
+            connection.execute("PRAGMA synchronous").fetchone()[0]
+        )
+    except (IndexError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise PullBufferError(
+            "READY_QUARANTINE_DATABASE_DURABILITY_INVALID"
+        ) from exc
+    if journal_mode != "wal" or foreign_keys != 1 or synchronous != 2:
+        raise PullBufferError("READY_QUARANTINE_DATABASE_DURABILITY_INVALID")
+
+
+@contextmanager
+def _ready_quarantine_transaction(
+    connection: sqlite3.Connection,
+) -> Any:
+    if connection.in_transaction:
+        raise PullBufferError("READY_QUARANTINE_TRANSACTION_CONFLICT")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        lowered = str(exc).lower()
+        if "readonly" in lowered or "read-only" in lowered:
+            raise PullBufferError("READY_QUARANTINE_DATABASE_NOT_WRITABLE") from exc
+        raise
+    try:
+        yield
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def quarantine_unattested_ready(
+    store: CoordinationStore | sqlite3.Connection,
+    request: dict[str, Any],
+    *,
+    now: str,
+    failpoint: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Atomically quarantine every safe unattested READY item in one repository."""
+
+    _validate_ready_quarantine_request(request)
+    if not isinstance(now, str) or not now.endswith("Z"):
+        raise PullBufferError("READY_QUARANTINE_TIMESTAMP_INVALID")
+    connection = (
+        store if isinstance(store, sqlite3.Connection) else store.connection
+    )
+    _require_ready_quarantine_schema(connection)
+    _require_ready_quarantine_writer_configuration(connection)
+    request_sha256 = digest_json(request)
+    with _ready_quarantine_transaction(connection):
+        existing = connection.execute(
+            "SELECT * FROM portfolio_ready_quarantines WHERE operation_key=?",
+            (request["operation_key"],),
+        ).fetchone()
+        same_request = connection.execute(
+            "SELECT * FROM portfolio_ready_quarantines WHERE request_sha256=?",
+            (request_sha256,),
+        ).fetchone()
+        existing_scope = connection.execute(
+            "SELECT * FROM portfolio_ready_quarantines WHERE repository=? "
+            "AND source_harness_main_sha=?",
+            (
+                request["repository"],
+                request["source_harness_main_sha"],
+            ),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_sha256"] != request_sha256:
+                raise PullBufferError("READY_QUARANTINE_OPERATION_KEY_CONFLICT")
+            receipt = _validate_ready_quarantine_receipt_row(
+                existing, request, request_sha256
+            )
+            current = ready_quarantine_inventory(
+                connection, request["repository"]
+            )
+            try:
+                _validate_ready_quarantine_postconditions(
+                    connection, receipt, current
+                )
+            except PullBufferError:
+                raise
+            except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+                raise PullBufferError(
+                    "READY_QUARANTINE_REPLAY_STATE_DRIFT"
+                ) from exc
+            return receipt
+        if same_request is not None:
+            raise PullBufferError("READY_QUARANTINE_REQUEST_KEY_CONFLICT")
+        if existing_scope is not None:
+            raise PullBufferError("READY_QUARANTINE_SCOPE_CONFLICT")
+
+        before = ready_quarantine_inventory(connection, request["repository"])
+        if not hmac.compare_digest(
+            before["inventory_sha256"],
+            request["expected_ready_inventory_sha256"],
+        ):
+            raise PullBufferError("READY_QUARANTINE_INVENTORY_DRIFT")
+        unsafe = []
+        for item in before["items"]:
+            reasons = _ready_quarantine_unsafe_reasons(item)
+            if reasons:
+                unsafe.append(
+                    {
+                        "issue_number": item["issue_number"],
+                        "reasons": reasons,
+                    }
+                )
+        if unsafe:
+            raise PullBufferError(
+                "READY_QUARANTINE_ACTIVE_LINEAGE:"
+                + canonical_json(unsafe)
+            )
+
+        preserved = [
+            {
+                "issue_number": item["issue_number"],
+                "generation": item["generation"],
+                "item_version": item["item_version"],
+                "source_payload_sha256": item["source_payload_sha256"],
+                "candidate_id": item["candidate"]["id"],
+                "candidate_sha256": item["candidate"]["candidate_sha256"],
+                "lineage_evidence_sha256": item[
+                    "lineage_evidence_sha256"
+                ],
+            }
+            for item in before["items"]
+            if item["attestation"] == "ATTESTED"
+        ]
+        quarantined: list[dict[str, Any]] = []
+        for item in before["items"]:
+            if item["attestation"] == "ATTESTED":
+                continue
+            issue_number = int(item["issue_number"])
+            candidate = item["candidate"]
+            readiness = item["readiness"]
+            if failpoint is not None:
+                failpoint(f"before_quarantine:{issue_number}")
+            retirement_id = None
+            if candidate is not None:
+                prior_retirement = connection.execute(
+                    "SELECT 1 FROM portfolio_pull_buffer_retirements "
+                    "WHERE candidate_id=?",
+                    (int(candidate["id"]),),
+                ).fetchone()
+                if prior_retirement is not None:
+                    raise PullBufferError(
+                        "READY_QUARANTINE_RETIREMENT_CONFLICT"
+                    )
+                reasons = [READY_QUARANTINE_REASON]
+                _retire_pointer(
+                    connection,
+                    repository=request["repository"],
+                    issue_number=issue_number,
+                    candidate_id=int(candidate["id"]),
+                    reasons=reasons,
+                    now=now,
+                )
+                retirement = connection.execute(
+                    "SELECT * FROM portfolio_pull_buffer_retirements "
+                    "WHERE candidate_id=?",
+                    (int(candidate["id"]),),
+                ).fetchone()
+                if (
+                    retirement is None
+                    or retirement["repository"] != request["repository"]
+                    or int(retirement["issue_number"]) != issue_number
+                    or retirement["reasons_json"]
+                    != canonical_json(sorted(set(reasons)))
+                    or connection.execute(
+                        "SELECT 1 FROM portfolio_pull_buffer_current "
+                        "WHERE repository=? AND issue_number=?",
+                        (request["repository"], issue_number),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise PullBufferError("READY_QUARANTINE_POINTER_FENCE_LOST")
+                retirement_id = int(retirement["id"])
+                if failpoint is not None:
+                    failpoint(f"after_pointer:{issue_number}")
+            changed = connection.execute(
+                "UPDATE coordination_items SET status='HOLD', version=version+1, "
+                "updated_at=? WHERE repository=? AND issue_number=? "
+                "AND status='READY' AND allocation_class='NONE' "
+                "AND accountable_session_id IS NULL "
+                "AND lease_manifest_sha256 IS NULL AND generation=? "
+                "AND version=? AND source_payload_sha256=? "
+                "AND development_units=? AND shared_units=? AND sre_units=?",
+                (
+                    now,
+                    request["repository"],
+                    issue_number,
+                    int(item["generation"]),
+                    int(item["item_version"]),
+                    item["source_payload_sha256"],
+                    int(item["capacity"]["development_units"]),
+                    int(item["capacity"]["shared_units"]),
+                    int(item["capacity"]["sre_units"]),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise PullBufferError("READY_QUARANTINE_ITEM_FENCE_LOST")
+            held_item = connection.execute(
+                "SELECT * FROM coordination_items WHERE repository=? "
+                "AND issue_number=?",
+                (request["repository"], issue_number),
+            ).fetchone()
+            if (
+                held_item is None
+                or held_item["status"] != "HOLD"
+                or held_item["allocation_class"] != "NONE"
+                or held_item["accountable_session_id"] is not None
+                or held_item["lease_manifest_sha256"] is not None
+            ):
+                raise PullBufferError("READY_QUARANTINE_ITEM_FENCE_LOST")
+            if failpoint is not None:
+                failpoint(f"after_item:{issue_number}")
+            held_readiness_version = None
+            held_readiness = None
+            if readiness is not None:
+                changed = connection.execute(
+                    "UPDATE portfolio_readiness_current SET state='HOLD', "
+                    "version=version+1, updated_at=?, last_error=? "
+                    "WHERE repository=? AND issue_number=? AND campaign_id=? "
+                    "AND state=? AND version=?",
+                    (
+                        now,
+                        READY_QUARANTINE_REASON,
+                        request["repository"],
+                        issue_number,
+                        int(readiness["campaign_id"]),
+                        readiness["state"],
+                        int(readiness["version"]),
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise PullBufferError(
+                        "READY_QUARANTINE_READINESS_FENCE_LOST"
+                    )
+                held_readiness_version = int(readiness["version"]) + 1
+                held_readiness = connection.execute(
+                    "SELECT * FROM portfolio_readiness_current "
+                    "WHERE repository=? AND issue_number=?",
+                    (request["repository"], issue_number),
+                ).fetchone()
+                if (
+                    held_readiness is None
+                    or held_readiness["state"] != "HOLD"
+                    or int(held_readiness["version"])
+                    != held_readiness_version
+                    or held_readiness["last_error"]
+                    != READY_QUARANTINE_REASON
+                ):
+                    raise PullBufferError(
+                        "READY_QUARANTINE_READINESS_FENCE_LOST"
+                    )
+                if failpoint is not None:
+                    failpoint(f"after_readiness:{issue_number}")
+            hold_lineage_sha256 = _ready_lineage_evidence_sha256(
+                connection,
+                held_item,
+                None,
+                None,
+                held_readiness,
+            )
+            quarantined.append(
+                {
+                    "issue_number": issue_number,
+                    "generation": int(item["generation"]),
+                    "source_payload_sha256": item["source_payload_sha256"],
+                    "capacity": item["capacity"],
+                    "prior_item_version": int(item["item_version"]),
+                    "hold_item_version": int(item["item_version"]) + 1,
+                    "prior_lineage_evidence_sha256": item[
+                        "lineage_evidence_sha256"
+                    ],
+                    "hold_lineage_evidence_sha256": hold_lineage_sha256,
+                    "candidate_id": None
+                    if candidate is None
+                    else int(candidate["id"]),
+                    "candidate_sha256": None
+                    if candidate is None
+                    else candidate["candidate_sha256"],
+                    "retirement_id": retirement_id,
+                    "readiness_campaign_id": None
+                    if readiness is None
+                    else int(readiness["campaign_id"]),
+                    "prior_readiness_version": None
+                    if readiness is None
+                    else int(readiness["version"]),
+                    "hold_readiness_version": held_readiness_version,
+                    "attestation_error": item["attestation"],
+                }
+            )
+
+        after = ready_quarantine_inventory(connection, request["repository"])
+        after_items = {
+            int(item["issue_number"]): item for item in after["items"]
+        }
+        if (
+            any(item["attestation"] != "ATTESTED" for item in after["items"])
+            or set(after_items)
+            != {int(item["issue_number"]) for item in preserved}
+            or any(
+                after_items[int(item["issue_number"])][
+                    "lineage_evidence_sha256"
+                ]
+                != item["lineage_evidence_sha256"]
+                for item in preserved
+            )
+        ):
+            raise PullBufferError("READY_QUARANTINE_POSTCONDITION_FAILED")
+        counts = {
+            "inspected": len(before["items"]),
+            "preserved": len(preserved),
+            "quarantined": len(quarantined),
+        }
+        receipt = {
+            "schema": READY_QUARANTINE_RECEIPT_SCHEMA,
+            "operation_key": request["operation_key"],
+            "request_sha256": request_sha256,
+            "repository": request["repository"],
+            "source_harness_repository": request[
+                "source_harness_repository"
+            ],
+            "source_harness_main_sha": request["source_harness_main_sha"],
+            "cutover_authority_sha256": request[
+                "cutover_authority_sha256"
+            ],
+            "before_ready_inventory_sha256": before["inventory_sha256"],
+            "after_ready_inventory_sha256": after["inventory_sha256"],
+            "inspected_items": [
+                {
+                    "issue_number": item["issue_number"],
+                    "generation": item["generation"],
+                    "item_version": item["item_version"],
+                    "source_payload_sha256": item[
+                        "source_payload_sha256"
+                    ],
+                    "candidate_id": None
+                    if item["candidate"] is None
+                    else item["candidate"]["id"],
+                    "candidate_sha256": None
+                    if item["candidate"] is None
+                    else item["candidate"]["candidate_sha256"],
+                    "attestation": item["attestation"],
+                    "lineage_evidence_sha256": item[
+                        "lineage_evidence_sha256"
+                    ],
+                }
+                for item in before["items"]
+            ],
+            "preserved": preserved,
+            "quarantined": quarantined,
+            "counts": counts,
+            "empty_ready_inventory": not before["items"],
+            "terminal_result": "COMPLETE",
+            "created_at": now,
+        }
+        receipt_sha256 = digest_json(receipt)
+        if failpoint is not None:
+            failpoint("before_receipt")
+        connection.execute(
+            "INSERT INTO portfolio_ready_quarantines("
+            "operation_key,repository,request_sha256,source_harness_repository,"
+            "source_harness_main_sha,cutover_authority_sha256,"
+            "before_ready_inventory_sha256,after_ready_inventory_sha256,"
+            "inspected_count,preserved_count,quarantined_count,receipt_sha256,"
+            "receipt_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                request["operation_key"],
+                request["repository"],
+                request_sha256,
+                request["source_harness_repository"],
+                request["source_harness_main_sha"],
+                request["cutover_authority_sha256"],
+                before["inventory_sha256"],
+                after["inventory_sha256"],
+                counts["inspected"],
+                counts["preserved"],
+                counts["quarantined"],
+                receipt_sha256,
+                canonical_json(receipt),
+                now,
+            ),
+        )
+        if failpoint is not None:
+            failpoint("after_receipt")
+            failpoint("before_commit")
+        return receipt
 
 
 def _validate_zero_wip_preparation_request(request: Any) -> None:
@@ -5878,6 +8277,10 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     register = subparsers.add_parser("register")
     register.add_argument("--packet", type=Path, required=True)
+    ready_inventory = subparsers.add_parser("ready-quarantine-inventory")
+    ready_inventory.add_argument("--repository", required=True)
+    quarantine = subparsers.add_parser("quarantine-unattested-ready")
+    quarantine.add_argument("--request", type=Path, required=True)
     prepare = subparsers.add_parser("prepare-zero-wip")
     prepare.add_argument("--request", type=Path, required=True)
     finalize = subparsers.add_parser("finalize-ready")
@@ -5984,25 +8387,71 @@ def main() -> int:
         ) as exc:
             print(canonical_json({"phase": "HOLD", "error": str(exc)}))
             return 1
+    quarantine_request: dict[str, Any] | None = None
+    if args.command == "quarantine-unattested-ready":
+        try:
+            quarantine_request = _read_ready_quarantine_request(
+                DEFAULT_DATABASE, args.request
+            )
+        except (OSError, PullBufferError, ValueError) as exc:
+            print(canonical_json({"phase": "HOLD", "error": str(exc)}))
+            return 1
     read_only = (
         args.command in {
             "show", "readiness-discover", "readiness-show",
+            "ready-quarantine-inventory",
         }
         or (args.command == "audit" and not args.record)
         or (args.command == "readiness-evaluate" and not args.record)
     )
     audit_store: CoordinationStore | None = None
-    if args.command == "audit" and args.record:
-        audit_store = CoordinationStore(DEFAULT_DATABASE)
-        connection = audit_store.connection
-    elif read_only:
-        connection = open_owner_database_readonly(DEFAULT_DATABASE)
-    else:
-        prepare_owner_database(DEFAULT_DATABASE)
-        connection = sqlite3.connect(DEFAULT_DATABASE)
-        connection.row_factory = sqlite3.Row
+    connection: sqlite3.Connection | None = None
     try:
-        if args.command.startswith("readiness-"):
+        if args.command == "audit" and args.record:
+            audit_store = CoordinationStore(DEFAULT_DATABASE)
+            connection = audit_store.connection
+        elif read_only:
+            connection = open_owner_database_readonly(DEFAULT_DATABASE)
+        elif args.command == "quarantine-unattested-ready":
+            validated_database = validate_owner_database(DEFAULT_DATABASE)
+            connection = sqlite3.connect(
+                validated_database, isolation_level=None, timeout=5
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA synchronous=FULL")
+        else:
+            prepare_owner_database(DEFAULT_DATABASE)
+            connection = sqlite3.connect(DEFAULT_DATABASE)
+            connection.row_factory = sqlite3.Row
+    except (
+        CoordinationError,
+        OSError,
+        PullBufferError,
+        RegistryError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
+        if audit_store is not None:
+            audit_store.close()
+        elif connection is not None:
+            connection.close()
+        print(canonical_json({"phase": "HOLD", "error": str(exc)}))
+        return 1
+    if connection is None:
+        print(canonical_json({"phase": "HOLD", "error": "DATABASE_OPEN_FAILED"}))
+        return 1
+    try:
+        if args.command == "ready-quarantine-inventory":
+            result = ready_quarantine_inventory(connection, args.repository)
+        elif args.command == "quarantine-unattested-ready":
+            if quarantine_request is None:
+                raise PullBufferError("READY_QUARANTINE_REQUEST_INVALID")
+            result = quarantine_unattested_ready(
+                connection, quarantine_request, now=utc_now()
+            )
+        elif args.command.startswith("readiness-"):
             from kanban_readiness import (
                 attach as attach_readiness,
                 apply_readiness_decision,
@@ -6200,6 +8649,7 @@ def main() -> int:
 
             ensure_pull_buffer_schema(connection)
             ensure_readiness_schema(connection)
+            _require_ready_quarantine_schema(connection)
             result = {"state": "INITIALIZED"}
         elif args.command == "audit":
             result = audit_pull_buffer(
@@ -6214,6 +8664,7 @@ def main() -> int:
     except (
         CoordinationError,
         PullBufferError,
+        RegistryError,
         OSError,
         sqlite3.Error,
         ValueError,

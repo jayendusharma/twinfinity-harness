@@ -104,6 +104,86 @@ sha256sum "$backup_file"
 
 Record the backup digest and purpose outside the database without embedding credentials or mutable queue contents.
 
+## Stopped-state READY quarantine before convergence
+
+Do not start either convergence-capable supervisor against historical `READY`
+state. After separately authorized source installation, stop every database
+writer, prove that no role attempt is active, and take the owner-safe backup
+above. Keep the database and a canonical request file beneath the owner-only
+coordination root. The quarantine command validates an existing database; it
+does not create the database or implicitly install schema.
+
+Perform the cutover in this order:
+
+1. Run the explicit schema-readiness step while writers remain stopped.
+2. Read the complete repository-scoped `READY` inventory and retain its
+   `inventory_sha256`.
+3. Review a canonical request binding that digest, one unique operation key,
+   the exact installed and merged harness main, and the applicable cutover
+   authority digest.
+4. Run `quarantine-unattested-ready` once and retain its complete canonical
+   receipt. Exact replay returns that receipt; changed bytes or post-state
+   drift return `HOLD` without another transition.
+5. Read the inventory again. Every remaining `READY` item must report
+   `ATTESTED`; safe invalid lineages are `HOLD/NONE`, have no current
+   pull-buffer pointer, and retain their immutable history.
+6. Complete routing and installed-runtime attestation. Only then may a
+   separately authorized operator start convergence.
+
+From the installed skill root, the schema and inventory commands are:
+
+```bash
+pull_buffer=scripts/kanban_pull_buffer.py
+repository=twinfinityai/twinfinityapp
+/usr/bin/python3 "$pull_buffer" initialize
+/usr/bin/python3 "$pull_buffer" ready-quarantine-inventory \
+  --repository "$repository"
+```
+
+The request file must be UTF-8 canonical JSON with no trailing newline and
+exactly these fields (placeholders are not executable values):
+
+```json
+{"cutover_authority_sha256":"<64-lowercase-hex>","expected_ready_inventory_sha256":"<inventory-sha256>","operation_key":"<unique-operation-key>","repository":"twinfinityai/twinfinityapp","schema":"twinfinity-ready-quarantine-request/v1","source_harness_main_sha":"<40-lowercase-hex>","source_harness_repository":"jayendusharma/twinfinity-harness"}
+```
+
+After placing that reviewed file beneath the coordination root as an
+owner-owned, nonsymlink, single-link regular file with exact mode `0600`, run
+and read back. The command opens this request nonblocking, verifies its stable
+descriptor identity before and after a bounded read of at most 1 MiB plus one
+sentinel byte, and rejects a FIFO, device, oversized file, wrong mode, link, or
+owner before opening the database:
+
+```bash
+request=/home/ubuntu/.codex/twinfinity-coordination/ready-quarantine-request.json
+chmod 0600 "$request"
+/usr/bin/python3 "$pull_buffer" quarantine-unattested-ready --request "$request"
+/usr/bin/python3 "$pull_buffer" quarantine-unattested-ready --request "$request"
+/usr/bin/python3 "$pull_buffer" ready-quarantine-inventory \
+  --repository "$repository"
+/usr/bin/python3 scripts/executor_registry.py \
+  --config references/twinfinity-executor-registry.toml audit-config
+/usr/bin/python3 scripts/archive_readiness_audit.py
+```
+
+The first quarantine invocation uses one `BEGIN IMMEDIATE` transaction across
+classification, pointer retirement, item/readiness holds, and the immutable
+receipt. It derives validity only from SQLite relationships. A foreign pointer,
+stale inventory, row-version drift, any active or retained READY lineage, or any
+partial failure rolls the whole operation back. The command never deletes or
+rewrites immutable candidates, campaigns, receipts, finalizations, dirty
+events, admissions, messages, watches, attempts, or audits. Reserved pre-push
+publications and their retained execution lineage are both inventory-bound and
+an operation-wide active-lineage fence. Every durable `MESSAGE_CLAIMED` event is
+enumerated independently before READY-item classification. A claimed execution
+message with a missing link, malformed or duplicate-keyed JSON, missing
+identity, conflicting repository or issue identity, or a payload-digest
+conflict returns
+`READY_QUARANTINE_CLAIMED_MESSAGE_INVALID` before the first durable write,
+including when the message is already `COMPLETE` or `HOLD`. None of these source
+commands installs files, changes endpoints, manages systemd, runs convergence,
+or touches a provider or TwinfinityApp checkout.
+
 ## Owner-safe disaster restore
 
 Use file restore only after exact authorization, all writers are stopped, and newer coordination state loss is explicitly accepted. Endpoint rollback is the normal routing recovery.
