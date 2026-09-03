@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import run_harness_baseline_validations as baseline_runner
+import source_install_atom as install_atom
 
 
 class HarnessBaselineValidationRunnerTests(unittest.TestCase):
@@ -1257,6 +1259,174 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             ),
         )
 
+    def _actual_mixed_install_fixture(
+        self,
+        root: Path,
+        order: tuple[str, ...],
+    ) -> dict[str, object]:
+        source_root = root / "producer-source"
+        destination_root = root / "producer-destination"
+        source_root.mkdir(mode=0o700)
+        destination_root.mkdir(mode=0o700)
+        definitions = {
+            install_atom.ABSENT_TO_PRESENT: (
+                "absent.txt",
+                "installed/absent.txt",
+                b"absent-new\n",
+                None,
+            ),
+            install_atom.CHANGED_PRESENT: (
+                "changed.txt",
+                "installed/changed.txt",
+                b"changed-new\n",
+                b"changed-old\n",
+            ),
+            install_atom.SOURCE_EQUAL: (
+                "equal-é.txt",
+                "installed/equal-é.txt",
+                b"equal\n",
+                b"equal\n",
+            ),
+        }
+        for (
+            source_name,
+            _destination_name,
+            source_bytes,
+            _prior,
+        ) in definitions.values():
+            source = source_root / source_name
+            source.write_bytes(source_bytes)
+            source.chmod(0o600)
+        self._git(source_root, "init", "-q")
+        self._git(source_root, "add", ".")
+        self._git(
+            source_root,
+            "-c",
+            "user.name=Twinfinity Test",
+            "-c",
+            "user.email=test@twinfinity.invalid",
+            "commit",
+            "-qm",
+            "producer fixture",
+        )
+        source_commit = self._git(source_root, "rev-parse", "HEAD")
+
+        entries: list[dict] = []
+        for equivalence in order:
+            source_name, destination_name, source_bytes, prior_bytes = definitions[
+                equivalence
+            ]
+            destination = destination_root / destination_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if prior_bytes is None:
+                prior = {"state": "ABSENT"}
+            else:
+                destination.write_bytes(prior_bytes)
+                destination.chmod(0o600)
+                prior = {
+                    "state": "PRESENT",
+                    "sha256": hashlib.sha256(prior_bytes).hexdigest(),
+                    "mode": 0o600,
+                    "uid": os.getuid(),
+                    "gid": os.getgid(),
+                }
+            entries.append(
+                {
+                    "source_path": source_name,
+                    "destination_path": destination_name,
+                    "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                    "source_mode": 0o600,
+                    "destination_mode": 0o600,
+                    "destination_uid": os.getuid(),
+                    "destination_gid": os.getgid(),
+                    "destination_prior": prior,
+                }
+            )
+        manifest_payload = install_atom.seal_manifest(
+            {
+                "schema": install_atom.SCHEMA,
+                "atom_id": "baseline-mixed-producer",
+                "source_commit": source_commit,
+                "entries": entries,
+            },
+            destination_root,
+        )
+        manifest_path = root / "producer-manifest.json"
+        manifest_path.write_text(
+            install_atom.canonical_json(manifest_payload), encoding="utf-8"
+        )
+        manifest_path.chmod(0o600)
+        manifest = baseline_runner.load_install_manifest(manifest_path)
+        stage_root = root / "producer-stage"
+        staged_receipt = install_atom.stage_atom(
+            manifest=manifest_payload,
+            source_root=source_root,
+            destination_root=destination_root,
+            stage_root=stage_root,
+        )
+        return {
+            "source_root": source_root,
+            "destination_root": destination_root,
+            "stage_root": stage_root,
+            "rollback_root": root / "producer-rollback",
+            "manifest_payload": manifest_payload,
+            "manifest": manifest,
+            "staged_receipt": staged_receipt,
+        }
+
+    @staticmethod
+    def _producer_installed_receipt(
+        manifest: baseline_runner.InstallManifest,
+        target_root: Path,
+    ) -> dict:
+        entries = [
+            {
+                **install_atom._entry_receipt_binding(entry),
+                "destination_parent_identity": (
+                    baseline_runner._destination_parent_identity(
+                        target_root, entry["destination_path"]
+                    )
+                ),
+            }
+            for entry in manifest.entries
+        ]
+        prepared = install_atom._seal_receipt(
+            {
+                "schema": install_atom.SCHEMA,
+                "manifest_sha256": manifest.manifest_sha256,
+                "destination_root_identity": manifest.destination_root_identity,
+                "entries": entries,
+                "lifecycle": {
+                    "schema": install_atom.LIFECYCLE_SCHEMA,
+                    "operation": "INSTALL",
+                    "predecessor_state": None,
+                    "predecessor_receipt_sha256": None,
+                    "predecessor_receipt": None,
+                    "transition": install_atom.BEGIN_INSTALL,
+                    "result_state": "PREPARED",
+                },
+                "state": "PREPARED",
+            }
+        )
+        return install_atom._seal_receipt(
+            {
+                "schema": install_atom.SCHEMA,
+                "manifest_sha256": manifest.manifest_sha256,
+                "destination_root_identity": manifest.destination_root_identity,
+                "entries": entries,
+                "lifecycle": {
+                    "schema": install_atom.LIFECYCLE_SCHEMA,
+                    "operation": "INSTALL",
+                    "predecessor_state": "PREPARED",
+                    "predecessor_receipt_sha256": prepared["receipt_sha256"],
+                    "predecessor_receipt": prepared,
+                    "transition": install_atom.PREPARED_TO_INSTALLED,
+                    "result_state": "INSTALLED",
+                },
+                "state": "INSTALLED",
+            }
+        )
+
     def test_install_manifest_scopes_mutable_root_and_rejects_wrong_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tool_name, tempfile.TemporaryDirectory() as target_name:
             tool_root = Path(tool_name)
@@ -2039,30 +2209,8 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             )
             self.assertNotEqual(root_profile_destination, mapping[planner_profile])
 
-            installed_payload = {
-                "schema": baseline_runner.INSTALL_MANIFEST_SCHEMA,
-                "manifest_sha256": manifest.manifest_sha256,
-                "destination_root_identity": manifest.destination_root_identity,
-                "entries": [
-                    {
-                        "destination_path": entry["destination_path"],
-                        "destination_prior": entry["destination_prior"],
-                        "installed_sha256": entry["source_sha256"],
-                        "installed_mode": entry["destination_mode"],
-                        "installed_uid": entry["destination_uid"],
-                        "installed_gid": entry["destination_gid"],
-                        "destination_parent_identity": (
-                            baseline_runner._destination_parent_identity(
-                                target_root, entry["destination_path"]
-                            )
-                        ),
-                    }
-                    for entry in manifest.entries
-                ],
-                "state": "INSTALLED",
-            }
-            installed_payload["receipt_sha256"] = (
-                baseline_runner._install_receipt_digest(installed_payload)
+            installed_payload = self._producer_installed_receipt(
+                manifest, target_root
             )
             installer_evidence = evidence_root / "rollback.json"
             installer_evidence.write_text(
@@ -2362,177 +2510,398 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                 tool_identity="git:" + "a" * 40,
             )
 
-    def test_staged_and_installed_require_disjoint_verified_installer_state(self) -> None:
-        with tempfile.TemporaryDirectory() as tool_name, tempfile.TemporaryDirectory() as target_name:
-            tool_root = Path(tool_name)
-            target_root = Path(target_name)
-            relative = "skills/tool.py"
-            source = tool_root / relative
-            source.parent.mkdir(parents=True)
-            source.write_text("value = 1\n", encoding="utf-8")
-            source.chmod(0o644)
-            manifest = self._install_manifest(
-                tool_root, target_root, (relative,)
-            )
-            entry = manifest.entries[0]
-            staged_payload = {
-                "schema": baseline_runner.INSTALL_MANIFEST_SCHEMA,
-                "manifest_sha256": manifest.manifest_sha256,
-                "destination_root_identity": manifest.destination_root_identity,
-                "entries": [
-                    {
-                        "destination_path": relative,
-                        "sha256": entry["source_sha256"],
-                        "mode": entry["destination_mode"],
-                    }
-                ],
-                "state": "STAGED",
-            }
-            staged_payload["receipt_sha256"] = (
-                baseline_runner._install_receipt_digest(staged_payload)
-            )
-            staged_path = target_root / baseline_runner.INSTALL_STAGE_RECEIPT
-            staged_path.write_text(
-                baseline_runner.canonical_json(staged_payload), encoding="utf-8"
-            )
-            staged_path.chmod(0o600)
-            staged_digest, staged_identity = (
-                baseline_runner._verify_installer_state_evidence(
-                    target_root,
-                    "staged-install-atom",
-                    manifest,
-                    staged_path,
+    def test_actual_producer_receipts_accept_all_classes_in_mixed_order(self) -> None:
+        classes = (
+            install_atom.ABSENT_TO_PRESENT,
+            install_atom.CHANGED_PRESENT,
+            install_atom.SOURCE_EQUAL,
+        )
+        for order in itertools.permutations(classes):
+            with self.subTest(order=order), tempfile.TemporaryDirectory() as name:
+                fixture = self._actual_mixed_install_fixture(Path(name), order)
+                manifest = fixture["manifest"]
+                stage_root = fixture["stage_root"]
+                staged_path = stage_root / install_atom.STAGE_RECEIPT
+                staged_digest, staged_identity = (
+                    baseline_runner._verify_installer_state_evidence(
+                        stage_root,
+                        "staged-install-atom",
+                        manifest,
+                        staged_path,
+                    )
                 )
+                staged_receipt = fixture["staged_receipt"]
+                self.assertEqual(
+                    list(order),
+                    [
+                        entry["install_equivalence"]
+                        for entry in staged_receipt["entries"]
+                    ],
+                )
+                self.assertEqual(
+                    hashlib.sha256(staged_path.read_bytes()).hexdigest(),
+                    staged_digest,
+                )
+                self.assertEqual(
+                    baseline_runner._target_filesystem_identity_sha256(stage_root),
+                    staged_identity,
+                )
+
+                installed_receipt = install_atom.apply_atom(
+                    manifest=fixture["manifest_payload"],
+                    source_root=fixture["source_root"],
+                    destination_root=fixture["destination_root"],
+                    stage_root=stage_root,
+                    rollback_root=fixture["rollback_root"],
+                    confirmation=(
+                        f"INSTALL:{fixture['manifest_payload']['manifest_sha256']}"
+                    ),
+                )
+                installed_path = (
+                    fixture["rollback_root"] / install_atom.ROLLBACK_RECEIPT
+                )
+                installed_digest, installed_identity = (
+                    baseline_runner._verify_installer_state_evidence(
+                        fixture["destination_root"],
+                        "installed-runtime",
+                        manifest,
+                        installed_path,
+                    )
+                )
+                self.assertEqual(
+                    list(order),
+                    [
+                        entry["install_equivalence"]
+                        for entry in installed_receipt["entries"]
+                    ],
+                )
+                self.assertEqual(
+                    "PREPARED",
+                    installed_receipt["lifecycle"]["predecessor_state"],
+                )
+                self.assertEqual(
+                    installed_receipt["lifecycle"]["predecessor_receipt_sha256"],
+                    installed_receipt["lifecycle"]["predecessor_receipt"][
+                        "receipt_sha256"
+                    ],
+                )
+                self.assertEqual(
+                    hashlib.sha256(installed_path.read_bytes()).hexdigest(),
+                    installed_digest,
+                )
+                self.assertEqual(
+                    baseline_runner._target_filesystem_identity_sha256(
+                        fixture["destination_root"]
+                    ),
+                    installed_identity,
+                )
+                self.assertNotEqual(staged_identity, installed_identity)
+
+    def test_actual_receipts_reject_legacy_and_resealed_adversarial_shapes(
+        self,
+    ) -> None:
+        order = (
+            install_atom.CHANGED_PRESENT,
+            install_atom.ABSENT_TO_PRESENT,
+            install_atom.SOURCE_EQUAL,
+        )
+        with tempfile.TemporaryDirectory() as name:
+            fixture = self._actual_mixed_install_fixture(Path(name), order)
+            manifest = fixture["manifest"]
+            stage_root = fixture["stage_root"]
+            staged_path = stage_root / install_atom.STAGE_RECEIPT
+            staged_receipt = fixture["staged_receipt"]
+
+            legacy_stage = copy.deepcopy(staged_receipt)
+            legacy_stage["entries"] = [
+                {
+                    "destination_path": entry["destination_path"],
+                    "sha256": entry["installed_sha256"],
+                    "mode": entry["installed_mode"],
+                }
+                for entry in staged_receipt["entries"]
+            ]
+            stage_mutations = {
+                "legacy": legacy_stage,
+                "unknown-field": {
+                    **copy.deepcopy(staged_receipt),
+                    "caller_claim": True,
+                },
+                "unknown-class": copy.deepcopy(staged_receipt),
+                "caller-authored-allowed-class": copy.deepcopy(staged_receipt),
+                "omission": copy.deepcopy(staged_receipt),
+                "duplication": copy.deepcopy(staged_receipt),
+                "reordering": copy.deepcopy(staged_receipt),
+                "source-path": copy.deepcopy(staged_receipt),
+                "source-sha256": copy.deepcopy(staged_receipt),
+                "source-mode": copy.deepcopy(staged_receipt),
+                "destination-path": copy.deepcopy(staged_receipt),
+                "destination-prior": copy.deepcopy(staged_receipt),
+                "installed-sha256": copy.deepcopy(staged_receipt),
+                "installed-mode": copy.deepcopy(staged_receipt),
+                "installed-uid": copy.deepcopy(staged_receipt),
+                "installed-gid": copy.deepcopy(staged_receipt),
+                "manifest": copy.deepcopy(staged_receipt),
+                "destination-root": copy.deepcopy(staged_receipt),
+                "state": copy.deepcopy(staged_receipt),
+            }
+            stage_mutations["unknown-class"]["entries"][0][
+                "install_equivalence"
+            ] = "CALLER_AUTHORED"
+            stage_mutations["caller-authored-allowed-class"]["entries"][0][
+                "install_equivalence"
+            ] = install_atom.SOURCE_EQUAL
+            stage_mutations["omission"]["entries"][0].pop("source_mode")
+            stage_mutations["duplication"]["entries"].append(
+                copy.deepcopy(stage_mutations["duplication"]["entries"][0])
             )
-            self.assertRegex(staged_digest, r"^[0-9a-f]{64}$")
-            self.assertRegex(staged_identity, r"^[0-9a-f]{64}$")
-            tampered_stage = dict(staged_payload)
-            tampered_stage["receipt_sha256"] = "f" * 64
+            stage_mutations["reordering"]["entries"].reverse()
+            stage_mutations["source-path"]["entries"][0]["source_path"] = (
+                "substituted.txt"
+            )
+            stage_mutations["source-sha256"]["entries"][0]["source_sha256"] = (
+                "0" * 64
+            )
+            stage_mutations["source-mode"]["entries"][0]["source_mode"] = 0o644
+            stage_mutations["destination-path"]["entries"][0][
+                "destination_path"
+            ] = "installed/substituted.txt"
+            stage_mutations["destination-prior"]["entries"][0][
+                "destination_prior"
+            ]["sha256"] = "0" * 64
+            stage_mutations["installed-sha256"]["entries"][0][
+                "installed_sha256"
+            ] = "0" * 64
+            stage_mutations["installed-mode"]["entries"][0][
+                "installed_mode"
+            ] = 0o644
+            stage_mutations["installed-uid"]["entries"][0]["installed_uid"] += 1
+            stage_mutations["installed-gid"]["entries"][0]["installed_gid"] += 1
+            stage_mutations["manifest"]["manifest_sha256"] = "0" * 64
+            changed_root = stage_mutations["destination-root"][
+                "destination_root_identity"
+            ]
+            changed_root["canonical_path_sha256"] = "0" * 64
+            changed_root["identity_sha256"] = install_atom.digest_json(
+                {
+                    "schema": changed_root["schema"],
+                    "canonical_path_sha256": changed_root[
+                        "canonical_path_sha256"
+                    ],
+                    "filesystem_identity_sha256": changed_root[
+                        "filesystem_identity_sha256"
+                    ],
+                }
+            )
+            stage_mutations["state"]["state"] = "PASS"
+            for mutation, payload in stage_mutations.items():
+                with self.subTest(root_kind="staged", mutation=mutation):
+                    payload["receipt_sha256"] = install_atom.receipt_digest(payload)
+                    staged_path.write_text(
+                        install_atom.canonical_json(payload), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(
+                        baseline_runner.BaselineError,
+                        "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
+                    ):
+                        baseline_runner._verify_installer_state_evidence(
+                            stage_root,
+                            "staged-install-atom",
+                            manifest,
+                            staged_path,
+                        )
+            invalid_digest = copy.deepcopy(staged_receipt)
+            invalid_digest["receipt_sha256"] = "f" * 64
             staged_path.write_text(
-                baseline_runner.canonical_json(tampered_stage), encoding="utf-8"
+                install_atom.canonical_json(invalid_digest), encoding="utf-8"
             )
             with self.assertRaisesRegex(
                 baseline_runner.BaselineError,
                 "BASELINE_INSTALL_STATE_EVIDENCE_INVALID",
             ):
                 baseline_runner._verify_installer_state_evidence(
-                    target_root, "staged-install-atom", manifest, staged_path
+                    stage_root,
+                    "staged-install-atom",
+                    manifest,
+                    staged_path,
                 )
             staged_path.write_text(
-                baseline_runner.canonical_json(staged_payload), encoding="utf-8"
+                json.dumps(staged_receipt, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                baseline_runner.BaselineError,
+                "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
+            ):
+                baseline_runner._verify_installer_state_evidence(
+                    stage_root,
+                    "staged-install-atom",
+                    manifest,
+                    staged_path,
+                )
+            staged_path.write_text(
+                install_atom.canonical_json(staged_receipt), encoding="utf-8"
             )
 
-            original_target = tool_root / "original-target"
-            target_root.rename(original_target)
-            target_root.mkdir()
-            recreated_destination = target_root / relative
-            recreated_destination.parent.mkdir(parents=True)
-            recreated_destination.write_bytes(
-                (original_target / relative).read_bytes()
+            installed_receipt = install_atom.apply_atom(
+                manifest=fixture["manifest_payload"],
+                source_root=fixture["source_root"],
+                destination_root=fixture["destination_root"],
+                stage_root=stage_root,
+                rollback_root=fixture["rollback_root"],
+                confirmation=(
+                    f"INSTALL:{fixture['manifest_payload']['manifest_sha256']}"
+                ),
             )
-            recreated_destination.chmod(0o644)
-            staged_path = target_root / baseline_runner.INSTALL_STAGE_RECEIPT
-            staged_path.write_text(
-                baseline_runner.canonical_json(staged_payload), encoding="utf-8"
+            installed_path = (
+                fixture["rollback_root"] / install_atom.ROLLBACK_RECEIPT
             )
-            staged_path.chmod(0o600)
+            destination_root = fixture["destination_root"]
+            destination_stage_marker = (
+                destination_root / baseline_runner.INSTALL_STAGE_RECEIPT
+            )
+            destination_stage_marker.write_text("{}", encoding="utf-8")
+            destination_stage_marker.chmod(0o600)
+            with self.assertRaisesRegex(
+                baseline_runner.BaselineError,
+                "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
+            ):
+                baseline_runner._verify_installer_state_evidence(
+                    destination_root,
+                    "installed-runtime",
+                    manifest,
+                    installed_path,
+                )
+            destination_stage_marker.unlink()
+            in_target_evidence = destination_root / "installed-receipt.json"
+            in_target_evidence.write_text(
+                install_atom.canonical_json(installed_receipt), encoding="utf-8"
+            )
+            in_target_evidence.chmod(0o600)
+            with self.assertRaisesRegex(
+                baseline_runner.BaselineError,
+                "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
+            ):
+                baseline_runner._verify_installer_state_evidence(
+                    destination_root,
+                    "installed-runtime",
+                    manifest,
+                    in_target_evidence,
+                )
+            in_target_evidence.unlink()
+
+            legacy_installed = copy.deepcopy(installed_receipt)
+            legacy_installed.pop("lifecycle")
+            legacy_installed["entries"] = [
+                {
+                    key: value
+                    for key, value in entry.items()
+                    if key
+                    in {
+                        "destination_path",
+                        "destination_prior",
+                        "installed_sha256",
+                        "installed_mode",
+                        "installed_uid",
+                        "installed_gid",
+                        "destination_parent_identity",
+                    }
+                }
+                for entry in installed_receipt["entries"]
+            ]
+            nested_digest = copy.deepcopy(installed_receipt)
+            nested_digest["lifecycle"]["predecessor_receipt"][
+                "receipt_sha256"
+            ] = "0" * 64
+            resealed_inner = copy.deepcopy(installed_receipt)
+            predecessor = resealed_inner["lifecycle"]["predecessor_receipt"]
+            predecessor["entries"][0]["install_equivalence"] = (
+                install_atom.SOURCE_EQUAL
+            )
+            predecessor["receipt_sha256"] = install_atom.receipt_digest(predecessor)
+            resealed_inner["lifecycle"]["predecessor_receipt_sha256"] = (
+                predecessor["receipt_sha256"]
+            )
+            lifecycle_substitution = copy.deepcopy(installed_receipt)
+            lifecycle_substitution["lifecycle"]["operation"] = "ROLLBACK"
+            predecessor_state = copy.deepcopy(installed_receipt)
+            predecessor_state["lifecycle"]["predecessor_state"] = "INSTALLED"
+            transition = copy.deepcopy(installed_receipt)
+            transition["lifecycle"]["transition"] = (
+                install_atom.INSTALLED_TO_PREPARED
+            )
+            result_state = copy.deepcopy(installed_receipt)
+            result_state["lifecycle"]["result_state"] = "PREPARED"
+            top_state = copy.deepcopy(installed_receipt)
+            top_state["state"] = "PREPARED"
+            installed_reordering = copy.deepcopy(installed_receipt)
+            installed_reordering["entries"].reverse()
+            parent_substitution = copy.deepcopy(installed_receipt)
+            parent_substitution["entries"][0]["destination_parent_identity"][0][
+                "links"
+            ] += 1
+            installed_mutations = {
+                "legacy": legacy_installed,
+                "nested-digest": nested_digest,
+                "resealed-inner-evidence": resealed_inner,
+                "lifecycle-substitution": lifecycle_substitution,
+                "predecessor-state": predecessor_state,
+                "transition": transition,
+                "result-state": result_state,
+                "top-state": top_state,
+                "entry-reordering": installed_reordering,
+                "parent-substitution": parent_substitution,
+            }
+            tampered_path = Path(name) / "tampered-installed.json"
+            for mutation, payload in installed_mutations.items():
+                with self.subTest(root_kind="installed", mutation=mutation):
+                    payload["receipt_sha256"] = install_atom.receipt_digest(payload)
+                    tampered_path.write_text(
+                        install_atom.canonical_json(payload), encoding="utf-8"
+                    )
+                    tampered_path.chmod(0o600)
+                    with self.assertRaisesRegex(
+                        baseline_runner.BaselineError,
+                        "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
+                    ):
+                        baseline_runner._verify_installer_state_evidence(
+                            destination_root,
+                            "installed-runtime",
+                            manifest,
+                            tampered_path,
+                        )
+
+            installed_parent = destination_root / "installed"
+            old_parent = destination_root / "installed-old"
+            installed_parent.rename(old_parent)
+            installed_parent.mkdir()
+            for entry in manifest.entries:
+                relative = Path(entry["destination_path"])
+                source = old_parent / relative.relative_to("installed")
+                replacement = destination_root / relative
+                replacement.write_bytes(source.read_bytes())
+                replacement.chmod(stat.S_IMODE(source.stat().st_mode))
+            with self.assertRaisesRegex(
+                baseline_runner.BaselineError,
+                "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
+            ):
+                baseline_runner._verify_installer_state_evidence(
+                    destination_root,
+                    "installed-runtime",
+                    manifest,
+                    installed_path,
+                )
+
+            old_destination_root = Path(name) / "producer-destination-old"
+            destination_root.rename(old_destination_root)
+            destination_root.mkdir(mode=0o700)
             with self.assertRaisesRegex(
                 baseline_runner.BaselineError,
                 "BASELINE_INSTALL_ROOT_IDENTITY_MISMATCH",
             ):
                 baseline_runner._verify_installer_state_evidence(
-                    target_root,
-                    "staged-install-atom",
-                    manifest,
-                    staged_path,
-                )
-            staged_path.unlink()
-            manifest = self._install_manifest(tool_root, target_root, (relative,))
-            entry = manifest.entries[0]
-            replaced_identity = baseline_runner._target_filesystem_identity_sha256(
-                target_root
-            )
-            self.assertNotEqual(staged_identity, replaced_identity)
-
-            installed_payload = {
-                "schema": baseline_runner.INSTALL_MANIFEST_SCHEMA,
-                "manifest_sha256": manifest.manifest_sha256,
-                "destination_root_identity": (
-                    baseline_runner._destination_root_identity(target_root)
-                ),
-                "entries": [
-                    {
-                        "destination_path": relative,
-                        "destination_prior": entry["destination_prior"],
-                        "installed_sha256": entry["source_sha256"],
-                        "installed_mode": entry["destination_mode"],
-                        "installed_uid": entry["destination_uid"],
-                        "installed_gid": entry["destination_gid"],
-                        "destination_parent_identity": (
-                            baseline_runner._destination_parent_identity(
-                                target_root, relative
-                            )
-                        ),
-                    }
-                ],
-                "state": "INSTALLED",
-            }
-            installed_payload["receipt_sha256"] = (
-                baseline_runner._install_receipt_digest(installed_payload)
-            )
-            installed_path = tool_root / "rollback.json"
-            installed_path.write_text(
-                baseline_runner.canonical_json(installed_payload),
-                encoding="utf-8",
-            )
-            installed_path.chmod(0o600)
-            staged_path.write_text("{}", encoding="utf-8")
-            staged_path.chmod(0o600)
-            with self.assertRaisesRegex(
-                baseline_runner.BaselineError,
-                "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
-            ):
-                baseline_runner._verify_installer_state_evidence(
-                    target_root,
+                    destination_root,
                     "installed-runtime",
-                    manifest,
-                    installed_path,
-                )
-            staged_path.unlink()
-            installed_digest, installed_identity = (
-                baseline_runner._verify_installer_state_evidence(
-                    target_root,
-                    "installed-runtime",
-                    manifest,
-                    installed_path,
-                )
-            )
-            self.assertNotEqual(staged_digest, installed_digest)
-            self.assertEqual(replaced_identity, installed_identity)
-            installed_parent = target_root / "skills"
-            old_parent = target_root / "skills-old"
-            installed_parent.rename(old_parent)
-            installed_parent.mkdir()
-            replacement = installed_parent / "tool.py"
-            replacement.write_bytes((old_parent / "tool.py").read_bytes())
-            replacement.chmod(0o644)
-            with self.assertRaisesRegex(
-                baseline_runner.BaselineError,
-                "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
-            ):
-                baseline_runner._verify_installer_state_evidence(
-                    target_root,
-                    "installed-runtime",
-                    manifest,
-                    installed_path,
-                )
-            with self.assertRaisesRegex(
-                baseline_runner.BaselineError,
-                "BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH",
-            ):
-                baseline_runner._verify_installer_state_evidence(
-                    target_root,
-                    "staged-install-atom",
                     manifest,
                     installed_path,
                 )

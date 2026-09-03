@@ -25,6 +25,15 @@ STAGE_RECEIPT = ".twinfinity-source-install-stage.json"
 ROLLBACK_RECEIPT = "rollback.json"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+ABSENT_TO_PRESENT = "ABSENT_TO_PRESENT"
+CHANGED_PRESENT = "CHANGED_PRESENT"
+SOURCE_EQUAL = "SOURCE_EQUAL"
+LIFECYCLE_SCHEMA = "twinfinity-source-install-lifecycle/v1"
+BEGIN_INSTALL = "BEGIN_INSTALL"
+PREPARED_TO_INSTALLED = "PREPARED_TO_INSTALLED"
+INSTALLED_TO_PREPARED = "INSTALLED_TO_PREPARED"
+ROLLED_BACK_TO_PREPARED = "ROLLED_BACK_TO_PREPARED"
+PREPARED_TO_ROLLED_BACK = "PREPARED_TO_ROLLED_BACK"
 
 
 class SourceInstallAtomError(RuntimeError):
@@ -63,6 +72,20 @@ def _read_json(path: Path, error: str) -> dict[str, Any]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SourceInstallAtomError(error) from exc
     if not isinstance(value, dict):
+        raise SourceInstallAtomError(error)
+    return value
+
+
+def _read_canonical_json(path: Path, error: str) -> dict[str, Any]:
+    try:
+        contents = path.read_bytes()
+        value = json.loads(contents.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceInstallAtomError(error) from exc
+    if (
+        not isinstance(value, dict)
+        or contents != canonical_json(value).encode("utf-8")
+    ):
         raise SourceInstallAtomError(error)
     return value
 
@@ -705,6 +728,44 @@ def _validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
+def _install_equivalence(entry: dict[str, Any]) -> str:
+    """Derive the prior-to-target class exclusively from manifest-bound tuples."""
+
+    prior = entry["destination_prior"]
+    if prior["state"] == "ABSENT":
+        return ABSENT_TO_PRESENT
+    prior_tuple = (
+        prior["sha256"],
+        prior["mode"],
+        prior["uid"],
+        prior["gid"],
+    )
+    target_tuple = (
+        entry["source_sha256"],
+        entry["destination_mode"],
+        entry["destination_uid"],
+        entry["destination_gid"],
+    )
+    return SOURCE_EQUAL if prior_tuple == target_tuple else CHANGED_PRESENT
+
+
+def _entry_receipt_binding(entry: dict[str, Any]) -> dict[str, Any]:
+    """Bind the derivation inputs and result; callers never attest the class."""
+
+    return {
+        "source_path": entry["source_path"],
+        "source_sha256": entry["source_sha256"],
+        "source_mode": entry["source_mode"],
+        "destination_path": entry["destination_path"],
+        "destination_prior": dict(entry["destination_prior"]),
+        "installed_sha256": entry["source_sha256"],
+        "installed_mode": entry["destination_mode"],
+        "installed_uid": entry["destination_uid"],
+        "installed_gid": entry["destination_gid"],
+        "install_equivalence": _install_equivalence(entry),
+    }
+
+
 def _validate_prior_at(destination_descriptor: int, entry: dict[str, Any]) -> None:
     relative = _relative(entry["destination_path"])
     actual = _read_regular_at(destination_descriptor, relative, required=False)
@@ -823,7 +884,9 @@ def stage_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _require_destination_root_identity(manifest, destination_root)
             _write_file_exclusive(target, source.read_bytes(), entry["destination_mode"])
-            staged.append({"destination_path": relative.as_posix(), "sha256": _file_sha256(target), "mode": entry["destination_mode"]})
+            if _file_sha256(target) != entry["source_sha256"]:
+                raise SourceInstallAtomError("INSTALL_ATOM_STAGE_VALIDATION_FAILED")
+            staged.append(_entry_receipt_binding(entry))
         receipt = _seal_receipt({
             "schema": SCHEMA,
             "manifest_sha256": manifest["manifest_sha256"],
@@ -856,7 +919,9 @@ def validate_stage(
     )
     _verify_source_commit(source_root, manifest, entries)
     stage_root = _safe_root(stage_root)
-    receipt = _read_json(stage_root / STAGE_RECEIPT, "INSTALL_ATOM_STAGE_RECEIPT_INVALID")
+    receipt = _read_canonical_json(
+        stage_root / STAGE_RECEIPT, "INSTALL_ATOM_STAGE_RECEIPT_INVALID"
+    )
     if set(receipt) != {
         "schema",
         "manifest_sha256",
@@ -893,7 +958,7 @@ def validate_stage(
             or stat.S_IMODE(staged.lstat().st_mode) != entry["destination_mode"]
         ):
             raise SourceInstallAtomError("INSTALL_ATOM_STAGE_VALIDATION_FAILED")
-        observed.append({"destination_path": entry["destination_path"], "sha256": entry["source_sha256"], "mode": entry["destination_mode"]})
+        observed.append(_entry_receipt_binding(entry))
     if receipt.get("entries") != observed:
         raise SourceInstallAtomError("INSTALL_ATOM_STAGE_RECEIPT_INVALID")
     _require_destination_root_identity(manifest, destination_root)
@@ -901,10 +966,7 @@ def validate_stage(
         "schema": SCHEMA,
         "manifest_sha256": manifest["manifest_sha256"],
         "destination_root_identity": root_identity,
-        "rollback_data": [
-            {"destination_path": entry["destination_path"], "prior": entry["destination_prior"], "installed_sha256": entry["source_sha256"]}
-            for entry in entries
-        ],
+        "entries": observed,
         "state": "PASS",
     })
 
@@ -1011,30 +1073,50 @@ def _binding_identity_evidence(
     ]
 
 
+def _receipt_entries(
+    manifest: dict[str, Any],
+    entries: list[dict[str, Any]],
+    bindings: dict[str, DestinationParentBinding],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **_entry_receipt_binding(entry),
+            "destination_parent_identity": _binding_identity_evidence(
+                bindings[_binding_key(entry)]
+            ),
+        }
+        for entry in entries
+    ]
+
+
 def _receipt(
     manifest: dict[str, Any],
     entries: list[dict[str, Any]],
     state: str,
     bindings: dict[str, DestinationParentBinding],
+    *,
+    operation: str,
+    transition: str,
+    predecessor: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    predecessor_state = None if predecessor is None else predecessor.get("state")
+    predecessor_digest = (
+        None if predecessor is None else predecessor.get("receipt_sha256")
+    )
     return _seal_receipt({
         "schema": SCHEMA,
         "manifest_sha256": manifest["manifest_sha256"],
         "destination_root_identity": manifest["destination_root_identity"],
-        "entries": [
-            {
-                "destination_path": entry["destination_path"],
-                "destination_prior": entry["destination_prior"],
-                "installed_sha256": entry["source_sha256"],
-                "installed_mode": entry["destination_mode"],
-                "installed_uid": entry["destination_uid"],
-                "installed_gid": entry["destination_gid"],
-                "destination_parent_identity": _binding_identity_evidence(
-                    bindings[_binding_key(entry)]
-                ),
-            }
-            for entry in entries
-        ],
+        "entries": _receipt_entries(manifest, entries, bindings),
+        "lifecycle": {
+            "schema": LIFECYCLE_SCHEMA,
+            "operation": operation,
+            "predecessor_state": predecessor_state,
+            "predecessor_receipt_sha256": predecessor_digest,
+            "predecessor_receipt": predecessor,
+            "transition": transition,
+            "result_state": state,
+        },
         "state": state,
     })
 
@@ -1048,6 +1130,8 @@ def _read_receipt_at(rollback_descriptor: int) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID") from exc
     if not isinstance(receipt, dict):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    if observed[0] != canonical_json(receipt).encode("utf-8"):
         raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
     return receipt
 
@@ -1068,18 +1152,23 @@ def _validate_receipt(
     entries: list[dict[str, Any]],
     receipt: dict[str, Any],
     bindings: dict[str, DestinationParentBinding],
+    *,
+    depth: int = 0,
 ) -> None:
+    if depth > 16:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
     if set(receipt) != {
         "schema",
         "manifest_sha256",
         "destination_root_identity",
         "entries",
+        "lifecycle",
         "state",
         "receipt_sha256",
     }:
         raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
     _validate_receipt_digest(receipt, "INSTALL_ATOM_ROLLBACK_DATA_INVALID")
-    expected = _receipt(manifest, entries, "PREPARED", bindings)
+    expected_entries = _receipt_entries(manifest, entries, bindings)
     if (
         receipt["schema"] != SCHEMA
         or receipt["manifest_sha256"] != manifest["manifest_sha256"]
@@ -1087,11 +1176,11 @@ def _validate_receipt(
         != manifest["destination_root_identity"]
         or receipt["state"] not in ("PREPARED", "INSTALLED", "ROLLED_BACK")
         or not isinstance(receipt["entries"], list)
-        or len(receipt["entries"]) != len(expected["entries"])
+        or len(receipt["entries"]) != len(expected_entries)
     ):
         raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
     for observed, current in zip(
-        receipt["entries"], expected["entries"], strict=True
+        receipt["entries"], expected_entries, strict=True
     ):
         if not isinstance(observed, dict) or set(observed) != set(current):
             raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
@@ -1114,6 +1203,135 @@ def _validate_receipt(
             raise SourceInstallAtomError(
                 "INSTALL_ATOM_DESTINATION_IDENTITY_DRIFT"
             )
+    lifecycle = receipt["lifecycle"]
+    if not isinstance(lifecycle, dict) or set(lifecycle) != {
+        "schema",
+        "operation",
+        "predecessor_state",
+        "predecessor_receipt_sha256",
+        "predecessor_receipt",
+        "transition",
+        "result_state",
+    }:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    if (
+        lifecycle["schema"] != LIFECYCLE_SCHEMA
+        or lifecycle["result_state"] != receipt["state"]
+    ):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    predecessor = lifecycle["predecessor_receipt"]
+    transition = lifecycle["transition"]
+    if predecessor is None:
+        if (
+            transition != BEGIN_INSTALL
+            or lifecycle["operation"] != "INSTALL"
+            or receipt["state"] != "PREPARED"
+            or lifecycle["predecessor_state"] is not None
+            or lifecycle["predecessor_receipt_sha256"] is not None
+        ):
+            raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+        return
+    if not isinstance(predecessor, dict):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    _validate_receipt(
+        manifest,
+        entries,
+        predecessor,
+        bindings,
+        depth=depth + 1,
+    )
+    if (
+        lifecycle["predecessor_state"] != predecessor["state"]
+        or lifecycle["predecessor_receipt_sha256"]
+        != predecessor["receipt_sha256"]
+    ):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    allowed = {
+        PREPARED_TO_INSTALLED: (
+            "INSTALL",
+            "PREPARED",
+            "INSTALLED",
+            {BEGIN_INSTALL},
+        ),
+        INSTALLED_TO_PREPARED: (
+            "ROLLBACK",
+            "INSTALLED",
+            "PREPARED",
+            {PREPARED_TO_INSTALLED},
+        ),
+        ROLLED_BACK_TO_PREPARED: (
+            "RECOVERY",
+            "ROLLED_BACK",
+            "PREPARED",
+            {PREPARED_TO_ROLLED_BACK},
+        ),
+        PREPARED_TO_ROLLED_BACK: (
+            "ROLLBACK",
+            "PREPARED",
+            "ROLLED_BACK",
+            {BEGIN_INSTALL, INSTALLED_TO_PREPARED, ROLLED_BACK_TO_PREPARED},
+        ),
+    }.get(transition)
+    if allowed is None:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    operation, predecessor_state, result_state, predecessor_transitions = allowed
+    if (
+        lifecycle["operation"] != operation
+        or predecessor["state"] != predecessor_state
+        or receipt["state"] != result_state
+        or predecessor["lifecycle"]["transition"]
+        not in predecessor_transitions
+    ):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+
+
+def _replace_validated_receipt(
+    rollback_descriptor: int,
+    manifest: dict[str, Any],
+    entries: list[dict[str, Any]],
+    receipt: dict[str, Any],
+    bindings: dict[str, DestinationParentBinding],
+) -> dict[str, Any]:
+    _replace_receipt_at(rollback_descriptor, receipt)
+    durable = _read_receipt_at(rollback_descriptor)
+    _validate_receipt(manifest, entries, durable, bindings)
+    if durable != receipt:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    return durable
+
+
+def _invalidate_terminal_receipt(
+    rollback_descriptor: int,
+    manifest: dict[str, Any],
+    entries: list[dict[str, Any]],
+    bindings: dict[str, DestinationParentBinding],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    _validate_receipt(manifest, entries, receipt, bindings)
+    if receipt["state"] == "INSTALLED":
+        operation = "ROLLBACK"
+        transition = INSTALLED_TO_PREPARED
+    elif receipt["state"] == "ROLLED_BACK":
+        operation = "RECOVERY"
+        transition = ROLLED_BACK_TO_PREPARED
+    else:
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
+    prepared = _receipt(
+        manifest,
+        entries,
+        "PREPARED",
+        bindings,
+        operation=operation,
+        transition=transition,
+        predecessor=receipt,
+    )
+    return _replace_validated_receipt(
+        rollback_descriptor,
+        manifest,
+        entries,
+        prepared,
+        bindings,
+    )
 
 
 def _entry_state_binding(
@@ -1123,6 +1341,7 @@ def _entry_state_binding(
         binding.descriptor, binding.leaf, required=False
     )
     prior = entry["destination_prior"]
+    equivalence = _install_equivalence(entry)
     if current is not None:
         contents, metadata = current
         if (
@@ -1131,9 +1350,12 @@ def _entry_state_binding(
             and metadata.st_uid == entry["destination_uid"]
             and metadata.st_gid == entry["destination_gid"]
         ):
+            if equivalence == SOURCE_EQUAL:
+                return SOURCE_EQUAL
             return "INSTALLED"
         if (
-            prior["state"] == "PRESENT"
+            equivalence != SOURCE_EQUAL
+            and prior["state"] == "PRESENT"
             and _sha256_bytes(contents) == prior["sha256"]
             and stat.S_IMODE(metadata.st_mode) == prior["mode"]
             and metadata.st_uid == prior["uid"]
@@ -1143,6 +1365,54 @@ def _entry_state_binding(
     elif prior["state"] == "ABSENT":
         return "PRIOR"
     raise SourceInstallAtomError("INSTALL_ATOM_FILESYSTEM_STATE_INVALID")
+
+
+def _entry_states(
+    destination_bindings: dict[str, DestinationParentBinding],
+    entries: list[dict[str, Any]],
+) -> list[str]:
+    return [
+        _entry_state_binding(destination_bindings[_binding_key(entry)], entry)
+        for entry in entries
+    ]
+
+
+def _state_is_prior(entry: dict[str, Any], state: str) -> bool:
+    if _install_equivalence(entry) == SOURCE_EQUAL:
+        return state == SOURCE_EQUAL
+    return state == "PRIOR"
+
+
+def _require_rollback_complete(
+    destination_bindings: dict[str, DestinationParentBinding],
+    entries: list[dict[str, Any]],
+) -> None:
+    if any(
+        not _state_is_prior(entry, state)
+        for entry, state in zip(
+            entries, _entry_states(destination_bindings, entries), strict=True
+        )
+    ):
+        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_POSTCONDITION_FAILED")
+
+
+def _require_apply_progress(
+    destination_bindings: dict[str, DestinationParentBinding],
+    entries: list[dict[str, Any]],
+    installed_destinations: set[str],
+) -> None:
+    for entry, state in zip(
+        entries, _entry_states(destination_bindings, entries), strict=True
+    ):
+        equivalence = _install_equivalence(entry)
+        if equivalence == SOURCE_EQUAL:
+            expected = SOURCE_EQUAL
+        elif entry["destination_path"] in installed_destinations:
+            expected = "INSTALLED"
+        else:
+            expected = "PRIOR"
+        if state != expected:
+            raise SourceInstallAtomError("INSTALL_ATOM_FILESYSTEM_STATE_INVALID")
 
 
 def _recover_entries(
@@ -1164,14 +1434,38 @@ def _recover_entries(
         require_current_path=False,
     )
     _validate_receipt(manifest, entries, receipt, destination_bindings)
-    states = [
-        _entry_state_binding(destination_bindings[_binding_key(entry)], entry)
-        for entry in entries
-    ]
+    if receipt["state"] == "INSTALLED":
+        receipt = _invalidate_terminal_receipt(
+            rollback_descriptor,
+            manifest,
+            entries,
+            destination_bindings,
+            receipt,
+        )
+    try:
+        states = _entry_states(destination_bindings, entries)
+    except BaseException as failure:
+        if receipt["state"] == "ROLLED_BACK":
+            try:
+                _invalidate_terminal_receipt(
+                    rollback_descriptor,
+                    manifest,
+                    entries,
+                    destination_bindings,
+                    receipt,
+                )
+            except BaseException as invalidation_failure:
+                raise SourceInstallAtomError(
+                    "INSTALL_ATOM_RECOVERY_REQUIRED"
+                ) from invalidation_failure
+        raise failure
     backups: dict[str, bytes] = {}
-    for entry in entries:
+    for entry, state in zip(entries, states, strict=True):
         prior = entry["destination_prior"]
-        if prior["state"] != "PRESENT":
+        if (
+            _install_equivalence(entry) != CHANGED_PRESENT
+            or state != "INSTALLED"
+        ):
             continue
         relative = Path("files") / _relative(entry["destination_path"])
         observed = _read_regular_at(rollback_descriptor, relative)
@@ -1187,7 +1481,39 @@ def _recover_entries(
             raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_DATA_INVALID")
         backups[entry["destination_path"]] = contents
     if receipt["state"] == "ROLLED_BACK":
-        if any(state != "PRIOR" for state in states):
+        try:
+            _require_rollback_complete(destination_bindings, entries)
+            _require_destination_root_identity(
+                manifest,
+                destination_root,
+                root_descriptor=destination_descriptor,
+                require_current_path=False,
+            )
+            _require_rollback_complete(destination_bindings, entries)
+        except BaseException as failure:
+            try:
+                _invalidate_terminal_receipt(
+                    rollback_descriptor,
+                    manifest,
+                    entries,
+                    destination_bindings,
+                    receipt,
+                )
+            except BaseException as invalidation_failure:
+                raise SourceInstallAtomError(
+                    "INSTALL_ATOM_RECOVERY_REQUIRED"
+                ) from invalidation_failure
+            raise failure
+        return receipt
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        states = _entry_states(destination_bindings, entries)
+        state = states[index]
+        if _state_is_prior(entry, state):
+            continue
+        binding = destination_bindings[_binding_key(entry)]
+        equivalence = _install_equivalence(entry)
+        if state != "INSTALLED" or equivalence == SOURCE_EQUAL:
             raise SourceInstallAtomError("INSTALL_ATOM_FILESYSTEM_STATE_INVALID")
         _require_destination_root_identity(
             manifest,
@@ -1195,21 +1521,10 @@ def _recover_entries(
             root_descriptor=destination_descriptor,
             require_current_path=False,
         )
-        return receipt
-    for entry, state in reversed(list(zip(entries, states, strict=True))):
-        if state == "PRIOR":
-            continue
-        binding = destination_bindings[_binding_key(entry)]
-        prior = entry["destination_prior"]
-        _require_destination_root_identity(
-            manifest,
-            destination_root,
-            root_descriptor=destination_descriptor,
-            require_current_path=False,
-        )
-        if prior["state"] == "ABSENT":
+        if equivalence == ABSENT_TO_PRESENT:
             _unlink_regular_leaf_at(binding.descriptor, binding.leaf)
         else:
+            prior = entry["destination_prior"]
             _atomic_replace_leaf_at(
                 binding.descriptor,
                 binding.leaf,
@@ -1218,14 +1533,20 @@ def _recover_entries(
                 uid=prior["uid"],
                 gid=prior["gid"],
             )
-    if any(
-        _entry_state_binding(destination_bindings[_binding_key(entry)], entry)
-        != "PRIOR"
-        for entry in entries
-    ):
-        raise SourceInstallAtomError("INSTALL_ATOM_ROLLBACK_POSTCONDITION_FAILED")
+        states = _entry_states(destination_bindings, entries)
+        if not _state_is_prior(entry, states[index]):
+            raise SourceInstallAtomError(
+                "INSTALL_ATOM_ROLLBACK_POSTCONDITION_FAILED"
+            )
+    _require_rollback_complete(destination_bindings, entries)
     rolled_back = _receipt(
-        manifest, entries, "ROLLED_BACK", destination_bindings
+        manifest,
+        entries,
+        "ROLLED_BACK",
+        destination_bindings,
+        operation="ROLLBACK",
+        transition=PREPARED_TO_ROLLED_BACK,
+        predecessor=receipt,
     )
     _require_destination_root_identity(
         manifest,
@@ -1233,8 +1554,44 @@ def _recover_entries(
         root_descriptor=destination_descriptor,
         require_current_path=False,
     )
-    _replace_receipt_at(rollback_descriptor, rolled_back)
-    return rolled_back
+    try:
+        durable = _replace_validated_receipt(
+            rollback_descriptor,
+            manifest,
+            entries,
+            rolled_back,
+            destination_bindings,
+        )
+        _require_destination_root_identity(
+            manifest,
+            destination_root,
+            root_descriptor=destination_descriptor,
+            require_current_path=False,
+        )
+        _require_rollback_complete(destination_bindings, entries)
+    except BaseException as failure:
+        try:
+            observed = _read_receipt_at(rollback_descriptor)
+            _validate_receipt(
+                manifest,
+                entries,
+                observed,
+                destination_bindings,
+            )
+            if observed["state"] in ("INSTALLED", "ROLLED_BACK"):
+                _invalidate_terminal_receipt(
+                    rollback_descriptor,
+                    manifest,
+                    entries,
+                    destination_bindings,
+                    observed,
+                )
+        except BaseException as invalidation_failure:
+            raise SourceInstallAtomError(
+                "INSTALL_ATOM_RECOVERY_REQUIRED"
+            ) from invalidation_failure
+        raise failure
+    return durable
 
 
 def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root: Path, stage_root: Path, rollback_root: Path, confirmation: str) -> dict[str, Any]:
@@ -1273,9 +1630,53 @@ def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
             )
             _make_private_directory(rollback_root)
             with _root_descriptor(rollback_root) as rollback_descriptor:
-                for entry in entries:
-                    prior = entry["destination_prior"]
-                    if prior["state"] == "PRESENT":
+                try:
+                    installed_destinations: set[str] = set()
+                    _require_apply_progress(
+                        destination_bindings, entries, installed_destinations
+                    )
+                    prepared = _receipt(
+                        manifest,
+                        entries,
+                        "PREPARED",
+                        destination_bindings,
+                        operation="INSTALL",
+                        transition=BEGIN_INSTALL,
+                        predecessor=None,
+                    )
+                    _require_destination_root_identity(
+                        manifest,
+                        destination_root,
+                        root_descriptor=destination_descriptor,
+                    )
+                    _write_exclusive_at(
+                        rollback_descriptor,
+                        Path(ROLLBACK_RECEIPT),
+                        canonical_json(prepared).encode("utf-8"),
+                        mode=0o600,
+                        uid=os.getuid(),
+                        gid=os.getgid(),
+                    )
+                    durable_prepared = _read_receipt_at(rollback_descriptor)
+                    _validate_receipt(
+                        manifest,
+                        entries,
+                        durable_prepared,
+                        destination_bindings,
+                    )
+                    if durable_prepared != prepared:
+                        raise SourceInstallAtomError(
+                            "INSTALL_ATOM_ROLLBACK_DATA_INVALID"
+                        )
+                    for entry in entries:
+                        if _install_equivalence(entry) != CHANGED_PRESENT:
+                            continue
+                        _require_apply_progress(
+                            destination_bindings,
+                            entries,
+                            installed_destinations,
+                        )
+                        prior = entry["destination_prior"]
                         binding = destination_bindings[_binding_key(entry)]
                         current = _read_regular_leaf_at(
                             binding.descriptor, binding.leaf
@@ -1289,34 +1690,43 @@ def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
                             destination_root,
                             root_descriptor=destination_descriptor,
                         )
+                        backup_relative = Path("files") / _relative(
+                            entry["destination_path"]
+                        )
                         _write_exclusive_at(
                             rollback_descriptor,
-                            Path("files") / _relative(entry["destination_path"]),
+                            backup_relative,
                             current[0],
                             mode=prior["mode"],
                             uid=prior["uid"],
                             gid=prior["gid"],
                             create_parents=True,
                         )
-                prepared = _receipt(
-                    manifest, entries, "PREPARED", destination_bindings
-                )
-                _require_destination_root_identity(
-                    manifest,
-                    destination_root,
-                    root_descriptor=destination_descriptor,
-                )
-                _write_exclusive_at(
-                    rollback_descriptor,
-                    Path(ROLLBACK_RECEIPT),
-                    canonical_json(prepared).encode("utf-8"),
-                    mode=0o600,
-                    uid=os.getuid(),
-                    gid=os.getgid(),
-                )
-                try:
+                        backup = _read_regular_at(
+                            rollback_descriptor, backup_relative
+                        )
+                        if backup is None:
+                            raise SourceInstallAtomError(
+                                "INSTALL_ATOM_ROLLBACK_DATA_INVALID"
+                            )
+                        backup_contents, backup_metadata = backup
+                        if (
+                            _sha256_bytes(backup_contents) != prior["sha256"]
+                            or stat.S_IMODE(backup_metadata.st_mode)
+                            != prior["mode"]
+                            or backup_metadata.st_uid != prior["uid"]
+                            or backup_metadata.st_gid != prior["gid"]
+                        ):
+                            raise SourceInstallAtomError(
+                                "INSTALL_ATOM_ROLLBACK_DATA_INVALID"
+                            )
                     with _root_descriptor(stage_root) as stage_descriptor:
                         for entry in entries:
+                            _require_apply_progress(
+                                destination_bindings,
+                                entries,
+                                installed_destinations,
+                            )
                             staged = _read_regular_at(
                                 stage_descriptor,
                                 _relative(entry["destination_path"]),
@@ -1326,6 +1736,15 @@ def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
                                     "INSTALL_ATOM_STAGE_VALIDATION_FAILED"
                                 )
                             binding = destination_bindings[_binding_key(entry)]
+                            if _install_equivalence(entry) == SOURCE_EQUAL:
+                                if (
+                                    _entry_state_binding(binding, entry)
+                                    != SOURCE_EQUAL
+                                ):
+                                    raise SourceInstallAtomError(
+                                        "INSTALL_ATOM_FILESYSTEM_STATE_INVALID"
+                                    )
+                                continue
                             _require_destination_root_identity(
                                 manifest,
                                 destination_root,
@@ -1346,13 +1765,28 @@ def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
                                 raise SourceInstallAtomError(
                                     "INSTALL_ATOM_POSTCONDITION_FAILED"
                                 )
+                            installed_destinations.add(entry["destination_path"])
+                            _require_apply_progress(
+                                destination_bindings,
+                                entries,
+                                installed_destinations,
+                            )
+                    _require_apply_progress(
+                        destination_bindings, entries, installed_destinations
+                    )
                     _verify_destination_bindings(
                         destination_root,
                         destination_descriptor,
                         destination_bindings,
                     )
                     installed = _receipt(
-                        manifest, entries, "INSTALLED", destination_bindings
+                        manifest,
+                        entries,
+                        "INSTALLED",
+                        destination_bindings,
+                        operation="INSTALL",
+                        transition=PREPARED_TO_INSTALLED,
+                        predecessor=durable_prepared,
                     )
                     _require_destination_root_identity(
                         manifest,
@@ -1370,10 +1804,38 @@ def apply_atom(*, manifest: dict[str, Any], source_root: Path, destination_root:
                         destination_root,
                         root_descriptor=destination_descriptor,
                     )
-                    return installed
+                    durable_installed = _read_receipt_at(rollback_descriptor)
+                    _validate_receipt(
+                        manifest,
+                        entries,
+                        durable_installed,
+                        destination_bindings,
+                    )
+                    if durable_installed != installed:
+                        raise SourceInstallAtomError(
+                            "INSTALL_ATOM_ROLLBACK_DATA_INVALID"
+                        )
+                    _require_apply_progress(
+                        destination_bindings, entries, installed_destinations
+                    )
+                    return durable_installed
                 except BaseException as failure:
                     try:
                         observed_receipt = _read_receipt_at(rollback_descriptor)
+                        _validate_receipt(
+                            manifest,
+                            entries,
+                            observed_receipt,
+                            destination_bindings,
+                        )
+                        if observed_receipt["state"] == "INSTALLED":
+                            observed_receipt = _invalidate_terminal_receipt(
+                                rollback_descriptor,
+                                manifest,
+                                entries,
+                                destination_bindings,
+                                observed_receipt,
+                            )
                         _recover_entries(
                             destination_root=destination_root,
                             destination_descriptor=destination_descriptor,
@@ -1432,14 +1894,7 @@ def rollback_atom(*, manifest: dict[str, Any], destination_root: Path, rollback_
                     destination_descriptor,
                     destination_bindings,
                 )
-    terminal = {
-        "schema": SCHEMA,
-        "manifest_sha256": manifest["manifest_sha256"],
-        "destination_root_identity": manifest["destination_root_identity"],
-        "state": result["state"],
-    }
-    terminal["receipt_sha256"] = receipt_digest(terminal)
-    return terminal
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

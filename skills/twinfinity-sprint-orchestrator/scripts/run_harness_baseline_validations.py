@@ -39,7 +39,13 @@ ROOT_RECEIPT_SCHEMA = "twinfinity-harness-baseline-root-receipt/v1"
 PAIR_RECEIPT_SCHEMA = "twinfinity-harness-baseline-pair-receipt/v1"
 INSTALL_MANIFEST_SCHEMA = "twinfinity-source-install-atom/v2"
 DESTINATION_ROOT_IDENTITY_SCHEMA = "twinfinity-destination-root-identity/v1"
+INSTALL_LIFECYCLE_SCHEMA = "twinfinity-source-install-lifecycle/v1"
 INSTALL_STAGE_RECEIPT = ".twinfinity-source-install-stage.json"
+INSTALL_ABSENT_TO_PRESENT = "ABSENT_TO_PRESENT"
+INSTALL_CHANGED_PRESENT = "CHANGED_PRESENT"
+INSTALL_SOURCE_EQUAL = "SOURCE_EQUAL"
+INSTALL_BEGIN = "BEGIN_INSTALL"
+INSTALL_PREPARED_TO_INSTALLED = "PREPARED_TO_INSTALLED"
 TRUSTED_BASE_REF = "refs/remotes/origin/main"
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -626,11 +632,64 @@ def _install_manifest_digest(payload: dict[str, Any]) -> str:
     return sha256_bytes(serialized.encode("utf-8"))
 
 
+def _canonical_install_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def _install_receipt_digest(payload: dict[str, Any]) -> str:
     without_digest = {
         key: value for key, value in payload.items() if key != "receipt_sha256"
     }
-    return digest_json(without_digest)
+    return sha256_bytes(_canonical_install_json(without_digest).encode("utf-8"))
+
+
+def _seal_install_receipt(payload: dict[str, Any]) -> dict[str, Any]:
+    sealed = dict(payload)
+    sealed["receipt_sha256"] = _install_receipt_digest(sealed)
+    return sealed
+
+
+def _install_equivalence(entry: dict[str, Any]) -> str:
+    prior = entry["destination_prior"]
+    if prior["state"] == "ABSENT":
+        return INSTALL_ABSENT_TO_PRESENT
+    prior_tuple = (
+        prior["sha256"],
+        prior["mode"],
+        prior["uid"],
+        prior["gid"],
+    )
+    target_tuple = (
+        entry["source_sha256"],
+        entry["destination_mode"],
+        entry["destination_uid"],
+        entry["destination_gid"],
+    )
+    return (
+        INSTALL_SOURCE_EQUAL
+        if prior_tuple == target_tuple
+        else INSTALL_CHANGED_PRESENT
+    )
+
+
+def _install_receipt_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_path": entry["source_path"],
+        "source_sha256": entry["source_sha256"],
+        "source_mode": entry["source_mode"],
+        "destination_path": entry["destination_path"],
+        "destination_prior": dict(entry["destination_prior"]),
+        "installed_sha256": entry["source_sha256"],
+        "installed_mode": entry["destination_mode"],
+        "installed_uid": entry["destination_uid"],
+        "installed_gid": entry["destination_gid"],
+        "install_equivalence": _install_equivalence(entry),
+    }
 
 
 def _validate_destination_root_identity(value: Any) -> dict[str, str]:
@@ -856,8 +915,9 @@ def _verify_installer_state_evidence(
     evidence_path: Path,
 ) -> tuple[str, str]:
     target_root = _validated_root(target_root)
-    destination_root_identity = _require_manifest_destination_root_identity(
-        manifest, target_root
+    # A stage is a separate root; its receipt still binds the sealed destination.
+    destination_root_identity = _validate_destination_root_identity(
+        manifest.destination_root_identity
     )
     evidence_lexical = Path(os.path.abspath(evidence_path))
     if root_kind == "staged-install-atom":
@@ -865,6 +925,9 @@ def _verify_installer_state_evidence(
         if evidence_lexical != expected_evidence:
             raise BaselineError("BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH")
     elif root_kind == "installed-runtime":
+        destination_root_identity = _require_manifest_destination_root_identity(
+            manifest, target_root
+        )
         try:
             (target_root / INSTALL_STAGE_RECEIPT).lstat()
         except FileNotFoundError:
@@ -897,55 +960,74 @@ def _verify_installer_state_evidence(
         payload = json.loads(raw, object_pairs_hook=_object_without_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, BaselineError) as exc:
         raise BaselineError("BASELINE_INSTALL_STATE_EVIDENCE_INVALID") from exc
-    if not isinstance(payload, dict) or set(payload) != {
-        "schema",
-        "manifest_sha256",
-        "destination_root_identity",
-        "entries",
-        "state",
-        "receipt_sha256",
-    }:
+    if not isinstance(payload, dict):
         raise BaselineError("BASELINE_INSTALL_STATE_EVIDENCE_INVALID")
     if (
-        type(payload["receipt_sha256"]) is not str
+        type(payload.get("receipt_sha256")) is not str
         or not SHA256.fullmatch(payload["receipt_sha256"])
         or _install_receipt_digest(payload) != payload["receipt_sha256"]
     ):
         raise BaselineError("BASELINE_INSTALL_STATE_EVIDENCE_INVALID")
+    receipt_entries = [_install_receipt_entry(entry) for entry in manifest.entries]
     if root_kind == "staged-install-atom":
-        expected_entries = [
+        expected_receipt = _seal_install_receipt(
             {
-                "destination_path": entry["destination_path"],
-                "sha256": entry["source_sha256"],
-                "mode": entry["destination_mode"],
+                "schema": INSTALL_MANIFEST_SCHEMA,
+                "manifest_sha256": manifest.manifest_sha256,
+                "destination_root_identity": destination_root_identity,
+                "entries": receipt_entries,
+                "state": "STAGED",
             }
-            for entry in manifest.entries
-        ]
-        expected_state = "STAGED"
+        )
     else:
-        expected_entries = [
+        installed_entries = [
             {
-                "destination_path": entry["destination_path"],
-                "destination_prior": entry["destination_prior"],
-                "installed_sha256": entry["source_sha256"],
-                "installed_mode": entry["destination_mode"],
-                "installed_uid": entry["destination_uid"],
-                "installed_gid": entry["destination_gid"],
+                **entry,
                 "destination_parent_identity": _destination_parent_identity(
                     target_root, entry["destination_path"]
                 ),
             }
-            for entry in manifest.entries
+            for entry in receipt_entries
         ]
-        expected_state = "INSTALLED"
-    if payload != {
-        "schema": INSTALL_MANIFEST_SCHEMA,
-        "manifest_sha256": manifest.manifest_sha256,
-        "destination_root_identity": destination_root_identity,
-        "entries": expected_entries,
-        "state": expected_state,
-        "receipt_sha256": payload["receipt_sha256"],
-    }:
+        prepared_receipt = _seal_install_receipt(
+            {
+                "schema": INSTALL_MANIFEST_SCHEMA,
+                "manifest_sha256": manifest.manifest_sha256,
+                "destination_root_identity": destination_root_identity,
+                "entries": installed_entries,
+                "lifecycle": {
+                    "schema": INSTALL_LIFECYCLE_SCHEMA,
+                    "operation": "INSTALL",
+                    "predecessor_state": None,
+                    "predecessor_receipt_sha256": None,
+                    "predecessor_receipt": None,
+                    "transition": INSTALL_BEGIN,
+                    "result_state": "PREPARED",
+                },
+                "state": "PREPARED",
+            }
+        )
+        expected_receipt = _seal_install_receipt(
+            {
+                "schema": INSTALL_MANIFEST_SCHEMA,
+                "manifest_sha256": manifest.manifest_sha256,
+                "destination_root_identity": destination_root_identity,
+                "entries": installed_entries,
+                "lifecycle": {
+                    "schema": INSTALL_LIFECYCLE_SCHEMA,
+                    "operation": "INSTALL",
+                    "predecessor_state": "PREPARED",
+                    "predecessor_receipt_sha256": prepared_receipt[
+                        "receipt_sha256"
+                    ],
+                    "predecessor_receipt": prepared_receipt,
+                    "transition": INSTALL_PREPARED_TO_INSTALLED,
+                    "result_state": "INSTALLED",
+                },
+                "state": "INSTALLED",
+            }
+        )
+    if raw != _canonical_install_json(expected_receipt).encode("utf-8"):
         raise BaselineError("BASELINE_INSTALL_STATE_EVIDENCE_MISMATCH")
     return sha256_bytes(raw), _target_filesystem_identity_sha256(target_root)
 
