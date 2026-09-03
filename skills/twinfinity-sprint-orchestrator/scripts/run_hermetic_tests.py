@@ -14,6 +14,7 @@ import sys
 import tempfile
 import tomllib
 from typing import Any, Sequence
+import venv
 
 from executor_registry import RegistryError, load_registry_config
 
@@ -198,8 +199,10 @@ def validate_test_registry(codex_home: Path) -> None:
         raise HermeticTestError("HERMETIC_REGISTRY_BINDING_INVALID")
 
 
-def _test_command(selectors: Sequence[str], verbose: bool) -> list[str]:
-    command = [sys.executable, "-B", "-m", "unittest"]
+def _test_command(
+    selectors: Sequence[str], verbose: bool, *, interpreter: Path
+) -> list[str]:
+    command = [os.fspath(interpreter), "-B", "-m", "unittest"]
     if verbose:
         command.append("-v")
     if selectors:
@@ -212,13 +215,20 @@ def _test_command(selectors: Sequence[str], verbose: bool) -> list[str]:
 def run_tests(selectors: Sequence[str], *, verbose: bool = False) -> int:
     previous_umask = os.umask(0o077)
     try:
-        with tempfile.TemporaryDirectory(prefix="twinfinity-hermetic-tests-") as root:
+        # Keep the private root deliberately short. Several tests create an
+        # additional TemporaryDirectory, coordination directory, PARK
+        # capability directory, and AF_UNIX socket below TMPDIR. Linux limits
+        # pathname-based AF_UNIX addresses to 107 bytes, so descriptive names
+        # at this outer layer can make an otherwise valid issue-owned run fail.
+        with tempfile.TemporaryDirectory(prefix="h-", dir="/tmp") as root:
             temporary_root = Path(root)
             temporary_root.chmod(0o700)
-            codex_home = temporary_root / "codex-home"
-            test_tmp = temporary_root / "tmp"
+            codex_home = temporary_root / "c"
+            test_environment = temporary_root / "v"
+            test_tmp = temporary_root
             codex_home.mkdir(mode=0o700)
-            test_tmp.mkdir(mode=0o700)
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(test_environment)
+            test_python = test_environment / "bin" / "python"
             install_reviewed_profiles(codex_home)
             validate_test_registry(codex_home)
 
@@ -229,9 +239,10 @@ def run_tests(selectors: Sequence[str], *, verbose: bool = False) -> int:
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONPATH": os.fspath(TEST_ROOT),
                 "TMPDIR": os.fspath(test_tmp),
+                "VIRTUAL_ENV": os.fspath(test_environment),
             }
             completed = subprocess.run(
-                _test_command(selectors, verbose),
+                _test_command(selectors, verbose, interpreter=test_python),
                 cwd=SKILL_ROOT,
                 env=environment,
                 check=False,
