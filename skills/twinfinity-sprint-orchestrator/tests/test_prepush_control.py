@@ -2011,16 +2011,13 @@ class PrePushControlTests(unittest.TestCase):
         self.assertGreater(calls[0]["timeout"], 1)
 
     @staticmethod
-    def _make_backend_environment(root: Path, *, python_symlink: bool = True) -> Path:
+    def _make_backend_environment(root: Path) -> Path:
         bin_path = root / "bin"
         bin_path.mkdir(parents=True)
         (root / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
         python = bin_path / "python"
-        if python_symlink:
-            python.symlink_to(sys.executable)
-        else:
-            python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            python.chmod(0o700)
+        python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        python.chmod(0o700)
         ruff = bin_path / "ruff"
         ruff.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         ruff.chmod(0o700)
@@ -2051,6 +2048,30 @@ class PrePushControlTests(unittest.TestCase):
         )
         self.assertIn("twinfinityapp-issue-314", accepted["python"])
         self.assertIn("twinfinityapp-issue-314", accepted["ruff"])
+
+    def test_backend_fixture_ignores_outer_issue_interpreter_identity(self) -> None:
+        lineage = self.control._lineage(REPOSITORY, ISSUE)
+        commands = (("backend/check.sh", "backend", ("./check.sh",)),)
+        outer_python = (
+            Path(self.temp.name)
+            / "twinfinity-issue177-outer"
+            / "bin"
+            / "python"
+        )
+        outer_python.parent.mkdir(parents=True)
+        outer_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        outer_python.chmod(0o700)
+        with patch.object(sys, "executable", str(outer_python)):
+            owned_bin = self._make_backend_environment(
+                Path(self.temp.name) / "twinfinityapp-issue-314-env"
+            )
+
+        fixture_python = owned_bin / "python"
+        self.assertFalse(fixture_python.is_symlink())
+        accepted = self.control._validate_gate_environment(
+            lineage, commands, {"PATH": str(owned_bin)}
+        )
+        self.assertEqual(str(fixture_python), accepted["python"])
 
     def test_frontend_gate_environment_requires_node_20_before_lower_gates(self) -> None:
         lineage = self.control._lineage(REPOSITORY, ISSUE)

@@ -212,13 +212,17 @@ def _test_command(selectors: Sequence[str], verbose: bool) -> list[str]:
 def run_tests(selectors: Sequence[str], *, verbose: bool = False) -> int:
     previous_umask = os.umask(0o077)
     try:
-        with tempfile.TemporaryDirectory(prefix="twinfinity-hermetic-tests-") as root:
+        # Keep the private root deliberately short. Several tests create an
+        # additional TemporaryDirectory, coordination directory, PARK
+        # capability directory, and AF_UNIX socket below TMPDIR. Linux limits
+        # pathname-based AF_UNIX addresses to 107 bytes, so descriptive names
+        # at this outer layer can make an otherwise valid issue-owned run fail.
+        with tempfile.TemporaryDirectory(prefix="h-", dir="/tmp") as root:
             temporary_root = Path(root)
             temporary_root.chmod(0o700)
-            codex_home = temporary_root / "codex-home"
-            test_tmp = temporary_root / "tmp"
+            codex_home = temporary_root / "c"
+            test_tmp = temporary_root
             codex_home.mkdir(mode=0o700)
-            test_tmp.mkdir(mode=0o700)
             install_reviewed_profiles(codex_home)
             validate_test_registry(codex_home)
 
