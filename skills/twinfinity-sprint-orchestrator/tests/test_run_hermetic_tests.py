@@ -52,17 +52,12 @@ class HermeticTestRunnerTests(unittest.TestCase):
                 "PYTHONDONTWRITEBYTECODE",
                 "PYTHONPATH",
                 "TMPDIR",
-                "VIRTUAL_ENV",
             },
             set(observed),
         )
         self.assertTrue(observed["CODEX_HOME"].startswith(observed["HOME"]))
         self.assertTrue(observed["TMPDIR"].startswith(observed["HOME"]))
-        self.assertTrue(observed["VIRTUAL_ENV"].startswith(observed["HOME"]))
-        self.assertEqual(
-            os.fspath(Path(observed["VIRTUAL_ENV"]) / "bin" / "python"),
-            observed_argv[0],
-        )
+        self.assertEqual(sys.executable, observed_argv[0])
         self.assertEqual("1", observed["PYTHONDONTWRITEBYTECODE"])
         self.assertEqual("/usr/local/bin:/usr/bin", observed["PATH"])
         self.assertEqual(
@@ -109,7 +104,6 @@ class HermeticTestRunnerTests(unittest.TestCase):
             self.assertFalse(private_root.is_relative_to(issue_root))
             self.assertEqual({"mode": 0o700, "uid": os.getuid()}, observed_root)
             self.assertTrue(Path(observed["CODEX_HOME"]).is_relative_to(private_root))
-            self.assertTrue(Path(observed["VIRTUAL_ENV"]).is_relative_to(private_root))
             self.assertTrue(test_tmp.is_relative_to(private_root))
             self.assertLessEqual(len(os.fsencode(maximum_park_socket)), 107)
 
