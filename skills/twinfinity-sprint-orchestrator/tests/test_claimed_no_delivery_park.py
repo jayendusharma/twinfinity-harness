@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3063,8 +3064,10 @@ stream_idle_timeout_ms = 5000
             "files": files,
         }
 
-    def test_reserved_enqueue_uses_exact_source_equivalence_not_digest_equality(self) -> None:
-        with self.assertRaisesRegex(CoordinationError, "SOURCE_SNAPSHOT_DRIFT"):
+    def test_dedicated_reserved_enqueue_uses_exact_source_equivalence(self) -> None:
+        with self.assertRaisesRegex(
+            CoordinationError, "CLAIMED_NO_DELIVERY_PARK_HANDLER_REQUIRED"
+        ):
             self.store.enqueue_message(
                 idempotency_key="generic-park-is-forbidden",
                 recipient_session_id=PLANNER_ENDPOINT,
@@ -3081,6 +3084,25 @@ stream_idle_timeout_ms = 5000
         self.assertEqual("PREPARED", row["state"])
         self.assertEqual(digest_json(self.payload), row["payload_sha256"])
         self.assertNotEqual(self.bound_sha, self.current_sha)
+
+    def test_generic_enqueue_rejects_reserved_park_before_message_or_event_write(self) -> None:
+        generic_payload = copy.deepcopy(self.payload)
+        generic_payload["source"]["payload_sha256"] = self.current_sha
+        generic_payload["evidence"]["bound_source_sha256"] = self.current_sha
+        before = list(self.store.connection.iterdump())
+
+        with self.assertRaisesRegex(
+            CoordinationError, "^CLAIMED_NO_DELIVERY_PARK_HANDLER_REQUIRED$"
+        ):
+            self.store.enqueue_message(
+                idempotency_key="generic-park-reserved-handler-denied",
+                recipient_session_id=PLANNER_ENDPOINT,
+                topic="coordination.notice",
+                payload=generic_payload,
+                now="2026-08-26T20:00:24Z",
+            )
+
+        self.assertEqual(before, list(self.store.connection.iterdump()))
 
     def test_preservation_attempt_target_substitution_is_denied_without_mutation(self) -> None:
         substituted, _token = self._run_attempt(
@@ -3743,6 +3765,1050 @@ stream_idle_timeout_ms = 5000
                 _test_failpoint=failpoint,
             )
         self.assertEqual(before, list(self.store.connection.iterdump()))
+
+    def _run_prepare_cli(
+        self,
+        *,
+        idempotency_key: str,
+        recipient: str,
+        raw_payload: bytes,
+        expected_payload_sha256: str,
+        suffix: str,
+    ) -> tuple[int, dict[str, object]]:
+        payload_file = self.store.path.parent / f"park-prepare-{suffix}.json"
+        payload_file.write_bytes(raw_payload)
+        output = io.StringIO()
+        with (
+            mock.patch.object(coordination, "DEFAULT_DATABASE", self.store.path),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "coordination_store.py",
+                    "prepare-claimed-no-delivery-park",
+                    "--idempotency-key",
+                    idempotency_key,
+                    "--planner-session-id",
+                    recipient,
+                    "--payload-file",
+                    str(payload_file),
+                    "--expected-payload-sha256",
+                    expected_payload_sha256,
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            result = coordination.main()
+        return result, json.loads(output.getvalue())
+
+    def _logical_tables_except_park_receipt(self) -> dict[str, list[tuple]]:
+        excluded = {
+            "coordination_events",
+            "coordination_messages",
+            "sqlite_sequence",
+        }
+        names = self.store.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        return {
+            str(row[0]): [
+                tuple(value)
+                for value in self.store.connection.execute(
+                    f'SELECT * FROM "{row[0]}"'
+                ).fetchall()
+            ]
+            for row in names
+            if row[0] not in excluded
+        }
+
+    def test_prepare_cli_is_strict_single_parse_dedicated_and_idempotent(self) -> None:
+        request_sha256 = digest_json(self.payload)
+        raw_payload = json.dumps(self.payload, indent=2).encode("utf-8")
+        before_protected = self._logical_tables_except_park_receipt()
+        before_messages = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_messages"
+        ).fetchone()[0]
+        before_events = self.store.connection.execute(
+            "SELECT COUNT(*) FROM coordination_events"
+        ).fetchone()[0]
+        parsed_requests = []
+        dispatched_envelopes = []
+        real_parse = coordination.parse_coordination_envelope
+        real_enqueue = CoordinationStore.enqueue_claimed_no_delivery_park_message
+
+        def traced_parse(raw):
+            parsed = real_parse(raw)
+            if parsed.payload_sha256 == request_sha256:
+                parsed_requests.append(parsed)
+            return parsed
+
+        def traced_enqueue(store, *args, **kwargs):
+            envelope = kwargs.get("_parsed_envelope")
+            dispatched_envelopes.append(envelope)
+            self.assertIs(kwargs.get("payload"), envelope.payload)
+            return real_enqueue(store, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                coordination,
+                "parse_coordination_envelope",
+                side_effect=traced_parse,
+            ),
+            mock.patch.object(
+                CoordinationStore,
+                "enqueue_claimed_no_delivery_park_message",
+                autospec=True,
+                side_effect=traced_enqueue,
+            ),
+            mock.patch.object(
+                CoordinationStore,
+                "enqueue_message",
+                side_effect=AssertionError("generic enqueue must not run"),
+            ),
+        ):
+            result, prepared = self._run_prepare_cli(
+                idempotency_key="issue-272-park-cli",
+                recipient=PLANNER_ENDPOINT,
+                raw_payload=raw_payload,
+                expected_payload_sha256=request_sha256,
+                suffix="first",
+            )
+            self.assertEqual(0, result)
+            self.assertEqual(
+                {
+                    "phase": "PREPARED",
+                    "message_id": prepared["message_id"],
+                    "payload_sha256": request_sha256,
+                    "recipient_session_id": PLANNER_ENDPOINT,
+                    "idempotency_key": "issue-272-park-cli",
+                },
+                prepared,
+            )
+            result, replay = self._run_prepare_cli(
+                idempotency_key="issue-272-park-cli",
+                recipient=PLANNER_ENDPOINT,
+                raw_payload=raw_payload,
+                expected_payload_sha256=request_sha256,
+                suffix="replay",
+            )
+            self.assertEqual(0, result)
+            self.assertEqual(prepared, replay)
+
+        self.assertEqual(2, len(parsed_requests))
+        self.assertEqual(2, len(dispatched_envelopes))
+        self.assertIs(parsed_requests[0], dispatched_envelopes[0])
+        self.assertIs(parsed_requests[1], dispatched_envelopes[1])
+        self.assertEqual(before_protected, self._logical_tables_except_park_receipt())
+        self.assertEqual(
+            before_messages + 1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_messages"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            before_events + 1,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM coordination_events"
+            ).fetchone()[0],
+        )
+        event = self.store.connection.execute(
+            "SELECT event_type,entity_key,payload_sha256 FROM coordination_events "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(
+            (
+                "CLAIMED_NO_DELIVERY_PARK_PREPARED",
+                f'message:{prepared["message_id"]}',
+                digest_json(
+                    {
+                        "request_sha256": request_sha256,
+                        "repository": REPOSITORY,
+                        "issue_number": ISSUE,
+                    }
+                ),
+            ),
+            tuple(event),
+        )
+        row = self.store.connection.execute(
+            "SELECT recipient_session_id,topic,payload_sha256,payload_json,state "
+            "FROM coordination_messages WHERE id=?",
+            (prepared["message_id"],),
+        ).fetchone()
+        self.assertEqual(
+            (
+                PLANNER_ENDPOINT,
+                "coordination.notice",
+                request_sha256,
+                canonical_json(self.payload),
+                "PREPARED",
+            ),
+            tuple(row),
+        )
+
+        changed = copy.deepcopy(self.payload)
+        changed["summary"] += " changed"
+        before_conflict = list(self.store.connection.iterdump())
+        with mock.patch.object(
+            coordination,
+            "CoordinationStore",
+            side_effect=AssertionError("writable database must not open"),
+        ):
+            result, conflict = self._run_prepare_cli(
+                idempotency_key="issue-272-park-cli",
+                recipient=PLANNER_ENDPOINT,
+                raw_payload=canonical_json(changed).encode("utf-8"),
+                expected_payload_sha256=digest_json(changed),
+                suffix="conflict",
+            )
+        self.assertEqual(1, result)
+        self.assertEqual(
+            {"phase": "HOLD", "error": "IDEMPOTENCY_CONFLICT"}, conflict
+        )
+        self.assertEqual(before_conflict, list(self.store.connection.iterdump()))
+
+        before_recipient_conflict = list(self.store.connection.iterdump())
+        with mock.patch.object(
+            coordination,
+            "CoordinationStore",
+            side_effect=AssertionError("writable database must not open"),
+        ):
+            result, conflict = self._run_prepare_cli(
+                idempotency_key="issue-272-park-cli",
+                recipient=DEVELOPMENT_ENDPOINT,
+                raw_payload=raw_payload,
+                expected_payload_sha256=request_sha256,
+                suffix="recipient-conflict",
+            )
+        self.assertEqual(1, result)
+        self.assertEqual(
+            {"phase": "HOLD", "error": "IDEMPOTENCY_CONFLICT"}, conflict
+        )
+        self.assertEqual(
+            before_recipient_conflict, list(self.store.connection.iterdump())
+        )
+
+        for suffix, recipient, error in (
+            ("historical", "role.planner.v2", "CURRENT_ROLE_ENDPOINT_REQUIRED"),
+            (
+                "alias",
+                "01a017f9-4ce5-7110-9a1f-73b1c10f5625",
+                "CURRENT_ROLE_ENDPOINT_REQUIRED",
+            ),
+            ("wrong-role", DEVELOPMENT_ENDPOINT, "PARK_PREPARER_INVALID"),
+            ("substituted", "role.planner.v999", "CURRENT_ROLE_ENDPOINT_REQUIRED"),
+        ):
+            with self.subTest(recipient=recipient):
+                before_identity = list(self.store.connection.iterdump())
+                result, denial = self._run_prepare_cli(
+                    idempotency_key=f"issue-272-park-cli-{suffix}",
+                    recipient=recipient,
+                    raw_payload=raw_payload,
+                    expected_payload_sha256=request_sha256,
+                    suffix=suffix,
+                )
+                self.assertEqual(1, result)
+                self.assertEqual({"phase": "HOLD", "error": error}, denial)
+                self.assertEqual(
+                    before_identity, list(self.store.connection.iterdump())
+                )
+
+
+class ClaimedNoDeliveryParkPreparationPreDatabaseTests(unittest.TestCase):
+    @staticmethod
+    def _inventory(root: Path) -> dict[str, tuple[int, int, str | None]]:
+        inventory = {}
+        for path in root.rglob("*"):
+            metadata = path.lstat()
+            content_sha256 = None
+            if stat.S_ISREG(metadata.st_mode):
+                content_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            inventory[str(path.relative_to(root))] = (
+                metadata.st_mode,
+                metadata.st_size,
+                content_sha256,
+            )
+        return inventory
+
+    @staticmethod
+    def _argv(
+        payload_file: Path,
+        expected_payload_sha256: str,
+        *,
+        idempotency_key: str = "pre-database-denial",
+    ) -> list[str]:
+        return [
+            "coordination_store.py",
+            "prepare-claimed-no-delivery-park",
+            "--idempotency-key",
+            idempotency_key,
+            "--planner-session-id",
+            PLANNER_ENDPOINT,
+            "--payload-file",
+            str(payload_file),
+            "--expected-payload-sha256",
+            expected_payload_sha256,
+        ]
+
+    def _run_without_database(
+        self,
+        raw_payload: bytes,
+        expected_payload_sha256: str,
+        *,
+        existing_database: bool = False,
+        idempotency_key: str = "pre-database-denial",
+    ) -> tuple[int, dict[str, object], dict[str, tuple[int, int, str | None]]]:
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-prepare-") as temp:
+            root = Path(temp)
+            payload_file = root / "payload.json"
+            payload_file.write_bytes(raw_payload)
+            database = root / "coordination" / "state.sqlite3"
+            if existing_database:
+                database.parent.mkdir(mode=0o700)
+                for path, content in (
+                    (database, b"synthetic-database"),
+                    (Path(f"{database}-wal"), b"synthetic-wal"),
+                    (Path(f"{database}-shm"), b"synthetic-shm"),
+                    (database.parent / "state.lock", b"synthetic-lock"),
+                ):
+                    path.write_bytes(content)
+
+            before = self._inventory(root)
+            output = io.StringIO()
+            with (
+                mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                mock.patch.object(
+                    coordination,
+                    "CoordinationStore",
+                    side_effect=AssertionError("database must not open"),
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self._argv(
+                        payload_file,
+                        expected_payload_sha256,
+                        idempotency_key=idempotency_key,
+                    ),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                result = coordination.main()
+            self.assertEqual(before, self._inventory(root))
+            return result, json.loads(output.getvalue()), self._inventory(root)
+
+    def test_empty_key_preserves_payload_and_digest_rejection_precedence(self) -> None:
+        reserved_payload = canonical_json(
+            {
+                "evidence": {
+                    "schema": CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA,
+                    "disposition": "PARK",
+                }
+            }
+        ).encode("utf-8")
+        for name, raw_payload, expected_sha256, expected_error in (
+            (
+                "malformed",
+                b'{"evidence":',
+                "0" * 64,
+                "COORDINATION_ENVELOPE_MALFORMED",
+            ),
+            (
+                "digest-mismatch",
+                reserved_payload,
+                "0" * 64,
+                "MESSAGE_PAYLOAD_MISMATCH",
+            ),
+        ):
+            with self.subTest(name=name), mock.patch.object(
+                coordination,
+                "_require_current_planner_identity_readonly",
+                side_effect=AssertionError("planner lookup must not run"),
+            ):
+                result, output, _inventory = self._run_without_database(
+                    raw_payload,
+                    expected_sha256,
+                    idempotency_key="",
+                )
+                self.assertEqual(1, result)
+                self.assertEqual(
+                    {"phase": "HOLD", "error": expected_error},
+                    output,
+                )
+
+    def test_malformed_ambiguous_and_digest_inputs_fail_before_database_open(self) -> None:
+        reserved_schema = CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA
+        cases = (
+            ("malformed", b'{"evidence":', "0" * 64, "COORDINATION_ENVELOPE_MALFORMED"),
+            ("non-object", b"[]", "0" * 64, "COORDINATION_ENVELOPE_NON_OBJECT"),
+            ("nonfinite", b'{"value":NaN}', "0" * 64, "COORDINATION_ENVELOPE_NONFINITE"),
+            ("duplicate", b'{"x":1,"x":2}', "0" * 64, "COORDINATION_ENVELOPE_DUPLICATE_KEY"),
+            (
+                "ambiguous",
+                (
+                    '{"evidence":{"schema":"'
+                    + reserved_schema
+                    + '","disposition":"COMPLETE"}}'
+                ).encode("utf-8"),
+                "0" * 64,
+                "COORDINATION_ENVELOPE_AMBIGUOUS_RESERVED_INTENT",
+            ),
+            (
+                "ordinary",
+                b'{"value":1}',
+                digest_json({"value": 1}),
+                "CLAIMED_NO_DELIVERY_PARK_HANDLER_REQUIRED",
+            ),
+            (
+                "oversized",
+                b'{"value":"' + b"a" * (1024 * 1024) + b'"}',
+                "0" * 64,
+                "COORDINATION_ENVELOPE_RESOURCE_LIMIT",
+            ),
+            (
+                "digest",
+                (
+                    '{"evidence":{"schema":"'
+                    + reserved_schema
+                    + '","disposition":"PARK"}}'
+                ).encode("utf-8"),
+                "0" * 64,
+                "MESSAGE_PAYLOAD_MISMATCH",
+            ),
+        )
+        for name, raw_payload, expected_sha256, error in cases:
+            with self.subTest(name=name):
+                result, output, _inventory = self._run_without_database(
+                    raw_payload, expected_sha256
+                )
+                self.assertEqual(1, result)
+                self.assertEqual({"phase": "HOLD", "error": error}, output)
+
+    def test_invalid_input_preserves_existing_database_and_sidecar_bytes(self) -> None:
+        result, output, _inventory = self._run_without_database(
+            b'{"evidence":',
+            "0" * 64,
+            existing_database=True,
+        )
+        self.assertEqual(1, result)
+        self.assertEqual(
+            {"phase": "HOLD", "error": "COORDINATION_ENVELOPE_MALFORMED"},
+            output,
+        )
+
+    def test_exponent_overflow_is_nonfinite_before_digest_or_database(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-overflow-") as temp:
+            root = Path(temp)
+            payload_file = root / "payload.json"
+            payload_file.write_bytes(
+                (
+                    '{"evidence":{"schema":"'
+                    + CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA
+                    + '","disposition":"PARK"},"overflow":1e400}'
+                ).encode("utf-8")
+            )
+            database = root / "coordination" / "state.sqlite3"
+            before = self._inventory(root)
+            output = io.StringIO()
+            with (
+                mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                mock.patch.object(
+                    coordination,
+                    "CoordinationStore",
+                    side_effect=AssertionError("database must not open"),
+                ),
+                mock.patch.object(
+                    coordination,
+                    "digest_json",
+                    side_effect=AssertionError("digest must not run"),
+                ),
+                mock.patch.object(sys, "argv", self._argv(payload_file, "0" * 64)),
+                contextlib.redirect_stdout(output),
+            ):
+                result = coordination.main()
+            self.assertEqual(1, result)
+            self.assertEqual(
+                {"phase": "HOLD", "error": "COORDINATION_ENVELOPE_NONFINITE"},
+                json.loads(output.getvalue()),
+            )
+            self.assertEqual(before, self._inventory(root))
+            self.assertFalse(database.parent.exists())
+
+    def test_required_acquisition_flags_fail_closed_before_open_or_parse(self) -> None:
+        for flag_name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+            with self.subTest(flag_name=flag_name):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"twinfinity-park-required-{flag_name.lower()}-"
+                ) as temp:
+                    root = Path(temp)
+                    payload_file = root / "payload.json"
+                    payload_file.write_bytes(b"{}")
+                    database = root / "coordination" / "state.sqlite3"
+                    before = self._inventory(root)
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                        mock.patch.object(coordination.os, flag_name, 0),
+                        mock.patch.object(
+                            coordination.os,
+                            "open",
+                            side_effect=AssertionError("payload must not open"),
+                        ),
+                        mock.patch.object(
+                            coordination,
+                            "parse_coordination_envelope",
+                            side_effect=AssertionError("parser must not run"),
+                        ),
+                        mock.patch.object(
+                            coordination,
+                            "digest_json",
+                            side_effect=AssertionError("digest must not run"),
+                        ),
+                        mock.patch.object(
+                            coordination,
+                            "CoordinationStore",
+                            side_effect=AssertionError("database must not open"),
+                        ),
+                        mock.patch.object(
+                            sys, "argv", self._argv(payload_file, "0" * 64)
+                        ),
+                        contextlib.redirect_stdout(output),
+                    ):
+                        result = coordination.main()
+
+                    self.assertEqual(1, result)
+                    self.assertEqual(
+                        {"phase": "HOLD", "error": "PARK_PAYLOAD_READ_FAILED"},
+                        json.loads(output.getvalue()),
+                    )
+                    self.assertEqual(before, self._inventory(root))
+                    self.assertFalse(database.parent.exists())
+
+    def test_short_read_valid_prefix_fails_before_parse_digest_or_database(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-short-read-") as temp:
+            root = Path(temp)
+            valid_prefix = b'{"value":1}'
+            payload_file = root / "payload.json"
+            payload_file.write_bytes(valid_prefix + b"unread-suffix")
+            database = root / "coordination" / "state.sqlite3"
+            before = self._inventory(root)
+            observed_reads = []
+
+            def short_read(_descriptor, size):
+                observed_reads.append(size)
+                return valid_prefix
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                mock.patch.object(coordination.os, "read", side_effect=short_read),
+                mock.patch.object(
+                    coordination,
+                    "parse_coordination_envelope",
+                    side_effect=AssertionError("parser must not run"),
+                ),
+                mock.patch.object(
+                    coordination,
+                    "digest_json",
+                    side_effect=AssertionError("digest must not run"),
+                ),
+                mock.patch.object(
+                    coordination,
+                    "CoordinationStore",
+                    side_effect=AssertionError("database must not open"),
+                ),
+                mock.patch.object(sys, "argv", self._argv(payload_file, "0" * 64)),
+                contextlib.redirect_stdout(output),
+            ):
+                result = coordination.main()
+
+            self.assertEqual(1, result)
+            self.assertEqual(
+                {"phase": "HOLD", "error": "PARK_PAYLOAD_READ_FAILED"},
+                json.loads(output.getvalue()),
+            )
+            self.assertEqual(
+                [coordination.COORDINATION_ENVELOPE_MAX_BYTES + 1], observed_reads
+            )
+            self.assertEqual(before, self._inventory(root))
+            self.assertFalse(database.parent.exists())
+
+    def test_identity_denials_use_readonly_lookup_before_writable_store(self) -> None:
+        raw_payload = canonical_json(
+            {
+                "evidence": {
+                    "schema": CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA,
+                    "disposition": "PARK",
+                }
+            }
+        ).encode("utf-8")
+        payload_sha256 = digest_json(json.loads(raw_payload))
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-identity-") as temp:
+            root = Path(temp)
+            coordination_root = root / "coordination"
+            coordination_root.mkdir(mode=0o700)
+            database = coordination_root / "state.sqlite3"
+            installed = root / "installed"
+            installed.mkdir()
+            for profile in (ROOT / "references").glob("*-v*.config.toml"):
+                shutil.copy2(profile, installed / profile.name)
+            config = load_registry_config(
+                ROOT / "references" / "twinfinity-executor-registry.toml",
+                codex_home=installed,
+                profile_template_root=ROOT / "references",
+            )
+            store = CoordinationStore(database)
+            aliases, alias_sha = load_legacy_alias_fixture(
+                ROOT / "references" / "twinfinity-legacy-role-aliases.json"
+            )
+            plan = build_plan(
+                store.connection,
+                config,
+                aliases,
+                alias_fixture_sha256=alias_sha,
+            )
+            apply_plan(
+                store.connection,
+                plan=plan,
+                operation_key="claimed-no-delivery-park-readonly-identity-fixture",
+                expected_plan_sha256=plan["plan_sha256"],
+                now="2026-08-26T20:00:00Z",
+            )
+            store.close()
+            payload_file = root / "payload.json"
+            payload_file.write_bytes(raw_payload)
+
+            cases = (
+                ("wrong-role", DEVELOPMENT_ENDPOINT, "PARK_PREPARER_INVALID"),
+                ("historical", "role.planner.v2", "CURRENT_ROLE_ENDPOINT_REQUIRED"),
+                (
+                    "alias",
+                    "01a017f9-4ce5-7110-9a1f-73b1c10f5625",
+                    "CURRENT_ROLE_ENDPOINT_REQUIRED",
+                ),
+                ("substituted", "role.planner.v999", "CURRENT_ROLE_ENDPOINT_REQUIRED"),
+            )
+            with registry_config_scope(config):
+                for suffix, recipient, expected_error in cases:
+                    with self.subTest(suffix=suffix):
+                        before = self._inventory(root)
+                        output = io.StringIO()
+                        with (
+                            mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                            mock.patch.object(
+                                coordination,
+                                "CoordinationStore",
+                                side_effect=AssertionError(
+                                    "writable database must not open"
+                                ),
+                            ),
+                            mock.patch.object(
+                                sys,
+                                "argv",
+                                [
+                                    "coordination_store.py",
+                                    "prepare-claimed-no-delivery-park",
+                                    "--idempotency-key",
+                                    f"readonly-identity-{suffix}",
+                                    "--planner-session-id",
+                                    recipient,
+                                    "--payload-file",
+                                    str(payload_file),
+                                    "--expected-payload-sha256",
+                                    payload_sha256,
+                                ],
+                            ),
+                            contextlib.redirect_stdout(output),
+                        ):
+                            result = coordination.main()
+                        self.assertEqual(1, result)
+                        self.assertEqual(
+                            {"phase": "HOLD", "error": expected_error},
+                            json.loads(output.getvalue()),
+                        )
+                        self.assertEqual(before, self._inventory(root))
+
+    def test_empty_key_fails_before_planner_lookup_or_store_construction(self) -> None:
+        raw_payload = canonical_json(
+            {
+                "evidence": {
+                    "schema": CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA,
+                    "disposition": "PARK",
+                }
+            }
+        ).encode("utf-8")
+        payload_sha256 = digest_json(json.loads(raw_payload))
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-empty-key-") as temp:
+            root = Path(temp)
+            coordination_root = root / "coordination"
+            coordination_root.mkdir(mode=0o700)
+            database = coordination_root / "state.sqlite3"
+            installed = root / "installed"
+            installed.mkdir()
+            for profile in (ROOT / "references").glob("*-v*.config.toml"):
+                shutil.copy2(profile, installed / profile.name)
+            config = load_registry_config(
+                ROOT / "references" / "twinfinity-executor-registry.toml",
+                codex_home=installed,
+                profile_template_root=ROOT / "references",
+            )
+            fixture_store = CoordinationStore(database)
+            aliases, alias_sha = load_legacy_alias_fixture(
+                ROOT / "references" / "twinfinity-legacy-role-aliases.json"
+            )
+            plan = build_plan(
+                fixture_store.connection,
+                config,
+                aliases,
+                alias_fixture_sha256=alias_sha,
+            )
+            apply_plan(
+                fixture_store.connection,
+                plan=plan,
+                operation_key="claimed-no-delivery-park-empty-key-fixture",
+                expected_plan_sha256=plan["plan_sha256"],
+                now="2026-08-26T20:00:00Z",
+            )
+            fixture_store.close()
+            payload_file = root / "payload.json"
+            payload_file.write_bytes(raw_payload)
+            before = self._inventory(root)
+            store_constructions = []
+            planner_lookups = []
+            real_store = coordination.CoordinationStore
+            real_planner_lookup = coordination._require_current_planner_identity_readonly
+
+            def traced_store(*args, **kwargs):
+                store_constructions.append((args, kwargs))
+                return real_store(*args, **kwargs)
+
+            def traced_planner_lookup(*args, **kwargs):
+                planner_lookups.append((args, kwargs))
+                return real_planner_lookup(*args, **kwargs)
+
+            argv = self._argv(payload_file, payload_sha256)
+            argv[argv.index("--idempotency-key") + 1] = ""
+            output = io.StringIO()
+            with (
+                registry_config_scope(config),
+                mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                mock.patch.object(
+                    coordination,
+                    "CoordinationStore",
+                    side_effect=traced_store,
+                ),
+                mock.patch.object(
+                    coordination,
+                    "_require_current_planner_identity_readonly",
+                    side_effect=traced_planner_lookup,
+                ),
+                mock.patch.object(sys, "argv", argv),
+                contextlib.redirect_stdout(output),
+            ):
+                result = coordination.main()
+
+            self.assertEqual(1, result)
+            self.assertEqual(
+                {"phase": "HOLD", "error": "PARK_PREPARER_INVALID"},
+                json.loads(output.getvalue()),
+            )
+            self.assertEqual(0, len(store_constructions))
+            self.assertEqual(0, len(planner_lookups))
+            self.assertEqual(before, self._inventory(root))
+
+    def test_missing_registry_and_absent_database_deny_without_artifacts(self) -> None:
+        raw_payload = canonical_json(
+            {
+                "evidence": {
+                    "schema": CLAIMED_NO_DELIVERY_PARK_NOTICE_SCHEMA,
+                    "disposition": "PARK",
+                }
+            }
+        ).encode("utf-8")
+        payload_sha256 = digest_json(json.loads(raw_payload))
+        for suffix, create_database, expected_error in (
+            ("missing-registry", True, "REGISTRY_PROFILE_MISSING"),
+            ("absent-database", False, "DATABASE_PARENT_UNSAFE"),
+        ):
+            with self.subTest(suffix=suffix):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"twinfinity-park-{suffix}-"
+                ) as temp:
+                    root = Path(temp)
+                    database = root / "coordination" / "state.sqlite3"
+                    if create_database:
+                        database.parent.mkdir(mode=0o700)
+                        store = CoordinationStore(database)
+                        store.close()
+                    codex_home = root / "codex-home"
+                    if suffix == "missing-registry":
+                        codex_home.mkdir(mode=0o700)
+                    environment = (
+                        mock.patch.dict(
+                            os.environ,
+                            {"CODEX_HOME": str(codex_home)},
+                        )
+                        if suffix == "missing-registry"
+                        else contextlib.nullcontext()
+                    )
+                    payload_file = root / "payload.json"
+                    payload_file.write_bytes(raw_payload)
+                    before = self._inventory(root)
+                    output = io.StringIO()
+                    with (
+                        environment,
+                        mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                        mock.patch.object(
+                            coordination,
+                            "CoordinationStore",
+                            side_effect=AssertionError("writable database must not open"),
+                        ),
+                        mock.patch.object(
+                            sys,
+                            "argv",
+                            [
+                                "coordination_store.py",
+                                "prepare-claimed-no-delivery-park",
+                                "--idempotency-key",
+                                f"readonly-identity-{suffix}",
+                                "--planner-session-id",
+                                PLANNER_ENDPOINT,
+                                "--payload-file",
+                                str(payload_file),
+                                "--expected-payload-sha256",
+                                payload_sha256,
+                            ],
+                        ),
+                        contextlib.redirect_stdout(output),
+                    ):
+                        result = coordination.main()
+                    self.assertEqual(1, result)
+                    self.assertEqual(
+                        {"phase": "HOLD", "error": expected_error},
+                        json.loads(output.getvalue()),
+                    )
+                    self.assertEqual(before, self._inventory(root))
+                    if not create_database:
+                        self.assertFalse(database.parent.exists())
+
+    def test_fifo_returns_within_explicit_timeout_and_creates_no_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-fifo-timeout-") as temp:
+            root = Path(temp)
+            payload_file = root / "payload.fifo"
+            os.mkfifo(payload_file, mode=0o600)
+            database = root / "coordination" / "state.sqlite3"
+            before = self._inventory(root)
+            child = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import coordination_store as coordination\n"
+                "coordination.DEFAULT_DATABASE = Path(sys.argv[2])\n"
+                "sys.argv = ['coordination_store.py', "
+                "'prepare-claimed-no-delivery-park', '--idempotency-key', "
+                "'fifo-timeout', '--planner-session-id', 'role.planner.v3', "
+                "'--payload-file', sys.argv[3], '--expected-payload-sha256', '0' * 64]\n"
+                "raise SystemExit(coordination.main())\n"
+            )
+            environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            started = time.monotonic()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    child,
+                    str(SCRIPTS),
+                    str(database),
+                    str(payload_file),
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=2.0,
+                check=False,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            self.assertLess(elapsed, 2.0)
+            self.assertEqual(
+                {"phase": "HOLD", "error": "PARK_PAYLOAD_READ_FAILED"},
+                json.loads(completed.stdout),
+            )
+            self.assertEqual(before, self._inventory(root))
+            self.assertFalse(database.parent.exists())
+
+    def test_fifo_fails_before_parse_digest_store_or_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-fifo-") as temp:
+            root = Path(temp)
+            payload_file = root / "payload.fifo"
+            os.mkfifo(payload_file, mode=0o600)
+            database = root / "coordination" / "state.sqlite3"
+            before = self._inventory(root)
+            observed_open_flags = []
+            real_os_open = os.open
+
+            def traced_os_open(path, flags, *arguments, **keywords):
+                if os.fspath(path) == os.fspath(payload_file):
+                    observed_open_flags.append(flags)
+                return real_os_open(path, flags, *arguments, **keywords)
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                mock.patch.object(
+                    coordination,
+                    "CoordinationStore",
+                    side_effect=AssertionError("database must not open"),
+                ),
+                mock.patch.object(
+                    coordination,
+                    "parse_coordination_envelope",
+                    side_effect=AssertionError("parser must not run"),
+                ),
+                mock.patch.object(
+                    coordination,
+                    "digest_json",
+                    side_effect=AssertionError("digest must not run"),
+                ),
+                mock.patch.object(coordination.os, "open", side_effect=traced_os_open),
+                mock.patch.object(sys, "argv", self._argv(payload_file, "0" * 64)),
+                contextlib.redirect_stdout(output),
+            ):
+                result = coordination.main()
+
+            self.assertEqual(1, result)
+            self.assertEqual(
+                {"phase": "HOLD", "error": "PARK_PAYLOAD_READ_FAILED"},
+                json.loads(output.getvalue()),
+            )
+            self.assertEqual(1, len(observed_open_flags))
+            flags = observed_open_flags[0]
+            self.assertEqual(os.O_RDONLY, flags & os.O_ACCMODE)
+            self.assertEqual(os.O_NONBLOCK, flags & os.O_NONBLOCK)
+            self.assertEqual(os.O_NOFOLLOW, flags & os.O_NOFOLLOW)
+            self.assertEqual(os.O_CLOEXEC, flags & os.O_CLOEXEC)
+            self.assertEqual(before, self._inventory(root))
+            self.assertFalse(database.parent.exists())
+
+    def test_symlink_directory_and_character_device_fail_before_parse_or_store(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-nonregular-") as temp:
+            root = Path(temp)
+            regular = root / "regular.json"
+            regular.write_text("{}", encoding="utf-8")
+            symlink = root / "payload-link.json"
+            symlink.symlink_to(regular)
+            directory = root / "payload-directory"
+            directory.mkdir()
+            for name, payload_file in (
+                ("symlink", symlink),
+                ("directory", directory),
+                ("character-device", Path("/dev/null")),
+            ):
+                with self.subTest(name=name):
+                    database = root / f"coordination-{name}" / "state.sqlite3"
+                    before = self._inventory(root)
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                        mock.patch.object(
+                            coordination,
+                            "CoordinationStore",
+                            side_effect=AssertionError("database must not open"),
+                        ),
+                        mock.patch.object(
+                            coordination,
+                            "parse_coordination_envelope",
+                            side_effect=AssertionError("parser must not run"),
+                        ),
+                        mock.patch.object(sys, "argv", self._argv(payload_file, "0" * 64)),
+                        contextlib.redirect_stdout(output),
+                    ):
+                        result = coordination.main()
+                    self.assertEqual(1, result)
+                    self.assertEqual(
+                        {"phase": "HOLD", "error": "PARK_PAYLOAD_READ_FAILED"},
+                        json.loads(output.getvalue()),
+                    )
+                    self.assertEqual(before, self._inventory(root))
+                    self.assertFalse(database.parent.exists())
+
+    def test_socket_fails_before_parse_or_store(self) -> None:
+        import socket
+
+        with tempfile.TemporaryDirectory(prefix="tf-park-socket-") as temp:
+            root = Path(temp)
+            payload_file = root / "payload.sock"
+            database = root / "coordination" / "state.sqlite3"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(os.fspath(payload_file))
+                before = self._inventory(root)
+                output = io.StringIO()
+                with (
+                    mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                    mock.patch.object(
+                        coordination,
+                        "CoordinationStore",
+                        side_effect=AssertionError("database must not open"),
+                    ),
+                    mock.patch.object(
+                        coordination,
+                        "parse_coordination_envelope",
+                        side_effect=AssertionError("parser must not run"),
+                    ),
+                    mock.patch.object(sys, "argv", self._argv(payload_file, "0" * 64)),
+                    contextlib.redirect_stdout(output),
+                ):
+                    result = coordination.main()
+                self.assertEqual(1, result)
+                self.assertEqual(
+                    {"phase": "HOLD", "error": "PARK_PAYLOAD_READ_FAILED"},
+                    json.loads(output.getvalue()),
+                )
+                self.assertEqual(before, self._inventory(root))
+                self.assertFalse(database.parent.exists())
+
+    def test_oversized_regular_payload_uses_one_limit_plus_one_read(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="twinfinity-park-bounded-") as temp:
+            root = Path(temp)
+            payload_file = root / "payload.json"
+            with payload_file.open("wb") as descriptor:
+                descriptor.write(b"{")
+                descriptor.seek(coordination.COORDINATION_ENVELOPE_MAX_BYTES * 4)
+                descriptor.write(b"}")
+            database = root / "coordination" / "state.sqlite3"
+            before = self._inventory(root)
+            observed_reads = []
+            real_os_read = os.read
+
+            def traced_os_read(descriptor, size):
+                content = real_os_read(descriptor, size)
+                observed_reads.append((size, len(content)))
+                return content
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(coordination, "DEFAULT_DATABASE", database),
+                mock.patch.object(
+                    coordination,
+                    "CoordinationStore",
+                    side_effect=AssertionError("database must not open"),
+                ),
+                mock.patch.object(coordination.os, "read", side_effect=traced_os_read),
+                mock.patch.object(sys, "argv", self._argv(payload_file, "0" * 64)),
+                contextlib.redirect_stdout(output),
+            ):
+                result = coordination.main()
+            bounded_size = coordination.COORDINATION_ENVELOPE_MAX_BYTES + 1
+            self.assertEqual(1, result)
+            self.assertEqual(
+                {"phase": "HOLD", "error": "COORDINATION_ENVELOPE_RESOURCE_LIMIT"},
+                json.loads(output.getvalue()),
+            )
+            self.assertEqual([(bounded_size, bounded_size)], observed_reads)
+            self.assertEqual(before, self._inventory(root))
+            self.assertFalse(database.parent.exists())
 
 
 if __name__ == "__main__":
