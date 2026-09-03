@@ -4400,11 +4400,23 @@ class ClaimedNoDeliveryParkPreparationPreDatabaseTests(unittest.TestCase):
                         database.parent.mkdir(mode=0o700)
                         store = CoordinationStore(database)
                         store.close()
+                    codex_home = root / "codex-home"
+                    if suffix == "missing-registry":
+                        codex_home.mkdir(mode=0o700)
+                    environment = (
+                        mock.patch.dict(
+                            os.environ,
+                            {"CODEX_HOME": str(codex_home)},
+                        )
+                        if suffix == "missing-registry"
+                        else contextlib.nullcontext()
+                    )
                     payload_file = root / "payload.json"
                     payload_file.write_bytes(raw_payload)
                     before = self._inventory(root)
                     output = io.StringIO()
                     with (
+                        environment,
                         mock.patch.object(coordination, "DEFAULT_DATABASE", database),
                         mock.patch.object(
                             coordination,
