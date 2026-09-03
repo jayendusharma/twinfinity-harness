@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -32,17 +33,33 @@ class SourceInstallAtomTests(unittest.TestCase):
         self.destination.mkdir(mode=0o700)
         (self.source / "new.txt").write_text("new\n", encoding="utf-8")
         (self.source / "second.txt").write_text("second-new\n", encoding="utf-8")
+        (self.source / "absent.txt").write_text("absent-new\n", encoding="utf-8")
+        (self.source / "changed.txt").write_text("changed-new\n", encoding="utf-8")
+        (self.source / "equal.txt").write_text("equal\n", encoding="utf-8")
         (self.destination / "installed.txt").write_text("old\n", encoding="utf-8")
         (self.destination / "second-installed.txt").write_text(
             "second-old\n", encoding="utf-8"
         )
         (self.source / "new.txt").chmod(0o600)
         (self.source / "second.txt").chmod(0o600)
+        (self.source / "absent.txt").chmod(0o600)
+        (self.source / "changed.txt").chmod(0o600)
+        (self.source / "equal.txt").chmod(0o600)
         (self.destination / "installed.txt").chmod(0o600)
         (self.destination / "second-installed.txt").chmod(0o600)
         subprocess.run(["git", "init", "-q", str(self.source)], check=True)
         subprocess.run(
-            ["git", "-C", str(self.source), "add", "new.txt", "second.txt"],
+            [
+                "git",
+                "-C",
+                str(self.source),
+                "add",
+                "new.txt",
+                "second.txt",
+                "absent.txt",
+                "changed.txt",
+                "equal.txt",
+            ],
             check=True,
         )
         subprocess.run(
@@ -124,6 +141,493 @@ class SourceInstallAtomTests(unittest.TestCase):
             )
         value["manifest_sha256"] = atom.manifest_digest(value)
         return value
+
+    def mixed_manifest(
+        self,
+        order: tuple[str, ...],
+        *,
+        destination: Path,
+    ) -> dict[str, object]:
+        destination.mkdir(mode=0o700)
+        (destination / "changed-installed.txt").write_text(
+            "changed-old\n", encoding="utf-8"
+        )
+        (destination / "equal-installed.txt").write_text(
+            "equal\n", encoding="utf-8"
+        )
+        (destination / "changed-installed.txt").chmod(0o600)
+        (destination / "equal-installed.txt").chmod(0o600)
+        mapping = {
+            atom.ABSENT_TO_PRESENT: ("absent.txt", "absent-installed.txt"),
+            atom.CHANGED_PRESENT: ("changed.txt", "changed-installed.txt"),
+            atom.SOURCE_EQUAL: ("equal.txt", "equal-installed.txt"),
+        }
+        entries: list[dict[str, object]] = []
+        for equivalence in order:
+            source_name, destination_name = mapping[equivalence]
+            source = self.source / source_name
+            target = destination / destination_name
+            if equivalence == atom.ABSENT_TO_PRESENT:
+                prior: dict[str, object] = {"state": "ABSENT"}
+            else:
+                prior = {
+                    "state": "PRESENT",
+                    "sha256": sha(target),
+                    "mode": 0o600,
+                    "uid": os.getuid(),
+                    "gid": os.getgid(),
+                }
+            entries.append(
+                {
+                    "source_path": source_name,
+                    "destination_path": destination_name,
+                    "source_sha256": sha(source),
+                    "source_mode": 0o600,
+                    "destination_mode": 0o600,
+                    "destination_uid": os.getuid(),
+                    "destination_gid": os.getgid(),
+                    "destination_prior": prior,
+                }
+            )
+        manifest: dict[str, object] = {
+            "schema": atom.SCHEMA,
+            "manifest_sha256": "0" * 64,
+            "atom_id": "mixed-install",
+            "source_commit": self.source_commit,
+            "destination_root_identity": atom.destination_root_identity(
+                destination
+            ),
+            "entries": entries,
+        }
+        manifest["manifest_sha256"] = atom.manifest_digest(manifest)
+        return manifest
+
+    def assert_mixed_prior(self, destination: Path) -> None:
+        self.assertFalse((destination / "absent-installed.txt").exists())
+        self.assertEqual(
+            "changed-old\n",
+            (destination / "changed-installed.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "equal\n",
+            (destination / "equal-installed.txt").read_text(encoding="utf-8"),
+        )
+
+    def assert_mixed_installed(self, destination: Path) -> None:
+        self.assertEqual(
+            "absent-new\n",
+            (destination / "absent-installed.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "changed-new\n",
+            (destination / "changed-installed.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "equal\n",
+            (destination / "equal-installed.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_three_classes_are_derived_and_bound_without_manifest_attestation(
+        self,
+    ) -> None:
+        order = (
+            atom.ABSENT_TO_PRESENT,
+            atom.CHANGED_PRESENT,
+            atom.SOURCE_EQUAL,
+        )
+        destination = self.root / "derived-destination"
+        manifest = self.mixed_manifest(order, destination=destination)
+        self.assertNotIn("install_equivalence", manifest["entries"][0])  # type: ignore[index]
+        stage = self.root / "derived-stage"
+        staged = atom.stage_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=destination,
+            stage_root=stage,
+        )
+        validated = atom.validate_stage(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=destination,
+            stage_root=stage,
+        )
+        for receipt in (staged, validated):
+            self.assertEqual(
+                list(order),
+                [entry["install_equivalence"] for entry in receipt["entries"]],
+            )
+            self.assertEqual(receipt["receipt_sha256"], atom.receipt_digest(receipt))
+        changed = self.mixed_manifest(
+            (atom.SOURCE_EQUAL,),
+            destination=self.root / "metadata-destination",
+        )
+        changed["entries"][0]["destination_mode"] = 0o644  # type: ignore[index]
+        changed["manifest_sha256"] = atom.manifest_digest(changed)  # type: ignore[arg-type]
+        self.assertEqual(
+            atom.CHANGED_PRESENT,
+            atom._install_equivalence(changed["entries"][0]),  # type: ignore[index]
+        )
+
+    def test_source_equal_has_zero_destination_mutation_or_backup(self) -> None:
+        destination = self.root / "equal-destination"
+        manifest = self.mixed_manifest(
+            (atom.SOURCE_EQUAL,), destination=destination
+        )
+        target = destination / "equal-installed.txt"
+        before = target.stat()
+        stage = self.root / "equal-stage"
+        rollback = self.root / "equal-rollback"
+        atom.stage_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=destination,
+            stage_root=stage,
+        )
+        replaced: list[str] = []
+        original_replace = atom._atomic_replace_leaf_at
+
+        def observe_replace(*args: object, **kwargs: object) -> None:
+            replaced.append(str(args[1]))
+            original_replace(*args, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(atom, "_atomic_replace_leaf_at", side_effect=observe_replace):
+            installed = atom.apply_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                source_root=self.source,
+                destination_root=destination,
+                stage_root=stage,
+                rollback_root=rollback,
+                confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+            )
+            rolled_back = atom.rollback_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                destination_root=destination,
+                rollback_root=rollback,
+                confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+            )
+        after = target.stat()
+        self.assertEqual(before.st_ino, after.st_ino)
+        self.assertEqual(before.st_mode, after.st_mode)
+        self.assertEqual((before.st_uid, before.st_gid), (after.st_uid, after.st_gid))
+        self.assertNotIn("equal-installed.txt", replaced)
+        self.assertFalse((rollback / "files/equal-installed.txt").exists())
+        self.assertEqual(atom.SOURCE_EQUAL, installed["entries"][0]["install_equivalence"])
+        self.assertEqual(atom.SOURCE_EQUAL, rolled_back["entries"][0]["install_equivalence"])
+
+    def test_all_six_mixed_orderings_apply_rollback_and_replay(self) -> None:
+        classes = (
+            atom.ABSENT_TO_PRESENT,
+            atom.CHANGED_PRESENT,
+            atom.SOURCE_EQUAL,
+        )
+        for index, order in enumerate(itertools.permutations(classes)):
+            with self.subTest(order=order):
+                destination = self.root / f"ordering-destination-{index}"
+                manifest = self.mixed_manifest(order, destination=destination)
+                equal_inode = (destination / "equal-installed.txt").stat().st_ino
+                stage = self.root / f"ordering-stage-{index}"
+                rollback = self.root / f"ordering-rollback-{index}"
+                staged = atom.stage_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    source_root=self.source,
+                    destination_root=destination,
+                    stage_root=stage,
+                )
+                installed = atom.apply_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    source_root=self.source,
+                    destination_root=destination,
+                    stage_root=stage,
+                    rollback_root=rollback,
+                    confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+                )
+                self.assert_mixed_installed(destination)
+                first = atom.rollback_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    destination_root=destination,
+                    rollback_root=rollback,
+                    confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+                )
+                replay = atom.rollback_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    destination_root=destination,
+                    rollback_root=rollback,
+                    confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+                )
+                durable = json.loads(
+                    (rollback / atom.ROLLBACK_RECEIPT).read_text(encoding="utf-8")
+                )
+                self.assert_mixed_prior(destination)
+                self.assertEqual(equal_inode, (destination / "equal-installed.txt").stat().st_ino)
+                self.assertEqual(list(order), [entry["install_equivalence"] for entry in staged["entries"]])
+                self.assertEqual(list(order), [entry["install_equivalence"] for entry in installed["entries"]])
+                self.assertEqual(first, replay)
+                self.assertEqual(replay, durable)
+
+    def test_partial_apply_recovers_all_six_mixed_orderings(self) -> None:
+        classes = (
+            atom.ABSENT_TO_PRESENT,
+            atom.CHANGED_PRESENT,
+            atom.SOURCE_EQUAL,
+        )
+        mutable_leaves = {"absent-installed.txt", "changed-installed.txt"}
+        for index, order in enumerate(itertools.permutations(classes)):
+            with self.subTest(order=order):
+                destination = self.root / f"apply-failure-destination-{index}"
+                manifest = self.mixed_manifest(order, destination=destination)
+                equal_inode = (destination / "equal-installed.txt").stat().st_ino
+                stage = self.root / f"apply-failure-stage-{index}"
+                rollback = self.root / f"apply-failure-rollback-{index}"
+                atom.stage_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    source_root=self.source,
+                    destination_root=destination,
+                    stage_root=stage,
+                )
+                original_replace = atom._atomic_replace_leaf_at
+                failed = False
+
+                def fail_after_first_effect(*args: object, **kwargs: object) -> None:
+                    nonlocal failed
+                    original_replace(*args, **kwargs)  # type: ignore[arg-type]
+                    if str(args[1]) in mutable_leaves and not failed:
+                        failed = True
+                        raise RuntimeError("issue-172 apply interruption")
+
+                with patch.object(
+                    atom,
+                    "_atomic_replace_leaf_at",
+                    side_effect=fail_after_first_effect,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "apply interruption"):
+                        atom.apply_atom(
+                            manifest=manifest,  # type: ignore[arg-type]
+                            source_root=self.source,
+                            destination_root=destination,
+                            stage_root=stage,
+                            rollback_root=rollback,
+                            confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+                        )
+                self.assertTrue(failed)
+                self.assert_mixed_prior(destination)
+                self.assertEqual(equal_inode, (destination / "equal-installed.txt").stat().st_ino)
+                durable = json.loads(
+                    (rollback / atom.ROLLBACK_RECEIPT).read_text(encoding="utf-8")
+                )
+                self.assertEqual("ROLLED_BACK", durable["state"])
+                replay = atom.rollback_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    destination_root=destination,
+                    rollback_root=rollback,
+                    confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+                )
+                self.assertEqual(durable, replay)
+
+    def test_partial_rollback_replays_all_six_mixed_orderings(self) -> None:
+        classes = (
+            atom.ABSENT_TO_PRESENT,
+            atom.CHANGED_PRESENT,
+            atom.SOURCE_EQUAL,
+        )
+        for index, order in enumerate(itertools.permutations(classes)):
+            with self.subTest(order=order):
+                destination = self.root / f"rollback-failure-destination-{index}"
+                manifest = self.mixed_manifest(order, destination=destination)
+                equal_inode = (destination / "equal-installed.txt").stat().st_ino
+                stage = self.root / f"rollback-failure-stage-{index}"
+                rollback = self.root / f"rollback-failure-rollback-{index}"
+                atom.stage_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    source_root=self.source,
+                    destination_root=destination,
+                    stage_root=stage,
+                )
+                atom.apply_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    source_root=self.source,
+                    destination_root=destination,
+                    stage_root=stage,
+                    rollback_root=rollback,
+                    confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+                )
+                original_replace = atom._atomic_replace_leaf_at
+                original_unlink = atom._unlink_regular_leaf_at
+                failed = False
+
+                def fail_replace(*args: object, **kwargs: object) -> None:
+                    nonlocal failed
+                    original_replace(*args, **kwargs)  # type: ignore[arg-type]
+                    if str(args[1]) == "changed-installed.txt" and not failed:
+                        failed = True
+                        raise RuntimeError("issue-172 rollback interruption")
+
+                def fail_unlink(*args: object, **kwargs: object) -> None:
+                    nonlocal failed
+                    original_unlink(*args, **kwargs)  # type: ignore[arg-type]
+                    if str(args[1]) == "absent-installed.txt" and not failed:
+                        failed = True
+                        raise RuntimeError("issue-172 rollback interruption")
+
+                with (
+                    patch.object(atom, "_atomic_replace_leaf_at", side_effect=fail_replace),
+                    patch.object(atom, "_unlink_regular_leaf_at", side_effect=fail_unlink),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "rollback interruption"):
+                        atom.rollback_atom(
+                            manifest=manifest,  # type: ignore[arg-type]
+                            destination_root=destination,
+                            rollback_root=rollback,
+                            confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+                        )
+                self.assertTrue(failed)
+                durable_prepared = json.loads(
+                    (rollback / atom.ROLLBACK_RECEIPT).read_text(encoding="utf-8")
+                )
+                self.assertEqual("PREPARED", durable_prepared["state"])
+                recovered = atom.rollback_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    destination_root=destination,
+                    rollback_root=rollback,
+                    confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+                )
+                replay = atom.rollback_atom(
+                    manifest=manifest,  # type: ignore[arg-type]
+                    destination_root=destination,
+                    rollback_root=rollback,
+                    confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+                )
+                self.assert_mixed_prior(destination)
+                self.assertEqual(equal_inode, (destination / "equal-installed.txt").stat().st_ino)
+                self.assertEqual("ROLLED_BACK", recovered["state"])
+                self.assertEqual(recovered, replay)
+
+    def test_stale_noncanonical_and_impossible_receipts_fail_closed(self) -> None:
+        order = (
+            atom.ABSENT_TO_PRESENT,
+            atom.CHANGED_PRESENT,
+            atom.SOURCE_EQUAL,
+        )
+        destination = self.root / "receipt-destination"
+        manifest = self.mixed_manifest(order, destination=destination)
+        stage = self.root / "receipt-stage"
+        rollback = self.root / "receipt-rollback"
+        staged = atom.stage_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=destination,
+            stage_root=stage,
+        )
+        stage_path = stage / atom.STAGE_RECEIPT
+        stale_stage = json.loads(atom.canonical_json(staged))
+        stale_stage["entries"][0].pop("install_equivalence")
+        stale_stage["receipt_sha256"] = atom.receipt_digest(stale_stage)
+        stage_path.write_text(atom.canonical_json(stale_stage), encoding="utf-8")
+        with self.assertRaisesRegex(
+            atom.SourceInstallAtomError, "INSTALL_ATOM_STAGE_RECEIPT_INVALID"
+        ):
+            atom.validate_stage(
+                manifest=manifest,  # type: ignore[arg-type]
+                source_root=self.source,
+                destination_root=destination,
+                stage_root=stage,
+            )
+        stage_path.write_text(atom.canonical_json(staged), encoding="utf-8")
+        atom.apply_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            source_root=self.source,
+            destination_root=destination,
+            stage_root=stage,
+            rollback_root=rollback,
+            confirmation=f"INSTALL:{manifest['manifest_sha256']}",
+        )
+        receipt_path = rollback / atom.ROLLBACK_RECEIPT
+        accepted = json.loads(receipt_path.read_text(encoding="utf-8"))
+        other_root = self.root / "other-root"
+        other_root.mkdir(mode=0o700)
+
+        def old_shape(value: dict[str, object]) -> None:
+            value.pop("lifecycle")
+
+        def wrong_manifest(value: dict[str, object]) -> None:
+            value["manifest_sha256"] = "f" * 64
+
+        def wrong_root(value: dict[str, object]) -> None:
+            value["destination_root_identity"] = atom.destination_root_identity(other_root)
+
+        def wrong_order(value: dict[str, object]) -> None:
+            value["entries"] = list(reversed(value["entries"]))  # type: ignore[arg-type]
+
+        def wrong_class(value: dict[str, object]) -> None:
+            value["entries"][0]["install_equivalence"] = atom.SOURCE_EQUAL  # type: ignore[index]
+
+        def wrong_tuple(value: dict[str, object]) -> None:
+            value["entries"][0]["installed_sha256"] = "e" * 64  # type: ignore[index]
+
+        def impossible_transition(value: dict[str, object]) -> None:
+            value["lifecycle"]["transition"] = atom.PREPARED_TO_ROLLED_BACK  # type: ignore[index]
+
+        def mismatched_result(value: dict[str, object]) -> None:
+            value["lifecycle"]["result_state"] = "ROLLED_BACK"  # type: ignore[index]
+
+        mutations = (
+            old_shape,
+            wrong_manifest,
+            wrong_root,
+            wrong_order,
+            wrong_class,
+            wrong_tuple,
+            impossible_transition,
+            mismatched_result,
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation.__name__):
+                forged = json.loads(atom.canonical_json(accepted))
+                mutation(forged)
+                forged["receipt_sha256"] = atom.receipt_digest(forged)
+                receipt_path.write_text(atom.canonical_json(forged), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    atom.SourceInstallAtomError,
+                    "INSTALL_ATOM_ROLLBACK_DATA_INVALID",
+                ):
+                    atom.rollback_atom(
+                        manifest=manifest,  # type: ignore[arg-type]
+                        destination_root=destination,
+                        rollback_root=rollback,
+                        confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+                    )
+                self.assert_mixed_installed(destination)
+        receipt_path.write_text(json.dumps(accepted, indent=2), encoding="utf-8")
+        with self.assertRaisesRegex(
+            atom.SourceInstallAtomError, "INSTALL_ATOM_ROLLBACK_DATA_INVALID"
+        ):
+            atom.rollback_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                destination_root=destination,
+                rollback_root=rollback,
+                confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+            )
+        receipt_path.write_text(atom.canonical_json(accepted), encoding="utf-8")
+        receipt_path.write_text(
+            atom.canonical_json({**accepted, "receipt_sha256": "0" * 64}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            atom.SourceInstallAtomError, "INSTALL_ATOM_ROLLBACK_DATA_INVALID"
+        ):
+            atom.rollback_atom(
+                manifest=manifest,  # type: ignore[arg-type]
+                destination_root=destination,
+                rollback_root=rollback,
+                confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+            )
+        receipt_path.write_text(atom.canonical_json(accepted), encoding="utf-8")
+        atom.rollback_atom(
+            manifest=manifest,  # type: ignore[arg-type]
+            destination_root=destination,
+            rollback_root=rollback,
+            confirmation=f"ROLLBACK:{manifest['manifest_sha256']}",
+        )
+        self.assert_mixed_prior(destination)
 
     def test_stage_validate_apply_and_rollback(self) -> None:
         manifest = self.manifest()

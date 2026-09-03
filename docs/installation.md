@@ -31,6 +31,23 @@ rejected without producing an accepted manifest. Review the sealed manifest
 before use. Sealing is source preparation only: it grants no installation,
 activation, endpoint, systemd, or SQLite authority.
 
+For every ordered destination, schema v2 derives one class from the manifest's
+prior tuple and intended tuple; the caller does not supply that class:
+
+| Class | Derivation | Install and rollback effect |
+| --- | --- | --- |
+| `ABSENT_TO_PRESENT` | The prior state is absent. | Install creates the file; rollback removes the verified installed file. |
+| `CHANGED_PRESENT` | The prior `(sha256, mode, uid, gid)` differs from the intended tuple. | Install backs up and replaces the file; rollback restores the exact prior tuple. |
+| `SOURCE_EQUAL` | The complete prior tuple equals `(source_sha256, destination_mode, destination_uid, destination_gid)`. | Install and rollback revalidate the file but do not write, replace, chmod, chown, unlink, or back it up. |
+
+Equal bytes with different metadata are `CHANGED_PRESENT`. Repeated source
+paths remain an immutable fan-out only when their source digest and source mode
+agree, while destination paths remain unique. Stage, validation, and lifecycle
+receipts bind the ordered source, prior, installed tuple, derived class,
+destination-root identity, state transition, predecessor receipt, and canonical
+receipt digest. Receipts lacking those bindings are stale and rejected; they
+are not upgraded from current filesystem state.
+
 Use private, unique stage and rollback directories. The default installation
 command only stages and validates through the existing installation atom:
 
@@ -55,8 +72,16 @@ scripts/install.sh --apply \
 ```
 
 Apply delegates validation, replacement, journal creation, and failure rollback
-to `source_install_atom.py`. It does not reload systemd, enable a timer, start a
-unit, change an endpoint pointer, or touch SQLite.
+to `source_install_atom.py`. Mixed atoms may contain all three classes in any
+order, and rollback replay returns the exact durable terminal receipt. These
+checks provide structural consistency only within the trusted owner operating
+system and account. The manifest and receipts are ordinary owner-controlled
+files with self-checking digests; they do not provide authenticity, tamper
+resistance, an external trust anchor, or protection from a compromised owner or
+operating system. Apply does not reload systemd, enable a timer, start a unit,
+change an endpoint pointer, or touch SQLite. Any staging, installation,
+rollback, or activation against owner paths still requires its own current
+authority; reviewed or merged source performs no live operation.
 
 With separately authorized live use, validate the installed manifest and the
 current registry-derived Planner, Development, and SRE profiles, then reload
