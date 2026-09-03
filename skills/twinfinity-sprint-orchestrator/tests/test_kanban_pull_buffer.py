@@ -1461,6 +1461,8 @@ class KanbanPullBufferTests(unittest.TestCase):
                     "duplicate-key",
                     "missing-identity",
                     "cross-repository",
+                    "missing-source-fallback",
+                    "non-object-source-fallback",
                     "invalid-repository",
                     "payload-digest-conflict",
                 )
@@ -1506,10 +1508,30 @@ class KanbanPullBufferTests(unittest.TestCase):
                                 "generation": 1,
                             }
                         )
+                    elif case == "missing-source-fallback":
+                        payload_json = canonical_json(
+                            {
+                                "repository": "fixtures.test/other",
+                                "issue_number": number,
+                                "generation": 1,
+                            }
+                        )
+                    elif case == "non-object-source-fallback":
+                        payload_json = canonical_json(
+                            {
+                                "source": "not-an-object",
+                                "repository": "fixtures.test/other",
+                                "issue_number": number,
+                                "generation": 1,
+                            }
+                        )
                     elif case == "invalid-repository":
                         payload_json = canonical_json(
                             {
-                                "repository": "not-a-repository",
+                                "source": {
+                                    **source,
+                                    "repository": "not-a-repository",
+                                },
                                 "issue_number": number,
                                 "generation": 1,
                             }
@@ -1517,7 +1539,7 @@ class KanbanPullBufferTests(unittest.TestCase):
                     else:
                         payload_json = canonical_json(
                             {
-                                "repository": "fixtures.test/other",
+                                "source": source,
                                 "issue_number": number,
                                 "generation": 1,
                             }

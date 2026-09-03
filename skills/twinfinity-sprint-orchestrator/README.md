@@ -176,9 +176,9 @@ events, admissions, messages, watches, attempts, or audits. Reserved pre-push
 publications and their retained execution lineage are both inventory-bound and
 an operation-wide active-lineage fence. Every durable `MESSAGE_CLAIMED` event is
 enumerated independently before READY-item classification. A claimed execution
-message with a missing link, malformed or duplicate-keyed JSON, missing
-identity, conflicting repository or issue identity, or a payload-digest
-conflict returns
+message with a missing link, malformed or duplicate-keyed JSON, missing or
+non-object authoritative `source` identity, conflicting repository or issue
+identity, or a payload-digest conflict returns
 `READY_QUARANTINE_CLAIMED_MESSAGE_INVALID` before the first durable write,
 including when the message is already `COMPLETE` or `HOLD`. None of these source
 commands installs files, changes endpoints, manages systemd, runs convergence,

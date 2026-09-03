@@ -2585,10 +2585,19 @@ def _exact_ready_attestation_error(
     return None
 
 
-def _message_lineage(payload: Any) -> tuple[str, int, int | None] | None:
+def _message_lineage(
+    payload: Any, *, require_source_identity: bool = False
+) -> tuple[str, int, int | None] | None:
     if not isinstance(payload, dict):
         return None
     source = payload.get("source")
+    if require_source_identity and (
+        not isinstance(source, dict)
+        or source.get("object_kind") != "issue"
+        or not isinstance(source.get("repository"), str)
+        or type(source.get("object_number")) is not int
+    ):
+        return None
     if isinstance(source, dict) and source.get("object_kind") not in {
         None,
         "issue",
@@ -2668,7 +2677,9 @@ def _claimed_execution_lineage_rows(
             raise PullBufferError(
                 "READY_QUARANTINE_CLAIMED_MESSAGE_INVALID"
             ) from exc
-        lineage = _message_lineage(envelope.payload)
+        lineage = _message_lineage(
+            envelope.payload, require_source_identity=True
+        )
         if (
             lineage is None
             or envelope.payload_sha256 != message["payload_sha256"]
