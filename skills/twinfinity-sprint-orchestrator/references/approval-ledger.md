@@ -137,17 +137,24 @@ python3 scripts/approval_ledger.py semantic-contract-v2-apply \
   --expected-preview-sha256 <preview digest>
 ```
 
-Apply repeats the sidecar-free read-only preflight, then opens only the fixed
-existing database. One `BEGIN IMMEDIATE` transaction revalidates the sentinel
-and full pointer, compare-and-swaps that exact v1 row to the request's v2
-authority, and appends one fixed `APPROVAL_SEMANTIC_CONTRACT_V2_ACTIVATED`
-operation receipt to `approval_events`. Pointer and receipt commit together or
-both roll back. The receipt digest binds the complete request, request and
-preview digests, schema sentinel, exact result pointer, and original activation
-time. A byte-identical replay returns that same receipt without a mutable open;
-another authority, source, inventory, stopped-state proof, pointer, operation
-key, request digest, preview digest, missing receipt, or duplicate receipt is a
-zero-write HOLD.
+Apply opens one read-only, no-follow anchor for the sidecar-free owner-safe
+database and retains that exact inode across its read-only preflight and later
+writable SQLite open. Before any transaction or write, the Linux procfs
+file-descriptor inventory must prove that SQLite's sole newly retained regular
+file handle for each open has the anchor's exact device, inode, mode, owner, and
+link count, while the owner-safe pathname must still resolve to that same
+identity. A pathname re-stat alone is not accepted as opened-handle evidence.
+Missing or ambiguous anchor or procfs evidence and any handle-identity mismatch
+fail closed with `APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE`. One
+`BEGIN IMMEDIATE` transaction then revalidates the sentinel and full pointer,
+compare-and-swaps that exact v1 row to the request's v2 authority, and appends
+one fixed `APPROVAL_SEMANTIC_CONTRACT_V2_ACTIVATED` operation receipt to
+`approval_events`. Pointer and receipt commit together or both roll back. The
+receipt digest binds the complete request, request and preview digests, schema
+sentinel, exact result pointer, and original activation time. A byte-identical
+replay returns that same receipt without a mutable open; another authority,
+source, inventory, stopped-state proof, pointer, operation key, request digest,
+preview digest, missing receipt, or duplicate receipt is a zero-write HOLD.
 
 Stable preflight failures include
 `APPROVAL_SEMANTIC_CONTRACT_SCHEMA_SENTINEL_REQUIRED`,

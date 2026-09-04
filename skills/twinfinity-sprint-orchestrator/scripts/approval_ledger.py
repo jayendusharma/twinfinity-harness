@@ -1093,6 +1093,151 @@ def _semantic_contract_v2_activation_database_identity(
     )
 
 
+def _open_semantic_contract_v2_activation_database_anchor(
+    path: Path,
+    expected_identity: tuple[int, int, int, int, int],
+) -> int:
+    """Retain the validated database inode across both SQLite opens."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    close_on_exec = getattr(os, "O_CLOEXEC", None)
+    if type(no_follow) is not int or type(close_on_exec) is not int:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+    flags = os.O_RDONLY | close_on_exec | no_follow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        opened_identity = (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_mode),
+            int(metadata.st_uid),
+            int(metadata.st_nlink),
+        )
+        if (
+            opened_identity != expected_identity
+            or _semantic_contract_v2_activation_database_identity(path)
+            != expected_identity
+        ):
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _require_semantic_contract_v2_activation_database_anchor(
+    descriptor: int,
+    path: Path,
+    expected_identity: tuple[int, int, int, int, int],
+) -> None:
+    """Require the retained inode and its owner-safe pathname to agree."""
+
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    anchored_identity = (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_uid),
+        int(metadata.st_nlink),
+    )
+    if (
+        anchored_identity != expected_identity
+        or _semantic_contract_v2_activation_database_identity(path)
+        != expected_identity
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+
+
+def _semantic_contract_v2_activation_regular_fd_identities(
+) -> dict[int, tuple[int, int, int, int, int]]:
+    """Return stable regular-file identities held by this process.
+
+    The v2 activation command is supported only where Linux procfs can attest
+    which file descriptor SQLite actually retained.  A disappearing directory
+    descriptor created by ``listdir`` is expected and is ignored; every
+    persistent regular descriptor is included in the comparison.
+    """
+
+    try:
+        entries = os.listdir("/proc/self/fd")
+    except OSError as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    identities: dict[int, tuple[int, int, int, int, int]] = {}
+    for entry in entries:
+        if not entry.isdecimal():
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+            )
+        descriptor = int(entry)
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            # /proc/self/fd includes the transient descriptor used to list it.
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        identities[descriptor] = (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_mode),
+            int(metadata.st_uid),
+            int(metadata.st_nlink),
+        )
+    return identities
+
+
+def _require_semantic_contract_v2_opened_database_identity(
+    connection: sqlite3.Connection,
+    before_open: dict[int, tuple[int, int, int, int, int]],
+    expected_identity: tuple[int, int, int, int, int],
+) -> None:
+    """Prove that SQLite retained exactly the prevalidated database inode."""
+
+    try:
+        databases = connection.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    if (
+        len(databases) != 1
+        or int(databases[0][0]) != 0
+        or databases[0][1] != "main"
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+    after_open = _semantic_contract_v2_activation_regular_fd_identities()
+    opened = [
+        identity
+        for descriptor, identity in after_open.items()
+        if before_open.get(descriptor) != identity
+    ]
+    if opened != [expected_identity]:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+
+
 def _open_semantic_contract_v2_activation_readonly(
     path: Path,
 ) -> sqlite3.Connection:
@@ -1194,9 +1339,23 @@ def _require_semantic_contract_v2_exact_replay(
 
 def _semantic_contract_v2_activation_readonly_state(
     database: Path,
+    *,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
 ) -> tuple[dict[str, Any], list[sqlite3.Row]]:
+    open_files_before = (
+        _semantic_contract_v2_activation_regular_fd_identities()
+        if expected_identity is not None
+        else None
+    )
     connection = _open_semantic_contract_v2_activation_readonly(database)
     try:
+        if expected_identity is not None:
+            assert open_files_before is not None
+            _require_semantic_contract_v2_opened_database_identity(
+                connection,
+                open_files_before,
+                expected_identity,
+            )
         _require_semantic_contract_v2_activation_schema(connection)
         return (
             _semantic_contract_v2_explicit_pointer(connection),
@@ -1354,29 +1513,50 @@ def apply_semantic_contract_v2_activation(
         raise CoordinationError(
             "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_PREVIEW_DRIFT"
         )
-    pointer, events = _semantic_contract_v2_activation_readonly_state(database)
-    if pointer["schema"] == SCHEMA:
-        return _require_semantic_contract_v2_exact_replay(
-            pointer, events, request, preview
-        )
-    if pointer != request["expected_v1_pointer"]:
-        raise CoordinationError(
-            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_POINTER_DRIFT"
-        )
-    if events:
-        raise CoordinationError(
-            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
-        )
-
     validated = _validated_quiescent_activation_database(database)
     preopen_identity = _semantic_contract_v2_activation_database_identity(
         validated
     )
+    anchor = _open_semantic_contract_v2_activation_database_anchor(
+        validated,
+        preopen_identity,
+    )
     connection: sqlite3.Connection | None = None
     try:
+        pointer, events = _semantic_contract_v2_activation_readonly_state(
+            validated,
+            expected_identity=preopen_identity,
+        )
+        _require_semantic_contract_v2_activation_database_anchor(
+            anchor,
+            validated,
+            preopen_identity,
+        )
+        if pointer["schema"] == SCHEMA:
+            return _require_semantic_contract_v2_exact_replay(
+                pointer, events, request, preview
+            )
+        if pointer != request["expected_v1_pointer"]:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_POINTER_DRIFT"
+            )
+        if events:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
+            )
+
+        writable_path = _validated_quiescent_activation_database(validated)
+        _require_semantic_contract_v2_activation_database_anchor(
+            anchor,
+            writable_path,
+            preopen_identity,
+        )
+        open_files_before = (
+            _semantic_contract_v2_activation_regular_fd_identities()
+        )
         try:
             connection = sqlite3.connect(
-                f"{validated.as_uri()}?mode=rw",
+                f"{writable_path.as_uri()}?mode=rw",
                 uri=True,
                 isolation_level=None,
                 timeout=5,
@@ -1387,11 +1567,16 @@ def apply_semantic_contract_v2_activation(
             ) from exc
         connection.row_factory = sqlite3.Row
         if _semantic_contract_v2_activation_database_identity(
-            validated
+            writable_path
         ) != preopen_identity:
             raise CoordinationError(
                 "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
             )
+        _require_semantic_contract_v2_opened_database_identity(
+            connection,
+            open_files_before,
+            preopen_identity,
+        )
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA synchronous=FULL")
@@ -1458,6 +1643,7 @@ def apply_semantic_contract_v2_activation(
     finally:
         if connection is not None:
             connection.close()
+        os.close(anchor)
 
 
 def _legacy_authority_quarantined(

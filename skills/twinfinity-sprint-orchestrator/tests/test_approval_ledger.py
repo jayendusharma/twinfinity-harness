@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -1811,7 +1812,7 @@ class ApprovalSemanticContractV2ActivationCliTests(unittest.TestCase):
             nonlocal validations
             validated = original_validate(path)
             validations += 1
-            if validations == 2:
+            if validations == 3:
                 validated.unlink()
                 validated.symlink_to(victim)
             return validated
@@ -1827,6 +1828,143 @@ class ApprovalSemanticContractV2ActivationCliTests(unittest.TestCase):
         self.assertEqual(victim_before, victim.read_bytes())
         self.assertTrue(self.database.is_symlink())
 
+    def test_writable_open_proves_the_opened_inode_after_restored_swap(
+        self,
+    ) -> None:
+        preview = self.preview()
+        victim = self.root / "replacement-restored.sqlite3"
+        victim.write_bytes(self.database.read_bytes())
+        victim.chmod(0o600)
+        displaced = self.root / "validated-database.sqlite3"
+        intended_before = self.database.read_bytes()
+        victim_before = victim.read_bytes()
+        original_connect = sqlite3.connect
+        swaps = 0
+
+        def swap_only_while_writable_open(database, *args, **kwargs):
+            nonlocal swaps
+            if isinstance(database, str) and "mode=rw" in database:
+                swaps += 1
+                self.database.rename(displaced)
+                self.database.symlink_to(victim)
+                try:
+                    return original_connect(database, *args, **kwargs)
+                finally:
+                    self.database.unlink()
+                    displaced.rename(self.database)
+            return original_connect(database, *args, **kwargs)
+
+        with patch.object(
+            approval_ledger_module.sqlite3,
+            "connect",
+            side_effect=swap_only_while_writable_open,
+        ):
+            code, result = self.apply(preview)
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_DATABASE_UNSAFE", result["error"])
+        self.assertEqual(1, swaps)
+        self.assertEqual(intended_before, self.database.read_bytes())
+        self.assertEqual(victim_before, victim.read_bytes())
+        self.assertFalse(self.database.is_symlink())
+        self.assertFalse(displaced.exists())
+
+    def test_apply_binds_writable_open_to_readonly_preflight_inode(
+        self,
+    ) -> None:
+        preview = self.preview()
+        victim = self.root / "preflight-substitute.sqlite3"
+        victim.write_bytes(self.database.read_bytes())
+        victim.chmod(0o600)
+        displaced = self.root / "preflight-validated.sqlite3"
+        intended_before = self.database.read_bytes()
+        victim_before = victim.read_bytes()
+        original_connect = sqlite3.connect
+        swaps = 0
+
+        def swap_only_while_readonly_preflight(database, *args, **kwargs):
+            nonlocal swaps
+            if (
+                isinstance(database, str)
+                and "mode=ro" in database
+                and "immutable=1" in database
+            ):
+                swaps += 1
+                self.database.rename(displaced)
+                self.database.symlink_to(victim)
+                try:
+                    return original_connect(database, *args, **kwargs)
+                finally:
+                    self.database.unlink()
+                    displaced.rename(self.database)
+            return original_connect(database, *args, **kwargs)
+
+        with patch.object(
+            approval_ledger_module.sqlite3,
+            "connect",
+            side_effect=swap_only_while_readonly_preflight,
+        ):
+            code, result = self.apply(preview)
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_DATABASE_UNSAFE", result["error"])
+        self.assertEqual(1, swaps)
+        self.assertEqual(intended_before, self.database.read_bytes())
+        self.assertEqual(victim_before, victim.read_bytes())
+        self.assertFalse(self.database.is_symlink())
+        self.assertFalse(displaced.exists())
+
+    def test_writable_open_fails_closed_without_handle_attestation(self) -> None:
+        preview = self.preview()
+        before_database = self.database.read_bytes()
+        before_names = sorted(path.name for path in self.root.iterdir())
+        original_listdir = os.listdir
+
+        def deny_procfs_handle_inventory(path):
+            if os.fspath(path) == "/proc/self/fd":
+                raise OSError("procfs file-descriptor inventory unavailable")
+            return original_listdir(path)
+
+        with patch.object(
+            approval_ledger_module.os,
+            "listdir",
+            side_effect=deny_procfs_handle_inventory,
+        ):
+            code, result = self.apply(preview)
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_DATABASE_UNSAFE", result["error"])
+        self.assertEqual(before_database, self.database.read_bytes())
+        self.assertEqual(
+            before_names,
+            sorted(path.name for path in self.root.iterdir()),
+        )
+
+    def test_writable_open_fails_closed_without_anchor_flags(self) -> None:
+        preview = self.preview()
+        before_database = self.database.read_bytes()
+        before_names = sorted(path.name for path in self.root.iterdir())
+        for flag in ("O_NOFOLLOW", "O_CLOEXEC"):
+            with self.subTest(flag=flag):
+                with patch.object(
+                    approval_ledger_module.os,
+                    flag,
+                    None,
+                ):
+                    with self.assertRaises(CoordinationError) as context:
+                        approval_ledger_module.apply_semantic_contract_v2_activation(
+                            self.database,
+                            self.request_payload,
+                            expected_request_sha256=preview["request_sha256"],
+                            expected_preview_sha256=preview["preview_sha256"],
+                        )
+                self.assertIn(
+                    "ACTIVATION_DATABASE_UNSAFE",
+                    str(context.exception),
+                )
+        self.assertEqual(before_database, self.database.read_bytes())
+        self.assertEqual(
+            before_names,
+            sorted(path.name for path in self.root.iterdir()),
+        )
+
     def test_pointer_drift_between_preflight_and_transaction_cannot_activate(
         self,
     ) -> None:
@@ -1840,7 +1978,7 @@ class ApprovalSemanticContractV2ActivationCliTests(unittest.TestCase):
             nonlocal validations
             validated = original_validate(path)
             validations += 1
-            if validations == 2:
+            if validations == 3:
                 connection = sqlite3.connect(validated)
                 connection.execute(
                     "UPDATE approval_semantic_contract_current "
