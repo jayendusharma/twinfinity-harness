@@ -32,6 +32,7 @@ from approval_ledger import (  # noqa: E402
 from hosted_operation_control import HostedOperationControl  # noqa: E402
 from kanban_pull_buffer import ensure_pull_buffer_schema  # noqa: E402
 from kanban_readiness import ensure_schema as ensure_readiness_schema  # noqa: E402
+from role_executor_broker import ensure_broker_schema  # noqa: E402
 from reviewed_endpoint_catalog_fixture import (  # noqa: E402
     apply_reviewed_current_endpoint_catalog,
 )
@@ -756,6 +757,89 @@ class CoordinationTruthSnapshotTests(unittest.TestCase):
             SnapshotHold, "COORDINATION_TRUTH_SCHEMA_INCOMPLETE"
         ):
             snapshot_database(incomplete, REPOSITORY)
+
+    def test_defect_first_exact_79_table_predecessor_is_rejected(self) -> None:
+        ensure_broker_schema(self.control.connection)
+        self.control.connection.execute(
+            "DROP TABLE approval_semantic_contract_current"
+        )
+        self.control.connection.execute("DROP TABLE portfolio_ready_quarantines")
+        present = {
+            str(row[0])
+            for row in self.control.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        self.assertEqual(79, len(present))
+        self.assertNotIn("approval_semantic_contract_current", present)
+        self.assertNotIn("portfolio_ready_quarantines", present)
+        self.assertEqual(
+            4,
+            len(
+                {
+                    name for name in present
+                    if name.startswith("role_executor_broker_")
+                }
+            ),
+        )
+        self.close_to_database_only_wal()
+        with self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_SCHEMA_INCOMPLETE"
+        ):
+            snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+            )
+
+    def test_exact_empty_broker_family_is_quarantined_without_wire_effect(self) -> None:
+        self.prime_wal_reader_mark()
+        without_broker = snapshot_database(self.database, REPOSITORY)
+        ensure_broker_schema(self.control.connection)
+        self.prime_wal_reader_mark()
+        with_broker = snapshot_database(self.database, REPOSITORY)
+        self.assertEqual(without_broker, with_broker)
+        encoded = canonical_json(with_broker)
+        self.assertNotIn("role_executor_broker", encoded)
+        self.assertNotIn("broker", encoded.lower())
+
+    def test_partial_broker_family_is_rejected(self) -> None:
+        ensure_broker_schema(self.control.connection)
+        self.control.connection.execute(
+            "DROP TABLE role_executor_broker_events"
+        )
+        self.prime_wal_reader_mark()
+        with self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_BROKER_QUARANTINE_PARTIAL"
+        ):
+            snapshot_database(self.database, REPOSITORY)
+
+    def test_malformed_broker_family_is_rejected(self) -> None:
+        ensure_broker_schema(self.control.connection)
+        self.control.connection.execute(
+            "DROP TRIGGER role_executor_broker_event_delete"
+        )
+        self.prime_wal_reader_mark()
+        with self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_BROKER_QUARANTINE_SCHEMA_DRIFT"
+        ):
+            snapshot_database(self.database, REPOSITORY)
+
+    def test_nonempty_broker_family_is_rejected(self) -> None:
+        ensure_broker_schema(self.control.connection)
+        self.control.connection.execute("PRAGMA foreign_keys=OFF")
+        self.control.connection.execute(
+            "INSERT INTO role_executor_broker_events("
+            "attempt_id,to_state,to_version,created_at) VALUES (?,?,?,?)",
+            ("synthetic-attempt", "HOLD", 1, "2026-09-04T20:00:00Z"),
+        )
+        self.control.connection.execute("PRAGMA foreign_keys=ON")
+        self.prime_wal_reader_mark()
+        with self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_BROKER_QUARANTINE_NONEMPTY"
+        ):
+            snapshot_database(self.database, REPOSITORY)
 
     def test_missing_capacity_and_endpoint_current_fail_closed(self) -> None:
         with self.control.store.transaction():
