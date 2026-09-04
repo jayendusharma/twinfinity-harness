@@ -365,6 +365,152 @@ class PreCanarySchemaBootstrapTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_commit_boundary_anchor_failure_rolls_back_complete_effect(self) -> None:
+        preview = self.preview()
+        before = self.database.read_bytes()
+        before_namespace = sorted(entry.name for entry in self.root.iterdir())
+        require_anchor = bootstrap._require_anchor
+        anchor_calls = 0
+
+        def fail_final_anchor(*args: object, **kwargs: object) -> None:
+            nonlocal anchor_calls
+            anchor_calls += 1
+            require_anchor(*args, **kwargs)
+            if anchor_calls == 3:
+                raise bootstrap.BootstrapHold(
+                    "PRE_CANARY_BOOTSTRAP_DATABASE_IDENTITY_DRIFT"
+                )
+
+        with patch.object(bootstrap, "DEFAULT_DATABASE", self.database), patch.object(
+            bootstrap, "_require_anchor", side_effect=fail_final_anchor
+        ):
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapHold,
+                "PRE_CANARY_BOOTSTRAP_DATABASE_IDENTITY_DRIFT",
+            ):
+                bootstrap.apply_schema_bootstrap(
+                    self.request,
+                    expected_request_sha256=preview["request_sha256"],
+                    expected_preview_sha256=preview["preview_sha256"],
+                )
+        self.assertEqual(3, anchor_calls)
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(
+            before_namespace,
+            sorted(entry.name for entry in self.root.iterdir()),
+        )
+
+    def test_commit_boundary_path_replacement_is_rejected_before_commit(self) -> None:
+        preview = self.preview()
+        before = self.database.read_bytes()
+        displaced = self.root / "commit-boundary-original.sqlite3"
+
+        def replace_path(step: str) -> None:
+            if step == "before_commit":
+                self.database.rename(displaced)
+                shutil.copy2(displaced, self.database)
+                self.database.chmod(0o600)
+
+        with patch.object(bootstrap, "DEFAULT_DATABASE", self.database), patch.object(
+            bootstrap, "_apply_failpoint", side_effect=replace_path
+        ):
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapHold,
+                "PRE_CANARY_BOOTSTRAP_DATABASE_IDENTITY_DRIFT",
+            ):
+                bootstrap.apply_schema_bootstrap(
+                    self.request,
+                    expected_request_sha256=preview["request_sha256"],
+                    expected_preview_sha256=preview["preview_sha256"],
+                )
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before, displaced.read_bytes())
+        for database in (self.database, displaced):
+            connection = immutable_connection(database)
+            try:
+                table_count = connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchone()[0]
+                event_count = connection.execute(
+                    "SELECT COUNT(*) FROM approval_events WHERE event_type=?",
+                    (bootstrap.EVENT_TYPE,),
+                ).fetchone()[0]
+                self.assertEqual(79, table_count)
+                self.assertEqual(0, event_count)
+            finally:
+                connection.close()
+
+    def test_result_replay_rejects_complete_new_table_object_drift(self) -> None:
+        cases = (
+            (
+                "extra-approval-index",
+                ("CREATE INDEX synthetic_approval_index ON "
+                 "approval_semantic_contract_current(authority_sha256)",),
+            ),
+            (
+                "extra-quarantine-index",
+                ("CREATE INDEX synthetic_quarantine_index ON "
+                 "portfolio_ready_quarantines(repository)",),
+            ),
+            (
+                "extra-approval-trigger",
+                ("CREATE TRIGGER synthetic_approval_trigger AFTER INSERT ON "
+                 "approval_semantic_contract_current BEGIN SELECT 1; END",),
+            ),
+            (
+                "extra-quarantine-trigger",
+                ("CREATE TRIGGER synthetic_quarantine_trigger AFTER INSERT ON "
+                 "portfolio_ready_quarantines BEGIN SELECT 1; END",),
+            ),
+            (
+                "accepted-trigger-schema-drift",
+                (
+                    "DROP TRIGGER approval_semantic_contract_no_delete",
+                    "CREATE TRIGGER approval_semantic_contract_no_delete "
+                    "BEFORE DELETE ON approval_semantic_contract_current "
+                    "BEGIN SELECT RAISE(ABORT, 'SYNTHETIC_DRIFT'); END",
+                ),
+            ),
+        )
+        for name, statements in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                database = build_predecessor(Path(root))
+                request = request_for(database)
+                with patch.object(bootstrap, "DEFAULT_DATABASE", database):
+                    preview = bootstrap.preview_schema_bootstrap(request)
+                    bootstrap.apply_schema_bootstrap(
+                        request,
+                        expected_request_sha256=preview["request_sha256"],
+                        expected_preview_sha256=preview["preview_sha256"],
+                    )
+                connection = sqlite3.connect(database, isolation_level=None)
+                try:
+                    for statement in statements:
+                        connection.execute(statement)
+                    checkpoint = tuple(
+                        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    )
+                    self.assertEqual((0, 0, 0), checkpoint)
+                finally:
+                    connection.close()
+                database.chmod(0o600)
+                before = database.read_bytes()
+                before_namespace = sorted(
+                    entry.name for entry in database.parent.iterdir()
+                )
+                with patch.object(bootstrap, "DEFAULT_DATABASE", database):
+                    with self.assertRaisesRegex(
+                        bootstrap.BootstrapHold,
+                        "PRE_CANARY_BOOTSTRAP_RESULT_SCHEMA_DRIFT",
+                    ):
+                        bootstrap.preview_schema_bootstrap(request)
+                self.assertEqual(before, database.read_bytes())
+                self.assertEqual(
+                    before_namespace,
+                    sorted(entry.name for entry in database.parent.iterdir()),
+                )
+
     def test_bootstrap_result_is_consumable_by_strict_v2_preview_only(self) -> None:
         receipt = self.apply()
         v2_request = {

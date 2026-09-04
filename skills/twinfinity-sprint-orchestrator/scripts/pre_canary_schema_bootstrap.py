@@ -308,44 +308,51 @@ def _require_source_sentinels() -> None:
         raise BootstrapHold("PRE_CANARY_BOOTSTRAP_SOURCE_SENTINEL_DRIFT")
 
 
+def _objects_owned_by_missing_tables(
+    connection: sqlite3.Connection,
+) -> list[dict[str, str]]:
+    """Return the complete explicit schema-object family for both new tables."""
+
+    placeholders = ",".join("?" for _ in MISSING_TABLES)
+    rows = connection.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        f"WHERE sql IS NOT NULL AND tbl_name IN ({placeholders}) "
+        "AND type IN ('table','index','trigger') ORDER BY type,name",
+        MISSING_TABLES,
+    ).fetchall()
+    return [
+        {
+            "type": str(row["type"]),
+            "name": str(row["name"]),
+            "table": str(row["tbl_name"]),
+            "sql": str(row["sql"]),
+        }
+        for row in rows
+    ]
+
+
+def _schema_object_manifest(
+    objects: Sequence[Mapping[str, str]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            **{key: item[key] for key in ("type", "name", "table")},
+            "sql": _normalized_schema_sql(item["sql"]),
+        }
+        for item in objects
+    ]
+
+
 def _canonical_missing_objects() -> list[dict[str, str]]:
-    """Derive only the six missing objects from accepted source initializers."""
+    """Derive the complete six-object family from accepted source initializers."""
 
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
     try:
         ensure_approval_schema(connection)
         ensure_pull_buffer_schema(connection)
-        names = {
-            "approval_semantic_contract_current",
-            "approval_semantic_contract_no_delete",
-            "approval_semantic_contract_no_downgrade",
-            "portfolio_ready_quarantines",
-            "portfolio_ready_quarantines_immutable_update",
-            "portfolio_ready_quarantines_immutable_delete",
-        }
-        placeholders = ",".join("?" for _ in names)
-        rows = connection.execute(
-            "SELECT type,name,tbl_name,sql FROM sqlite_master "
-            f"WHERE name IN ({placeholders}) ORDER BY type,name",
-            tuple(sorted(names)),
-        ).fetchall()
-        objects = [
-            {
-                "type": str(row["type"]),
-                "name": str(row["name"]),
-                "table": str(row["tbl_name"]),
-                "sql": str(row["sql"]),
-            }
-            for row in rows
-        ]
-        manifest = [
-            {
-                **{key: item[key] for key in ("type", "name", "table")},
-                "sql": _normalized_schema_sql(item["sql"]),
-            }
-            for item in objects
-        ]
+        objects = _objects_owned_by_missing_tables(connection)
+        manifest = _schema_object_manifest(objects)
         if (
             len(objects) != 6
             or digest_json(manifest)
@@ -429,29 +436,12 @@ def _accepted_schema_state(
     if digest_json(defaults) != expected_defaults:
         raise BootstrapHold("PRE_CANARY_BOOTSTRAP_ACCEPTED_SCHEMA_DRIFT")
     if state == "RESULT":
-        names = {
-            "approval_semantic_contract_current",
-            "approval_semantic_contract_no_delete",
-            "approval_semantic_contract_no_downgrade",
-            "portfolio_ready_quarantines",
-            "portfolio_ready_quarantines_immutable_update",
-            "portfolio_ready_quarantines_immutable_delete",
-        }
-        placeholders = ",".join("?" for _ in names)
-        objects = [
-            {
-                "type": str(row[0]),
-                "name": str(row[1]),
-                "table": str(row[2]),
-                "sql": _normalized_schema_sql(str(row[3])),
-            }
-            for row in connection.execute(
-                "SELECT type,name,tbl_name,sql FROM sqlite_master "
-                f"WHERE name IN ({placeholders}) ORDER BY type,name",
-                tuple(sorted(names)),
-            )
-        ]
-        if digest_json(objects) != MISSING_SCHEMA_OBJECT_MANIFEST_SHA256:
+        objects = _objects_owned_by_missing_tables(connection)
+        if (
+            len(objects) != 6
+            or digest_json(_schema_object_manifest(objects))
+            != MISSING_SCHEMA_OBJECT_MANIFEST_SHA256
+        ):
             raise BootstrapHold("PRE_CANARY_BOOTSTRAP_RESULT_SCHEMA_DRIFT")
     return state, _broker_state(connection)
 
@@ -801,10 +791,10 @@ def apply_schema_bootstrap(
         if final_state != "RESULT" or stored_receipt != receipt:
             raise BootstrapHold("PRE_CANARY_BOOTSTRAP_RESULT_INVALID")
         _apply_failpoint("before_commit")
-        connection.execute("COMMIT")
         _require_anchor(
             anchor, database, request["database_identity"], replay=True
         )
+        connection.execute("COMMIT")
         return receipt
     except BootstrapHold:
         if connection is not None and connection.in_transaction:
