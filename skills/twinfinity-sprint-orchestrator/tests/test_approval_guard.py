@@ -16,6 +16,7 @@ from approval_guard import (  # noqa: E402
     require_effective_approval,
 )
 from approval_ledger import (  # noqa: E402
+    activate_semantic_contract_v2,
     claim_decision,
     create_review_batch,
     record_decision,
@@ -63,7 +64,7 @@ class ApprovalGuardTests(unittest.TestCase):
 
     def packet(self) -> dict:
         packet = {
-            "schema": "twinfinity.approval-proposal.v1",
+            "schema": "twinfinity.approval-proposal.v2",
             "decision_key": "issue-143:ruleset-update",
             "repository": REPOSITORY,
             "owning_issue": 143,
@@ -123,9 +124,10 @@ class ApprovalGuardTests(unittest.TestCase):
         )
         return packet
 
-    def effective(self) -> tuple[str, int]:
+    def effective(self, packet: dict | None = None) -> tuple[str, int]:
+        packet = self.packet() if packet is None else packet
         proposal = submit_proposal(
-            self.store, self.packet(), "2026-08-24T05:00:02Z"
+            self.store, packet, "2026-08-24T05:00:02Z"
         )["proposal_sha256"]
         batch = create_review_batch(
             self.store, REPOSITORY, "2026-08-24T05:00:03Z"
@@ -171,6 +173,85 @@ class ApprovalGuardTests(unittest.TestCase):
             },
         )
         return decision["decision_sha256"], 4321
+
+    def test_legacy_v1_effective_authority_fails_closed_after_cutover(self) -> None:
+        legacy = self.packet()
+        legacy["schema"] = "twinfinity.approval-proposal.v1"
+        decision_sha256, comment_id = self.effective(legacy)
+        activate_semantic_contract_v2(
+            self.store.connection,
+            authority_sha256="8" * 64,
+            now="2026-08-24T05:00:07Z",
+        )
+        for binding in (
+            {"authority_sha256": decision_sha256},
+            {"authority_comment_id": comment_id},
+        ):
+            with self.subTest(binding=binding), self.assertRaisesRegex(
+                ApprovalGuardError,
+                "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED",
+            ):
+                require_effective_approval(
+                    self.store.connection,
+                    repository=REPOSITORY,
+                    issue_number=143,
+                    recipient_session_id=SRE_SESSION,
+                    execution_scope_sha256=legacy["execution_scope_sha256"],
+                    required=False,
+                    **binding,
+                )
+
+    def test_v1_resolution_lineage_cannot_fall_through_optional_admission(self) -> None:
+        legacy = self.packet()
+        legacy["schema"] = "twinfinity.approval-proposal.v1"
+        decision_sha256, _ = self.effective(legacy)
+        proposal_sha256 = self.store.connection.execute(
+            "SELECT proposal_sha256 FROM approval_current WHERE repository=? "
+            "AND owning_issue=?",
+            (REPOSITORY, 143),
+        ).fetchone()[0]
+        activate_semantic_contract_v2(
+            self.store.connection,
+            authority_sha256="9" * 64,
+            now="2026-08-24T05:00:07Z",
+        )
+        watched_tables = (
+            "portfolio_pull_buffer_candidates",
+            "portfolio_ready_finalizations",
+            "coordination_items",
+            "coordination_messages",
+            "coordination_terminal_watches",
+        )
+        before = {
+            table: self.store.connection.execute(
+                f'SELECT COUNT(*) FROM "{table}"'
+            ).fetchone()[0]
+            for table in watched_tables
+            if self.store.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+        }
+        with self.assertRaisesRegex(
+            ApprovalGuardError, "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED"
+        ):
+            require_effective_approval(
+                self.store.connection,
+                repository=REPOSITORY,
+                issue_number=143,
+                recipient_session_id="role.development.v4",
+                execution_scope_sha256=legacy["execution_scope_sha256"],
+                authority_sha256=decision_sha256,
+                required_proposal_sha256=proposal_sha256,
+                required=False,
+            )
+        after = {
+            table: self.store.connection.execute(
+                f'SELECT COUNT(*) FROM "{table}"'
+            ).fetchone()[0]
+            for table in before
+        }
+        self.assertEqual(before, after)
 
     def test_missing_ledger_is_optional_only_for_nonmaterial_legacy_path(self) -> None:
         self.assertIsNone(

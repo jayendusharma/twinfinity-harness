@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 
 import sys
@@ -14,6 +15,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from approval_ledger import (  # noqa: E402
+    activate_semantic_contract_v2,
     acknowledge_decision,
     claim_decision,
     claim_decision_in_transaction,
@@ -81,7 +83,7 @@ class ApprovalLedgerTests(unittest.TestCase):
 
     def packet(self, *, key: str = "issue-58:material-choice", summary: str = "Choose behavior") -> dict:
         return {
-            "schema": "twinfinity.approval-proposal.v1",
+            "schema": "twinfinity.approval-proposal.v2",
             "decision_key": key,
             "repository": REPOSITORY,
             "owning_issue": 58,
@@ -266,6 +268,138 @@ class ApprovalLedgerTests(unittest.TestCase):
             [(PLANNER_SESSION, "coordination.notice", "PREPARED")],
             [tuple(row) for row in notice],
         )
+
+    def test_v2_proposal_identity_includes_exact_evidence(self) -> None:
+        first_packet = self.packet()
+        first = submit_proposal(
+            self.store, first_packet, "2026-08-24T04:00:02Z"
+        )
+        replay = submit_proposal(
+            self.store, first_packet, "2026-08-24T04:00:03Z"
+        )
+        changed_packet = self.packet()
+        changed_packet["evidence"] = [
+            "A distinct secret-safe review artifact is now current."
+        ]
+        changed = submit_proposal(
+            self.store, changed_packet, "2026-08-24T04:00:04Z"
+        )
+
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(first["proposal_sha256"], replay["proposal_sha256"])
+        self.assertNotEqual(first["proposal_sha256"], changed["proposal_sha256"])
+        self.assertEqual(
+            2,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM approval_proposals"
+            ).fetchone()[0],
+        )
+
+    def test_v1_pending_is_quarantined_after_explicit_v2_cutover(self) -> None:
+        legacy = self.packet()
+        legacy["schema"] = "twinfinity.approval-proposal.v1"
+        submitted = submit_proposal(
+            self.store, legacy, "2026-08-24T04:00:02Z"
+        )
+        before = self.store.connection.execute(
+            "SELECT proposal_sha256,semantic_sha256,packet_json "
+            "FROM approval_proposals WHERE proposal_sha256=?",
+            (submitted["proposal_sha256"],),
+        ).fetchone()
+
+        activate_semantic_contract_v2(
+            self.store.connection,
+            authority_sha256="7" * 64,
+            now="2026-08-24T04:00:03Z",
+        )
+        batch = create_review_batch(
+            self.store, REPOSITORY, "2026-08-24T04:00:04Z"
+        )
+        self.assertEqual(0, batch["pending_count"])
+        self.assertEqual(
+            "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED",
+            batch["held"][0]["reason"],
+        )
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED"
+        ):
+            submit_proposal(
+                self.store, legacy, "2026-08-24T04:00:05Z"
+            )
+
+        replacement = submit_proposal(
+            self.store, self.packet(), "2026-08-24T04:00:06Z"
+        )
+        self.assertNotEqual(
+            submitted["proposal_sha256"], replacement["proposal_sha256"]
+        )
+        after = self.store.connection.execute(
+            "SELECT proposal_sha256,semantic_sha256,packet_json "
+            "FROM approval_proposals WHERE proposal_sha256=?",
+            (submitted["proposal_sha256"],),
+        ).fetchone()
+        self.assertEqual(tuple(before), tuple(after))
+
+    def test_v1_deliverable_claim_holds_before_refresh_or_any_write(self) -> None:
+        legacy = self.packet()
+        legacy["schema"] = "twinfinity.approval-proposal.v1"
+        proposal = submit_proposal(
+            self.store, legacy, "2026-08-24T04:00:02Z"
+        )["proposal_sha256"]
+        decision = self.decide(proposal)
+        self.publish(decision["owner_outbox_id"])
+        activate_semantic_contract_v2(
+            self.store.connection,
+            authority_sha256="b" * 64,
+            now="2026-08-24T04:00:06Z",
+        )
+        refresher = Mock(side_effect=AssertionError("must not refresh"))
+        before = list(self.store.connection.iterdump())
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED"
+        ):
+            claim_decision(
+                self.store,
+                proposal_sha256=proposal,
+                recipient_session_id=DEVELOPMENT_SESSION,
+                now="2026-08-24T04:00:07Z",
+                source_refresher=refresher,
+            )
+        refresher.assert_not_called()
+        self.assertEqual(before, list(self.store.connection.iterdump()))
+
+    def test_v1_claimed_delivery_cannot_be_acknowledged_after_cutover(self) -> None:
+        legacy = self.packet()
+        legacy["schema"] = "twinfinity.approval-proposal.v1"
+        proposal = submit_proposal(
+            self.store, legacy, "2026-08-24T04:00:02Z"
+        )["proposal_sha256"]
+        decision = self.decide(proposal)
+        self.publish(decision["owner_outbox_id"])
+        claim_decision(
+            self.store,
+            proposal_sha256=proposal,
+            recipient_session_id=DEVELOPMENT_SESSION,
+            now="2026-08-24T04:00:06Z",
+            source_refresher=self.refreshed_source,
+        )
+        activate_semantic_contract_v2(
+            self.store.connection,
+            authority_sha256="c" * 64,
+            now="2026-08-24T04:00:07Z",
+        )
+        before = list(self.store.connection.iterdump())
+        with self.assertRaisesRegex(
+            CoordinationError, "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED"
+        ):
+            acknowledge_decision(
+                self.store,
+                proposal_sha256=proposal,
+                decision_sha256=decision["decision_sha256"],
+                recipient_session_id=DEVELOPMENT_SESSION,
+                now="2026-08-24T04:00:08Z",
+            )
+        self.assertEqual(before, list(self.store.connection.iterdump()))
 
     def test_decision_requires_frozen_batch_and_matching_option_outcome(self) -> None:
         proposal = submit_proposal(

@@ -24,6 +24,16 @@ import run_harness_baseline_validations as baseline_runner
 import source_install_atom as install_atom
 
 
+EXPECTED_REQUIRED_SOURCE_COUNT = 217
+EXPECTED_REQUIRED_SOURCE_SET_SHA256 = (
+    "b1bc0942d7f38f2aff74b52ae2f67bf79fc48bc15cba68f2dbe82d17bf4a23af"
+)
+EXPECTED_FANOUT_DESTINATION_COUNT = 218
+EXPECTED_FANOUT_DESTINATION_SET_SHA256 = (
+    "e894cda0fd132c85461ca6b3aed5ab162af68dbc7f85c4afae097565a0960fbc"
+)
+
+
 class HarnessBaselineValidationRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository_root = Path(__file__).resolve().parents[3]
@@ -1827,9 +1837,9 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             required = baseline_runner._required_target_files(
                 self.repository_root, self.catalog
             )
-            self.assertEqual(215, len(required))
+            self.assertEqual(EXPECTED_REQUIRED_SOURCE_COUNT, len(required))
             self.assertEqual(
-                "efcf4db0af3443a30748b98882093e24926e83230829bd52cb36046e4730b5a8",
+                EXPECTED_REQUIRED_SOURCE_SET_SHA256,
                 baseline_runner.digest_json(sorted(required)),
             )
             self.assertIn(planner_profile, required)
@@ -1904,17 +1914,28 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
                     extra_first=(manifest.entries[0] == extra_profile)
                 ):
                     self.assertEqual(
-                        215,
+                        EXPECTED_REQUIRED_SOURCE_COUNT,
                         len({entry["source_path"] for entry in manifest.entries}),
                     )
-                    self.assertEqual(216, len(manifest.entries))
                     self.assertEqual(
-                        216,
+                        EXPECTED_FANOUT_DESTINATION_COUNT, len(manifest.entries)
+                    )
+                    self.assertEqual(
+                        EXPECTED_FANOUT_DESTINATION_COUNT,
                         len(
                             {
                                 entry["destination_path"]
                                 for entry in manifest.entries
                             }
+                        ),
+                    )
+                    self.assertEqual(
+                        EXPECTED_FANOUT_DESTINATION_SET_SHA256,
+                        baseline_runner.digest_json(
+                            sorted(
+                                entry["destination_path"]
+                                for entry in manifest.entries
+                            )
                         ),
                     )
                     self.assertEqual(
@@ -2098,9 +2119,9 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             required = baseline_runner._required_target_files(
                 self.repository_root, self.catalog
             )
-            self.assertEqual(215, len(required))
+            self.assertEqual(EXPECTED_REQUIRED_SOURCE_COUNT, len(required))
             self.assertEqual(
-                "efcf4db0af3443a30748b98882093e24926e83230829bd52cb36046e4730b5a8",
+                EXPECTED_REQUIRED_SOURCE_SET_SHA256,
                 baseline_runner.digest_json(sorted(required)),
             )
             entries: list[dict] = []
@@ -2182,13 +2203,24 @@ class HarnessBaselineValidationRunnerTests(unittest.TestCase):
             manifest_path.write_bytes(manifest_bytes)
             manifest_path.chmod(0o600)
             manifest = baseline_runner.load_install_manifest(manifest_path)
-            self.assertEqual(216, len(manifest.entries))
             self.assertEqual(
-                215, len({entry["source_path"] for entry in manifest.entries})
+                EXPECTED_FANOUT_DESTINATION_COUNT, len(manifest.entries)
             )
             self.assertEqual(
-                216,
+                EXPECTED_REQUIRED_SOURCE_COUNT,
+                len({entry["source_path"] for entry in manifest.entries}),
+            )
+            self.assertEqual(
+                EXPECTED_FANOUT_DESTINATION_COUNT,
                 len({entry["destination_path"] for entry in manifest.entries}),
+            )
+            self.assertEqual(
+                EXPECTED_FANOUT_DESTINATION_SET_SHA256,
+                baseline_runner.digest_json(
+                    sorted(
+                        entry["destination_path"] for entry in manifest.entries
+                    )
+                ),
             )
             self.assertEqual(
                 manifest_payload["manifest_sha256"], manifest.manifest_sha256

@@ -20,7 +20,7 @@ Submit one strict JSON object with exactly these fields:
 
 ```json
 {
-  "schema": "twinfinity.approval-proposal.v1",
+  "schema": "twinfinity.approval-proposal.v2",
   "decision_key": "issue-000:stable-semantic-key",
   "repository": "twinfinityai/twinfinityapp",
   "owning_issue": 1,
@@ -56,6 +56,28 @@ Allowed workstreams are `DEVELOPMENT`, `SRE`, `READINESS`, `PLANNER`, `PORTFOLIO
 
 Never store secrets, private rows, Auth identities, Storage objects, customer data, bearer tokens, credential values, or URLs containing secret query parameters.
 
+### Versioned semantic identity
+
+`twinfinity.approval-proposal.v2` is the current source contract for newly
+issued authority. Its immutable semantic identity includes every field shown
+above, including the ordered, secret-safe `evidence` list. Consequently an
+evidence-only substitution produces a different semantic and proposal digest;
+recomputing an outer packet digest cannot preserve the former authority.
+
+Historical `twinfinity.approval-proposal.v1` packets, identifiers, decisions,
+and rows remain byte-immutable audit evidence. Before an explicitly authorized
+v2 activation they retain their legacy behavior. After the monotonic semantic
+contract pointer is activated to v2, every authority-bearing v1 current,
+pending, publication-waiting, deliverable, claimed-but-unacknowledged, or
+effective lineage fails closed with
+`APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED` before it can authorize new work.
+Do not relabel, rekey, reinterpret, or automatically convert v1 history. An
+explicit revoke or HOLD may terminalize it; continued work requires a fresh v2
+proposal, review batch, user decision, publication/readback, claim,
+acknowledgement, and exact-scope effectivity. Source support for v2 does not
+itself activate the pointer or migrate a live database; those are separately
+authorized stopped-state operations.
+
 ## Transaction sequence
 
 1. Refresh and ingest the owning issue snapshot.
@@ -79,7 +101,7 @@ Never store secrets, private rows, Auth identities, Storage objects, customer da
 
 ## Lifecycle and drift
 
-- Exact submission resubmission is idempotent. Requester-independent semantic identity clusters matching workstreams without losing their immutable packets, priorities, urgency, or recipient interests. Once a decision is recorded, its recipient set is frozen: an existing recipient may append immutable workstream evidence, but a new recipient requires a successor proposal and publication.
+- Exact submission resubmission is idempotent. Within one semantic-contract version, requester-independent semantic identity clusters matching workstreams without losing their immutable packets, priorities, urgency, or recipient interests. v1 and v2 are never interchangeable authority. Once a decision is recorded, its recipient set is frozen: an existing recipient may append immutable workstream evidence, but a new recipient requires a successor proposal and publication.
 - Changed packet bytes create a monotonic successor generation and preserve the predecessor.
 - A decided proposal cannot be superseded while any non-held delivery remains in flight. A user reversal uses `revoke`; it appends immutable provenance and an owning-issue outbox receipt, atomically holds unconsumed deliveries, and invalidates the old authority guard before a corrected successor is admitted.
 - Source drift before decision excludes the proposal from a review batch and requires a refreshed successor; it does not create another user question.

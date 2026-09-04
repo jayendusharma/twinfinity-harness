@@ -14,6 +14,18 @@ from repository_delivery_policy import HARNESS_REPOSITORY, HARNESS_STANDING_AUTH
 SHA256_LENGTH = 64
 REVIEW_BATCH_SCHEMA = "twinfinity.approval-review-batch.v2"
 BATCH_ANSWER_SCHEMA = "twinfinity.approval-batch-answer-map.v1"
+LEGACY_PROPOSAL_SCHEMA = "twinfinity.approval-proposal.v1"
+PROPOSAL_SCHEMA = "twinfinity.approval-proposal.v2"
+LEGACY_AUTHORITY_HOLD = "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED"
+PROPOSAL_PACKET_KEYS = {
+    "schema", "decision_key", "repository", "owning_issue",
+    "source_snapshot_sha256", "execution_scope_sha256",
+    "requester_session_id", "recipient_session_id", "workstream",
+    "boundary", "priority", "urgency", "summary", "question",
+    "requested_action", "target", "affected_issues", "blocked_mutation",
+    "immediate_beneficiary", "evidence", "risk", "drift_guards",
+    "prohibited_side_effects", "options", "recommendation", "expires_at",
+}
 
 
 class ApprovalGuardError(ValueError):
@@ -37,6 +49,64 @@ def _canonical_json(value: Any) -> str:
 
 def _digest_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _approval_contract_is_v2(connection: sqlite3.Connection) -> bool:
+    if not _table_exists(connection, "approval_semantic_contract_current"):
+        return False
+    rows = connection.execute(
+        "SELECT schema FROM approval_semantic_contract_current WHERE singleton=1"
+    ).fetchall()
+    if not rows:
+        return False
+    if len(rows) != 1 or rows[0]["schema"] not in {
+        LEGACY_PROPOSAL_SCHEMA, PROPOSAL_SCHEMA
+    }:
+        raise ApprovalGuardError("APPROVAL_SEMANTIC_CONTRACT_POINTER_INVALID")
+    return rows[0]["schema"] == PROPOSAL_SCHEMA
+
+
+def _proposal_semantic_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "schema", "decision_key", "repository", "owning_issue",
+        "source_snapshot_sha256", "execution_scope_sha256", "boundary",
+        "summary", "question", "requested_action", "target",
+        "affected_issues", "blocked_mutation", "immediate_beneficiary",
+        "risk", "drift_guards", "prohibited_side_effects", "options",
+        "recommendation", "expires_at",
+    ]
+    if packet.get("schema") == PROPOSAL_SCHEMA:
+        keys.append("evidence")
+    return {key: packet[key] for key in keys}
+
+
+def _require_bound_proposal(row: sqlite3.Row, *, v2_active: bool) -> dict[str, Any]:
+    try:
+        packet = json.loads(
+            row["packet_json"], object_pairs_hook=_strict_object
+        )
+    except (KeyError, TypeError, json.JSONDecodeError, ApprovalGuardError) as exc:
+        raise ApprovalGuardError("APPROVAL_PROPOSAL_BINDING_INVALID") from exc
+    if (
+        not isinstance(packet, dict)
+        or set(packet) != PROPOSAL_PACKET_KEYS
+        or packet.get("schema") not in {LEGACY_PROPOSAL_SCHEMA, PROPOSAL_SCHEMA}
+        or _canonical_json(packet) != row["packet_json"]
+    ):
+        raise ApprovalGuardError("APPROVAL_PROPOSAL_BINDING_INVALID")
+    expected = _digest_json(_proposal_semantic_packet(packet))
+    if (
+        expected != row["proposal_sha256"]
+        or expected != row["semantic_sha256"]
+        or packet.get("repository") != row["repository"]
+        or packet.get("owning_issue") != row["owning_issue"]
+        or packet.get("source_snapshot_sha256") != row["proposal_source_sha256"]
+        or packet.get("boundary") != row["boundary"]
+    ):
+        raise ApprovalGuardError("APPROVAL_PROPOSAL_BINDING_INVALID")
+    if v2_active and packet["schema"] == LEGACY_PROPOSAL_SCHEMA:
+        raise ApprovalGuardError(LEGACY_AUTHORITY_HOLD)
+    return packet
 
 
 def _require_frozen_batch_decision(row: sqlite3.Row) -> None:
@@ -440,7 +510,10 @@ def require_effective_approval(
 
     proposals = connection.execute(
         """
-        SELECT DISTINCT p.proposal_sha256, i.recipient_session_id
+        SELECT DISTINCT p.proposal_sha256, p.semantic_sha256, p.packet_json,
+               p.repository, p.owning_issue, p.boundary,
+               p.source_snapshot_sha256 AS proposal_source_sha256,
+               i.recipient_session_id
         FROM approval_current c
         JOIN approval_proposals p USING(proposal_sha256)
         JOIN approval_interests i USING(proposal_sha256)
@@ -464,6 +537,10 @@ def require_effective_approval(
             required_boundary,
         ),
     ).fetchall()
+    v2_active = _approval_contract_is_v2(connection)
+    if required_proposal_sha256 is not None:
+        for proposal in proposals:
+            _require_bound_proposal(proposal, v2_active=v2_active)
     proposals = [
         row
         for row in proposals
@@ -471,6 +548,8 @@ def require_effective_approval(
             connection, str(row["recipient_session_id"]), actor
         )
     ]
+    for proposal in proposals:
+        _require_bound_proposal(proposal, v2_active=v2_active)
     if not proposals:
         if required:
             raise ApprovalGuardError("APPROVAL_DECISION_REQUIRED")
@@ -503,7 +582,8 @@ def require_effective_approval(
         raise ApprovalGuardError("APPROVAL_AUTHORITY_BINDING_MISSING")
     matches = connection.execute(
         f"""
-        SELECT p.proposal_sha256, p.repository, p.boundary,
+        SELECT p.proposal_sha256, p.semantic_sha256, p.packet_json,
+               p.repository, p.owning_issue, p.boundary,
                p.source_snapshot_sha256 AS proposal_source_sha256,
                x.recipient_session_id,
                d.decision_sha256, d.decision, d.selected_option_id,
@@ -567,6 +647,7 @@ def require_effective_approval(
     match = None if not role_matches else role_matches[0]
     if match is None:
         raise ApprovalGuardError("APPROVAL_AUTHORITY_MISMATCH")
+    _require_bound_proposal(match, v2_active=v2_active)
     if match["approved_execution_scope_sha256"] != execution_scope_sha256:
         raise ApprovalGuardError("APPROVAL_EXECUTION_SCOPE_MISMATCH")
     _require_frozen_batch_decision(match)

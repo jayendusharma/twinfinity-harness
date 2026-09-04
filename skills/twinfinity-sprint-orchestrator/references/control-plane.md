@@ -108,7 +108,24 @@ Every covered open issue must be a node or a reasoned exclusion. A normal applic
 
 Derive the queue by releasing only nodes whose hard predecessors are accepted, preserving lane order among equal priority, selecting the earliest collision-free set that fits current policy, recording skip reasons, and continuing independent lanes so one blocked head does not block the portfolio.
 
-The prepared buffer may hold reviewed zero-WIP candidates. For the exact harness repository, the owner preparation operation composes one repository-local graph revision, `PREPARED/NONE` item, registered owner-only artifact, and `PREPARED_NOT_READY` pointer under one `BEGIN IMMEDIATE`; exact replay creates no row or event growth and no message, watch, attempt, branch, worktree, publication, lease, allocation, or writer WIP. It requires bracketed current-main evidence, an existing reviewed capacity policy, exact issue-set sources and exclusions, graph-derived collisions, and the harness source demand `{Development: 0, Shared: 1, SRE: 0}`. A distinct READY packet must bind the exact candidate artifact, source digest, issue generation/version, observed main, graph revision, capacity policy, lane, allocation demand, collision matrix, activation contract, lease manifest, and complete atomic-admission transaction. Any source, main, graph, policy, item, artifact, lease, or admission drift retires the current packet without changing historical evidence.
+The prepared buffer may hold reviewed zero-WIP application candidates. Normal
+TwinfinityApp delivery retains the complete SQLite graph, item, artifact,
+readiness, READY, capacity, lease, endpoint-attempt, message, watch, admission,
+outbox, and terminal-closeout controls described here.
+
+Harness source self-maintenance is the explicit recursive-safety exception. It
+uses one direct Product-Planner-fenced, digest-bound packet under
+[harness-self-maintenance.md](harness-self-maintenance.md), one separately
+accounted direct writer unit, and an exact repository-derived branch, isolated
+worktree, source surface, stages, validation, exclusions, and hard stops. That
+source lane creates and consults no SQLite graph, item, artifact, `PREPARED`,
+readiness, READY, Shared allocation, lease, message, endpoint attempt, terminal
+watch, approval, outbox, or closeout row for authority, veto, reservation,
+acknowledgement, publication, or completion. Source review and merge remain
+distinct from installation, live-database migration, endpoint activation, and
+runtime restoration. Never fall back from a missing or drifted direct packet
+to the normal application route, and never use this exception for
+TwinfinityApp work.
 
 Kanban owns the missing middle between a prepared candidate and a READY packet. Discover structurally ready, current-main, zero-WIP candidates; register one immutable readiness campaign per candidate; and dispatch at most one fresh read-only Development or SRE attempt for the campaign. That attempt evaluates the complete source, dependency, lease, collision, scope/boundary, scenario/evidence, and operational checklist and returns one all-gates receipt. Gates are checklist entries, never independently queued micro-handoffs. Parallelism is across disjoint candidates. Readiness attempts consume no Development, Shared, or SRE writer allocation.
 
