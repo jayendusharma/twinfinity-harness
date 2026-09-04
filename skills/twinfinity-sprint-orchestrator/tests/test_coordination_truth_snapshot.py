@@ -72,6 +72,42 @@ class CoordinationTruthSnapshotTests(unittest.TestCase):
             "SELECT COUNT(*) FROM sqlite_master"
         ).fetchone()
 
+    @staticmethod
+    def synthetic_wal_filesystem_state() -> dict:
+        def identity(*, inode: int, digest: str) -> dict:
+            return {
+                "device": 2096,
+                "inode": inode,
+                "mode": 0o600,
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+                "links": 1,
+                "size": 4096,
+                "mtime_ns": 100,
+                "ctime_ns": 100,
+                "atime_ns": 100,
+                "sha256": digest,
+            }
+
+        parent = {
+            "device": 2096,
+            "inode": 10,
+            "mode": 0o700,
+            "uid": os.getuid(),
+            "gid": os.getgid(),
+            "links": 2,
+        }
+        return {
+            "parent_chain": [dict(parent)],
+            "parent": dict(parent),
+            "namespace": ["state.sqlite3", "state.sqlite3-shm", "state.sqlite3-wal"],
+            "files": {
+                "database": identity(inode=11, digest="a" * 64),
+                "-wal": identity(inode=12, digest="b" * 64),
+                "-shm": identity(inode=13, digest="c" * 64),
+            },
+        }
+
     def approval_packet(self, schema: str) -> dict:
         return {
             "schema": schema,
@@ -245,6 +281,19 @@ class CoordinationTruthSnapshotTests(unittest.TestCase):
                 "delivery_control", "routing_truth",
             },
             set(first["families"]),
+        )
+        self.assertEqual(
+            {
+                "database_opens": 1,
+                "read_transactions": 1,
+                "rollbacks": 1,
+                "sql_writes": 0,
+                "filesystem_namespace_writes": 0,
+                "rollback_journal_metadata_changes": 0,
+                "read_atime_changes_only": True,
+                "wal_existing_shm_lock_bytes_and_timestamps_only": True,
+            },
+            first["read_effect_budget"],
         )
         encoded = json.dumps(first, sort_keys=True)
         self.assertNotIn(sentinel, encoded)
@@ -490,6 +539,75 @@ class CoordinationTruthSnapshotTests(unittest.TestCase):
             before["files"]["database"]["sha256"],
             after["files"]["database"]["sha256"],
         )
+
+    def test_synthetic_wal_reader_effects_accept_only_atime_and_bounded_shm(self) -> None:
+        before = self.synthetic_wal_filesystem_state()
+        for name in before["files"]:
+            with self.subTest(effect="atime", name=name):
+                after = json.loads(json.dumps(before))
+                after["files"][name]["atime_ns"] += 1
+                snapshot_module._validate_filesystem_effect(before, after, "WAL")
+
+        after = json.loads(json.dumps(before))
+        after["files"]["-shm"].update(
+            {
+                "mtime_ns": 101,
+                "ctime_ns": 102,
+                "sha256": "d" * 64,
+            }
+        )
+        snapshot_module._validate_filesystem_effect(before, after, "WAL")
+
+        for field in (
+            "device", "inode", "mode", "uid", "gid", "links", "size"
+        ):
+            with self.subTest(effect="shm-invariant", field=field):
+                after = json.loads(json.dumps(before))
+                after["files"]["-shm"][field] += 1
+                with self.assertRaisesRegex(
+                    SnapshotHold, "COORDINATION_TRUTH_FILESYSTEM_EFFECT"
+                ):
+                    snapshot_module._validate_filesystem_effect(
+                        before, after, "WAL"
+                    )
+
+    def test_synthetic_wal_mutations_and_namespace_effects_fail_closed(self) -> None:
+        before = self.synthetic_wal_filesystem_state()
+        for field in (
+            "device", "inode", "mode", "uid", "gid", "links", "size",
+            "mtime_ns", "ctime_ns", "sha256",
+        ):
+            with self.subTest(effect="wal", field=field):
+                after = json.loads(json.dumps(before))
+                if field == "sha256":
+                    after["files"]["-wal"][field] = "e" * 64
+                else:
+                    after["files"]["-wal"][field] += 1
+                with self.assertRaisesRegex(
+                    SnapshotHold, "COORDINATION_TRUTH_FILESYSTEM_EFFECT"
+                ):
+                    snapshot_module._validate_filesystem_effect(
+                        before, after, "WAL"
+                    )
+
+        structural_mutations = {
+            "namespace": lambda after: after["namespace"].append("unexpected"),
+            "parent": lambda after: after["parent"].update({"mode": 0o755}),
+            "parent-chain": lambda after: after["parent_chain"][0].update(
+                {"mode": 0o755}
+            ),
+        }
+        for effect, mutate in structural_mutations.items():
+            with self.subTest(effect=effect):
+                after = json.loads(json.dumps(before))
+                mutate(after)
+                with self.assertRaisesRegex(
+                    SnapshotHold,
+                    "COORDINATION_TRUTH_FILESYSTEM_NAMESPACE_EFFECT",
+                ):
+                    snapshot_module._validate_filesystem_effect(
+                        before, after, "WAL"
+                    )
 
     def test_routing_object_consumer_oracle_is_exact_and_non_boolean(self) -> None:
         valid = {
