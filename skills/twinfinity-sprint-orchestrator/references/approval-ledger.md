@@ -78,6 +78,94 @@ acknowledgement, and exact-scope effectivity. Source support for v2 does not
 itself activate the pointer or migrate a live database; those are separately
 authorized stopped-state operations.
 
+### Fenced semantic-contract v2 activation
+
+The registered activation surface is fixed to the owner coordination database,
+this harness repository, the v1-to-v2 transition, and the existing approval
+schema. It accepts no database, SQL, Python function, endpoint, or target-version
+selector. A separately authorized stopped-state SRE packet must first produce
+one canonical request with exactly these fields:
+
+```json
+{
+  "accepted_harness_main_sha": "<40 lowercase hex characters>",
+  "expected_v1_pointer": {
+    "activated_at": "<exact existing pointer timestamp>",
+    "authority_sha256": "<exact existing v1 authority digest>",
+    "schema": "twinfinity.approval-proposal.v1",
+    "singleton": 1
+  },
+  "legacy_authority_inventory_sha256": "<64 lowercase hex characters>",
+  "operation_key": "<unique bounded operation key>",
+  "repository": "jayendusharma/twinfinity-harness",
+  "schema": "twinfinity.approval-semantic-contract-v2-activation-request.v1",
+  "schema_sentinel_sha256": "<digest emitted by the matching reviewed source>",
+  "stopped_state_evidence_sha256": "<64 lowercase hex characters>",
+  "v2_authority_sha256": "<64 lowercase hex characters>"
+}
+```
+
+The request file must contain the canonical compact JSON bytes. The accepted
+harness source, legacy-authority inventory, stopped-state proof, and v2
+authority digests are closed evidence assertions from that SRE packet; this
+command binds them atomically but does not invent or broaden their authority.
+The expected pointer binds all four existing row fields, not only the schema
+name. An absent pointer is not implicit v1 for this operation.
+
+Preview with the fixed non-mutating command:
+
+```bash
+python3 scripts/approval_ledger.py semantic-contract-v2-preview \
+  --request <owner-local-canonical-request.json>
+```
+
+Before opening SQLite mutably, preview requires an owner-only existing database
+with no rollback journal, WAL, or SHM sidecar; exact compiled table, column,
+foreign-key, and trigger sentinels for
+`approval_semantic_contract_current` and `approval_events`; the exact explicit
+v1 pointer; and no prior activation receipt. It returns a canonical request
+digest and preview digest and creates no database, table, row, sidecar, event,
+or receipt. An exact already-applied operation may reproduce the same preview
+only after its v2 pointer and durable receipt both validate.
+
+Apply consumes both preview bindings:
+
+```bash
+python3 scripts/approval_ledger.py semantic-contract-v2-apply \
+  --request <owner-local-canonical-request.json> \
+  --expected-request-sha256 <request digest> \
+  --expected-preview-sha256 <preview digest>
+```
+
+Apply opens one read-only, no-follow anchor for the sidecar-free owner-safe
+database and retains that exact inode across its read-only preflight and later
+writable SQLite open. Before any transaction or write, the Linux procfs
+file-descriptor inventory must prove that SQLite's sole newly retained regular
+file handle for each open has the anchor's exact device, inode, mode, owner, and
+link count, while the owner-safe pathname must still resolve to that same
+identity. A pathname re-stat alone is not accepted as opened-handle evidence.
+Missing or ambiguous anchor or procfs evidence and any handle-identity mismatch
+fail closed with `APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE`. One
+`BEGIN IMMEDIATE` transaction then revalidates the sentinel and full pointer,
+compare-and-swaps that exact v1 row to the request's v2 authority, and appends
+one fixed `APPROVAL_SEMANTIC_CONTRACT_V2_ACTIVATED` operation receipt to
+`approval_events`. Pointer and receipt commit together or both roll back. The
+receipt digest binds the complete request, request and preview digests, schema
+sentinel, exact result pointer, and original activation time. A byte-identical
+replay returns that same receipt without a mutable open; another authority,
+source, inventory, stopped-state proof, pointer, operation key, request digest,
+preview digest, missing receipt, or duplicate receipt is a zero-write HOLD.
+
+Stable preflight failures include
+`APPROVAL_SEMANTIC_CONTRACT_SCHEMA_SENTINEL_REQUIRED`,
+`APPROVAL_SEMANTIC_CONTRACT_SCHEMA_SENTINEL_INVALID`,
+`APPROVAL_SEMANTIC_CONTRACT_EXPLICIT_V1_POINTER_REQUIRED`,
+`APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_POINTER_DRIFT`, and
+`APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_NOT_QUIESCENT`. The command never seeds
+an absent v1 pointer, creates or migrates schema, installs reviewed source,
+starts services or timers, changes endpoints, or launches an application
+canary. Those effects retain their separate authority and evidence boundaries.
+
 ## Transaction sequence
 
 1. Refresh and ingest the owning issue snapshot.

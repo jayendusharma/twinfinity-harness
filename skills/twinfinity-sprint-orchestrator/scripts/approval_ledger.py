@@ -25,6 +25,7 @@ from coordination_store import (
     CoordinationError,
     CoordinationStore,
     DEFAULT_DATABASE,
+    _normalized_schema_sql,
     canonical_json,
     canonicalize_coordination_identity,
     coordination_identity_role,
@@ -40,6 +41,10 @@ from executor_registry import (
     load_legacy_aliases,
     load_registry_config,
 )
+from owner_safe_sqlite import (
+    UnsafeSQLitePathError,
+    validate_owner_database,
+)
 from sync_github_coordination import fetch_object
 
 
@@ -47,6 +52,27 @@ LEGACY_SCHEMA = "twinfinity.approval-proposal.v1"
 SCHEMA = "twinfinity.approval-proposal.v2"
 APPROVAL_SEMANTIC_CONTRACT_V1 = LEGACY_SCHEMA
 APPROVAL_SEMANTIC_CONTRACT_V2 = SCHEMA
+SEMANTIC_CONTRACT_V2_ACTIVATION_REQUEST_SCHEMA = (
+    "twinfinity.approval-semantic-contract-v2-activation-request.v1"
+)
+SEMANTIC_CONTRACT_V2_ACTIVATION_PREVIEW_SCHEMA = (
+    "twinfinity.approval-semantic-contract-v2-activation-preview.v1"
+)
+SEMANTIC_CONTRACT_V2_ACTIVATION_RECEIPT_SCHEMA = (
+    "twinfinity.approval-semantic-contract-v2-activation-receipt.v1"
+)
+SEMANTIC_CONTRACT_V2_ACTIVATION_SENTINEL_SCHEMA = (
+    "twinfinity.approval-semantic-contract-v2-schema-sentinel.v1"
+)
+SEMANTIC_CONTRACT_V2_ACTIVATION_REPOSITORY = (
+    "jayendusharma/twinfinity-harness"
+)
+SEMANTIC_CONTRACT_V2_ACTIVATION_EVENT = (
+    "APPROVAL_SEMANTIC_CONTRACT_V2_ACTIVATED"
+)
+SEMANTIC_CONTRACT_V2_ACTIVATION_ENTITY_PREFIX = (
+    "approval-semantic-contract-v2:"
+)
 LEGACY_AUTHORITY_HOLD = "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED"
 REVIEW_BATCH_SCHEMA = "twinfinity.approval-review-batch.v2"
 BATCH_ANSWER_SCHEMA = "twinfinity.approval-batch-answer-map.v1"
@@ -114,6 +140,8 @@ SESSION = re.compile(
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DECISION_KEY = re.compile(r"^[a-z0-9][a-z0-9._:/-]{2,159}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+GIT_SHA1 = re.compile(r"^[0-9a-f]{40}$")
+OPERATION_KEY = re.compile(r"^[a-z0-9][a-z0-9._:/-]{7,159}$")
 OPTION_ID = re.compile(r"^[A-Z][A-Z0-9_]{1,39}$")
 USER_EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{7,255}$")
 SENSITIVE_VALUE = re.compile(
@@ -122,6 +150,102 @@ SENSITIVE_VALUE = re.compile(
     r"\bbearer\s+[A-Za-z0-9._~+/-]{12,})"
 )
 URL_QUERY = re.compile(r"https?://\S+\?\S+")
+
+
+_SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_OBJECTS = (
+    (
+        "table",
+        "approval_events",
+        """CREATE TABLE approval_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+    ),
+    (
+        "table",
+        "approval_semantic_contract_current",
+        """CREATE TABLE approval_semantic_contract_current (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            schema TEXT NOT NULL CHECK(schema IN (
+                'twinfinity.approval-proposal.v1',
+                'twinfinity.approval-proposal.v2'
+            )),
+            authority_sha256 TEXT NOT NULL,
+            activated_at TEXT NOT NULL
+        )""",
+    ),
+    (
+        "trigger",
+        "approval_semantic_contract_no_delete",
+        """CREATE TRIGGER approval_semantic_contract_no_delete
+        BEFORE DELETE ON approval_semantic_contract_current
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_SEMANTIC_CONTRACT_IMMUTABLE'); END""",
+    ),
+    (
+        "trigger",
+        "approval_semantic_contract_no_downgrade",
+        """CREATE TRIGGER approval_semantic_contract_no_downgrade
+        BEFORE UPDATE ON approval_semantic_contract_current
+        WHEN OLD.schema='twinfinity.approval-proposal.v2'
+         AND NEW.schema!='twinfinity.approval-proposal.v2'
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_SEMANTIC_CONTRACT_DOWNGRADE'); END""",
+    ),
+)
+
+
+def _semantic_contract_v2_activation_schema_sentinel() -> dict[str, Any]:
+    table_shapes = {
+        "approval_events": {
+            "columns": [
+                ["id", "INTEGER", 0, None, 1, 0],
+                ["event_type", "TEXT", 1, None, 0, 0],
+                ["entity_key", "TEXT", 1, None, 0, 0],
+                ["payload_sha256", "TEXT", 1, None, 0, 0],
+                ["created_at", "TEXT", 1, None, 0, 0],
+            ],
+            "foreign_keys": [],
+        },
+        "approval_semantic_contract_current": {
+            "columns": [
+                ["singleton", "INTEGER", 0, None, 1, 0],
+                ["schema", "TEXT", 1, None, 0, 0],
+                ["authority_sha256", "TEXT", 1, None, 0, 0],
+                ["activated_at", "TEXT", 1, None, 0, 0],
+            ],
+            "foreign_keys": [],
+        },
+    }
+    return {
+        "schema": SEMANTIC_CONTRACT_V2_ACTIVATION_SENTINEL_SCHEMA,
+        "objects": [
+            {
+                "type": object_type,
+                "name": name,
+                "sql": _normalized_schema_sql(sql),
+            }
+            for object_type, name, sql
+            in _SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_OBJECTS
+        ],
+        "activation_table_triggers": [
+            {
+                "name": name,
+                "table": "approval_semantic_contract_current",
+                "sql": _normalized_schema_sql(sql),
+            }
+            for object_type, name, sql
+            in _SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_OBJECTS
+            if object_type == "trigger"
+        ],
+        "table_shapes": table_shapes,
+    }
+
+
+SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_SENTINEL_SHA256 = digest_json(
+    _semantic_contract_v2_activation_schema_sentinel()
+)
 
 
 def _identity_syntax(value: Any) -> bool:
@@ -681,6 +805,668 @@ def current_semantic_contract(connection: sqlite3.Connection) -> str:
     return str(row["schema"])
 
 
+_SEMANTIC_CONTRACT_V2_ACTIVATION_REQUEST_KEYS = {
+    "schema",
+    "repository",
+    "accepted_harness_main_sha",
+    "schema_sentinel_sha256",
+    "expected_v1_pointer",
+    "v2_authority_sha256",
+    "legacy_authority_inventory_sha256",
+    "stopped_state_evidence_sha256",
+    "operation_key",
+}
+_SEMANTIC_CONTRACT_V2_POINTER_KEYS = {
+    "singleton", "schema", "authority_sha256", "activated_at"
+}
+
+
+def validate_semantic_contract_v2_activation_request(
+    request: Any,
+) -> dict[str, Any]:
+    """Validate the one closed v2 activation request shape."""
+
+    if not isinstance(request, dict) or set(request) != (
+        _SEMANTIC_CONTRACT_V2_ACTIVATION_REQUEST_KEYS
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_INVALID"
+        )
+    pointer = request.get("expected_v1_pointer")
+    if (
+        not isinstance(pointer, dict)
+        or set(pointer) != _SEMANTIC_CONTRACT_V2_POINTER_KEYS
+        or type(pointer.get("singleton")) is not int
+        or pointer["singleton"] != 1
+        or pointer.get("schema") != LEGACY_SCHEMA
+        or not isinstance(pointer.get("authority_sha256"), str)
+        or SHA256.fullmatch(pointer["authority_sha256"]) is None
+        or not isinstance(pointer.get("activated_at"), str)
+        or not pointer["activated_at"]
+        or len(pointer["activated_at"]) > 100
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_INVALID"
+        )
+    if (
+        request.get("schema")
+        != SEMANTIC_CONTRACT_V2_ACTIVATION_REQUEST_SCHEMA
+        or request.get("repository")
+        != SEMANTIC_CONTRACT_V2_ACTIVATION_REPOSITORY
+        or not isinstance(request.get("accepted_harness_main_sha"), str)
+        or GIT_SHA1.fullmatch(request["accepted_harness_main_sha"]) is None
+        or request.get("schema_sentinel_sha256")
+        != SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_SENTINEL_SHA256
+        or not isinstance(request.get("v2_authority_sha256"), str)
+        or SHA256.fullmatch(request["v2_authority_sha256"]) is None
+        or not isinstance(request.get("legacy_authority_inventory_sha256"), str)
+        or SHA256.fullmatch(request["legacy_authority_inventory_sha256"]) is None
+        or not isinstance(request.get("stopped_state_evidence_sha256"), str)
+        or SHA256.fullmatch(request["stopped_state_evidence_sha256"]) is None
+        or not isinstance(request.get("operation_key"), str)
+        or OPERATION_KEY.fullmatch(request["operation_key"]) is None
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_INVALID"
+        )
+    return {
+        key: dict(request[key]) if key == "expected_v1_pointer" else request[key]
+        for key in sorted(request)
+    }
+
+
+def load_semantic_contract_v2_activation_request(path: Path) -> dict[str, Any]:
+    """Load one owner-local canonical activation request without following links."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 64 * 1024
+        ):
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_FILE_UNSAFE"
+            )
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        raw = b"".join(chunks).decode("utf-8")
+        request = json.loads(raw, object_pairs_hook=_strict_object)
+        validated = validate_semantic_contract_v2_activation_request(request)
+        if raw != canonical_json(validated):
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_INVALID"
+            )
+        return validated
+    except CoordinationError as exc:
+        if str(exc).startswith("APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_"):
+            raise
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_INVALID"
+        ) from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_INVALID"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _actual_semantic_contract_v2_activation_schema_sentinel(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    objects: list[dict[str, str]] = []
+    for object_type, name, _expected_sql in (
+        _SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_OBJECTS
+    ):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+            (object_type, name),
+        ).fetchone()
+        if row is None or not isinstance(row["sql"], str):
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_SCHEMA_SENTINEL_REQUIRED"
+            )
+        objects.append(
+            {
+                "type": object_type,
+                "name": name,
+                "sql": _normalized_schema_sql(row["sql"]),
+            }
+        )
+    table_shapes: dict[str, Any] = {}
+    for table in (
+        "approval_events", "approval_semantic_contract_current"
+    ):
+        columns = [
+            [
+                str(row["name"]), str(row["type"]), int(row["notnull"]),
+                row["dflt_value"], int(row["pk"]), int(row["hidden"]),
+            ]
+            for row in connection.execute(f'PRAGMA table_xinfo("{table}")')
+        ]
+        foreign_keys = [
+            [
+                int(row["id"]), int(row["seq"]), str(row["table"]),
+                str(row["from"]), str(row["to"]), str(row["on_update"]),
+                str(row["on_delete"]), str(row["match"]),
+            ]
+            for row in connection.execute(f'PRAGMA foreign_key_list("{table}")')
+        ]
+        table_shapes[table] = {
+            "columns": columns,
+            "foreign_keys": foreign_keys,
+        }
+    activation_table_triggers = [
+        {
+            "name": str(row["name"]),
+            "table": str(row["tbl_name"]),
+            "sql": _normalized_schema_sql(row["sql"]),
+        }
+        for row in connection.execute(
+            "SELECT name,tbl_name,sql FROM sqlite_master "
+            "WHERE type='trigger' AND tbl_name IN (?,?) ORDER BY name",
+            (
+                "approval_events",
+                "approval_semantic_contract_current",
+            ),
+        )
+    ]
+    return {
+        "schema": SEMANTIC_CONTRACT_V2_ACTIVATION_SENTINEL_SCHEMA,
+        "objects": objects,
+        "activation_table_triggers": activation_table_triggers,
+        "table_shapes": table_shapes,
+    }
+
+
+def _require_semantic_contract_v2_activation_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    try:
+        actual = _actual_semantic_contract_v2_activation_schema_sentinel(
+            connection
+        )
+    except sqlite3.Error as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_SCHEMA_SENTINEL_INVALID"
+        ) from exc
+    if digest_json(actual) != (
+        SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_SENTINEL_SHA256
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_SCHEMA_SENTINEL_INVALID"
+        )
+
+
+def _semantic_contract_v2_explicit_pointer(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    rows = connection.execute(
+        "SELECT singleton,schema,authority_sha256,activated_at "
+        "FROM approval_semantic_contract_current ORDER BY singleton"
+    ).fetchall()
+    if not rows:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_EXPLICIT_V1_POINTER_REQUIRED"
+        )
+    if len(rows) != 1:
+        raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_POINTER_INVALID")
+    pointer = {
+        "singleton": int(rows[0]["singleton"]),
+        "schema": rows[0]["schema"],
+        "authority_sha256": rows[0]["authority_sha256"],
+        "activated_at": rows[0]["activated_at"],
+    }
+    if (
+        pointer["singleton"] != 1
+        or pointer["schema"] not in {LEGACY_SCHEMA, SCHEMA}
+        or not isinstance(pointer["authority_sha256"], str)
+        or SHA256.fullmatch(pointer["authority_sha256"]) is None
+        or not isinstance(pointer["activated_at"], str)
+        or not pointer["activated_at"]
+        or len(pointer["activated_at"]) > 100
+    ):
+        raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_POINTER_INVALID")
+    return pointer
+
+
+def _semantic_contract_v2_activation_events(
+    connection: sqlite3.Connection,
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        "SELECT event_type,entity_key,payload_sha256,created_at "
+        "FROM approval_events WHERE event_type=? ORDER BY id",
+        (SEMANTIC_CONTRACT_V2_ACTIVATION_EVENT,),
+    ).fetchall()
+
+
+def _validated_quiescent_activation_database(path: Path) -> Path:
+    try:
+        database = validate_owner_database(path)
+    except UnsafeSQLitePathError as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    for suffix in ("-journal", "-wal", "-shm"):
+        try:
+            os.lstat(f"{database}{suffix}")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+            ) from exc
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_NOT_QUIESCENT"
+        )
+    return database
+
+
+def _semantic_contract_v2_activation_database_identity(
+    path: Path,
+) -> tuple[int, int, int, int, int]:
+    try:
+        validated = validate_owner_database(path)
+        metadata = validated.stat(follow_symlinks=False)
+    except (OSError, UnsafeSQLitePathError) as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_uid),
+        int(metadata.st_nlink),
+    )
+
+
+def _open_semantic_contract_v2_activation_database_anchor(
+    path: Path,
+    expected_identity: tuple[int, int, int, int, int],
+) -> int:
+    """Retain the validated database inode across both SQLite opens."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    close_on_exec = getattr(os, "O_CLOEXEC", None)
+    if type(no_follow) is not int or type(close_on_exec) is not int:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+    flags = os.O_RDONLY | close_on_exec | no_follow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        opened_identity = (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_mode),
+            int(metadata.st_uid),
+            int(metadata.st_nlink),
+        )
+        if (
+            opened_identity != expected_identity
+            or _semantic_contract_v2_activation_database_identity(path)
+            != expected_identity
+        ):
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _require_semantic_contract_v2_activation_database_anchor(
+    descriptor: int,
+    path: Path,
+    expected_identity: tuple[int, int, int, int, int],
+) -> None:
+    """Require the retained inode and its owner-safe pathname to agree."""
+
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    anchored_identity = (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_uid),
+        int(metadata.st_nlink),
+    )
+    if (
+        anchored_identity != expected_identity
+        or _semantic_contract_v2_activation_database_identity(path)
+        != expected_identity
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+
+
+def _semantic_contract_v2_activation_regular_fd_identities(
+) -> dict[int, tuple[int, int, int, int, int]]:
+    """Return stable regular-file identities held by this process.
+
+    The v2 activation command is supported only where Linux procfs can attest
+    which file descriptor SQLite actually retained.  A disappearing directory
+    descriptor created by ``listdir`` is expected and is ignored; every
+    persistent regular descriptor is included in the comparison.
+    """
+
+    try:
+        entries = os.listdir("/proc/self/fd")
+    except OSError as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    identities: dict[int, tuple[int, int, int, int, int]] = {}
+    for entry in entries:
+        if not entry.isdecimal():
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+            )
+        descriptor = int(entry)
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            # /proc/self/fd includes the transient descriptor used to list it.
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        identities[descriptor] = (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_mode),
+            int(metadata.st_uid),
+            int(metadata.st_nlink),
+        )
+    return identities
+
+
+def _require_semantic_contract_v2_opened_database_identity(
+    connection: sqlite3.Connection,
+    before_open: dict[int, tuple[int, int, int, int, int]],
+    expected_identity: tuple[int, int, int, int, int],
+) -> None:
+    """Prove that SQLite retained exactly the prevalidated database inode."""
+
+    try:
+        databases = connection.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+    if (
+        len(databases) != 1
+        or int(databases[0][0]) != 0
+        or databases[0][1] != "main"
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+    after_open = _semantic_contract_v2_activation_regular_fd_identities()
+    opened = [
+        identity
+        for descriptor, identity in after_open.items()
+        if before_open.get(descriptor) != identity
+    ]
+    if opened != [expected_identity]:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        )
+
+
+def _open_semantic_contract_v2_activation_readonly(
+    path: Path,
+) -> sqlite3.Connection:
+    database = _validated_quiescent_activation_database(path)
+    try:
+        connection = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            isolation_level=None,
+            timeout=5,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        return connection
+    except sqlite3.Error as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+        ) from exc
+
+
+def _semantic_contract_v2_activation_preview(
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    body = {
+        "schema": SEMANTIC_CONTRACT_V2_ACTIVATION_PREVIEW_SCHEMA,
+        "request": request,
+        "request_sha256": digest_json(request),
+        "schema_sentinel_sha256": (
+            SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_SENTINEL_SHA256
+        ),
+        "target_pointer": {
+            "schema": SCHEMA,
+            "authority_sha256": request["v2_authority_sha256"],
+        },
+        "state": "READY_OR_EXACT_REPLAY",
+    }
+    return {**body, "preview_sha256": digest_json(body)}
+
+
+def _semantic_contract_v2_activation_receipt(
+    request: dict[str, Any],
+    preview: dict[str, Any],
+    activated_at: str,
+) -> dict[str, Any]:
+    body = {
+        "schema": SEMANTIC_CONTRACT_V2_ACTIVATION_RECEIPT_SCHEMA,
+        "request": request,
+        "request_sha256": preview["request_sha256"],
+        "preview_sha256": preview["preview_sha256"],
+        "schema_sentinel_sha256": (
+            SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_SENTINEL_SHA256
+        ),
+        "result_pointer": {
+            "singleton": 1,
+            "schema": SCHEMA,
+            "authority_sha256": request["v2_authority_sha256"],
+            "activated_at": activated_at,
+        },
+        "state": "APPLIED",
+    }
+    return {**body, "receipt_sha256": digest_json(body)}
+
+
+def _require_semantic_contract_v2_exact_replay(
+    pointer: dict[str, Any],
+    events: list[sqlite3.Row],
+    request: dict[str, Any],
+    preview: dict[str, Any],
+) -> dict[str, Any]:
+    if len(events) != 1:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
+        )
+    event = events[0]
+    expected_entity = (
+        SEMANTIC_CONTRACT_V2_ACTIVATION_ENTITY_PREFIX
+        + request["operation_key"]
+    )
+    if (
+        pointer["schema"] != SCHEMA
+        or pointer["authority_sha256"] != request["v2_authority_sha256"]
+        or event["entity_key"] != expected_entity
+        or event["created_at"] != pointer["activated_at"]
+    ):
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_OPERATION_CONFLICT"
+        )
+    receipt = _semantic_contract_v2_activation_receipt(
+        request, preview, pointer["activated_at"]
+    )
+    if event["payload_sha256"] != receipt["receipt_sha256"]:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
+        )
+    return receipt
+
+
+def _semantic_contract_v2_activation_readonly_state(
+    database: Path,
+    *,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
+) -> tuple[dict[str, Any], list[sqlite3.Row]]:
+    open_files_before = (
+        _semantic_contract_v2_activation_regular_fd_identities()
+        if expected_identity is not None
+        else None
+    )
+    connection = _open_semantic_contract_v2_activation_readonly(database)
+    try:
+        if expected_identity is not None:
+            assert open_files_before is not None
+            _require_semantic_contract_v2_opened_database_identity(
+                connection,
+                open_files_before,
+                expected_identity,
+            )
+        _require_semantic_contract_v2_activation_schema(connection)
+        return (
+            _semantic_contract_v2_explicit_pointer(connection),
+            _semantic_contract_v2_activation_events(connection),
+        )
+    except sqlite3.Error as exc:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_SCHEMA_SENTINEL_INVALID"
+        ) from exc
+    finally:
+        connection.close()
+
+
+def preview_semantic_contract_v2_activation(
+    database: Path,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Preview only the fixed v1-to-v2 activation without mutating SQLite."""
+
+    request = validate_semantic_contract_v2_activation_request(request)
+    preview = _semantic_contract_v2_activation_preview(request)
+    pointer, events = _semantic_contract_v2_activation_readonly_state(database)
+    if pointer["schema"] == SCHEMA:
+        _require_semantic_contract_v2_exact_replay(
+            pointer, events, request, preview
+        )
+        return preview
+    if pointer != request["expected_v1_pointer"]:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_POINTER_DRIFT"
+        )
+    if events:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
+        )
+    return preview
+
+
+def _activate_semantic_contract_v2_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    authority_sha256: str,
+    now: str,
+    expected_v1_pointer: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Perform the existing monotonic transition inside the caller's transaction."""
+
+    if not connection.in_transaction:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_TRANSACTION_REQUIRED"
+        )
+    prior = current_semantic_contract(connection)
+    if prior == SCHEMA:
+        row = connection.execute(
+            "SELECT authority_sha256,activated_at "
+            "FROM approval_semantic_contract_current WHERE singleton=1"
+        ).fetchone()
+        if row is None or row["authority_sha256"] != authority_sha256:
+            raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_CONFLICT")
+        return {
+            "schema": SCHEMA,
+            "activated_at": row["activated_at"],
+            "idempotent": True,
+        }
+
+    existing = connection.execute(
+        "SELECT singleton,schema,authority_sha256,activated_at "
+        "FROM approval_semantic_contract_current WHERE singleton=1"
+    ).fetchone()
+    if expected_v1_pointer is not None:
+        if existing is None or {
+            "singleton": int(existing["singleton"]),
+            "schema": existing["schema"],
+            "authority_sha256": existing["authority_sha256"],
+            "activated_at": existing["activated_at"],
+        } != expected_v1_pointer:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_POINTER_DRIFT"
+            )
+        cursor = connection.execute(
+            "UPDATE approval_semantic_contract_current "
+            "SET schema=?,authority_sha256=?,activated_at=? "
+            "WHERE singleton=1 AND schema=? AND authority_sha256=? "
+            "AND activated_at=?",
+            (
+                SCHEMA,
+                authority_sha256,
+                now,
+                LEGACY_SCHEMA,
+                expected_v1_pointer["authority_sha256"],
+                expected_v1_pointer["activated_at"],
+            ),
+        )
+    elif existing is None:
+        cursor = connection.execute(
+            "INSERT INTO approval_semantic_contract_current("
+            "singleton,schema,authority_sha256,activated_at) VALUES (1,?,?,?)",
+            (SCHEMA, authority_sha256, now),
+        )
+    else:
+        cursor = connection.execute(
+            "UPDATE approval_semantic_contract_current "
+            "SET schema=?,authority_sha256=?,activated_at=? "
+            "WHERE singleton=1 AND schema=?",
+            (SCHEMA, authority_sha256, now, LEGACY_SCHEMA),
+        )
+    if cursor.rowcount != 1:
+        raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_CONFLICT")
+    return {"schema": SCHEMA, "activated_at": now, "idempotent": False}
+
+
 def activate_semantic_contract_v2(
     connection: sqlite3.Connection,
     *,
@@ -695,40 +1481,169 @@ def activate_semantic_contract_v2(
     ensure_schema(connection)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        prior = current_semantic_contract(connection)
-        if prior == SCHEMA:
-            row = connection.execute(
-                "SELECT authority_sha256,activated_at "
-                "FROM approval_semantic_contract_current WHERE singleton=1"
-            ).fetchone()
-            if row is None or row["authority_sha256"] != authority_sha256:
-                raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_CONFLICT")
-            connection.execute("COMMIT")
-            return {"schema": SCHEMA, "activated_at": row["activated_at"], "idempotent": True}
-        existing = connection.execute(
-            "SELECT schema FROM approval_semantic_contract_current WHERE singleton=1"
-        ).fetchone()
-        if existing is None:
-            connection.execute(
-                "INSERT INTO approval_semantic_contract_current("
-                "singleton,schema,authority_sha256,activated_at) VALUES (1,?,?,?)",
-                (SCHEMA, authority_sha256, now),
-            )
-        else:
-            connection.execute(
-                "UPDATE approval_semantic_contract_current "
-                "SET schema=?,authority_sha256=?,activated_at=? "
-                "WHERE singleton=1 AND schema=?",
-                (SCHEMA, authority_sha256, now, LEGACY_SCHEMA),
-            )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_CONFLICT")
+        result = _activate_semantic_contract_v2_in_transaction(
+            connection,
+            authority_sha256=authority_sha256,
+            now=now,
+        )
         connection.execute("COMMIT")
+        return result
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
-    return {"schema": SCHEMA, "activated_at": now, "idempotent": False}
+
+
+def apply_semantic_contract_v2_activation(
+    database: Path,
+    request: dict[str, Any],
+    *,
+    expected_request_sha256: str,
+    expected_preview_sha256: str,
+) -> dict[str, Any]:
+    """Apply one exact, receipted v1-to-v2 activation transaction."""
+
+    request = validate_semantic_contract_v2_activation_request(request)
+    preview = _semantic_contract_v2_activation_preview(request)
+    if expected_request_sha256 != preview["request_sha256"]:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_REQUEST_DIGEST_DRIFT"
+        )
+    if expected_preview_sha256 != preview["preview_sha256"]:
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_PREVIEW_DRIFT"
+        )
+    validated = _validated_quiescent_activation_database(database)
+    preopen_identity = _semantic_contract_v2_activation_database_identity(
+        validated
+    )
+    anchor = _open_semantic_contract_v2_activation_database_anchor(
+        validated,
+        preopen_identity,
+    )
+    connection: sqlite3.Connection | None = None
+    try:
+        pointer, events = _semantic_contract_v2_activation_readonly_state(
+            validated,
+            expected_identity=preopen_identity,
+        )
+        _require_semantic_contract_v2_activation_database_anchor(
+            anchor,
+            validated,
+            preopen_identity,
+        )
+        if pointer["schema"] == SCHEMA:
+            return _require_semantic_contract_v2_exact_replay(
+                pointer, events, request, preview
+            )
+        if pointer != request["expected_v1_pointer"]:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_POINTER_DRIFT"
+            )
+        if events:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
+            )
+
+        writable_path = _validated_quiescent_activation_database(validated)
+        _require_semantic_contract_v2_activation_database_anchor(
+            anchor,
+            writable_path,
+            preopen_identity,
+        )
+        open_files_before = (
+            _semantic_contract_v2_activation_regular_fd_identities()
+        )
+        try:
+            connection = sqlite3.connect(
+                f"{writable_path.as_uri()}?mode=rw",
+                uri=True,
+                isolation_level=None,
+                timeout=5,
+            )
+        except sqlite3.Error as exc:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+            ) from exc
+        connection.row_factory = sqlite3.Row
+        if _semantic_contract_v2_activation_database_identity(
+            writable_path
+        ) != preopen_identity:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_DATABASE_UNSAFE"
+            )
+        _require_semantic_contract_v2_opened_database_identity(
+            connection,
+            open_files_before,
+            preopen_identity,
+        )
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("BEGIN IMMEDIATE")
+        _require_semantic_contract_v2_activation_schema(connection)
+        current = _semantic_contract_v2_explicit_pointer(connection)
+        current_events = _semantic_contract_v2_activation_events(connection)
+        if current["schema"] == SCHEMA:
+            receipt = _require_semantic_contract_v2_exact_replay(
+                current, current_events, request, preview
+            )
+            connection.execute("ROLLBACK")
+            return receipt
+        if current != request["expected_v1_pointer"]:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_POINTER_DRIFT"
+            )
+        if current_events:
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
+            )
+        activated_at = utc_now()
+        _activate_semantic_contract_v2_in_transaction(
+            connection,
+            authority_sha256=request["v2_authority_sha256"],
+            now=activated_at,
+            expected_v1_pointer=request["expected_v1_pointer"],
+        )
+        receipt = _semantic_contract_v2_activation_receipt(
+            request, preview, activated_at
+        )
+        receipt_body = {
+            key: value for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        _event(
+            connection,
+            SEMANTIC_CONTRACT_V2_ACTIVATION_EVENT,
+            SEMANTIC_CONTRACT_V2_ACTIVATION_ENTITY_PREFIX
+            + request["operation_key"],
+            receipt_body,
+            activated_at,
+        )
+        stored = _semantic_contract_v2_activation_events(connection)
+        if (
+            len(stored) != 1
+            or stored[0]["payload_sha256"] != receipt["receipt_sha256"]
+        ):
+            raise CoordinationError(
+                "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_RECEIPT_INVALID"
+            )
+        connection.execute("COMMIT")
+        return receipt
+    except CoordinationError:
+        if connection is not None and connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    except sqlite3.Error as exc:
+        if connection is not None and connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise CoordinationError(
+            "APPROVAL_SEMANTIC_CONTRACT_ACTIVATION_OPERATION_CONFLICT"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(anchor)
 
 
 def _legacy_authority_quarantined(
@@ -2931,10 +3846,44 @@ def main() -> int:
     report = subparsers.add_parser("summary")
     report.add_argument("--repository", required=True)
 
+    activation_preview = subparsers.add_parser(
+        "semantic-contract-v2-preview"
+    )
+    activation_preview.add_argument("--request", type=Path, required=True)
+
+    activation_apply = subparsers.add_parser(
+        "semantic-contract-v2-apply"
+    )
+    activation_apply.add_argument("--request", type=Path, required=True)
+    activation_apply.add_argument(
+        "--expected-request-sha256", required=True
+    )
+    activation_apply.add_argument(
+        "--expected-preview-sha256", required=True
+    )
+
     args = parser.parse_args()
     store: CoordinationStore | None = None
     try:
-        store = CoordinationStore(DEFAULT_DATABASE)
+        if args.command == "semantic-contract-v2-preview":
+            result = preview_semantic_contract_v2_activation(
+                DEFAULT_DATABASE,
+                load_semantic_contract_v2_activation_request(args.request),
+            )
+        elif args.command == "semantic-contract-v2-apply":
+            result = apply_semantic_contract_v2_activation(
+                DEFAULT_DATABASE,
+                load_semantic_contract_v2_activation_request(args.request),
+                expected_request_sha256=args.expected_request_sha256,
+                expected_preview_sha256=args.expected_preview_sha256,
+            )
+        else:
+            store = CoordinationStore(DEFAULT_DATABASE)
+        if args.command in {
+            "semantic-contract-v2-preview", "semantic-contract-v2-apply"
+        }:
+            print(canonical_json(result))
+            return 0
         if args.command == "submit":
             result = submit_proposal(store, load_packet(args.packet), utc_now())
         elif args.command == "review-batch":
