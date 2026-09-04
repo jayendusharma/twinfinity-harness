@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import coordination_truth_snapshot as snapshot_module  # noqa: E402
 from coordination_truth_snapshot import (  # noqa: E402
+    SIDECAR_FREE_WAL_READ_BOUNDARY,
     SNAPSHOT_SCHEMA,
     SnapshotHold,
     snapshot_database,
@@ -71,6 +72,27 @@ class CoordinationTruthSnapshotTests(unittest.TestCase):
         self.control.connection.execute(
             "SELECT COUNT(*) FROM sqlite_master"
         ).fetchone()
+
+    def close_to_database_only_wal(self) -> list[str]:
+        self.prime_wal_reader_mark()
+        checkpoint = tuple(
+            self.control.connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+        )
+        self.assertEqual((0, 0, 0), checkpoint)
+        self.control.close()
+        self.control = None
+        self.database.chmod(0o600)
+        self.assertEqual(b"\x02\x02", self.database.read_bytes()[18:20])
+        namespace = sorted(
+            entry.name for entry in self.database.parent.iterdir()
+        )
+        self.assertIn(self.database.name, namespace)
+        self.assertFalse(Path(str(self.database) + "-wal").exists())
+        self.assertFalse(Path(str(self.database) + "-shm").exists())
+        self.assertFalse(Path(str(self.database) + "-journal").exists())
+        return namespace
 
     @staticmethod
     def synthetic_wal_filesystem_state() -> dict:
@@ -245,6 +267,340 @@ class CoordinationTruthSnapshotTests(unittest.TestCase):
     def test_public_snapshot_contract_is_versioned(self) -> None:
         self.assertEqual(
             "twinfinity-coordination-truth-snapshot/v1", SNAPSHOT_SCHEMA
+        )
+
+    def test_database_only_wal_requires_the_exact_explicit_boundary(self) -> None:
+        self.prime_wal_reader_mark()
+        triplet = snapshot_database(self.database, REPOSITORY)
+        namespace = self.close_to_database_only_wal()
+
+        with patch.object(
+            snapshot_module, "open_owner_database_readonly"
+        ) as default_opener, self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_WAL_SIDECAR_REQUIRED"
+        ):
+            snapshot_database(self.database, REPOSITORY)
+        default_opener.assert_not_called()
+
+        explicit = snapshot_database(
+            self.database,
+            REPOSITORY,
+            read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+        )
+        self.assertEqual(triplet, explicit)
+        self.assertEqual(triplet["snapshot_sha256"], explicit["snapshot_sha256"])
+        self.assertEqual(SNAPSHOT_SCHEMA, explicit["schema"])
+        self.assertEqual(
+            {
+                "schema", "repository", "global_current", "schema_sentinels",
+                "families", "read_effect_budget", "snapshot_sha256",
+            },
+            set(explicit),
+        )
+        self.assertNotIn(
+            SIDECAR_FREE_WAL_READ_BOUNDARY,
+            canonical_json(explicit),
+        )
+        self.assertEqual(
+            namespace,
+            sorted(entry.name for entry in self.database.parent.iterdir()),
+        )
+
+    def test_sidecar_free_boundary_uses_private_pinned_immutable_connection(
+        self,
+    ) -> None:
+        self.close_to_database_only_wal()
+        real_connect = snapshot_module.sqlite3.connect
+        evidence: dict[str, object] = {"statements": []}
+
+        class TracedConnection:
+            def __init__(self, connection, descriptor: int):
+                object.__setattr__(self, "connection", connection)
+                object.__setattr__(self, "descriptor", descriptor)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def __setattr__(self, name, value):
+                if name in {"connection", "descriptor"}:
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self.connection, name, value)
+
+            def execute(self, statement, *args):
+                evidence["statements"].append(statement.strip().upper())
+                return self.connection.execute(statement, *args)
+
+            def close(self):
+                os.fstat(self.descriptor)
+                evidence["descriptor_alive_at_sqlite_close"] = True
+                return self.connection.close()
+
+        def traced_connect(database_uri, *args, **kwargs):
+            prefix = "file:/proc/self/fd/"
+            suffix = "?mode=ro&immutable=1&cache=private"
+            self.assertTrue(database_uri.startswith(prefix))
+            self.assertTrue(database_uri.endswith(suffix))
+            descriptor = int(database_uri[len(prefix):-len(suffix)])
+            os.fstat(descriptor)
+            evidence["descriptor"] = descriptor
+            evidence["uri"] = database_uri
+            self.assertTrue(kwargs["uri"])
+            self.assertIsNone(kwargs["isolation_level"])
+            self.assertEqual(5, kwargs["timeout"])
+            return TracedConnection(
+                real_connect(database_uri, *args, **kwargs), descriptor
+            )
+
+        before = snapshot_module._filesystem_state(self.database)
+        with patch.object(
+            snapshot_module.sqlite3, "connect", side_effect=traced_connect
+        ):
+            result = snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+            )
+        after = snapshot_module._filesystem_state(self.database)
+
+        self.assertEqual(SNAPSHOT_SCHEMA, result["schema"])
+        self.assertTrue(evidence["descriptor_alive_at_sqlite_close"])
+        descriptor = evidence["descriptor"]
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+        self.assertEqual(
+            ["BEGIN", "ROLLBACK"],
+            [
+                statement for statement in evidence["statements"]
+                if statement in {"BEGIN", "ROLLBACK", "COMMIT"}
+            ],
+        )
+        self.assertIn("PRAGMA QUERY_ONLY=ON", evidence["statements"])
+        snapshot_module._validate_filesystem_effect(
+            before, after, "WAL_SIDECAR_FREE_IMMUTABLE"
+        )
+
+    def test_sidecar_free_boundary_rejects_controlled_writer_before_open(
+        self,
+    ) -> None:
+        self.close_to_database_only_wal()
+        hook_calls: list[bool] = []
+
+        with patch.object(
+            snapshot_module, "_open_pinned_immutable_database_readonly"
+        ) as opener, self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_READ_BOUNDARY_WRITER_FORBIDDEN"
+        ):
+            snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+                after_begin=lambda: hook_calls.append(True),
+            )
+        opener.assert_not_called()
+        self.assertEqual([], hook_calls)
+
+    def test_sidecar_free_boundary_rejects_other_routes_and_values(self) -> None:
+        with self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_READ_BOUNDARY_INVALID"
+        ):
+            snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary="immutable",
+            )
+
+        with patch.object(
+            snapshot_module, "_open_pinned_immutable_database_readonly"
+        ) as opener, self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_READ_BOUNDARY_MISMATCH"
+        ):
+            snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+            )
+        opener.assert_not_called()
+
+        self.close_to_database_only_wal()
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(sidecar=suffix):
+                sidecar = Path(str(self.database) + suffix)
+                sidecar.write_bytes(b"")
+                sidecar.chmod(0o600)
+                with self.assertRaisesRegex(
+                    SnapshotHold, "COORDINATION_TRUTH_READ_BOUNDARY_MISMATCH"
+                ):
+                    snapshot_database(
+                        self.database,
+                        REPOSITORY,
+                        read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+                    )
+                sidecar.unlink()
+
+        connection = sqlite3.connect(self.database, isolation_level=None)
+        self.assertEqual(
+            "delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        )
+        connection.close()
+        self.database.chmod(0o600)
+        with self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_READ_BOUNDARY_MISMATCH"
+        ):
+            snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+            )
+
+    def test_pinned_database_identity_matrix_is_exact_except_atime(self) -> None:
+        self.close_to_database_only_wal()
+        descriptor = snapshot_module._open_file_noatime(self.database)
+        try:
+            expected = snapshot_module._descriptor_file_identity(descriptor)
+        finally:
+            os.close(descriptor)
+
+        for field in (
+            "device", "inode", "mode", "uid", "gid", "links", "size",
+            "mtime_ns", "ctime_ns", "sha256",
+        ):
+            with self.subTest(field=field):
+                observed = dict(expected)
+                if field == "sha256":
+                    observed[field] = "0" * 64
+                else:
+                    observed[field] += 1
+                with self.assertRaisesRegex(
+                    SnapshotHold, "COORDINATION_TRUTH_FILESYSTEM_DRIFT"
+                ):
+                    snapshot_module._validate_pinned_database_identity(
+                        expected, observed
+                    )
+
+        atime_only = dict(expected)
+        atime_only["atime_ns"] += 1
+        snapshot_module._validate_pinned_database_identity(expected, atime_only)
+
+    def test_sidecar_free_boundary_rejects_pinned_descriptor_substitution(
+        self,
+    ) -> None:
+        self.close_to_database_only_wal()
+        expected = snapshot_module._file_identity(self.database)
+        substitute = self.database.parent / "substitute.sqlite3"
+        substitute.write_bytes(self.database.read_bytes())
+        substitute.chmod(0o600)
+
+        def open_substitute(_path):
+            return os.open(substitute, os.O_RDONLY)
+
+        with (
+            patch.object(
+                snapshot_module,
+                "_open_file_noatime",
+                side_effect=open_substitute,
+            ),
+            patch.object(snapshot_module.sqlite3, "connect") as sqlite_open,
+            self.assertRaisesRegex(
+                    SnapshotHold, "COORDINATION_TRUTH_FILESYSTEM_DRIFT"
+            ),
+        ):
+            snapshot_module._open_pinned_immutable_database_readonly(
+                self.database, expected
+            )
+        sqlite_open.assert_not_called()
+
+    def test_sidecar_free_boundary_requires_sqlite_retained_file_identity(
+        self,
+    ) -> None:
+        self.close_to_database_only_wal()
+        expected = snapshot_module._file_identity(self.database)
+        before = snapshot_module._filesystem_state(self.database)
+
+        with patch.object(
+            snapshot_module,
+            "_regular_file_descriptor_identities",
+            return_value={},
+        ), self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_PINNED_SQLITE_IDENTITY_INVALID"
+        ):
+            snapshot_module._open_pinned_immutable_database_readonly(
+                self.database, expected
+            )
+
+        after = snapshot_module._filesystem_state(self.database)
+        snapshot_module._validate_filesystem_effect(
+            before, after, "WAL_SIDECAR_FREE_IMMUTABLE"
+        )
+
+    def test_sidecar_free_terminal_path_replacement_discards_snapshot(
+        self,
+    ) -> None:
+        self.close_to_database_only_wal()
+        original_bytes = self.database.read_bytes()
+        real_assemble = snapshot_module._assemble
+
+        def replace_path(connection, repository):
+            result = real_assemble(connection, repository)
+            self.database.rename(self.database.parent / "retired.sqlite3")
+            self.database.write_bytes(original_bytes)
+            self.database.chmod(0o600)
+            return result
+
+        with patch.object(
+            snapshot_module, "_assemble", side_effect=replace_path
+        ), self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_FILESYSTEM_NAMESPACE_EFFECT"
+        ):
+            snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+            )
+
+    def test_sidecar_free_terminal_sidecar_appearance_discards_snapshot(
+        self,
+    ) -> None:
+        self.close_to_database_only_wal()
+        real_assemble = snapshot_module._assemble
+
+        def add_sidecar(connection, repository):
+            result = real_assemble(connection, repository)
+            sidecar = Path(str(self.database) + "-wal")
+            sidecar.write_bytes(b"injected")
+            sidecar.chmod(0o600)
+            return result
+
+        with patch.object(
+            snapshot_module, "_assemble", side_effect=add_sidecar
+        ), self.assertRaisesRegex(
+            SnapshotHold, "COORDINATION_TRUTH_FILESYSTEM_NAMESPACE_EFFECT"
+        ):
+            snapshot_database(
+                self.database,
+                REPOSITORY,
+                read_boundary=SIDECAR_FREE_WAL_READ_BOUNDARY,
+            )
+
+    def test_cli_accepts_only_the_explicit_sidecar_free_boundary(self) -> None:
+        self.close_to_database_only_wal()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(
+                0,
+                snapshot_module.main(
+                    [
+                        "--repository", REPOSITORY,
+                        "--database", str(self.database),
+                        "--read-boundary", SIDECAR_FREE_WAL_READ_BOUNDARY,
+                    ]
+                ),
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(SNAPSHOT_SCHEMA, result["schema"])
+        self.assertNotIn(
+            SIDECAR_FREE_WAL_READ_BOUNDARY,
+            canonical_json(result),
         )
 
     def test_complete_snapshot_is_deterministic_and_privacy_safe(self) -> None:

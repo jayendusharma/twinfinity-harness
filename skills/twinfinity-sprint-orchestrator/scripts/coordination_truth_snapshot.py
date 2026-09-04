@@ -52,6 +52,8 @@ APPROVAL_V2 = "twinfinity.approval-proposal.v2"
 MAX_TABLE_ROWS = 20_000
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_ROUTING_OBJECTS = 10_000
+SIDECAR_FREE_WAL_READ_BOUNDARY = "stopped-checkpointed-sidecar-free-wal-v1"
+_SIDECAR_FREE_WAL_JOURNAL = "WAL_SIDECAR_FREE_IMMUTABLE"
 
 
 class SnapshotHold(ValueError):
@@ -2057,6 +2059,178 @@ def _file_identity(path: Path) -> dict[str, Any]:
         os.close(descriptor)
 
 
+def _descriptor_file_identity(descriptor: int) -> dict[str, Any]:
+    """Return the stable owner-safe identity of one already-pinned file."""
+
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise SnapshotHold("COORDINATION_TRUTH_FILESYSTEM_UNSAFE")
+    if not hasattr(os, "pread"):
+        raise SnapshotHold("COORDINATION_TRUTH_PINNED_DESCRIPTOR_UNAVAILABLE")
+    before = metadata
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, size)
+        if not chunk:
+            break
+        digest.update(chunk)
+        size += len(chunk)
+    after = os.fstat(descriptor)
+    if (
+        size != after.st_size
+        or _stable_file_tuple(before) != _stable_file_tuple(after)
+    ):
+        raise SnapshotHold("COORDINATION_TRUTH_FILESYSTEM_DRIFT")
+    return {
+        "device": after.st_dev, "inode": after.st_ino,
+        "mode": stat.S_IMODE(after.st_mode), "uid": after.st_uid,
+        "gid": after.st_gid, "links": after.st_nlink,
+        "size": after.st_size, "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns, "atime_ns": after.st_atime_ns,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _validate_pinned_database_identity(
+    expected: Mapping[str, Any], observed: Mapping[str, Any]
+) -> None:
+    """Require an exact pinned database identity, allowing read atime only."""
+
+    if set(expected) != set(observed) or any(
+        expected[key] != observed[key]
+        for key in expected
+        if key != "atime_ns"
+    ):
+        raise SnapshotHold("COORDINATION_TRUTH_FILESYSTEM_DRIFT")
+
+
+def _regular_file_descriptor_identities(
+) -> dict[int, tuple[int, int, int, int, int]]:
+    """Return stable regular-file identities currently held by this process."""
+
+    try:
+        entries = os.listdir("/proc/self/fd")
+    except OSError as exc:
+        raise SnapshotHold(
+            "COORDINATION_TRUTH_PINNED_DESCRIPTOR_UNAVAILABLE"
+        ) from exc
+    identities: dict[int, tuple[int, int, int, int, int]] = {}
+    for entry in entries:
+        if not entry.isdecimal():
+            raise SnapshotHold(
+                "COORDINATION_TRUTH_PINNED_DESCRIPTOR_UNAVAILABLE"
+            )
+        descriptor = int(entry)
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            # listdir itself may briefly occupy one descriptor in this directory.
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        identities[descriptor] = (
+            int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_mode),
+            int(metadata.st_uid), int(metadata.st_nlink),
+        )
+    return identities
+
+
+def _require_sqlite_opened_pinned_identity(
+    connection: sqlite3.Connection,
+    before_open: Mapping[int, tuple[int, int, int, int, int]],
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    """Prove SQLite retained exactly the identity supplied through procfs."""
+
+    try:
+        databases = connection.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error as exc:
+        raise SnapshotHold(
+            "COORDINATION_TRUTH_PINNED_SQLITE_IDENTITY_INVALID"
+        ) from exc
+    if (
+        len(databases) != 1
+        or int(databases[0][0]) != 0
+        or databases[0][1] != "main"
+    ):
+        raise SnapshotHold(
+            "COORDINATION_TRUTH_PINNED_SQLITE_IDENTITY_INVALID"
+        )
+    after_open = _regular_file_descriptor_identities()
+    opened = [
+        identity
+        for descriptor, identity in after_open.items()
+        if before_open.get(descriptor) != identity
+    ]
+    if opened != [expected]:
+        raise SnapshotHold(
+            "COORDINATION_TRUTH_PINNED_SQLITE_IDENTITY_INVALID"
+        )
+
+
+def _open_pinned_immutable_database_readonly(
+    database: Path, expected: Mapping[str, Any]
+) -> tuple[sqlite3.Connection, int]:
+    """Open sidecar-free WAL only through one continuously pinned descriptor."""
+
+    descriptor = _open_file_noatime(database)
+    connection: sqlite3.Connection | None = None
+    try:
+        pinned = _descriptor_file_identity(descriptor)
+        _validate_pinned_database_identity(expected, pinned)
+        _validate_pinned_database_identity(expected, _file_identity(database))
+
+        descriptor_path = Path("/proc/self/fd") / str(descriptor)
+        try:
+            descriptor_metadata = descriptor_path.stat()
+        except OSError as exc:
+            raise SnapshotHold(
+                "COORDINATION_TRUTH_PINNED_DESCRIPTOR_UNAVAILABLE"
+            ) from exc
+        if _stable_file_tuple(descriptor_metadata) != _stable_file_tuple(
+            os.fstat(descriptor)
+        ):
+            raise SnapshotHold("COORDINATION_TRUTH_FILESYSTEM_DRIFT")
+
+        metadata = os.fstat(descriptor)
+        expected_sqlite_identity = (
+            int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_mode),
+            int(metadata.st_uid), int(metadata.st_nlink),
+        )
+        before_sqlite_open = _regular_file_descriptor_identities()
+
+        uri = (
+            f"file:/proc/self/fd/{descriptor}"
+            "?mode=ro&immutable=1&cache=private"
+        )
+        connection = sqlite3.connect(
+            uri, uri=True, isolation_level=None, timeout=5
+        )
+        connection.row_factory = sqlite3.Row
+        _require_sqlite_opened_pinned_identity(
+            connection, before_sqlite_open, expected_sqlite_identity
+        )
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        _validate_pinned_database_identity(
+            expected, _descriptor_file_identity(descriptor)
+        )
+        _validate_pinned_database_identity(expected, _file_identity(database))
+        return connection, descriptor
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        os.close(descriptor)
+        raise
+
+
 def _filesystem_state(database: Path) -> dict[str, Any]:
     parent_chain = []
     for directory in (*reversed(database.parent.parents), database.parent):
@@ -2095,16 +2269,28 @@ def _filesystem_state(database: Path) -> dict[str, Any]:
     }
 
 
-def _journal_contract(database: Path, before: dict[str, Any]) -> str:
+def _journal_contract(
+    database: Path,
+    before: dict[str, Any],
+    read_boundary: str | None = None,
+) -> str:
+    if read_boundary not in {None, SIDECAR_FREE_WAL_READ_BOUNDARY}:
+        raise SnapshotHold("COORDINATION_TRUTH_READ_BOUNDARY_INVALID")
     header = _read_file_noatime(database, limit=20)
     if len(header) < 20 or header[:16] != b"SQLite format 3\x00":
         raise SnapshotHold("COORDINATION_TRUTH_DATABASE_INVALID")
     wal = header[18:20] == b"\x02\x02"
     names = set(before["files"])
     if wal:
+        if read_boundary == SIDECAR_FREE_WAL_READ_BOUNDARY:
+            if names != {"database"}:
+                raise SnapshotHold("COORDINATION_TRUTH_READ_BOUNDARY_MISMATCH")
+            return _SIDECAR_FREE_WAL_JOURNAL
         if not {"database", "-wal", "-shm"}.issubset(names) or "-journal" in names:
             raise SnapshotHold("COORDINATION_TRUTH_WAL_SIDECAR_REQUIRED")
         return "WAL"
+    if read_boundary == SIDECAR_FREE_WAL_READ_BOUNDARY:
+        raise SnapshotHold("COORDINATION_TRUTH_READ_BOUNDARY_MISMATCH")
     if names != {"database"}:
         raise SnapshotHold("COORDINATION_TRUTH_ROLLBACK_SIDECAR_FORBIDDEN")
     return "ROLLBACK"
@@ -2158,8 +2344,13 @@ def snapshot_database(
     repository: str,
     *,
     after_begin: Callable[[], None] | None = None,
+    read_boundary: str | None = None,
 ) -> dict[str, Any]:
-    """Return one complete stable snapshot or raise one typed HOLD."""
+    """Return one complete stable snapshot or raise one typed HOLD.
+
+    The explicit sidecar-free WAL boundary is a caller assertion, not evidence
+    of checkpoint, stop, descriptor exclusion, installation, or authority.
+    """
 
     if repository not in ALLOWED_REPOSITORIES:
         raise SnapshotHold("COORDINATION_TRUTH_REPOSITORY_INVALID")
@@ -2167,19 +2358,29 @@ def snapshot_database(
     try:
         database = validate_owner_database(database)
         before = _filesystem_state(database)
-        journal = _journal_contract(database, before)
+        journal = _journal_contract(database, before, read_boundary)
     except SnapshotHold:
         raise
     except (OSError, ValueError) as exc:
         raise SnapshotHold("COORDINATION_TRUTH_DATABASE_UNSAFE") from exc
+    if journal == _SIDECAR_FREE_WAL_JOURNAL and after_begin is not None:
+        raise SnapshotHold("COORDINATION_TRUTH_READ_BOUNDARY_WRITER_FORBIDDEN")
     connection: sqlite3.Connection | None = None
+    pinned_descriptor: int | None = None
     begun = False
     total_changes = 0
     result: dict[str, Any] | None = None
     failure: BaseException | None = None
     effect_baseline = before
     try:
-        connection = open_owner_database_readonly(database)
+        if journal == _SIDECAR_FREE_WAL_JOURNAL:
+            connection, pinned_descriptor = (
+                _open_pinned_immutable_database_readonly(
+                    database, before["files"]["database"]
+                )
+            )
+        else:
+            connection = open_owner_database_readonly(database)
         total_changes = connection.total_changes
         connection.execute("BEGIN")
         begun = True
@@ -2211,6 +2412,26 @@ def snapshot_database(
                 connection.close()
         except BaseException:
             failure = SnapshotHold("COORDINATION_TRUTH_CLOSE_FAILED")
+        if pinned_descriptor is not None:
+            try:
+                _validate_pinned_database_identity(
+                    before["files"]["database"],
+                    _descriptor_file_identity(pinned_descriptor),
+                )
+            except BaseException as exc:
+                if isinstance(exc, SnapshotHold):
+                    failure = exc
+                else:
+                    failure = SnapshotHold(
+                        "COORDINATION_TRUTH_POST_EFFECT_INVALID"
+                    )
+            finally:
+                try:
+                    os.close(pinned_descriptor)
+                except OSError:
+                    failure = SnapshotHold(
+                        "COORDINATION_TRUTH_PINNED_DESCRIPTOR_CLOSE_FAILED"
+                    )
         try:
             after = _filesystem_state(database)
             _validate_filesystem_effect(effect_baseline, after, journal)
@@ -2236,9 +2457,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+    parser.add_argument(
+        "--read-boundary",
+        choices=(SIDECAR_FREE_WAL_READ_BOUNDARY,),
+    )
     args = parser.parse_args(argv)
     try:
-        result = snapshot_database(args.database, args.repository)
+        result = snapshot_database(
+            args.database,
+            args.repository,
+            read_boundary=args.read_boundary,
+        )
     except SnapshotHold as exc:
         result = {"schema": HOLD_SCHEMA, "state": "HOLD", "error": str(exc)}
         print(canonical_json(result))
