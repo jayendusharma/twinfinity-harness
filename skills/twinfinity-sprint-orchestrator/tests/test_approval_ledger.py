@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 import sys
@@ -14,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import approval_ledger as approval_ledger_module  # noqa: E402
 from approval_ledger import (  # noqa: E402
     activate_semantic_contract_v2,
     acknowledge_decision,
@@ -1401,6 +1404,540 @@ class ApprovalLedgerTests(unittest.TestCase):
                 (proposal,),
             ).fetchone()[0],
         )
+
+
+class ApprovalSemanticContractV2ActivationCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "coordination"
+        self.root.mkdir(mode=0o700)
+        self.database = self.root / "state.sqlite3"
+        store = CoordinationStore(self.database)
+        ensure_schema(store.connection)
+        with store.transaction():
+            store.connection.execute(
+                "INSERT INTO approval_semantic_contract_current("
+                "singleton,schema,authority_sha256,activated_at) "
+                "VALUES (1,?,?,?)",
+                (
+                    "twinfinity.approval-proposal.v1",
+                    "1" * 64,
+                    "2026-09-04T05:00:00Z",
+                ),
+            )
+        store.close()
+        self.request = self.root / "activation-request.json"
+        self.request_payload = {
+            "schema": (
+                "twinfinity.approval-semantic-contract-v2-activation-request.v1"
+            ),
+            "repository": "jayendusharma/twinfinity-harness",
+            "accepted_harness_main_sha": "2" * 40,
+            "schema_sentinel_sha256": (
+                approval_ledger_module
+                .SEMANTIC_CONTRACT_V2_ACTIVATION_SCHEMA_SENTINEL_SHA256
+            ),
+            "expected_v1_pointer": {
+                "singleton": 1,
+                "schema": "twinfinity.approval-proposal.v1",
+                "authority_sha256": "1" * 64,
+                "activated_at": "2026-09-04T05:00:00Z",
+            },
+            "v2_authority_sha256": "3" * 64,
+            "legacy_authority_inventory_sha256": "4" * 64,
+            "stopped_state_evidence_sha256": "5" * 64,
+            "operation_key": "issue-193-v2-activation",
+        }
+        self.write_request(self.request_payload)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_request(self, payload: dict) -> None:
+        self.request.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    def run_cli(self, *arguments: str) -> tuple[int, dict]:
+        output = io.StringIO()
+        with (
+            patch.object(approval_ledger_module, "DEFAULT_DATABASE", self.database),
+            patch.object(
+                sys,
+                "argv",
+                ["approval_ledger.py", *arguments],
+            ),
+            redirect_stdout(output),
+        ):
+            result = approval_ledger_module.main()
+        return result, json.loads(output.getvalue())
+
+    def preview(self) -> dict:
+        code, result = self.run_cli(
+            "semantic-contract-v2-preview", "--request", str(self.request)
+        )
+        self.assertEqual(0, code)
+        return result
+
+    def apply(self, preview: dict) -> tuple[int, dict]:
+        return self.run_cli(
+            "semantic-contract-v2-apply",
+            "--request",
+            str(self.request),
+            "--expected-request-sha256",
+            preview["request_sha256"],
+            "--expected-preview-sha256",
+            preview["preview_sha256"],
+        )
+
+    def database_dump(self) -> list[str]:
+        connection = sqlite3.connect(
+            f"{self.database.as_uri()}?mode=ro&immutable=1", uri=True
+        )
+        try:
+            return list(connection.iterdump())
+        finally:
+            connection.close()
+
+    def test_registered_preview_command_is_available_and_non_mutating(self) -> None:
+        before = self.database.read_bytes()
+        before_names = sorted(path.name for path in self.root.iterdir())
+        result = self.preview()
+        self.assertEqual(
+            "twinfinity.approval-semantic-contract-v2-activation-preview.v1",
+            result["schema"],
+        )
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(
+            before_names, sorted(path.name for path in self.root.iterdir())
+        )
+
+    def test_apply_commits_pointer_and_receipt_atomically_then_replays_exactly(
+        self,
+    ) -> None:
+        preview = self.preview()
+        code, first = self.apply(preview)
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "twinfinity.approval-semantic-contract-v2-activation-receipt.v1",
+            first["schema"],
+        )
+        connection = sqlite3.connect(
+            f"{self.database.as_uri()}?mode=ro&immutable=1", uri=True
+        )
+        try:
+            pointer = connection.execute(
+                "SELECT singleton,schema,authority_sha256,activated_at "
+                "FROM approval_semantic_contract_current"
+            ).fetchone()
+            event = connection.execute(
+                "SELECT event_type,entity_key,payload_sha256,created_at "
+                "FROM approval_events WHERE event_type=?",
+                (
+                    approval_ledger_module
+                    .SEMANTIC_CONTRACT_V2_ACTIVATION_EVENT,
+                ),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(
+            (1, "twinfinity.approval-proposal.v2", "3" * 64),
+            pointer[:3],
+        )
+        self.assertEqual(1, len(event))
+        self.assertEqual(first["receipt_sha256"], event[0][2])
+        self.assertEqual(pointer[3], event[0][3])
+
+        before_dump = self.database_dump()
+        before_bytes = self.database.read_bytes()
+        code, replay = self.apply(preview)
+        self.assertEqual(0, code)
+        self.assertEqual(first, replay)
+        self.assertEqual(before_dump, self.database_dump())
+        self.assertEqual(before_bytes, self.database.read_bytes())
+        self.assertEqual(preview, self.preview())
+
+    def test_request_and_preview_digest_drift_fail_before_writable_open(self) -> None:
+        preview = self.preview()
+        before = self.database_dump()
+        cases = (
+            ("0" * 64, preview["preview_sha256"], "REQUEST_DIGEST_DRIFT"),
+            (preview["request_sha256"], "0" * 64, "PREVIEW_DRIFT"),
+        )
+        for request_sha, preview_sha, error in cases:
+            with self.subTest(error=error):
+                code, result = self.run_cli(
+                    "semantic-contract-v2-apply",
+                    "--request",
+                    str(self.request),
+                    "--expected-request-sha256",
+                    request_sha,
+                    "--expected-preview-sha256",
+                    preview_sha,
+                )
+                self.assertEqual(1, code)
+                self.assertIn(error, result["error"])
+                self.assertEqual(before, self.database_dump())
+
+    def test_every_bound_request_field_substitution_is_zero_write(self) -> None:
+        preview = self.preview()
+        before = self.database_dump()
+        substitutions = {
+            "repository": "other/harness",
+            "accepted_harness_main_sha": "6" * 40,
+            "schema_sentinel_sha256": "6" * 64,
+            "expected_v1_pointer": {
+                **self.request_payload["expected_v1_pointer"],
+                "authority_sha256": "6" * 64,
+            },
+            "v2_authority_sha256": "6" * 64,
+            "legacy_authority_inventory_sha256": "6" * 64,
+            "stopped_state_evidence_sha256": "6" * 64,
+            "operation_key": "issue-193-v2-activation-substituted",
+        }
+        for field, value in substitutions.items():
+            with self.subTest(field=field):
+                changed = dict(self.request_payload)
+                changed[field] = value
+                self.write_request(changed)
+                code, _result = self.run_cli(
+                    "semantic-contract-v2-apply",
+                    "--request",
+                    str(self.request),
+                    "--expected-request-sha256",
+                    preview["request_sha256"],
+                    "--expected-preview-sha256",
+                    preview["preview_sha256"],
+                )
+                self.assertEqual(1, code)
+                self.assertEqual(before, self.database_dump())
+        self.write_request(self.request_payload)
+
+    def test_pointer_singleton_rejects_boolean_json_alias(self) -> None:
+        changed = dict(self.request_payload)
+        changed["expected_v1_pointer"] = {
+            **self.request_payload["expected_v1_pointer"],
+            "singleton": True,
+        }
+        self.write_request(changed)
+        before = self.database_dump()
+        code, result = self.run_cli(
+            "semantic-contract-v2-preview", "--request", str(self.request)
+        )
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_REQUEST_INVALID", result["error"])
+        self.assertEqual(before, self.database_dump())
+
+    def test_missing_schema_and_explicit_v1_pointer_do_not_create_state(self) -> None:
+        empty = self.root / "empty.sqlite3"
+        sqlite3.connect(empty).close()
+        empty.chmod(0o600)
+        no_pointer = self.root / "no-pointer.sqlite3"
+        store = CoordinationStore(no_pointer)
+        ensure_schema(store.connection)
+        store.close()
+        preview = approval_ledger_module._semantic_contract_v2_activation_preview(
+            self.request_payload
+        )
+        for database, expected_error in (
+            (empty, "SCHEMA_SENTINEL_REQUIRED"),
+            (no_pointer, "EXPLICIT_V1_POINTER_REQUIRED"),
+        ):
+            with self.subTest(database=database.name):
+                original = self.database
+                self.database = database
+                before_bytes = database.read_bytes()
+                before_names = sorted(path.name for path in self.root.iterdir())
+                for command in ("preview", "apply"):
+                    with self.subTest(command=command):
+                        if command == "preview":
+                            code, result = self.run_cli(
+                                "semantic-contract-v2-preview",
+                                "--request",
+                                str(self.request),
+                            )
+                        else:
+                            code, result = self.run_cli(
+                                "semantic-contract-v2-apply",
+                                "--request",
+                                str(self.request),
+                                "--expected-request-sha256",
+                                preview["request_sha256"],
+                                "--expected-preview-sha256",
+                                preview["preview_sha256"],
+                            )
+                        self.assertEqual(1, code)
+                        self.assertIn(expected_error, result["error"])
+                        self.assertEqual(before_bytes, database.read_bytes())
+                        self.assertEqual(
+                            before_names,
+                            sorted(path.name for path in self.root.iterdir()),
+                        )
+                self.database = original
+
+    def test_drifted_schema_sentinel_is_rejected_without_further_effect(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "DROP TRIGGER approval_semantic_contract_no_downgrade"
+        )
+        connection.commit()
+        connection.close()
+        before = self.database.read_bytes()
+        before_names = sorted(path.name for path in self.root.iterdir())
+        code, result = self.run_cli(
+            "semantic-contract-v2-preview", "--request", str(self.request)
+        )
+        self.assertEqual(1, code)
+        self.assertIn("SCHEMA_SENTINEL_REQUIRED", result["error"])
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(
+            before_names, sorted(path.name for path in self.root.iterdir())
+        )
+
+    def test_receipt_failure_rolls_back_pointer_and_event_together(self) -> None:
+        preview = self.preview()
+        before = self.database_dump()
+        original_event = approval_ledger_module._event
+
+        def fail_after_event(*args, **kwargs) -> None:
+            original_event(*args, **kwargs)
+            raise CoordinationError("INJECTED_RECEIPT_FAILURE")
+
+        with patch.object(
+            approval_ledger_module,
+            "_event",
+            side_effect=fail_after_event,
+        ):
+            code, result = self.apply(preview)
+        self.assertEqual(1, code)
+        self.assertEqual("INJECTED_RECEIPT_FAILURE", result["error"])
+        self.assertEqual(before, self.database_dump())
+
+    def test_non_activation_v1_rows_are_byte_preserved(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "INSERT INTO approval_events("
+            "event_type,entity_key,payload_sha256,created_at) VALUES (?,?,?,?)",
+            ("LEGACY_V1_EVIDENCE", "approval:legacy", "7" * 64,
+             "2026-09-04T05:00:01Z"),
+        )
+        connection.commit()
+        before = connection.execute(
+            "SELECT event_type,entity_key,payload_sha256,created_at "
+            "FROM approval_events WHERE event_type='LEGACY_V1_EVIDENCE'"
+        ).fetchone()
+        connection.close()
+        preview = self.preview()
+        code, _receipt = self.apply(preview)
+        self.assertEqual(0, code)
+        connection = sqlite3.connect(
+            f"{self.database.as_uri()}?mode=ro&immutable=1", uri=True
+        )
+        try:
+            after = connection.execute(
+                "SELECT event_type,entity_key,payload_sha256,created_at "
+                "FROM approval_events WHERE event_type='LEGACY_V1_EVIDENCE'"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(before, after)
+
+    def test_noncanonical_request_and_busy_sidecars_fail_with_zero_effect(self) -> None:
+        self.request.write_text(
+            json.dumps(self.request_payload, indent=2), encoding="utf-8"
+        )
+        before = self.database_dump()
+        code, result = self.run_cli(
+            "semantic-contract-v2-preview", "--request", str(self.request)
+        )
+        self.assertEqual(1, code)
+        self.assertIn("REQUEST_INVALID", result["error"])
+        self.assertEqual(before, self.database_dump())
+
+        self.write_request(self.request_payload)
+        wal = Path(f"{self.database}-wal")
+        wal.write_bytes(b"synthetic-busy-sidecar")
+        before_database = self.database.read_bytes()
+        before_wal = wal.read_bytes()
+        code, result = self.run_cli(
+            "semantic-contract-v2-preview", "--request", str(self.request)
+        )
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_NOT_QUIESCENT", result["error"])
+        self.assertEqual(before_database, self.database.read_bytes())
+        self.assertEqual(before_wal, wal.read_bytes())
+
+    def test_dangling_sidecar_entry_is_not_treated_as_quiescent(self) -> None:
+        wal = Path(f"{self.database}-wal")
+        wal.symlink_to(self.root / "missing-wal-target")
+        before = self.database.read_bytes()
+        code, result = self.run_cli(
+            "semantic-contract-v2-preview", "--request", str(self.request)
+        )
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_NOT_QUIESCENT", result["error"])
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertTrue(wal.is_symlink())
+
+    def test_extra_activation_table_trigger_is_schema_drift(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "CREATE TRIGGER unexpected_activation_receipt_effect "
+            "AFTER INSERT ON approval_events BEGIN SELECT 1; END"
+        )
+        connection.commit()
+        connection.close()
+        before = self.database.read_bytes()
+        code, result = self.run_cli(
+            "semantic-contract-v2-preview", "--request", str(self.request)
+        )
+        self.assertEqual(1, code)
+        self.assertIn("SCHEMA_SENTINEL_INVALID", result["error"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_writable_open_cannot_follow_a_post_preflight_path_swap(self) -> None:
+        preview = self.preview()
+        victim = self.root / "replacement.sqlite3"
+        victim.write_bytes(self.database.read_bytes())
+        victim.chmod(0o600)
+        victim_before = victim.read_bytes()
+        original_validate = (
+            approval_ledger_module._validated_quiescent_activation_database
+        )
+        validations = 0
+
+        def swap_before_writable_open(path: Path) -> Path:
+            nonlocal validations
+            validated = original_validate(path)
+            validations += 1
+            if validations == 2:
+                validated.unlink()
+                validated.symlink_to(victim)
+            return validated
+
+        with patch.object(
+            approval_ledger_module,
+            "_validated_quiescent_activation_database",
+            side_effect=swap_before_writable_open,
+        ):
+            code, result = self.apply(preview)
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_DATABASE_UNSAFE", result["error"])
+        self.assertEqual(victim_before, victim.read_bytes())
+        self.assertTrue(self.database.is_symlink())
+
+    def test_pointer_drift_between_preflight_and_transaction_cannot_activate(
+        self,
+    ) -> None:
+        preview = self.preview()
+        original_validate = (
+            approval_ledger_module._validated_quiescent_activation_database
+        )
+        validations = 0
+
+        def drift_before_writable_open(path: Path) -> Path:
+            nonlocal validations
+            validated = original_validate(path)
+            validations += 1
+            if validations == 2:
+                connection = sqlite3.connect(validated)
+                connection.execute(
+                    "UPDATE approval_semantic_contract_current "
+                    "SET authority_sha256=? WHERE singleton=1",
+                    ("6" * 64,),
+                )
+                connection.commit()
+                connection.close()
+            return validated
+
+        with patch.object(
+            approval_ledger_module,
+            "_validated_quiescent_activation_database",
+            side_effect=drift_before_writable_open,
+        ):
+            code, result = self.apply(preview)
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_POINTER_DRIFT", result["error"])
+        connection = sqlite3.connect(
+            f"{self.database.as_uri()}?mode=ro&immutable=1", uri=True
+        )
+        try:
+            pointer = connection.execute(
+                "SELECT schema,authority_sha256 "
+                "FROM approval_semantic_contract_current WHERE singleton=1"
+            ).fetchone()
+            activation_events = connection.execute(
+                "SELECT COUNT(*) FROM approval_events WHERE event_type=?",
+                (
+                    approval_ledger_module
+                    .SEMANTIC_CONTRACT_V2_ACTIVATION_EVENT,
+                ),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(
+            ("twinfinity.approval-proposal.v1", "6" * 64), pointer
+        )
+        self.assertEqual(0, activation_events)
+
+    def test_v2_without_exact_receipt_cannot_be_treated_as_replay(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE approval_semantic_contract_current "
+            "SET schema=?,authority_sha256=?,activated_at=? WHERE singleton=1",
+            (
+                "twinfinity.approval-proposal.v2",
+                self.request_payload["v2_authority_sha256"],
+                "2026-09-04T05:00:02Z",
+            ),
+        )
+        connection.commit()
+        connection.close()
+        preview = approval_ledger_module._semantic_contract_v2_activation_preview(
+            self.request_payload
+        )
+        before = self.database_dump()
+        code, result = self.apply(preview)
+        self.assertEqual(1, code)
+        self.assertIn("ACTIVATION_RECEIPT_INVALID", result["error"])
+        self.assertEqual(before, self.database_dump())
+
+    def test_changed_operation_cannot_replay_an_existing_activation(self) -> None:
+        preview = self.preview()
+        code, _receipt = self.apply(preview)
+        self.assertEqual(0, code)
+        before = self.database_dump()
+        changed = dict(self.request_payload)
+        changed["operation_key"] = "issue-193-v2-activation-other"
+        self.write_request(changed)
+        changed_preview = (
+            approval_ledger_module._semantic_contract_v2_activation_preview(
+                changed
+            )
+        )
+        code, result = self.apply(changed_preview)
+        self.assertEqual(1, code)
+        self.assertIn("OPERATION_CONFLICT", result["error"])
+        self.assertEqual(before, self.database_dump())
+
+    def test_changed_authority_with_recomputed_digests_cannot_replay(self) -> None:
+        preview = self.preview()
+        code, _receipt = self.apply(preview)
+        self.assertEqual(0, code)
+        before = self.database_dump()
+        changed = dict(self.request_payload)
+        changed["v2_authority_sha256"] = "6" * 64
+        self.write_request(changed)
+        changed_preview = (
+            approval_ledger_module._semantic_contract_v2_activation_preview(
+                changed
+            )
+        )
+        code, result = self.apply(changed_preview)
+        self.assertEqual(1, code)
+        self.assertIn("OPERATION_CONFLICT", result["error"])
+        self.assertEqual(before, self.database_dump())
 
 
 if __name__ == "__main__":
