@@ -343,6 +343,34 @@ python3 scripts/kanban_pull_buffer.py readiness-apply-decision \
 
 The consumer is atomic across message claim/completion, historical role-equivalent approval delivery claim/acknowledgement, source/scope/revocation checks, immutable consumption, and disposition. `APPROVE` derives one deterministic successor from stored state. `REJECT` and `COURSE_CORRECT` enter durable `HOLD`; course correction requires a new materially different proposal. Readiness `DEFER` enters `HOLD` with a strict UTC `AT` revisit trigger and produces one due Planner re-review rather than approving automatically. Generic message claim and caller-authored approval resumes fail closed. Revocations are processed before portfolio convergence, and approval-resumed READY activation rechecks effectivity inside the admission transaction.
 
+New approval authority uses `twinfinity.approval-proposal.v2`; its semantic
+identity includes the secret-safe evidence list. The monotonic v2 activation is
+a separate stopped-state operation. Once active, authority-bearing v1 current,
+pending, publication-waiting, deliverable, claimed-but-unacknowledged, or
+effective state returns `APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED`. Historical
+v1 bytes and identifiers remain immutable audit evidence and are never
+silently upgraded; continued authority requires a fresh complete v2 lineage.
+See [references/approval-ledger.md](references/approval-ledger.md).
+
+## Complete owner-read-only coordination snapshot
+
+`scripts/coordination_truth_snapshot.py` opens one already-existing owner-safe
+database read-only, holds one stable SQLite transaction, validates the exact
+schema/default sentinels, current pointers, typed identities, repository
+attribution, cross-family relationships, and bounded filesystem effects, then
+rolls back and emits only allowlisted secret-safe identities and digests. It
+supports only the TwinfinityApp and harness repositories and returns one typed,
+value-free HOLD on drift. Run it against a disposable or separately authorized
+owner database; source validation never reads or mutates the live coordination
+database.
+
+Harness source repair itself does not use that snapshot, or any live SQLite
+row, as authority or veto. It follows the direct packet route in
+`references/harness-self-maintenance.md` and creates zero graph, item,
+artifact, readiness, READY, allocation, lease, message, attempt, watch,
+approval, outbox, or closeout rows. Normal TwinfinityApp delivery continues to
+require those SQLite controls.
+
 ## Validation
 
 Run tests only against temporary databases and the source-bound hermetic Codex
@@ -483,6 +511,7 @@ Archive readiness never authorizes deletion. Deleting archives or other data req
 | `portfolio_graph.py` / `portfolio_graph_supervisor.py` | Milestone- or issue-set-scoped dependency graph, coverage, collisions, scheduling decisions, refresh, and recovery. |
 | `kanban_pull_buffer.py` / `kanban_readiness.py` / `portfolio_convergence.py` | Zero-WIP candidates, one-phase all-gates readiness, bounded resolution, READY binding, dirty events, and atomic successor admission. |
 | `approval_ledger.py` / `approval_guard.py` | Material proposal, user decision, delivery, revocation, and execution-effectivity checks. |
+| `coordination_truth_snapshot.py` | Stable privacy-safe owner-read-only schema, pointer, relationship, and state-family snapshot. |
 | `prepush_control.py` / `delivery_guard.py` | Repository-derived exact-head gate receipts, guarded publication, and native delivery command enforcement. |
 | `run_harness_baseline_validations.py` / `twinfinity-harness-baseline-catalog-v1.json` | Fixed ordered validator catalog, accepted-base/candidate comparison, and noninterchangeable source/staged/installed receipts. |
 | `hosted_operation_control.py` / `hosted_operation_clearance.py` | Exact SRE provider-operation lifecycle and clearance. |

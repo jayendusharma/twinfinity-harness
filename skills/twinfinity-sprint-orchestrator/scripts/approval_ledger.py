@@ -43,7 +43,11 @@ from executor_registry import (
 from sync_github_coordination import fetch_object
 
 
-SCHEMA = "twinfinity.approval-proposal.v1"
+LEGACY_SCHEMA = "twinfinity.approval-proposal.v1"
+SCHEMA = "twinfinity.approval-proposal.v2"
+APPROVAL_SEMANTIC_CONTRACT_V1 = LEGACY_SCHEMA
+APPROVAL_SEMANTIC_CONTRACT_V2 = SCHEMA
+LEGACY_AUTHORITY_HOLD = "APPROVAL_LEGACY_V1_AUTHORITY_QUARANTINED"
 REVIEW_BATCH_SCHEMA = "twinfinity.approval-review-batch.v2"
 BATCH_ANSWER_SCHEMA = "twinfinity.approval-batch-answer-map.v1"
 DECISIONS = {"APPROVE", "REJECT", "COURSE_CORRECT", "DEFER"}
@@ -188,7 +192,7 @@ def _validate_string_list(
 def validate_packet(packet: Any) -> dict[str, Any]:
     if not isinstance(packet, dict) or set(packet) != PACKET_KEYS:
         raise CoordinationError("APPROVAL_PACKET_SCHEMA_INVALID")
-    if packet["schema"] != SCHEMA:
+    if packet["schema"] not in {LEGACY_SCHEMA, SCHEMA}:
         raise CoordinationError("APPROVAL_PACKET_SCHEMA_INVALID")
     if (
         not isinstance(packet["decision_key"], str)
@@ -491,6 +495,15 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             payload_sha256 TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS approval_semantic_contract_current (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            schema TEXT NOT NULL CHECK(schema IN (
+                'twinfinity.approval-proposal.v1',
+                'twinfinity.approval-proposal.v2'
+            )),
+            authority_sha256 TEXT NOT NULL,
+            activated_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS approval_pending_order
             ON approval_proposals(repository, urgency, priority, created_at);
         CREATE TRIGGER IF NOT EXISTS approval_proposals_immutable_update
@@ -547,6 +560,14 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS approval_review_batches_immutable_delete
         BEFORE DELETE ON approval_review_batches
         BEGIN SELECT RAISE(ABORT, 'APPROVAL_REVIEW_BATCH_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_semantic_contract_no_delete
+        BEFORE DELETE ON approval_semantic_contract_current
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_SEMANTIC_CONTRACT_IMMUTABLE'); END;
+        CREATE TRIGGER IF NOT EXISTS approval_semantic_contract_no_downgrade
+        BEFORE UPDATE ON approval_semantic_contract_current
+        WHEN OLD.schema='twinfinity.approval-proposal.v2'
+         AND NEW.schema!='twinfinity.approval-proposal.v2'
+        BEGIN SELECT RAISE(ABORT, 'APPROVAL_SEMANTIC_CONTRACT_DOWNGRADE'); END;
         COMMIT;
             """
         )
@@ -614,7 +635,7 @@ def _stable_source_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _semantic_packet(packet: dict[str, Any]) -> dict[str, Any]:
-    keys = (
+    keys = [
         "schema",
         "decision_key",
         "repository",
@@ -635,8 +656,139 @@ def _semantic_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "options",
         "recommendation",
         "expires_at",
-    )
+    ]
+    if packet["schema"] == SCHEMA:
+        keys.append("evidence")
     return {key: packet[key] for key in keys}
+
+
+def current_semantic_contract(connection: sqlite3.Connection) -> str:
+    """Return the explicit approval contract pointer without creating state."""
+
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='approval_semantic_contract_current'"
+    ).fetchone()
+    if table is None:
+        return LEGACY_SCHEMA
+    row = connection.execute(
+        "SELECT schema FROM approval_semantic_contract_current WHERE singleton=1"
+    ).fetchone()
+    if row is None:
+        return LEGACY_SCHEMA
+    if row["schema"] not in {LEGACY_SCHEMA, SCHEMA}:
+        raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_POINTER_INVALID")
+    return str(row["schema"])
+
+
+def activate_semantic_contract_v2(
+    connection: sqlite3.Connection,
+    *,
+    authority_sha256: str,
+    now: str,
+) -> dict[str, Any]:
+    """Monotonically activate v2 in a separately authorized migration."""
+
+    if not isinstance(authority_sha256, str) or not SHA256.fullmatch(authority_sha256):
+        raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_AUTHORITY_INVALID")
+    _validate_text(now, "activated_at")
+    ensure_schema(connection)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        prior = current_semantic_contract(connection)
+        if prior == SCHEMA:
+            row = connection.execute(
+                "SELECT authority_sha256,activated_at "
+                "FROM approval_semantic_contract_current WHERE singleton=1"
+            ).fetchone()
+            if row is None or row["authority_sha256"] != authority_sha256:
+                raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_CONFLICT")
+            connection.execute("COMMIT")
+            return {"schema": SCHEMA, "activated_at": row["activated_at"], "idempotent": True}
+        existing = connection.execute(
+            "SELECT schema FROM approval_semantic_contract_current WHERE singleton=1"
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO approval_semantic_contract_current("
+                "singleton,schema,authority_sha256,activated_at) VALUES (1,?,?,?)",
+                (SCHEMA, authority_sha256, now),
+            )
+        else:
+            connection.execute(
+                "UPDATE approval_semantic_contract_current "
+                "SET schema=?,authority_sha256=?,activated_at=? "
+                "WHERE singleton=1 AND schema=?",
+                (SCHEMA, authority_sha256, now, LEGACY_SCHEMA),
+            )
+        if connection.execute("SELECT changes()").fetchone()[0] != 1:
+            raise CoordinationError("APPROVAL_SEMANTIC_CONTRACT_CONFLICT")
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    return {"schema": SCHEMA, "activated_at": now, "idempotent": False}
+
+
+def _legacy_authority_quarantined(
+    connection: sqlite3.Connection, packet: dict[str, Any]
+) -> bool:
+    return (
+        current_semantic_contract(connection) == SCHEMA
+        and packet.get("schema") == LEGACY_SCHEMA
+    )
+
+
+def _require_current_semantic_contract(
+    connection: sqlite3.Connection, packet: dict[str, Any]
+) -> None:
+    if _legacy_authority_quarantined(connection, packet):
+        raise CoordinationError(LEGACY_AUTHORITY_HOLD)
+
+
+def _stored_proposal_packet(row: sqlite3.Row) -> dict[str, Any]:
+    """Validate immutable proposal bytes and their schema-specific identity."""
+
+    try:
+        packet = validate_packet(
+            json.loads(row["packet_json"], object_pairs_hook=_strict_object)
+        )
+    except (KeyError, TypeError, json.JSONDecodeError, CoordinationError) as exc:
+        raise CoordinationError("APPROVAL_PROPOSAL_BINDING_INVALID") from exc
+    expected = digest_json(_semantic_packet(packet))
+    bindings = {
+        "decision_key": "decision_key",
+        "repository": "repository",
+        "owning_issue": "owning_issue",
+        "source_snapshot_sha256": "source_snapshot_sha256",
+        "requester_session_id": "requester_session_id",
+        "recipient_session_id": "recipient_session_id",
+        "workstream": "workstream",
+        "boundary": "boundary",
+        "priority": "priority",
+        "urgency": "urgency",
+    }
+    if (
+        canonical_json(packet) != row["packet_json"]
+        or row["proposal_sha256"] != expected
+        or row["semantic_sha256"] != expected
+        or any(row[column] != packet[field] for column, field in bindings.items())
+    ):
+        raise CoordinationError("APPROVAL_PROPOSAL_BINDING_INVALID")
+    return packet
+
+
+def _proposal_packet_for_sha(
+    connection: sqlite3.Connection, proposal_sha256: str
+) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT * FROM approval_proposals WHERE proposal_sha256=?",
+        (proposal_sha256,),
+    ).fetchone()
+    if row is None:
+        raise CoordinationError("APPROVAL_PROPOSAL_NOT_FOUND")
+    return _stored_proposal_packet(row)
 
 
 def _retire_planner_notice(
@@ -767,6 +919,7 @@ def submit_proposal(
         raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
     packet = validate_packet(packet)
     packet = dict(packet)
+    _require_current_semantic_contract(store.connection, packet)
     if packet["workstream"] == "READINESS":
         if not isinstance(_readiness_binding, dict) or set(_readiness_binding) != {
             "requester_session_id",
@@ -1051,7 +1204,7 @@ def _pending_rows(
             )
     result = []
     for row in rows:
-        packet = json.loads(row["packet_json"])
+        packet = _stored_proposal_packet(row)
         affected = packet["affected_issues"]
         active_count = sum(
             item_rows.get(issue) in {"ACTIVE_FENCED", "ACTIVE", "RETAINED"}
@@ -1083,6 +1236,9 @@ def _pending_rows(
         }
         packet["source_current"] = _source_is_current(store, packet)
         packet["expired"] = _expired(packet, now)
+        packet["legacy_quarantined"] = _legacy_authority_quarantined(
+            store.connection, packet
+        )
         safety_rank = 0 if packet["boundary"] in {
             "SECURITY_PRIVACY", "HOSTED_PROVIDER", "DESTRUCTIVE", "PERSISTENT_DATA"
         } else 1
@@ -1110,19 +1266,22 @@ def _proposal_batch_binding(
     proposal_sha256: str,
     packet: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if packet is None:
-        row = store.connection.execute(
-            "SELECT packet_json FROM approval_proposals WHERE proposal_sha256=?",
-            (proposal_sha256,),
-        ).fetchone()
-        if row is None:
-            raise CoordinationError("APPROVAL_PROPOSAL_NOT_FOUND")
-        try:
-            packet = validate_packet(
-                json.loads(row["packet_json"], object_pairs_hook=_strict_object)
-            )
-        except (json.JSONDecodeError, CoordinationError) as exc:
-            raise CoordinationError("APPROVAL_BATCH_PROPOSAL_INVALID") from exc
+    row = store.connection.execute(
+        "SELECT * FROM approval_proposals WHERE proposal_sha256=?",
+        (proposal_sha256,),
+    ).fetchone()
+    if row is None:
+        raise CoordinationError("APPROVAL_PROPOSAL_NOT_FOUND")
+    try:
+        stored_packet = _stored_proposal_packet(row)
+    except CoordinationError as exc:
+        raise CoordinationError("APPROVAL_BATCH_PROPOSAL_INVALID") from exc
+    _require_current_semantic_contract(store.connection, stored_packet)
+    if packet is not None and any(
+        packet.get(key) != stored_packet[key] for key in PACKET_KEYS
+    ):
+        raise CoordinationError("APPROVAL_BATCH_PROPOSAL_BINDING_DRIFT")
+    packet = stored_packet
     recipients = sorted({
         canonicalize_coordination_identity(
             store.connection,
@@ -1290,7 +1449,9 @@ def create_review_batch(
         selected = [
             entry
             for entry in proposals
-            if entry["source_current"] and not entry["expired"]
+            if entry["source_current"]
+            and not entry["expired"]
+            and not entry["legacy_quarantined"]
         ]
         bindings = [
             _proposal_batch_binding(
@@ -1333,10 +1494,20 @@ def create_review_batch(
         "held": [
             {
                 "proposal_sha256": entry["proposal_sha256"],
-                "reason": "SOURCE_DRIFT" if not entry["source_current"] else "EXPIRED",
+                "reason": (
+                    LEGACY_AUTHORITY_HOLD
+                    if entry["legacy_quarantined"]
+                    else "SOURCE_DRIFT"
+                    if not entry["source_current"]
+                    else "EXPIRED"
+                ),
             }
             for entry in proposals
-            if not entry["source_current"] or entry["expired"]
+            if (
+                entry["legacy_quarantined"]
+                or not entry["source_current"]
+                or entry["expired"]
+            )
         ],
     }
 
@@ -1356,6 +1527,7 @@ def _decision_comment(
         f"- Decision: `{decision}`\n"
         f"- Selected option: `{selected_option_id}`\n"
         f"- Proposal digest: `{proposal_sha256}`\n"
+        f"- Proposal semantic contract: `{packet['schema']}`\n"
         f"- Review-batch digest: `{batch_sha256}`\n"
         f"- Batch-answer-map digest: `{batch_answer_map_sha256}`\n"
         f"- Frozen option-map digest: `{option_map_sha256}`\n"
@@ -1456,7 +1628,8 @@ def record_decision(
             raise CoordinationError("APPROVAL_PROPOSAL_NOT_FOUND")
         if row["current_sha"] != proposal_sha256:
             raise CoordinationError("APPROVAL_PROPOSAL_SUPERSEDED")
-        packet = json.loads(row["packet_json"])
+        packet = _proposal_packet_for_sha(store.connection, proposal_sha256)
+        _require_current_semantic_contract(store.connection, packet)
         if not _source_is_current(store, packet):
             raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_DRIFT")
         if _expired(packet, now):
@@ -1744,7 +1917,7 @@ def revoke_decision(
                 "user_input_sha256,planner_session_id,created_at) VALUES (?,?,?,?,?)",
                 (user_event_source, user_event_id, user_input_sha256, planner_session_id, now),
             )
-        packet = json.loads(row["packet_json"])
+        packet = _proposal_packet_for_sha(store.connection, proposal_sha256)
         source = store.current_snapshot(packet["repository"], "issue", packet["owning_issue"])
         if source is None:
             raise CoordinationError("APPROVAL_SOURCE_SNAPSHOT_MISSING")
@@ -1908,6 +2081,14 @@ def enqueue_published_readiness_decision_notices(
             (limit,),
         ).fetchall()
         for row in rows:
+            packet = _proposal_packet_for_sha(
+                store.connection, str(row["proposal_sha256"])
+            )
+            if (
+                _legacy_authority_quarantined(store.connection, packet)
+                and row["revoked_decision_sha256"] is None
+            ):
+                continue
             if not identities_role_equivalent(
                 store.connection,
                 str(row["recipient_session_id"]),
@@ -2164,7 +2345,8 @@ def claim_decision_in_transaction(
     if row["state"] == "ACKNOWLEDGED" and not allow_acknowledged_replay:
         raise CoordinationError("APPROVAL_ALREADY_ACKNOWLEDGED")
 
-    packet = json.loads(row["packet_json"])
+    packet = _proposal_packet_for_sha(store.connection, proposal_sha256)
+    _require_current_semantic_contract(store.connection, packet)
     batch, frozen = _load_review_batch(
         store, row["batch_sha256"], proposal_sha256
     )
@@ -2362,7 +2544,8 @@ def claim_decision(
         raise CoordinationError("APPROVAL_DELIVERY_HELD")
     if preflight["outbox_state"] != "COMPLETE" or not preflight["remote_receipt"]:
         raise CoordinationError("APPROVAL_PUBLICATION_INCOMPLETE")
-    packet = json.loads(preflight["packet_json"])
+    packet = _proposal_packet_for_sha(store.connection, proposal_sha256)
+    _require_current_semantic_contract(store.connection, packet)
     refreshed_payload = source_refresher(
         packet["repository"], "issue", packet["owning_issue"]
     )
@@ -2489,7 +2672,7 @@ def claim_decision(
                 {"recipient_session_id": recipient_session_id},
                 now,
             )
-        packet = json.loads(row["packet_json"])
+        packet = _proposal_packet_for_sha(store.connection, proposal_sha256)
     if held_error is not None:
         raise CoordinationError(held_error)
     return {
@@ -2521,6 +2704,8 @@ def acknowledge_decision_in_transaction(
         raise CoordinationError("COORDINATOR_TRANSACTION_REQUIRED")
     if not SHA256.fullmatch(proposal_sha256) or not SHA256.fullmatch(decision_sha256):
         raise CoordinationError("APPROVAL_DIGEST_INVALID")
+    packet = _proposal_packet_for_sha(store.connection, proposal_sha256)
+    _require_current_semantic_contract(store.connection, packet)
     recipient_session_id = delivery_recipient_for_role(
         store, proposal_sha256, recipient_session_id
     )
@@ -2578,6 +2763,7 @@ def acknowledge_decision(
 def summary(store: CoordinationStore, repository: str, *, now: str | None = None) -> dict[str, Any]:
     ensure_schema(store.connection)
     observed_at = now or utc_now()
+    active_contract = current_semantic_contract(store.connection)
     pending = _pending_rows(store, repository, now=observed_at)
     counts = {
         row["state"]: int(row["count"])
@@ -2599,8 +2785,11 @@ def summary(store: CoordinationStore, repository: str, *, now: str | None = None
         JOIN github_outbox o ON o.id=d.owner_outbox_id
         WHERE p.repository=? AND x.state='WAITING_PUBLICATION'
           AND o.state='COMPLETE' AND o.remote_receipt IS NOT NULL
+          AND (?!='twinfinity.approval-proposal.v2'
+               OR json_extract(p.packet_json,'$.schema')
+                  ='twinfinity.approval-proposal.v2')
         """,
-        (repository,),
+        (repository, active_contract),
     ).fetchone()[0]
     notices = store.connection.execute(
         """
@@ -2613,12 +2802,18 @@ def summary(store: CoordinationStore, repository: str, *, now: str | None = None
     ).fetchone()[0]
     return {
         "repository": repository,
+        "semantic_contract": active_contract,
         "pending_current": sum(
             1 for item in pending
-            if _source_is_current(store, item) and not item["expired"]
+            if _source_is_current(store, item)
+            and not item["expired"]
+            and not item["legacy_quarantined"]
         ),
         "pending_stale": sum(1 for item in pending if not _source_is_current(store, item)),
         "pending_expired": sum(1 for item in pending if item["expired"]),
+        "legacy_v1_quarantined": sum(
+            1 for item in pending if item["legacy_quarantined"]
+        ),
         "deliverable": int(deliverable),
         "deliveries": counts,
         "pending_planner_notices": int(notices),
