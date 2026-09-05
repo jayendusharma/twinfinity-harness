@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from coordination_store import (
     CoordinationError,
     DEFAULT_DATABASE,
+    _normalized_schema_sql,
     canonical_json,
     digest_json,
     parse_coordination_envelope,
@@ -54,6 +55,18 @@ MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_ROUTING_OBJECTS = 10_000
 SIDECAR_FREE_WAL_READ_BOUNDARY = "stopped-checkpointed-sidecar-free-wal-v1"
 _SIDECAR_FREE_WAL_JOURNAL = "WAL_SIDECAR_FREE_IMMUTABLE"
+BROKER_QUARANTINE_TABLES = (
+    "role_executor_broker_runs",
+    "role_executor_broker_receipt_pickups",
+    "role_executor_broker_pickup_consumptions",
+    "role_executor_broker_events",
+)
+# Derived from role_executor_broker.ensure_broker_schema on the accepted source.
+# sqlite_autoindex entries deliberately have no SQL and are covered by their
+# owning table declarations.  Every named table, index, and trigger is bound.
+BROKER_QUARANTINE_SCHEMA_MANIFEST_SHA256 = (
+    "3b376384f8efe79feaa97bad7dde1eb8455be8a31d97ff30975921e236b6fe67"
+)
 
 
 class SnapshotHold(ValueError):
@@ -322,6 +335,34 @@ def _schema_record(connection: sqlite3.Connection, table: str) -> dict[str, Any]
     return {"columns": columns, "foreign_keys": foreign_keys}
 
 
+def _validate_broker_quarantine(connection: sqlite3.Connection) -> None:
+    """Accept the retired broker only as one exact, empty, unprojected family."""
+
+    placeholders = ",".join("?" for _ in BROKER_QUARANTINE_TABLES)
+    objects = [
+        {
+            "type": str(row[0]),
+            "name": str(row[1]),
+            "table": str(row[2]),
+            "sql": _normalized_schema_sql(str(row[3])),
+        }
+        for row in connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            f"WHERE sql IS NOT NULL AND tbl_name IN ({placeholders}) "
+            "AND type IN ('table','index','trigger') ORDER BY type,name",
+            BROKER_QUARANTINE_TABLES,
+        )
+    ]
+    if digest_json(objects) != BROKER_QUARANTINE_SCHEMA_MANIFEST_SHA256:
+        raise SnapshotHold("COORDINATION_TRUTH_BROKER_QUARANTINE_SCHEMA_DRIFT")
+    for table in BROKER_QUARANTINE_TABLES:
+        row = connection.execute(
+            f'SELECT COUNT(*) FROM "{table}"'
+        ).fetchone()
+        if row is None or type(row[0]) is not int or int(row[0]) != 0:
+            raise SnapshotHold("COORDINATION_TRUTH_BROKER_QUARANTINE_NONEMPTY")
+
+
 def _validate_schema(connection: sqlite3.Connection) -> dict[str, Any]:
     present = {
         str(row[0])
@@ -330,8 +371,15 @@ def _validate_schema(connection: sqlite3.Connection) -> dict[str, Any]:
             "AND name NOT LIKE 'sqlite_%'"
         )
     }
-    if present != set(EXPECTED_SCHEMA_SHA256):
+    accepted = set(EXPECTED_SCHEMA_SHA256)
+    broker = set(BROKER_QUARANTINE_TABLES)
+    broker_present = present & broker
+    if broker_present and broker_present != broker:
+        raise SnapshotHold("COORDINATION_TRUTH_BROKER_QUARANTINE_PARTIAL")
+    if present != accepted and present != accepted | broker:
         raise SnapshotHold("COORDINATION_TRUTH_SCHEMA_INCOMPLETE")
+    if broker_present:
+        _validate_broker_quarantine(connection)
     tables = []
     for table in sorted(EXPECTED_SCHEMA_SHA256):
         actual = digest_json(_schema_record(connection, table))

@@ -166,6 +166,130 @@ an absent v1 pointer, creates or migrates schema, installs reviewed source,
 starts services or timers, changes endpoints, or launches an application
 canary. Those effects retain their separate authority and evidence boundaries.
 
+### Exact pre-canary schema bootstrap
+
+The semantic-contract activation above deliberately cannot seed an absent v1
+pointer or create missing schema. Before its separately authorized live use,
+the registered pre-canary bootstrap may reconcile exactly one known historical
+predecessor: the 75 accepted tables already present, the two accepted tables
+absent, and the complete source-declared four-table broker family present and
+empty. The broker family remains quarantined history. It supplies no routing,
+attempt, endpoint, scheduler, delivery, or approval authority and no broker
+field is emitted by snapshot v1.
+
+The command is fixed to the owner coordination database and accepts no
+database path, SQL, table set, target version, Python callback, or generic
+migration selector. A separately authorized, stopped-state SRE operation must
+establish an exclusive maintenance window covering every harness writer,
+timer, executor attempt, and namespace-mutating maintenance operation. The
+stopped owner must be the sole database and namespace mutator from opening
+through validation, writes, COMMIT, and connection close. Concurrent external
+database, ancestor-directory, or SQLite-sidecar mutation is unsupported,
+whether accidental or malicious, including an uncooperative same-UID process.
+Available stopped-state and identity observations bind evidence; neither those
+observations nor advisory locks enforce namespace exclusion. The SRE operation
+must prepare canonical compact JSON with exactly these fields:
+
+```json
+{
+  "accepted_harness_main_sha": "<40 lowercase hex characters>",
+  "broker_row_counts": {
+    "role_executor_broker_events": 0,
+    "role_executor_broker_pickup_consumptions": 0,
+    "role_executor_broker_receipt_pickups": 0,
+    "role_executor_broker_runs": 0
+  },
+  "broker_schema_manifest_sha256": "<exact reviewed source sentinel>",
+  "database_identity": {
+    "ctime_ns": 0,
+    "device": 0,
+    "gid": 0,
+    "inode": 1,
+    "links": 1,
+    "mode": 384,
+    "mtime_ns": 0,
+    "sha256": "<exact stopped predecessor database digest>",
+    "size": 1,
+    "uid": 0
+  },
+  "missing_tables": [
+    "approval_semantic_contract_current",
+    "portfolio_ready_quarantines"
+  ],
+  "operation_key": "<unique bounded operation key>",
+  "predecessor_schema_sentinel_sha256": "<exact reviewed source sentinel>",
+  "repository": "jayendusharma/twinfinity-harness",
+  "rollback_evidence_sha256": "<64 lowercase hex characters>",
+  "schema": "twinfinity.pre-canary-schema-bootstrap-request.v1",
+  "stopped_state_evidence_sha256": "<64 lowercase hex characters>",
+  "v1_activated_at": "<strict RFC3339 UTC timestamp without fractions>",
+  "v1_authority_sha256": "<64 lowercase hex characters>"
+}
+```
+
+The numeric identity values above illustrate types only; the request must bind
+the exact validated owner-only database identity and content. Preview is the
+only first step:
+
+```bash
+python3 scripts/pre_canary_schema_bootstrap.py preview \
+  --request <owner-local-canonical-request.json>
+```
+
+Preview uses the retained, no-follow, immutable descriptor and the explicit
+stopped, checkpointed, sidecar-free WAL boundary. It validates the complete
+predecessor or an exact replay, and returns deterministic request and preview
+digests without changing database bytes, rows, schema, sidecars, timestamps
+other than read atime, or filesystem namespace.
+
+The existing predecessor/result sentinel fields bind source-derived complete
+table declarations, explicit indexes and triggers, columns, defaults, and
+foreign keys for every accepted predecessor table. This includes
+`approval_events`, every possible predecessor target of hidden trigger DML,
+and its system-owned `sqlite_sequence` declaration. The per-table schema
+digests include complete object definitions without adding request, preview,
+receipt, or sentinel fields. Automatic indexes are bound by their canonical
+table declarations. Extra, missing, renamed, or altered objects fail closed.
+
+Apply consumes both returned digests:
+
+```bash
+python3 scripts/pre_canary_schema_bootstrap.py apply \
+  --request <owner-local-canonical-request.json> \
+  --expected-request-sha256 <request digest> \
+  --expected-preview-sha256 <preview digest>
+```
+
+Apply keeps the validated inode pinned across read-only preflight and the
+writable open, proves SQLite retained that inode, and revalidates the complete
+predecessor object family, request bindings, and identity under one
+`BEGIN IMMEDIATE` transaction before bootstrap DDL or DML. It creates only the canonical
+`approval_semantic_contract_current` and `portfolio_ready_quarantines` tables
+and their accepted triggers and automatic indexes, inserts one explicit
+`twinfinity.approval-proposal.v1` singleton pointer using the request's exact
+authority and timestamp, and appends one
+`PRE_CANARY_SCHEMA_BOOTSTRAP_APPLIED` event whose payload digest is the
+canonical receipt digest. Result validation rechecks predecessor objects and
+the complete new-table family; identity is checked again before COMMIT.
+Observed pre-write drift returns HOLD without bootstrap writes. Detected
+pre-COMMIT drift or a transaction failure rolls back logical transactional
+effects. Rollback does not promise byte-identical database files or absence
+of transient SQLite sidecars. Once COMMIT succeeds, the exact durable
+`APPLIED` receipt remains the result even if connection or descriptor cleanup
+raises; cleanup cannot report HOLD or imply rollback after COMMIT. Exact replay
+validates the same complete object families, pointer, and event and returns
+the byte-identical receipt without another mutable open or effect.
+
+Unknown or additional missing tables, a partial, malformed, or nonempty broker
+family, schema/default drift, conflicting pointer or receipt, noncanonical
+request, or digest drift is a typed preflight HOLD. Observations cannot make
+identity checking and COMMIT atomic against an external namespace mutator.
+Interference outside sole ownership has no safety, canonical-path replay, or
+automatic-retry guarantee; recovery requires a separate SRE disposition.
+The bootstrap does not activate v2, install source,
+start endpoints or timers, operate providers, mutate TwinfinityApp, or launch a
+canary. Each later effect requires its own exact authority and readback.
+
 ## Transaction sequence
 
 1. Refresh and ingest the owning issue snapshot.
