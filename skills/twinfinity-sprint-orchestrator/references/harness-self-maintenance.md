@@ -50,9 +50,11 @@ terminal publication.
 
 At every decision boundary, re-fetch the issue body, main, branches, pull
 requests, exact head when present, and collisions and compare them with the
-packet. Before `MERGED`, main must remain the starting-main SHA. The registered
-match-head receipt alone may advance that binding to its recorded merge-result
-main SHA; after `MERGED`, live main must equal that result. Any other
+packet and any valid immutable integration continuation below. Before `MERGED`,
+main must equal the starting-main SHA or the exact accepted base advanced by
+that continuation. The registered match-head receipt alone advances this
+binding to its recorded merge-result main SHA; after `MERGED`, live main must
+equal that result through required closeout. Any other
 repository, issue, body, main, branch, worktree, opaque identity, writer, path,
 semantic scope, authority, capacity, stage, head, dependency, or collision
 drift is `HOLD`. Do not repair the packet in place, fall back to SQLite, select
@@ -64,15 +66,22 @@ direct lane. SQLite may be inspected only when the packet explicitly requires
 non-authorizing diagnostic evidence; its contents can neither authorize,
 veto, reserve, acknowledge, publish, nor close direct source maintenance.
 
-## Reserve direct capacity and isolate the lane
+## Reserve two independent authors and one integration lane
 
 Each packet consumes one directly accounted harness-source writer unit. The
 Planner counts it outside SQLite and must remain within the exact
 owner-authorized ceiling recorded in the packet; no Shared, Development, or
-SRE allocation row or lease is created. Parallel direct packets are allowed
-only when their branches, worktrees, changed paths, semantic surfaces, and
-review capacity are provably disjoint. One packet has exactly one active
-writer and one mutable worktree.
+SRE allocation row or lease is created. Admit at most two authoring packets,
+even when the numeric ceiling is larger. Count active and retained ownership
+until an exact safe capacity disposition; a waiting author still owns its
+unit. One packet has exactly one active writer and one mutable worktree.
+
+Before admitting a second author, the Planner must prove a useful independent
+pair: disjoint changed paths, semantic surfaces, dependency families, branches,
+worktrees, environments, test resources, and available independent review
+capacity. Neither candidate may depend on the other's unaccepted result.
+Different paths or numeric headroom alone do not establish eligibility; keep
+one writer for any overlapping or dependent area and refuse a third author.
 
 For the harness repository, use the packet's exact
 `change/<issue>-<slug>` branch. The worktree basename is
@@ -81,6 +90,68 @@ owner suffix, and the opaque worktree ID equals the basename. Reject an active
 branch, pull request, writer, worktree, path, or semantic collision. Preserve
 dirty, ambiguous, historical, or foreign workspaces; their cleanup is not
 implied by a new packet.
+
+The Planner owns one integration reservation, bound to one exact packet and
+candidate. It spans final validation and independent acceptance, publication,
+natural CI, registered match-head merge, exact-main green, and that packet's
+required cleanup, terminal readback and capacity disposition. It grants no
+extra writer unit or mutation authority. Merge and main green alone do not
+release it; another author cannot enter final integration or advance main
+while required closeout remains incomplete.
+
+A waiting author may perform only its packet's authorized independent local
+stages. Local checks remain provisional until final integration acceptance.
+Keep a candidate unpublished if later integration may rewrite its commits.
+Never force-push a published ref, silently select another branch, or use the
+reservation to infer publication or cleanup authority.
+
+## Advance only an exactly bound integration base
+
+After the intervening accepted delivery completes its required closeout, the
+Planner may issue one immutable integration continuation under the original
+authority. This is the sole exception to the pre-merge main binding above;
+it cannot authorize itself or rewrite a frozen packet. Digest-bind together:
+
+- the original packet and trusted owner authority, repository and complete
+  issue/body, writer, branch, worktree and opaque identity;
+- the old base ref/SHA and retained candidate head, tree and canonical diff;
+- the exact new accepted main and the intervening accepted delivery's merge,
+  exact-main green, required closeout and integration-release evidence;
+- renewed pair independence, collisions, capacity, environments, test and
+  independent review resources, and the sole integration reservation;
+- one exact permitted local integration operation on the same branch and
+  worktree, including whether the ref is unpublished and whether the operation
+  rewrites commits; and
+- every prior continuation digest in order, the unchanged repair limit and
+  used budget, and the precise old-to-new base expectations allowed to advance.
+
+Before that operation, the writer echoes the complete composite envelope and
+re-fetches and compares every live binding. Missing, substituted or stale
+fields, an unclosed predecessor, or rewriting an already published ref is
+`HOLD`. Preserve the original packet, old head and earlier continuations as
+immutable history. Record the operation and resulting head/tree/canonical
+diff against the named new base; distinguish imported accepted-main changes
+from the candidate's unchanged closed paths and semantic scope. A conflict,
+new collision, changed diagnosis, scope or authority requires Planner
+disposition before resolution. Integration grants no generic conflict repair
+and never resets or increases the recorded repair allowance.
+
+Only the explicitly bound base expectations advance. All other drift remains
+`HOLD`; later-stage continuations must bind the original packet, complete
+integration chain and resulting exact candidate. Changed base or head makes
+earlier acceptance historical: rerun final-head focused evidence, applicable
+trusted-baseline/candidate comparisons, the complete eleven-skill catalog,
+registry audit and full hermetic suite. Require fresh independent Governor
+acceptance, natural exact-head CI and current registered match-head guards
+against the new base before merge. An unavailable guard remains `HOLD`.
+
+Freeze new second-author admissions on collision, foreign environment use,
+lost review independence, stale evidence or ambiguous ownership. Preserve
+active lineages and drain only through their existing exact authority. Apply
+this contract only after its own accepted source delivery and required
+closeout, then evaluate the next useful pair. Measure comparable completed
+delivery time including integration, revalidation and cleanup before any
+expansion; author count or source merge does not demonstrate a speedup.
 
 ## Run the direct source lifecycle
 
@@ -101,9 +172,10 @@ Keep the workflow coarse and GitHub-bound:
   root-local focused hermetic selectors, the fixed complete eleven-skill
   quick-validator catalog, and the full hermetic suite without application,
   browser, Docker, installation, or runtime activation. Starting-main
-  validators remain the trusted baseline. If the candidate changes a
-  validator, workflow, Governor contract, or merge guard, run both the
-  starting-main and candidate versions and retain both results.
+  validators remain the trusted baseline, with the exact accepted integration
+  base also bound when applicable. If the candidate changes a validator,
+  workflow, governing reference, Governor contract, or merge guard, run the
+  applicable accepted-baseline/candidate comparisons and retain both results.
 - `GOVERNOR_APPROVED`: obtain the independent exact-head source receipt below.
   Writer or Planner judgment cannot substitute.
 - `PR_OPEN`: only an exact publication continuation may publish the accepted
@@ -162,7 +234,8 @@ packet grants that authority.
 ## Bind validation and Governor evidence
 
 The validation manifest must bind the exact repository, issue and body digest,
-direct packet digest, base ref and SHA, head ref and SHA, head tree, canonical
+direct packet digest, integration continuation chain when present, base ref
+and SHA, head ref and SHA, head tree, canonical
 diff digest, changed paths, validation tool provenance, exact commands and
 results, generated-file cleanliness, and excluded-effect inventory. Forward
 tests must exercise realistic routing decisions: a complete harness packet
@@ -187,7 +260,8 @@ and body digest; packet digest; starting-main ref and SHA; starting-main
 contract digest; base ref and SHA; head ref, SHA, and tree; canonical diff
 digest; validation-manifest digest; Governor contract digest; Governor report
 digest; and fresh independent Governor attempt identity. It must also state
-the terminal verb and evidence-backed findings. Any field drift invalidates
+the terminal verb, evidence-backed findings and complete integration
+continuation chain when present. Any field drift invalidates
 the receipt. A receipt is evidence, never mutation authority.
 
 ## Stop for human authority
@@ -224,6 +298,14 @@ source contract must not claim that absent automation is live.
 effective. Installation and live activation require their own current SRE
 authority, controls, evidence, and terminal receipt.
 
+Safe retirement, physical cleanup, direct-capacity disposition and
+`SOURCE_COMPLETE` are distinct. Retirement alone cannot satisfy unchanged
+predecessor or integration obligations, waive required cleanup, or authorize
+reuse of preserved resources or retired authority. Record residual ownership
+and cleanup `HOLD` truthfully; only an exact authorized safe disposition may
+release a retained unit. This source policy adds no canary prerequisite and
+changes no application admission, installation, live-goal or runtime control.
+
 After separately authorized installation and activation, operational
 restoration requires issue #80 to run one real current-v6 source canary through
 the normal harness path from preparation and SQLite admission through guarded
@@ -236,4 +318,4 @@ The following is proposed future goal wording only. It is inactive, does not
 modify `coordination/product-planner-goal.md`, and becomes effective only
 through a separate explicit user-approved goal replacement:
 
-> Maintain Twinfinity's versioned Codex harness through one bounded, independently governed source-maintenance lane; treat source completion as distinct from separately authorized, installed, and attested live state.
+> Maintain Twinfinity's versioned Codex harness through bounded, independently governed source maintenance; treat source completion as distinct from separately authorized, installed, and attested live state.
