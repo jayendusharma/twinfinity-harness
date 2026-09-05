@@ -184,33 +184,36 @@ Development and SRE native actions run only through their fresh endpoint skills 
 
 ## Repository publication and exact-head evidence
 
-For a repository head:
+For normal SQLite-backed delivery:
 
 1. confirm current source, item, admission, lease, branch, worktree, and clean exact head;
 2. use the issue-owned toolchain and run the complete affected lower gate;
-3. run the closed repository-derived final-head gate profile and prove its applicable cleanup contract; application or workflow heads retain local Docker Compose acceptance, while a harness source head runs only its focused hermetic selectors, complete fixed quick-validator catalog, and full hermetic suite;
+3. run the closed repository-derived final-head gate profile, including local Docker Compose acceptance for application or workflow heads, and prove its applicable cleanup contract;
 4. require a canonical exact-head PASS receipt;
 5. publish only by invoking the canonical installed `prepush_control.py guarded-push` directly through `/usr/bin/python3`, without a shell wrapper or leading environment assignment, and pass the active owning issue rather than a retained transfer surface issue; and
 6. wait for natural exact-head CI and independent exact-head review.
 
-The shared pre-push hook revalidates the live reserved publication, canonical remote, branch, head, and sole ref update. Raw or bypassed publication is prohibited. Ambiguous transport is readback-only recovery. A changed head invalidates prior head-bound evidence.
+For this route, the shared pre-push hook revalidates the live SQLite publication reservation, canonical remote, branch, head, and sole ref update; raw or bypassed publication is prohibited.
 
-Pull-buffer preparation and convergence resolve remote main only through one
-immutable exact-repository Git-directory registration. The registered directory
-is read-only evidence and never expands the writable canonical-checkout,
-worktree, branch, or Git-command authority enforced by the delivery guard.
+Source maintenance in exact repository `jayendusharma/twinfinity-harness` follows [harness-self-maintenance.md](harness-self-maintenance.md) outside SQLite, including its exact-action publication fallback and complete source lifecycle. Require a current Planner continuation binding original trusted user authority, unchanged packet, authorized stage, repository, remote, ref, and accepted head. Missing or drifted bindings stop the affected mutation; never switch routes.
+
+Both routes recover ambiguous transport through readback only; changed heads invalidate head-bound evidence. Explicit managed permission denial stops the action: report it and the stated reason; never bypass through another transport, wrapper, or permission change. Source authority does not guarantee execution permission; denial alone is not a new product decision.
+
+Normal pull-buffer preparation and convergence resolve remote main only through an immutable exact-repository Git-directory registration. This read-only evidence never expands canonical-checkout, worktree, branch, or Git-command authority enforced by the delivery guard.
 
 Read [environment-isolation.md](environment-isolation.md) for toolchain and cleanup rules and [ui-evidence.md](ui-evidence.md) for visual changes.
 
 ## Approval ledger and outbox
 
-Only the Product Planner solicits user decisions. Development or SRE may submit one strict secret-safe proposal and pause only the affected mutation. A proposal or local decision grants no authority.
+Only the Product Planner solicits new material user decisions; Development or SRE returns one secret-safe proposal and pauses the affected mutation. Unchanged routine work under original trusted authority and an exact current Planner continuation needs no renewed user decision. A proposal, packet, or receipt cannot create authority.
 
-An approved decision exists only inside one immutable review batch that freezes source, execution scope, recipient set, option map, and option-to-machine-outcome mapping; the user event binds the exact canonical batch answer map, and the ledger derives the decision from the selected frozen option. It becomes effective for an exact fresh attempt only after its owning-issue outbox row is published and read back, current source remains compatible, and the attempt claims its exact delivery. Revocation invalidates unconsumed execution guards and creates an owning-issue publication record. Read [approval-ledger.md](approval-ledger.md) for the schema and lifecycle.
+For normal SQLite-backed delivery, [approval-ledger.md](approval-ledger.md) governs material decisions: an immutable batch freezes source, scope, recipients, options, and machine-outcome mappings; the user event binds its canonical answer map. The selected decision becomes effective only after exact owning-issue outbox publication/readback, compatible current source, and the fresh attempt's exact delivery claim. Revocation invalidates unconsumed guards and records owning-issue publication. A local decision alone grants no authority. Direct harness source uses its referenced contract and no SQLite approval or outbox rows.
 
 GitHub publication is sparse: product decisions, material authority, PR collaboration, acceptance evidence, terminal receipts, operational receipts, and canonical tracker truth. Do not publish local queue state, claim chatter, scheduler state, routine stage completion, or process liveness.
 
-Before publication, re-fetch the target, compare the source digest, reserve the outbox row, perform at most one external write in that publication round, and require exact readback. An ambiguous result remains readback-only; the terminal protocol alone may re-arm the same immutable envelope after its bounded exact-marker absence proof and unchanged source/graph revalidation. Use the GitHub-safe projection: publish public issue/PR identities, exact public heads, repository-relative leases, opaque run IDs, counts, verdicts, residual blockers, and one manifest fingerprint; keep absolute paths, tool locations, per-file hashes, cleanup targets, and archives owner-local.
+For SQLite outbox publication, re-fetch the target, compare its source digest, reserve the row, write at most once per round, and require exact readback. Ambiguity remains readback-only; only the terminal protocol may re-arm the immutable envelope after bounded exact-marker absence proof and unchanged source/graph revalidation.
+
+Both routes use the GitHub-safe projection: public issue/PR identities, exact public heads, repository-relative leases, opaque run IDs, counts, verdicts, residual blockers, and one manifest fingerprint. Keep absolute paths, tool locations, per-file hashes, cleanup targets, and archives owner-local.
 
 ## Issue-body mutation
 
